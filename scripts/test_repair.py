@@ -547,7 +547,36 @@ class RegressionSelectionTests(unittest.TestCase):
 
 
 class PolicyBundleTests(unittest.TestCase):
-    def test_closed_review_pair_reuse_requires_policy_only_and_exact_bundle_proof(self):
+    def test_policy_bundle_reuse_is_bound_for_allowed_final_decisions(self):
+        candidate = {"schema": 1, "application_sha": HEAD}
+        candidate_id = "f" * 64
+        full = {"number": 3}
+        proof = {"decision": "reuse-policy-validation", "candidate_id": candidate_id,
+                 "manifest_sha256": "a" * 64}
+
+        for decision in ("allow", "policy-only", "already-validated"):
+            with self.subTest(decision=decision), \
+                    patch.object(release, "_validated_policy_bundle", return_value=proof) as validate:
+                self.assertEqual(release._policy_bundle_for_final_decision(
+                    REPO, candidate, candidate_id, full, decision), proof)
+                validate.assert_called_once_with(REPO, candidate, full)
+
+        for wrong_proof in (
+                {**proof, "candidate_id": "0" * 64},
+                {**proof, "manifest_sha256": "invalid"},
+        ):
+            with self.subTest(wrong_proof=wrong_proof), \
+                    patch.object(release, "_validated_policy_bundle", return_value=wrong_proof), \
+                    self.assertRaisesRegex(ValueError, "exact policy candidate"):
+                release._policy_bundle_for_final_decision(
+                    REPO, candidate, candidate_id, full, "allow")
+
+        with patch.object(release, "_validated_policy_bundle") as validate:
+            self.assertIsNone(release._policy_bundle_for_final_decision(
+                REPO, candidate, candidate_id, full, "blocked"))
+        validate.assert_not_called()
+
+    def test_closed_review_pair_reuse_requires_an_allowed_decision_and_exact_bundle_proof(self):
         candidate = {"schema": 1, "application_sha": HEAD}
         candidate_id = "f" * 64
         baseline = {"release_id": 5}
@@ -563,20 +592,23 @@ class PolicyBundleTests(unittest.TestCase):
                 return {"decision": self.decision}
 
         lifecycle = Lifecycle()
-        with (patch.object(release, "_final_history", return_value={"exact": True}) as history,
-              patch.object(release, "_validated_policy_bundle", return_value=proof) as validate):
-            self.assertTrue(release._closed_policy_pair_has_verified_bundle(
-                REPO, lifecycle, candidate, candidate_id, baseline, full, delta))
-        history.assert_called_once_with(REPO, {"repository": REPO, "baseline": baseline}, lifecycle)
-        validate.assert_called_once_with(REPO, candidate, full)
+        for decision in ("policy-only", "allow", "already-validated"):
+            lifecycle.decision = decision
+            with (self.subTest(decision=decision),
+                  patch.object(release, "_final_history", return_value={"exact": True}) as history,
+                  patch.object(release, "_validated_policy_bundle", return_value=proof) as validate):
+                self.assertTrue(release._closed_policy_pair_has_verified_bundle(
+                    REPO, lifecycle, candidate, candidate_id, baseline, full, delta))
+            history.assert_called_once_with(REPO, {"repository": REPO, "baseline": baseline}, lifecycle)
+            validate.assert_called_once_with(REPO, candidate, full)
 
-        lifecycle.decision = "allow"
+        lifecycle.decision = "blocked"
         with (patch.object(release, "_final_history", return_value={"exact": True}),
               patch.object(release, "_validated_policy_bundle") as validate):
             self.assertFalse(release._closed_policy_pair_has_verified_bundle(
                 REPO, lifecycle, candidate, candidate_id, baseline, full, delta))
         validate.assert_not_called()
-        lifecycle.decision = "policy-only"
+        lifecycle.decision = "allow"
         with (patch.object(release, "_final_history", return_value={"exact": True}),
               patch.object(release, "_validated_policy_bundle", return_value=proof),
               self.assertRaisesRegex(ValueError, "exact policy candidate")):
@@ -2449,6 +2481,31 @@ class NativeAttemptEvidenceTests(unittest.TestCase):
 
 
 class RecipeIdentityTests(unittest.TestCase):
+    def test_release_tags_bind_recipe_and_keep_legacy_tags_readable(self):
+        version = "1.2.3"
+        upstream = "a" * 40
+        patchset = "b" * 64
+        recipe = "c" * 64
+        changed_recipe = "d" * 64
+
+        tag = release._release_tag(version, upstream, patchset, recipe)
+        self.assertEqual(tag, f"build-{version}-{'a' * 12}-{'b' * 12}-r{'c' * 12}")
+        self.assertNotEqual(tag, release._release_tag(version, upstream, patchset, changed_recipe))
+
+        legacy_tag = release._legacy_release_tag(version, upstream, patchset)
+        legacy = release._parse_release_tag(legacy_tag)
+        current = release._parse_release_tag(tag)
+        self.assertIsNotNone(legacy)
+        self.assertIsNotNone(current)
+        self.assertIsNone(legacy.group("recipe"))
+        self.assertEqual(current.group("recipe"), recipe[:12])
+        release._validate_recipe_tag(legacy, {})
+        release._validate_recipe_tag(current, {"recipe_sha256": recipe})
+        with self.assertRaisesRegex(ValueError, "does not match its provenance recipe"):
+            release._validate_recipe_tag(current, {"recipe_sha256": changed_recipe})
+        with self.assertRaisesRegex(ValueError, "does not match its provenance recipe"):
+            release._validate_recipe_tag(current, {})
+
     def test_buildx_action_and_effective_configuration_are_in_recipe_identity(self):
         class Lifecycle:
             @staticmethod
@@ -3264,6 +3321,8 @@ class AdoptionTests(unittest.TestCase):
             ],
             "repair": [
                 ("uses", "", "actions/checkout"),
+                ("uses", "", "actions/checkout"),
+                ("run", "Fetch The Exact Candidate Configuration For Repair Worktree", ""),
                 ("run", "Request The Exact Repair Without Republishing", ""),
             ],
         }
@@ -3301,7 +3360,9 @@ class AdoptionTests(unittest.TestCase):
             ],
             "build": [trusted_checkout],
             "publish": [trusted_checkout, private_checkout],
-            "repair": [trusted_checkout],
+            "repair": [trusted_checkout,
+                       {"ref": "${{ github.sha }}", "path": "candidate",
+                        "persist-credentials": False}],
         }
         for job_name, expected in expected_checkouts.items():
             actual = [step.get("with") for step in jobs[job_name]["steps"]
@@ -3476,6 +3537,12 @@ class AdoptionTests(unittest.TestCase):
                 ['mkdir -p "$GITHUB_WORKSPACE/release"',
                  'cp "$GITHUB_WORKSPACE/lifecycle/shared-context.json" "$GITHUB_WORKSPACE/release/shared-context.json"',
                  'python3 trusted/scripts/release.py publish-shared "$GITHUB_WORKSPACE/release"'],
+            ("repair", "Fetch The Exact Candidate Configuration For Repair Worktree"):
+                ['test "$(git -C candidate rev-parse HEAD)" = "$GITHUB_SHA"',
+                 'git -C candidate update-ref refs/heads/fork-candidate "$GITHUB_SHA"',
+                 'git -C trusted fetch --no-tags "$GITHUB_WORKSPACE/candidate" refs/heads/fork-candidate',
+                 'test "$(git -C trusted rev-parse FETCH_HEAD)" = "$GITHUB_SHA"',
+                 'git -C trusted cat-file -e "$GITHUB_SHA^{commit}"'],
         }
         for (job_name, step_name), expected in expected_commands.items():
             self.assertEqual(run_step(job_name, step_name), expected,

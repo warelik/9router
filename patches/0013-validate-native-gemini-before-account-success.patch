@@ -1,0 +1,364 @@
+From 0f35b8d065956ed99d67fb685b81b55a4dee55dd Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Validate native Gemini streams before recording account
+ success
+
+---
+ .../handlers/chatCore/streamingHandler.js     | 14 ++-
+ open-sse/utils/stream.js                      | 88 +++++++++++++++----
+ tests/unit/gemini-native-stream.test.js       | 82 ++++++++++++++++-
+ 3 files changed, 160 insertions(+), 24 deletions(-)
+
+diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
+index 09219bd..84c0703 100644
+--- a/open-sse/handlers/chatCore/streamingHandler.js
++++ b/open-sse/handlers/chatCore/streamingHandler.js
+@@ -24,7 +24,7 @@ const CODEX_SOURCE_TO_TARGET = {
+ /**
+  * Determine which SSE transform stream to use based on provider/format.
+  */
+-function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials, nativeJson, nativeResponseProjection }) {
++function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, onNativeResponseSuccess, apiKey, credentials, nativeJson, nativeResponseProjection }) {
+   const isDroidCLI = userAgent?.toLowerCase().includes("droid") || userAgent?.toLowerCase().includes("codex-cli");
+   // Responses-API providers (e.g. codex) emit Responses SSE → translate into client format
+   const isResponsesProvider = PROVIDERS[provider]?.format === FORMATS.OPENAI_RESPONSES;
+@@ -39,7 +39,7 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
+     return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
+   }
+ 
+-  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, sourceFormat, nativeJson, nativeResponseProjection);
++  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, sourceFormat, nativeJson, nativeResponseProjection, onNativeResponseSuccess);
+ }
+ 
+ /**
+@@ -82,17 +82,23 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+     };
+   }
+ 
+-  if (onRequestSuccess) {
++  const deferNativeGeminiSuccess = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
++    && !needsTranslation(targetFormat, sourceFormat) && !toolNameMap?.size;
++  const reportRequestSuccess = () => {
++    if (!onRequestSuccess) return;
+     Promise.resolve()
+       .then(onRequestSuccess)
+       .catch(err => {
+         console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
+       });
++  };
++  if (onRequestSuccess && !deferNativeGeminiSuccess) {
++    reportRequestSuccess();
+   }
+ 
+   const nativeGeminiJson = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
+     && upstreamContentType.includes("application/json");
+-  const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
++  const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, onNativeResponseSuccess: deferNativeGeminiSuccess ? reportRequestSuccess : null, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
+ 
+   // Terminal bytes when the stream aborts after HTTP 200 was already sent, so the
+   // client sees a real error instead of a silently truncated stream.
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index 14f3a28..146aecb 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -61,6 +61,23 @@ function nativeCandidateFieldIsVisible(projection, field) {
+   });
+ }
+ 
++function nativeResponseProjectionAllowsEmpty(projection) {
++  return projection?.masks?.some(value => {
++    const mask = String(value ?? "").trim();
++    return mask.length > 0 && mask !== "*";
++  }) || false;
++}
++
++function isValidNativeGeminiResponse(response, projection) {
++  if (!response || typeof response !== "object" || Array.isArray(response)) return false;
++  if (!nativeResponseProjectionAllowsEmpty(projection) && Object.keys(response).length === 0) return false;
++
++  const nativeResponse = response.response || response;
++  if (!nativeResponse || typeof nativeResponse !== "object" || Array.isArray(nativeResponse)) return false;
++  if (!nativeResponseProjectionAllowsEmpty(projection) && Object.keys(nativeResponse).length === 0) return false;
++  return true;
++}
++
+ /**
+  * Create unified SSE transform stream
+  * @param {object} options
+@@ -91,7 +108,8 @@ export function createSSEStream(options = {}) {
+     apiKey = null,
+     credentials = null,
+     nativeJson = false,
+-    nativeResponseProjection = null
++    nativeResponseProjection = null,
++    onNativeResponseSuccess = null
+   } = options;
+ 
+   let buffer = "";
+@@ -134,31 +152,49 @@ export function createSSEStream(options = {}) {
+   let completionFlushTimer = null;
+   const nativeGeminiCandidates = new Map();
+   let nativeGeminiFailureSeen = false;
++  let nativeGeminiErrorSeen = false;
++  let nativeGeminiInvalidResponseSeen = false;
+   let nativeGeminiResponseSeen = false;
+   let nativeGeminiMultipleCandidatesSeen = false;
+   let nativeGeminiAnyFinishSeen = false;
++  let nativeGeminiSuccessReported = false;
+   let nativeGeminiData = [];
+   let nativeGeminiJson = "";
+ 
+   const captureNativeGeminiBody = (parsed) => {
++    if (!isValidNativeGeminiResponse(parsed, nativeResponseProjection)) return false;
+     nativeGeminiResponseSeen = true;
+     const extracted = extractUsage(parsed);
+     if (extracted) usage = mergeUsage(usage, extracted);
+     const response = parsed.response || parsed;
+-    if (response.error || response.promptFeedback?.blockReason) nativeGeminiFailureSeen = true;
+-    if ((response.candidates || []).length > 1) nativeGeminiMultipleCandidatesSeen = true;
+-    for (const [position, candidate] of (response.candidates || []).entries()) {
+-      const finished = !!candidate.finishReason && candidate.finishReason !== "FINISH_REASON_UNSPECIFIED";
+-      if (finished) nativeGeminiAnyFinishSeen = true;
++    if (response.error) {
++      nativeGeminiFailureSeen = true;
++      nativeGeminiErrorSeen = true;
++    }
++    if (response.promptFeedback?.blockReason) {
++      nativeGeminiFailureSeen = true;
++    }
++    const candidates = Array.isArray(response.candidates) ? response.candidates : [];
++    if (candidates.length > 1) nativeGeminiMultipleCandidatesSeen = true;
++    for (const [position, candidate] of candidates.entries()) {
++      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
++      const finished = typeof candidate.finishReason === "string"
++        && candidate.finishReason.length > 0 && candidate.finishReason !== "FINISH_REASON_UNSPECIFIED";
++      if (finished) {
++        nativeGeminiAnyFinishSeen = true;
++      }
+       const index = candidate.index ?? position;
+       nativeGeminiCandidates.set(index, nativeGeminiCandidates.get(index) || finished);
+     }
+-    for (const part of response.candidates?.[0]?.content?.parts || []) {
++    const parts = candidates[0]?.content?.parts;
++    for (const part of Array.isArray(parts) ? parts : []) {
++      if (!part || typeof part !== "object" || Array.isArray(part)) continue;
+       if (typeof part.text !== "string") continue;
+       totalContentLength += part.text.length;
+       if (part.thought === true) accumulatedThinking += part.text;
+       else accumulatedContent += part.text;
+     }
++    return true;
+   };
+   const captureNativeGeminiLine = (line) => {
+     if (line.startsWith("data:")) {
+@@ -166,9 +202,23 @@ export function createSSEStream(options = {}) {
+       return;
+     }
+     if (line.trim() || !nativeGeminiData.length) return;
+-    const parsed = parseSSELine(`data: ${nativeGeminiData.join("\n")}`, sourceFormat);
++    const payload = nativeGeminiData.join("\n");
+     nativeGeminiData = [];
+-    if (parsed) captureNativeGeminiBody(parsed);
++    let parsed;
++    try { parsed = JSON.parse(payload); }
++    catch {
++      nativeGeminiInvalidResponseSeen = true;
++      return;
++    }
++    if (!captureNativeGeminiBody(parsed)) nativeGeminiInvalidResponseSeen = true;
++  };
++
++  const reportNativeGeminiSuccess = () => {
++    if (!onNativeResponseSuccess || nativeGeminiSuccessReported) return;
++    nativeGeminiSuccessReported = true;
++    Promise.resolve().then(onNativeResponseSuccess).catch(err => {
++      console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
++    });
+   };
+ 
+   // Usage/logging tail, callable from transform() as well as flush(): a client that
+@@ -532,23 +582,24 @@ export function createSSEStream(options = {}) {
+                 return;
+               }
+               const responses = Array.isArray(nativeResponse) ? nativeResponse : [nativeResponse];
+-              if (!responses.length || responses.some(response => !response || typeof response !== "object" || Array.isArray(response))) {
+-                controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
+-                finalizeStream();
+-                return;
++              if (!responses.length) nativeGeminiInvalidResponseSeen = true;
++              else for (const response of responses) {
++                if (!captureNativeGeminiBody(response)) nativeGeminiInvalidResponseSeen = true;
+               }
+-              for (const response of responses) captureNativeGeminiBody(response);
+             } else {
+               if (buffer.trim()) captureNativeGeminiLine(buffer);
+               captureNativeGeminiLine("");
+             }
+-            if (!nativeGeminiResponseSeen) {
++            if (nativeGeminiInvalidResponseSeen || !nativeGeminiResponseSeen) {
+               if (nativeJson) {
+                 controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
+                 finalizeStream();
+                 return;
+               }
+-              const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream returned no valid response", sourceFormat);
++              const message = nativeGeminiInvalidResponseSeen
++                ? "Upstream Gemini stream contained invalid response data"
++                : "Upstream Gemini stream returned no valid response";
++              const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, message, sourceFormat);
+               reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
+               controller.enqueue(failure);
+             } else if (observeNativeFinishReason && !nativeGeminiFailureSeen && (
+@@ -566,6 +617,8 @@ export function createSSEStream(options = {}) {
+               const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream ended before a candidate finished", sourceFormat);
+               reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
+               controller.enqueue(failure);
++            } else if (!nativeGeminiErrorSeen) {
++              reportNativeGeminiSuccess();
+             }
+             finalizeStream();
+             return;
+@@ -703,13 +756,14 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
+   });
+ }
+ 
+-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null) {
++export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null, onNativeResponseSuccess = null) {
+   return createSSEStream({
+     mode: STREAM_MODE.PASSTHROUGH,
+     provider,
+     sourceFormat,
+     nativeJson,
+     nativeResponseProjection,
++    onNativeResponseSuccess,
+     reqLogger,
+     model,
+     connectionId,
+diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
+index 0717461..40b62a1 100644
+--- a/tests/unit/gemini-native-stream.test.js
++++ b/tests/unit/gemini-native-stream.test.js
+@@ -30,7 +30,7 @@ const chunk = {
+ };
+ const lateUsage = { usageMetadata: { promptTokenCount: 4096, candidatesTokenCount: 7, thoughtsTokenCount: 20, cachedContentTokenCount: 2048, totalTokenCount: 4123 } };
+ const inputStream = chunks => new ReadableStream({ start(controller) { for (const value of chunks) controller.enqueue(value); controller.close(); } });
+-const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nativeJson = false, projection = null) => createPassthroughStreamWithLogger(provider, null, "gemini-native-test", null, null, complete, null, source, nativeJson, projection);
++const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nativeJson = false, projection = null, onNativeResponseSuccess = null) => createPassthroughStreamWithLogger(provider, null, "gemini-native-test", null, null, complete, null, source, nativeJson, projection, onNativeResponseSuccess);
+ const readText = stream => new Response(stream).text();
+ 
+ describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
+@@ -233,6 +233,19 @@ describe("native response projections preserve requested data without inventing
+       .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, false, { masks: ["modelStatus"] })))).toBe(original);
+   });
+ 
++  it.each([
++    ["empty object", "{}"],
++    ["empty array", "[]"],
++    ["number", "17"],
++    ["null", "null"],
++    ["empty wrapped object", '{"response":{}}'],
++  ])("rejects a native SSE %s frame instead of accepting it as a response", async (_name, payload) => {
++    const original = `data: ${payload}\n\n`;
++    const output = await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("aistudio")));
++    expect(output.startsWith(original)).toBe(true);
++    expect(output.slice(original.length)).toContain('"code":502');
++  });
++
+   it("retains provider errors and details when finishReason is excluded", async () => {
+     const failure = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota", details: [{ retryDelay: "2s" }] } };
+     for (const nativeJson of [false, true]) {
+@@ -276,17 +289,76 @@ describe("native stream integration and failure cleanup", () => {
+     expect(succeeded).not.toHaveBeenCalled();
+   });
+ 
+-  it("passes the native client format through the real streaming handler", async () => {
++  it("reports native request success only after consuming a validated terminal response", async () => {
+     const original = frame(chunk) + frame(lateUsage);
++    const succeeded = vi.fn();
+     const controller = createStreamController({ provider: "aistudio", model: "gemini-native-test" });
+     const result = await handleStreamingResponse({
+       providerResponse: new Response(inputStream([encode(original)]), { headers: { "content-type": "text/event-stream" } }),
+       provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+       body: { contents: [{ role: "user", parts: [{ text: "task" }] }] }, stream: true, requestStartTime: Date.now(),
+-      streamController: controller,
++      streamController: controller, onRequestSuccess: succeeded,
+     });
+     expect(result.success).toBe(true);
++    expect(succeeded).not.toHaveBeenCalled();
+     expect(await result.response.text()).toBe(original);
++    await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
++  });
++
++  it.each([
++    ["finishReason is masked", frame({ candidates: [{ content: { parts: [{ text: "projected answer" }] } }] }), { masks: ["candidates/content/parts/text"] }],
++    ["the selected empty object is masked", frame({}), { masks: ["modelStatus"] }],
++    ["a null response wrapper falls back to its nonempty outer object", frame({ response: null }), null],
++  ])("reports native success at accepted EOF when %s", async (_name, raw, nativeResponseProjection) => {
++    const succeeded = vi.fn();
++    const result = await handleStreamingResponse({
++      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "text/event-stream" } }),
++      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++      body: {}, stream: true, requestStartTime: Date.now(), nativeResponseProjection,
++      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
++      onRequestSuccess: succeeded,
++    });
++    expect(succeeded).not.toHaveBeenCalled();
++    expect(await result.response.text()).toBe(raw);
++    await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
++  });
++
++  it.each([
++    ["HTTP 200 native error", frame(chunk) + frame({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" } }), "quota"],
++    ["malformed data after a terminal", frame(chunk) + "data: {not-json}\n\n", '"code":502'],
++    ["candidate without a terminal", frame({ candidates: [{ index: 0, content: { parts: [{ text: "partial" }] } }] }), "before a candidate finished"],
++  ])("does not report native request success for %s", async (_name, raw, expectedFailure) => {
++    const succeeded = vi.fn();
++    const result = await handleStreamingResponse({
++      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "text/event-stream" } }),
++      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++      body: {}, stream: true, requestStartTime: Date.now(),
++      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
++      onRequestSuccess: succeeded,
++    });
++    const output = await result.response.text();
++    expect(output).toContain(expectedFailure);
++    expect(succeeded).not.toHaveBeenCalled();
++  });
++
++  it.each([
++    ["empty object", "{}"],
++    ["empty array", "[]"],
++    ["scalar", "17"],
++    ["array with empty object", "[{}]"],
++    ["array with scalar", "[17]"],
++    ["empty wrapped object", '{"response":{}}'],
++  ])("does not report native request success for JSON %s", async (_name, raw) => {
++    const succeeded = vi.fn();
++    const result = await handleStreamingResponse({
++      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "application/json" } }),
++      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++      body: {}, stream: true, requestStartTime: Date.now(),
++      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
++      onRequestSuccess: succeeded,
++    });
++    await expect(result.response.text()).rejects.toThrow("Upstream Gemini JSON stream returned no valid response");
++    expect(succeeded).not.toHaveBeenCalled();
+   });
+ 
+   it.each([FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY])("builds a native numeric abort error without DONE for %s", source => {
+@@ -345,6 +417,10 @@ describe("native stream integration and failure cleanup", () => {
+   it.each([
+     ["empty transport", ""],
+     ["empty response array", "[]"],
++    ["empty response object", "{}"],
++    ["scalar response", "17"],
++    ["array containing an empty object", "[{}]"],
++    ["array containing a scalar", "[17]"],
+     ["incomplete JSON", '[{"candidates":['],
+     ["unfinished candidate in syntactically valid JSON", JSON.stringify([{ candidates: [{ index: 0, content: { parts: [{ text: "partial" }] } }] }])],
+   ])("rejects %s at clean native JSON EOF", async (_name, raw) => {
+-- 
+2.55.0
+
