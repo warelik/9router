@@ -4437,11 +4437,15 @@ class AdoptionTests(unittest.TestCase):
                 needs.finalize.result == 'success' && needs.finalize.outputs.ready == 'true' &&
                 needs.prepare.outputs.prepared_run_id == github.run_id &&
                 needs.finalize.outputs.mode == 'policy-only'""",
-            "test": """needs.prepare.outputs.review_ready == 'true' &&
+            "test": """always() && !cancelled() &&
+                needs.prepare.result == 'success' && needs.finalize.result == 'success' &&
+                needs.prepare.outputs.review_ready == 'true' &&
                 needs.finalize.outputs.ready == 'true' && needs.finalize.outputs.mode == 'application' &&
                 needs.prepare.outputs.prepared_run_id == github.run_id &&
                 needs.finalize.outputs.validated_run_id == github.run_id""",
-            "build": """needs.prepare.outputs.review_ready == 'true' && needs.finalize.outputs.ready == 'true' &&
+            "build": """always() && !cancelled() &&
+                needs.prepare.result == 'success' && needs.finalize.result == 'success' &&
+                needs.prepare.outputs.review_ready == 'true' && needs.finalize.outputs.ready == 'true' &&
                 needs.finalize.outputs.mode == 'application' && needs.test.result == 'success' &&
                 needs.prepare.outputs.prepared_run_id == github.run_id &&
                 needs.finalize.outputs.validated_run_id == github.run_id""",
@@ -5824,3 +5828,30 @@ class FinalReservationPermissionTests(unittest.TestCase):
             self.assertIsNotNone(block)
             self.assertRegex(block[0], r"(?m)^      pull-requests: write$")
             self.assertNotRegex(block[0], r"(?m)^      contents: write$")
+
+
+class OptionalPolicyLaneAdmissionTests(unittest.TestCase):
+    def test_skipped_policy_ancestor_keeps_authorized_application_lane_live(self):
+        import re
+        document = release.yaml_module().safe_load((release.ROOT / ".github/workflows/release.yml").read_text())
+        fields = {
+            "needs.prepare.result": "success", "needs.finalize.result": "success", "needs.test.result": "success",
+            "needs.prepare.outputs.review_ready": "true", "needs.finalize.outputs.ready": "true",
+            "needs.finalize.outputs.mode": "application", "needs.prepare.outputs.prepared_run_id": "42",
+            "needs.finalize.outputs.validated_run_id": "42", "github.run_id": "42",
+        }
+        def enabled(expression, values, cancelled=False):
+            # GitHub supplies implicit success() only without an explicit status function.
+            if not re.search(r"\b(?:always|cancelled|success|failure)\(", expression):
+                return False  # the optional policy-check ancestor is skipped
+            expression = re.sub(r"\b(?:needs|github)\.[A-Za-z0-9_.-]+", lambda m: repr(values[m[0]]), expression)
+            expression = expression.replace("always()", "True").replace("!cancelled()", str(not cancelled))
+            expression = expression.replace("&&", " and ").replace("||", " or ")
+            return bool(eval(expression.strip(), {"__builtins__": {}}, {}))
+        for job in ("test", "build"):
+            condition = document["jobs"][job]["if"]
+            self.assertTrue(enabled(condition, fields), job)
+            self.assertFalse(enabled(condition, fields, cancelled=True), job)
+            for parent in (("prepare", "finalize", "test") if job == "build" else ("prepare", "finalize")):
+                self.assertFalse(enabled(condition, {**fields, "needs." + parent + ".result": "failure"}), (job, parent))
+            self.assertFalse(enabled(condition, {**fields, "needs.finalize.outputs.mode": "policy-only"}), job)

@@ -338,6 +338,8 @@ jobs:
     name: Test The Historical Application Contracts
     needs: [prepare, finalize]
     if: >-
+      always() && !cancelled() &&
+      needs.prepare.result == 'success' && needs.finalize.result == 'success' &&
       needs.prepare.outputs.review_ready == 'true' &&
       needs.finalize.outputs.ready == 'true' && needs.finalize.outputs.mode == 'application' &&
       needs.prepare.outputs.prepared_run_id == github.run_id &&
@@ -396,6 +398,8 @@ jobs:
     name: Build And Smoke Test One Container
     needs: [prepare, finalize, test]
     if: >-
+      always() && !cancelled() &&
+      needs.prepare.result == 'success' && needs.finalize.result == 'success' &&
       needs.prepare.outputs.review_ready == 'true' && needs.finalize.outputs.ready == 'true' &&
       needs.finalize.outputs.mode == 'application' && needs.test.result == 'success' &&
       needs.prepare.outputs.prepared_run_id == github.run_id &&

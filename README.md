@@ -244,3 +244,5 @@ commit instead of selecting a different live HEAD. The source-selection
 regression covers the failure path before assembly completes.
 
 Maintenance review input is open carried work and the exact current candidate. Archived closed discussions are excluded. The existing unresolved snapshot is written before superseded pairs are retired; `fixed` and `disproved` decisions are not reopened in later cycles. Native final-attempt accounting remains independent.
+
+Authorized application test/build lanes use explicit status checks and required-parent success: a skipped optional policy ancestor cannot silently suppress them. Cancellation and failed required jobs still block execution.
