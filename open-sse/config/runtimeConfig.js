@@ -100,6 +100,13 @@ export const PORTABLE_COLLABORATION = {
   aliasCollisionBaseLength: 58,
 };
 
+export const RESPONSES_NAMESPACE_ALIAS = {
+  prefix: "ns_",
+  stemLength: 40,
+  hashLength: 16,
+  maxLength: 64,
+};
+
 // Retry config for 429 responses (legacy - kept for backward compatibility)
 export const RETRY_CONFIG = {
   maxAttempts: 2,
