@@ -23,7 +23,12 @@ import {
   GEMINI_RESERVED_RESPONSE_KEYS
 } from "../formats/gemini.js";
 import { deriveSessionId, toNumericSessionId } from "../../utils/sessionManager.js";
-import { ROLE, GEMINI_ROLE, OPENAI_BLOCK, CLAUDE_BLOCK, OPENAI_TOOL_CHOICE_NONE } from "../schema/index.js";
+import {
+  ROLE, GEMINI_ROLE, OPENAI_BLOCK, CLAUDE_BLOCK,
+  OPENAI_TOOL_CHOICE_AUTO, OPENAI_TOOL_CHOICE_NONE, OPENAI_TOOL_CHOICE_REQUIRED,
+  GEMINI_FUNCTION_CALLING_MODE_AUTO, GEMINI_FUNCTION_CALLING_MODE_NONE,
+  GEMINI_FUNCTION_CALLING_MODE_ANY, GEMINI_FUNCTION_CALLING_MODE_VALIDATED,
+} from "../schema/index.js";
 import { isGemini4Model } from "../../providers/capabilities.js";
 
 // Sanitize function names for Gemini API.
@@ -336,18 +341,18 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
       result.tools = [{ functionDeclarations }];
 
       const choice = body.tool_choice;
-      if (choice === "auto") {
-        result.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
+      if (choice === OPENAI_TOOL_CHOICE_AUTO) {
+        result.toolConfig = { functionCallingConfig: { mode: GEMINI_FUNCTION_CALLING_MODE_AUTO } };
       } else if (choice === OPENAI_TOOL_CHOICE_NONE) {
-        result.toolConfig = { functionCallingConfig: { mode: "NONE" } };
-      } else if (choice === "required") {
-        result.toolConfig = { functionCallingConfig: { mode: "ANY" } };
+        result.toolConfig = { functionCallingConfig: { mode: GEMINI_FUNCTION_CALLING_MODE_NONE } };
+      } else if (choice === OPENAI_TOOL_CHOICE_REQUIRED) {
+        result.toolConfig = { functionCallingConfig: { mode: GEMINI_FUNCTION_CALLING_MODE_ANY } };
       } else if (choice && typeof choice === "object") {
         const named = choice.function?.name ?? choice.name;
         if (typeof named === "string" && named) {
           result.toolConfig = {
             functionCallingConfig: {
-              mode: "ANY",
+              mode: GEMINI_FUNCTION_CALLING_MODE_ANY,
               allowedFunctionNames: [sanitizeGeminiFunctionName(named)]
             }
           };
@@ -418,7 +423,7 @@ function wrapInCloudCodeEnvelope(model, geminiCLI, credentials = null, isAntigra
 
   if (geminiCLI.tools?.length > 0) {
     envelope.request.toolConfig = geminiCLI.toolConfig || {
-      functionCallingConfig: { mode: "VALIDATED" }
+      functionCallingConfig: { mode: GEMINI_FUNCTION_CALLING_MODE_VALIDATED }
     };
   }
 
@@ -536,7 +541,7 @@ function wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials = nu
     if (functionDeclarations.length > 0) {
       envelope.request.tools = [{ functionDeclarations }];
       envelope.request.toolConfig = {
-        functionCallingConfig: { mode: "VALIDATED" }
+        functionCallingConfig: { mode: GEMINI_FUNCTION_CALLING_MODE_VALIDATED }
       };
     }
   }

@@ -25,6 +25,11 @@ import "../translator/registerAll.js";
 import { translateRequest } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
 import {
+  OPENAI_TOOL_CHOICE_AUTO, OPENAI_TOOL_CHOICE_NONE, OPENAI_TOOL_CHOICE_REQUIRED,
+  GEMINI_FUNCTION_CALLING_MODE_AUTO, GEMINI_FUNCTION_CALLING_MODE_NONE,
+  GEMINI_FUNCTION_CALLING_MODE_ANY, GEMINI_FUNCTION_CALLING_MODE_VALIDATED,
+} from "../../open-sse/translator/schema/index.js";
+import {
   openaiToGeminiRequest,
   openaiToGeminiCLIRequest,
   openaiToAntigravityRequest,
@@ -361,6 +366,15 @@ describe("cleanJSONSchemaForAntigravity traversal is schema-position aware", () 
 });
 
 describe("tool choice mapping", () => {
+  it("shared tool selectors and modes retain the exact wire values", () => {
+    expect([OPENAI_TOOL_CHOICE_AUTO, OPENAI_TOOL_CHOICE_NONE, OPENAI_TOOL_CHOICE_REQUIRED])
+      .toEqual(["auto", "none", "required"]);
+    expect([
+      GEMINI_FUNCTION_CALLING_MODE_AUTO, GEMINI_FUNCTION_CALLING_MODE_NONE,
+      GEMINI_FUNCTION_CALLING_MODE_ANY, GEMINI_FUNCTION_CALLING_MODE_VALIDATED,
+    ]).toEqual(["AUTO", "NONE", "ANY", "VALIDATED"]);
+  });
+
   const tools = [{ type: "function", function: { name: "pick_me", parameters: { type: "object", properties: {} } } }];
   const modeOf = (out) => (out.toolConfig || out.request?.toolConfig)?.functionCallingConfig?.mode;
   const namesOf = (out) => (out.toolConfig || out.request?.toolConfig)?.functionCallingConfig?.allowedFunctionNames;
