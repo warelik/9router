@@ -4383,7 +4383,7 @@ class AdoptionTests(unittest.TestCase):
         expected_permissions = {
             "prepare": {"contents": "write", "pull-requests": "write", "issues": "write", "actions": "read"},
             "policy-check": {"contents": "read"},
-            "finalize": {"contents": "read", "issues": "write", "pull-requests": "read", "actions": "read"},
+            "finalize": {"contents": "read", "issues": "write", "pull-requests": "write", "actions": "read"},
             "policy-only": {"contents": "write", "pull-requests": "write", "actions": "write"},
             # The test job inherits the workflow-wide read-only permission.
             "test": None,
