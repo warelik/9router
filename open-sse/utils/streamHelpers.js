@@ -2,7 +2,7 @@ import { FORMATS } from "../translator/formats.js";
 import { fallbackToolCallId } from "../translator/concerns/toolCall.js";
 import { buildErrorBody } from "./error.js";
 import { SSE_DONE } from "./sseConstants.js";
-import { NATIVE_GEMINI_RESPONSE_FIELDS, NATIVE_GEMINI_BRIDGE_FIELDS } from "../config/runtimeConfig.js";
+import { NATIVE_GEMINI_RESPONSE_FIELDS, NATIVE_GEMINI_BRIDGE_FIELDS, NATIVE_GEMINI_FORMATS } from "../config/runtimeConfig.js";
 
 const sharedEncoder = new TextEncoder();
 
@@ -226,7 +226,7 @@ export function formatSSE(data, sourceFormat) {
 export function buildStreamErrorBytes(statusCode, message, clientFormat) {
   const { error } = buildErrorBody(statusCode, message);
 
-  if ([FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY].includes(clientFormat)) {
+  if (NATIVE_GEMINI_FORMATS.includes(clientFormat)) {
     // Gemini clients decode every data payload as JSON and terminate at EOF.
     // Keep the numeric failure code instead of an OpenAI symbolic error code.
     return sharedEncoder.encode(formatSSE({ error: { code: statusCode, message: error.message } }, clientFormat));
