@@ -2694,7 +2694,7 @@ class SharedHistoryAdapterTests(unittest.TestCase):
             (config_root / "scripts/test_repair.py").write_text(
                 'def test_policy_source_fix():\n    assert repair_target() == "old"\n',
                 encoding="utf-8")
-        if policy_disproved_unchanged:
+        if policy_repair:
             (config_root / "scripts/maintenance.py").write_text(
                 'def policy_marker(): return "stable"\n', encoding="utf-8")
             (config_root / "scripts/test_maintenance.py").write_text(
