@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { GEMINI_FINISH } from "../../open-sse/translator/schema/index.js";
 
 vi.mock("@/lib/db/helpers/kvStore.js", () => ({
   makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
@@ -38,6 +39,10 @@ const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nat
 const readText = stream => new Response(stream).text();
 
 describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
+  it("shares the exact unspecified Gemini finish-reason wire value", () => {
+    expect(GEMINI_FINISH.UNSPECIFIED).toBe("FINISH_REASON_UNSPECIFIED");
+  });
+
   it.each([
     ["openai", FORMATS.OPENAI, 'data: {"choices":[{"delta":{"content":"fixture"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'],
     ["claude", FORMATS.CLAUDE, 'event: message_stop\ndata: {"type":"message_stop"}\n\n'],
