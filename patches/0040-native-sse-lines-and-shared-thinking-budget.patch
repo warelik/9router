@@ -1,0 +1,228 @@
+From b0ec9fd2bba74f3b203c8f93f97b8112f408ae6f Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] Split native SSE events on bare CR and share the provider
+ thinking budget
+
+---
+ open-sse/config/runtimeConfig.js              |  1 +
+ open-sse/handlers/chatCore.js                 |  4 +-
+ .../translator/concerns/thinkingUnified.js    |  3 +-
+ open-sse/utils/stream.js                      | 23 ++++++-
+ tests/translator/thinking-unified.test.js     | 17 +++++
+ tests/unit/gemini-native-stream.test.js       | 62 +++++++++++++++++++
+ 6 files changed, 105 insertions(+), 5 deletions(-)
+
+diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
+index f0919503..45586853 100644
+--- a/open-sse/config/runtimeConfig.js
++++ b/open-sse/config/runtimeConfig.js
+@@ -64,6 +64,7 @@ export const GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS = envMs("GEMINI_NATIVE_TTS_FETCH
+ // Default token limits
+ export const DEFAULT_MAX_TOKENS = 64000;
+ export const DEFAULT_MIN_TOKENS = 32000;
++export const DEFAULT_PROVIDER_THINKING_BUDGET = 10000;
+ 
+ export const TOKEN_SAVER_HEADER = "x-9router-token-saver";
+ 
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index bbd34dae..42d151df 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -12,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
+ import { PROVIDERS } from "../config/providers.js";
+ import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
+ import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
+-import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER } from "../config/runtimeConfig.js";
++import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET } from "../config/runtimeConfig.js";
+ import { handleBypassRequest } from "../utils/bypassHandler.js";
+ import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+ import { getExecutor } from "../executors/index.js";
+@@ -143,7 +143,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+     const mode = providerThinking.mode;
+     if (mode === "on" && !body.thinking) {
+       console.log("Injecting provider-level thinking config override: on");
+-      body = { ...body, thinking: { type: "enabled", budget_tokens: 10000 } };
++      body = { ...body, thinking: { type: "enabled", budget_tokens: DEFAULT_PROVIDER_THINKING_BUDGET } };
+     } else if (mode === "off" && !body.thinking) {
+       body = { ...body, thinking: { type: "disabled" } };
+     } else if (!body.reasoning_effort) {
+diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
+index 2a7958fd..b3530b28 100644
+--- a/open-sse/translator/concerns/thinkingUnified.js
++++ b/open-sse/translator/concerns/thinkingUnified.js
+@@ -6,6 +6,7 @@ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
+ import { getThinkingLevels } from "../../providers/thinkingLevels.js";
+ import { PROVIDERS } from "../../providers/index.js";
+ import { LEVEL_TO_BUDGET, budgetToLevel, effortToBudget, effortToThinkingLevel } from "./thinking.js";
++import { DEFAULT_PROVIDER_THINKING_BUDGET } from "../../config/runtimeConfig.js";
+ 
+ // Map a target wire-format to its native thinking format (when capability has none).
+ const FORMAT_TO_NATIVE = {
+@@ -481,7 +482,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
+   if (!override && explicit) return body;
+   const mode = providerThinking?.mode;
+   const intent = override || (!mode || mode === "auto" ? null
+-    : mode === "on" ? { mode: "budget", budget: 10000 }
++    : mode === "on" ? { mode: "budget", budget: DEFAULT_PROVIDER_THINKING_BUDGET }
+     : mode === "off" || mode === "none" ? { mode: "none" }
+     : { mode: "level", level: mode });
+   if (!intent) return body;
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index 655c07d5..1b286b74 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -99,6 +99,7 @@ export function createSSEStream(options = {}) {
+   } = options;
+ 
+   let buffer = "";
++  let pendingTrailingCr = false;
+   let usage = null;
+   // The client's wire protocol determines termination, regardless of which
+   // provider serves it. Native Gemini SSE ends at EOF and carries arbitrary
+@@ -305,7 +306,18 @@ export function createSSEStream(options = {}) {
+         nativeGeminiJson += text;
+         return;
+       }
+-      buffer += text;
++      let parserText = text;
++      if ((nativeGeminiPassthrough || observeNativeGeminiTransform) && !nativeJson
++          && parserText.length > 0) {
++        // Native Gemini events may also end with a bare CR; normalize only the
++        // parser text so forwarded bytes and decoded payloads stay untouched.
++        if (pendingTrailingCr && parserText.startsWith("\n")) {
++          parserText = parserText.slice(1);
++        }
++        pendingTrailingCr = text.endsWith("\r");
++        parserText = parserText.replace(/\r\n|\r/g, "\n");
++      }
++      buffer += parserText;
+ 
+       const lines = buffer.split("\n");
+       buffer = lines.pop() || "";
+@@ -644,7 +656,14 @@ export function createSSEStream(options = {}) {
+           await finalizeStream();
+           return;
+         }
+-        if (remaining) buffer += remaining;
++        if (remaining) {
++          let tail = remaining;
++          if ((nativeGeminiPassthrough || observeNativeGeminiTransform) && !nativeJson) {
++            if (pendingTrailingCr && tail.startsWith("\n")) tail = tail.slice(1);
++            tail = tail.replace(/\r\n|\r/g, "\n");
++          }
++          buffer += tail;
++        }
+ 
+         if (observeNativeGeminiTransform) {
+           if (buffer.trim()) captureNativeGeminiLine(buffer);
+diff --git a/tests/translator/thinking-unified.test.js b/tests/translator/thinking-unified.test.js
+index 4499e45a..54216ae1 100644
+--- a/tests/translator/thinking-unified.test.js
++++ b/tests/translator/thinking-unified.test.js
+@@ -5,7 +5,9 @@ import {
+   parseSuffix,
+   extractThinking,
+   applyThinking,
++  applyNativeGeminiThinking,
+ } from "../../open-sse/translator/concerns/thinkingUnified.js";
++import { DEFAULT_PROVIDER_THINKING_BUDGET } from "../../open-sse/config/runtimeConfig.js";
+ import { extractReasoningText } from "../../open-sse/translator/concerns/reasoning.js";
+ 
+ const apply = (targetFormat, model, body, provider) => {
+@@ -313,3 +315,18 @@ describe("OpenCode Free ids with no capabilities entry (#2690)", () => {
+     expect(apply("openai", "oc/no-such-model-xyz", bunny("high"), "oc").reasoning_effort).toBeUndefined();
+   });
+ });
++
++describe("applyNativeGeminiThinking provider default", () => {
++  it("provider mode on fills the shared default budget and keeps includeThoughts", () => {
++    const body = { generationConfig: { thinkingConfig: { includeThoughts: false } } };
++    const out = applyNativeGeminiThinking("gemini-2.5-flash", body, "gemini", { mode: "on" });
++    expect(out.generationConfig.thinkingConfig.thinkingBudget).toBe(DEFAULT_PROVIDER_THINKING_BUDGET);
++    expect(out.generationConfig.thinkingConfig.includeThoughts).toBe(false);
++  });
++
++  it("keeps an explicit client zero thinking budget", () => {
++    const body = { generationConfig: { thinkingConfig: { thinkingBudget: 0 } } };
++    const out = applyNativeGeminiThinking("gemini-2.5-flash", body, "gemini", { mode: "on" });
++    expect(out.generationConfig.thinkingConfig.thinkingBudget).toBe(0);
++  });
++});
+diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
+index 4890a3c9..5ecae0cf 100644
+--- a/tests/unit/gemini-native-stream.test.js
++++ b/tests/unit/gemini-native-stream.test.js
+@@ -335,6 +335,68 @@ describe("native Gemini SSE preserves provider payload and follows the client pr
+     const original = frame(body);
+     expect(await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("aistudio")))).toBe(original);
+   });
++
++  it.each(["\n", "\r\n", "\r"])("accepts %s-terminated native events whole and byte-fragmented", async separator => {
++    const framed = body => `data: ${JSON.stringify(body)}${separator}${separator}`;
++    const original = framed(chunk) + framed(lateUsage);
++    for (const inputs of [[encode(original)],
++                          Array.from(encode(original), byte => Uint8Array.of(byte))]) {
++      vi.clearAllMocks();
++      const completed = vi.fn();
++      const output = await readText(inputStream(inputs)
++        .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, completed)));
++      expect(output).toBe(original);
++      expect(output).not.toContain("[DONE]");
++      expect(output).not.toContain('"code":502');
++      expect(completed).toHaveBeenCalledOnce();
++      expect(completed.mock.calls[0][1].cached_tokens).toBe(2048);
++      for (const toolNameMap of [null, new Map([["wire_tool", "original_tool"]])]) {
++        vi.clearAllMocks();
++        const succeeded = vi.fn();
++        const failed = vi.fn();
++        const shared = { provider: "aistudio", model: "gemini-native-test", connectionId: "account",
++          body: {}, stream: true, requestStartTime: Date.now(), onRequestFailure: failed };
++        const result = await handleStreamingResponse({
++          ...shared, ...buildOnStreamComplete(shared), toolNameMap, onRequestSuccess: succeeded,
++          providerResponse: new Response(inputStream(inputs), { headers: { "content-type": "text/event-stream" } }),
++          sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++          streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
++        });
++        const text = await result.response.text();
++        expect(text).not.toContain('"code":502');
++        expect(text).not.toContain("[DONE]");
++        await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
++        expect(failed).not.toHaveBeenCalled();
++      }
++    }
++  });
++
++  it.each(["\n", "\r\n", "\r"])("reports malformed or unfinished %s-terminated native events as one 502", async separator => {
++    const framed = body => `data: ${JSON.stringify(body)}${separator}${separator}`;
++    const cases = [
++      ["malformed event after a valid one", framed(chunk) + `data: {not-json}${separator}${separator}`],
++      ["candidate without finishReason", framed({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: "partial" }] } }] })],
++    ];
++    for (const [name, raw] of cases) {
++      for (const toolNameMap of [null, new Map([["wire_tool", "original_tool"]])]) {
++        vi.clearAllMocks();
++        const succeeded = vi.fn();
++        const failed = vi.fn();
++        const shared = { provider: "aistudio", model: "gemini-native-test", connectionId: "account",
++          body: {}, stream: true, requestStartTime: Date.now(), onRequestFailure: failed };
++        const result = await handleStreamingResponse({
++          ...shared, ...buildOnStreamComplete(shared), toolNameMap, onRequestSuccess: succeeded,
++          providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "text/event-stream" } }),
++          sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++          streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
++        });
++        await result.response.text();
++        await vi.waitFor(() => expect(failed).toHaveBeenCalledOnce(), { timeout: 5000 });
++        expect(failed.mock.calls[0][0]).toMatchObject({ status: 502, error: expect.any(String) });
++        expect(succeeded).not.toHaveBeenCalled();
++      }
++    }
++  });
+ });
+ 
+ describe("native response projections preserve requested data without inventing completion failures", () => {
+-- 
+2.43.0
+

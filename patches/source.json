@@ -72,6 +72,7 @@
     "tests/unit/zed-completions-wire.test.js"
   ],
   "regression_files": [
-    "tests/unit/downstream-translator-history-regressions.test.js"
+    "tests/unit/downstream-translator-history-regressions.test.js",
+    "tests/translator/thinking-unified.test.js"
   ]
 }
