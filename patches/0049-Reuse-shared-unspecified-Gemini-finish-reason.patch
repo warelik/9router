@@ -1,0 +1,65 @@
+From 89ed8c00ac9cfbaaf70473a81b18ca0e69879fae Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] Reuse shared unspecified Gemini finish reason
+
+---
+ open-sse/translator/schema/finishReasons.js | 1 +
+ open-sse/utils/stream.js                    | 3 ++-
+ tests/unit/gemini-native-stream.test.js     | 5 +++++
+ 3 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/open-sse/translator/schema/finishReasons.js b/open-sse/translator/schema/finishReasons.js
+index 88c320f1748ec458de09f88105359db226d5cb44..c7455e507993da642d4a61079017d0a9fc66c89e 100644
+--- a/open-sse/translator/schema/finishReasons.js
++++ b/open-sse/translator/schema/finishReasons.js
+@@ -21,6 +21,7 @@ export const CLAUDE_STOP = {
+ 
+ // Gemini finishReason values.
+ export const GEMINI_FINISH = {
++  UNSPECIFIED: "FINISH_REASON_UNSPECIFIED",
+   STOP: "STOP",
+   MAX_TOKENS: "MAX_TOKENS",
+   SAFETY: "SAFETY",
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index 3d6d14693621c2ab2ec55b83a16a5803c7a8ffba..dbe473569b1fb22d16640279be921e70cd1eaa3b 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -1,5 +1,6 @@
+ import { translateResponse, initState } from "../translator/index.js";
+ import { FORMATS } from "../translator/formats.js";
++import { GEMINI_FINISH } from "../translator/schema/index.js";
+ import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
+ import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
+ import {
+@@ -199,7 +200,7 @@ export function createSSEStream(options = {}) {
+     for (const [position, candidate] of candidates.entries()) {
+       if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+       const finished = typeof candidate.finishReason === "string"
+-        && candidate.finishReason.length > 0 && candidate.finishReason !== "FINISH_REASON_UNSPECIFIED";
++        && candidate.finishReason.length > 0 && candidate.finishReason !== GEMINI_FINISH.UNSPECIFIED;
+       if (finished) {
+         nativeGeminiAnyFinishSeen = true;
+       }
+diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
+index 5ecae0cf1319c1beb01d4132cb172ce0e5f929c3..e811e69e87e80ec8b1105db6c5a449ba7abcddca 100644
+--- a/tests/unit/gemini-native-stream.test.js
++++ b/tests/unit/gemini-native-stream.test.js
+@@ -1,4 +1,5 @@
+ import { describe, expect, it, vi } from "vitest";
++import { GEMINI_FINISH } from "../../open-sse/translator/schema/index.js";
+ 
+ vi.mock("@/lib/db/helpers/kvStore.js", () => ({
+   makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
+@@ -38,6 +39,10 @@ const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nat
+ const readText = stream => new Response(stream).text();
+ 
+ describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
++  it("shares the exact unspecified Gemini finish-reason wire value", () => {
++    expect(GEMINI_FINISH.UNSPECIFIED).toBe("FINISH_REASON_UNSPECIFIED");
++  });
++
+   it.each([
+     ["openai", FORMATS.OPENAI, 'data: {"choices":[{"delta":{"content":"fixture"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'],
+     ["claude", FORMATS.CLAUDE, 'event: message_stop\ndata: {"type":"message_stop"}\n\n'],
