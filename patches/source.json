@@ -73,6 +73,7 @@
   ],
   "regression_files": [
     "tests/unit/downstream-translator-history-regressions.test.js",
-    "tests/translator/thinking-unified.test.js"
+    "tests/translator/thinking-unified.test.js",
+    "tests/unit/aistudio-discovery.test.js"
   ]
 }
