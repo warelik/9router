@@ -1126,7 +1126,7 @@ def _native_upstream_ancestor(ancestor, descendant):
 
 
 def _pending_shared_ref_candidate(repo, lifecycle, *, config_sha, patch_root,
-                                  workflow_text, accepted_upstream):
+                                  workflow_text, accepted_upstream, review_ref=None):
     """Reconstruct one exact pending candidate from its immutable full-review ref."""
     refs = api(f"repos/{repo}/git/matching-refs/heads/review")
     if not isinstance(refs, list):
@@ -1135,7 +1135,8 @@ def _pending_shared_ref_candidate(repo, lifecycle, *, config_sha, patch_root,
     candidate_refs = [
         item for item in refs
         if (isinstance(item, dict) and isinstance(item.get("ref"), str)
-            and full_ref.fullmatch(item["ref"].removeprefix("refs/heads/")))
+            and full_ref.fullmatch(item["ref"].removeprefix("refs/heads/"))
+            and (review_ref is None or item["ref"] == "refs/heads/" + review_ref))
     ]
     if not candidate_refs:
         return None
@@ -3548,12 +3549,33 @@ def _transition_review_candidates(repo, config_sha, lifecycle, *, accepted_basel
             if request_time.tzinfo is None:
                 raise ValueError("Transition review request timestamp needs a timezone")
             match = common.search(comment.get("body") or "")
-            if expected_candidate is None:
-                if match is None:
-                    if accepted_baseline is not None and expected_scope == "full":
-                        raise ValueError("Open full review request omits its exact canonical candidate identity")
+            recovered = None
+            if match is None and expected_candidate is None:
+                if accepted_baseline is None or expected_scope != "full":
                     continue
-                fields = match.groupdict()
+                if not SHA.fullmatch(accepted_baseline.get("upstream_sha", "")):
+                    raise ValueError("Open full review request omits its exact canonical candidate identity")
+                # ABI 1 owner requests bind the complete candidate by its digest.
+                # Recover its tuple from the exact tree-identical Git context;
+                # readable duplicate text is not a second source of authority.
+                recovered = _pending_shared_ref_candidate(
+                    repo, lifecycle, config_sha=config_sha, patch_root=ROOT / "patches",
+                    workflow_text=(ROOT / ".github/workflows/release.yml").read_text(
+                        encoding="utf-8"),
+                    accepted_upstream=accepted_baseline["upstream_sha"],
+                    review_ref=(pull.get("head") or {}).get("ref"))
+                if (recovered is None
+                        or lifecycle.candidate_identity(recovered) != marker["candidate_id"]):
+                    raise ValueError("Open full review request omits its exact canonical candidate identity")
+            bound_candidate = expected_candidate or recovered
+            if (match is None and bound_candidate is not None
+                    and accepted_baseline is not None):
+                fields = {**bound_candidate, "candidate_id": lifecycle.candidate_identity(bound_candidate),
+                          "scope": marker["scope"], "review_sha": marker["review_sha"],
+                          "base_sha": marker["base_sha"]}
+            else:
+                fields = match.groupdict() if match is not None else None
+            if expected_candidate is None:
                 if (marker.get("candidate_id") != fields["candidate_id"]
                         or marker.get("scope") != fields["scope"]
                         or marker.get("review_sha") != fields["review_sha"]
@@ -3573,9 +3595,8 @@ def _transition_review_candidates(repo, config_sha, lifecycle, *, accepted_basel
             else:
                 candidate = expected_candidate
                 candidate_id = expected_candidate_id
-                if match is None:
+                if fields is None:
                     raise ValueError("Transition review request omits its exact canonical candidate identity")
-                fields = match.groupdict()
                 if (fields["candidate_id"] != candidate_id
                         or fields["upstream_sha"] != candidate["upstream_sha"]
                         or fields["application_sha"] != candidate["application_sha"]

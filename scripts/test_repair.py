@@ -1615,6 +1615,41 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
             release._transition_review_candidates(
                 REPO, CONFIG, lifecycle, accepted_baseline=baseline)
 
+    def test_open_abi_requests_recover_identity_from_the_exact_native_git_context(self):
+        candidate, baseline, pulls, comments = self._open_candidate_pair()
+        baseline["upstream_sha"] = UPSTREAM
+        candidate_id = self._candidate_identity(candidate)
+        for pull, scope in zip(pulls, ("full", "delta")):
+            comment = comments[pull["number"]][0]
+            comment["body"] = release._review_marker(
+                candidate_id, scope, pull["head"]["sha"], pull["base"]["sha"])
+        lifecycle = SimpleNamespace(candidate_identity=self._candidate_identity)
+        with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+              patch.object(release, "pages", side_effect=lambda route:
+                           comments[self._comment_pull_number(route)]),
+              patch.object(release, "_pending_shared_ref_candidate",
+                           return_value=candidate) as native_context):
+            result = release._transition_review_candidates(
+                REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["candidate"], candidate)
+        self.assertEqual(result[0]["full"]["request_id"], 101)
+        self.assertEqual(result[0]["delta"]["request_id"], 100)
+        self.assertEqual(native_context.call_count, 1)
+        self.assertEqual(native_context.call_args.kwargs["review_ref"],
+                         pulls[0]["head"]["ref"])
+        self.assertEqual(native_context.call_args.kwargs["accepted_upstream"], UPSTREAM)
+        for reconstructed in (None, {**candidate, "configuration_sha": "f" * 40}):
+            with (self.subTest(reconstructed=reconstructed),
+                  patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+                  patch.object(release, "pages", side_effect=lambda route:
+                               comments[self._comment_pull_number(route)]),
+                  patch.object(release, "_pending_shared_ref_candidate",
+                               return_value=reconstructed),
+                  self.assertRaisesRegex(ValueError, "omits its exact canonical candidate identity")):
+                release._transition_review_candidates(
+                    REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+
     def test_open_selector_rejects_malformed_full_and_moved_delta_refs(self):
         candidate, baseline, pulls, comments = self._open_candidate_pair()
         lifecycle = SimpleNamespace(candidate_identity=self._candidate_identity)

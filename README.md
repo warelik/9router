@@ -225,3 +225,14 @@ reused by the shared workflow only when verified provenance and recipe match the
 selected candidate. Releases contain a `linux/amd64` Docker image,
 `provenance.json` and `SHA256SUMS`, not a VPS deployment.
 The server recipe downloads that immutable release; GitHub has no VPS credentials.
+
+### Canonical owner requests and retained source
+
+An immutable ABI 1 `fork-review:v1` request binds the complete candidate by its
+SHA-256 identity. When its duplicate readable tuple is absent, the open-pair
+selector verifies the exact native full-review ref, its tree-identical application
+parent, the current configuration, patch series, recipe and supported upstream
+range before accepting that identity. The delta must bind the same candidate and
+exact accepted source. Missing or different native identity remains a refusal.
+The compatibility regression covers this request shape without changing the
+application or weakening the prior malformed/source-movement checks.
