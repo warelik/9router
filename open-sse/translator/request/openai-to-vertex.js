@@ -1,12 +1,7 @@
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
 import { openaiToGeminiRequest } from "./openai-to-gemini.js";
-import { DEFAULT_THINKING_VERTEX_SIGNATURE, DEFAULT_THINKING_AG_SIGNATURE, DEFAULT_THINKING_GEMINI_CLI_SIGNATURE } from "../../config/defaultThinkingSignature.js";
-
-const SYNTHETIC_THINKING_SIGNATURES = new Set([
-  DEFAULT_THINKING_AG_SIGNATURE,
-  DEFAULT_THINKING_GEMINI_CLI_SIGNATURE,
-]);
+import { DEFAULT_THINKING_VERTEX_SIGNATURE, SYNTHETIC_THINKING_SIGNATURES } from "../../config/defaultThinkingSignature.js";
 
 /**
  * Post-process a Gemini-format body for Vertex AI compatibility:
