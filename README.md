@@ -236,3 +236,9 @@ range before accepting that identity. The delta must bind the same candidate and
 exact accepted source. Missing or different native identity remains a refusal.
 The compatibility regression covers this request shape without changing the
 application or weakening the prior malformed/source-movement checks.
+
+The official Node image index for the upstream-selected `node:22-alpine` tag is
+refreshed in patch0010 when registry preflight reports it stale. Source selection
+is emitted before assembly, so a failed preparation repairs the held upstream
+commit instead of selecting a different live HEAD. The source-selection
+regression covers the failure path before assembly completes.

@@ -2113,34 +2113,29 @@ def _is_shared_history_pull(repo, pull):
 
 
 def _shared_history_pull_inventory(repo, published_at):
-    """Read the bounded, updated-ordered review and repair PR inventory since publication."""
+    """Read every bounded page and canonicalize relevant exact PR identities."""
     if not isinstance(published_at, str):
         raise ValueError("Native review history requires a publication cutoff")
     cutoff = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
     if cutoff.tzinfo is None:
         raise ValueError("Native review history cutoff has no timezone")
     route = f"repos/{repo}/pulls?state=all&sort=updated&direction=desc"
-    result, seen_numbers, previous = [], set(), None
+    result, seen_numbers = [], set()
     for page in range(1, 1001):
         batch = api(f"{route}&per_page=100&page={page}")
         if not isinstance(batch, list):
             raise ValueError("Native history pull inventory is not a complete list")
-        timestamps = []
         for pull in batch:
             signature = _history_pull_signature(repo, pull)
             timestamp = datetime.fromisoformat(signature[1].replace("Z", "+00:00"))
-            if previous is not None and timestamp > previous:
-                raise ValueError("Native history pull inventory is not in stable updated order")
-            previous = timestamp
-            timestamps.append(timestamp)
+            number = signature[0]
+            if number in seen_numbers:
+                raise ValueError("Native history pagination repeated a pull request")
+            seen_numbers.add(number)
             if timestamp >= cutoff and _is_shared_history_pull(repo, pull):
-                number = signature[0]
-                if number in seen_numbers:
-                    raise ValueError("Native history pagination repeated a pull request")
-                seen_numbers.add(number)
                 result.append(pull)
-        if any(timestamp < cutoff for timestamp in timestamps) or len(batch) < 100:
-            return result
+        if len(batch) < 100:
+            return sorted(result, key=lambda pull: pull["number"])
     raise ValueError("Native review-history pull inventory exceeded its pagination bound")
 
 
@@ -4656,6 +4651,8 @@ def prepare_shared(directory):
                 else api(f"repos/{UPSTREAM}/commits/{UPSTREAM_BRANCH}").get("sha"))
     if not SHA.fullmatch(upstream or ""):
         raise ValueError("Upstream selection did not return a full commit SHA")
+    # A preparation failure must repair this selected source, not chase live HEAD.
+    output(upstream=upstream)
     app = directory / "application"
     application_sha, patchset, version = _prepare_source(app, upstream, repair["patch_root"])
     workflow_text = (repair["config_root"] / ".github/workflows/release.yml").read_text(encoding="utf-8")

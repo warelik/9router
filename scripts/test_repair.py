@@ -1754,6 +1754,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         def run_prepare(pending, ref_candidate=None):
             selected.clear()
             api_calls.clear()
+            outputs = {}
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 workflow = root / ".github/workflows/release.yml"
@@ -1776,8 +1777,11 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
                       patch.object(release, "_pending_shared_ref_candidate",
                                    return_value=ref_candidate),
                       patch.object(release, "_prepare_source", side_effect=stop_at_source),
+                      patch.object(release, "output", side_effect=lambda **values: outputs.update(values)),
                       self.assertRaises(SourceSelectionReached)):
                     release.prepare_shared(root)
+                self.assertEqual(outputs["upstream"], selected[0],
+                                 "Failure recovery must retain the selected source even before assembly succeeds")
 
         run_prepare(True)
         self.assertEqual(selected, [pinned_upstream])
@@ -1791,6 +1795,21 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         run_prepare(False, {"upstream_sha": pinned_upstream})
         self.assertEqual(selected, [pinned_upstream])
         self.assertNotIn(f"repos/{release.UPSTREAM}/commits/{release.UPSTREAM_BRANCH}", api_calls)
+
+    def test_history_inventory_reads_past_cutoff_inversions_and_preserves_all_recent_rows(self):
+        _candidate, _baseline, pulls, _comments = self._open_candidate_pair()
+        template = {**pulls[0], "user": {"login": "warelik", "type": "User"},
+                    "updated_at": "2026-10-20T11:00:00Z"}
+        page = [{**template, "number": n} for n in range(1, 101)]
+        page[0] = {**page[0], "updated_at": "2026-10-18T09:00:00Z"}
+        later = {**template, "number": 101, "updated_at": "2026-10-21T12:00:00Z"}
+        with patch.object(release, "api", side_effect=[page, [later]]) as read:
+            result = release._shared_history_pull_inventory(REPO, "2026-10-19T10:00:00Z")
+        self.assertEqual([x["number"] for x in result], list(range(2, 102)))
+        self.assertEqual(read.call_count, 2)
+        with patch.object(release, "api", return_value=[{**template, "number": 1}, {**template, "number": 1}]):
+            with self.assertRaisesRegex(ValueError, "repeated a pull request"):
+                release._shared_history_pull_inventory(REPO, "2026-10-19T10:00:00Z")
 
     def test_prepare_shared_resumes_full_only_pair_without_recreating_full_request(self):
         candidate, baseline_candidate, pulls, _comments = self._open_candidate_pair()
