@@ -1,0 +1,174 @@
+From abdadc267da25effecbcabea1e6e0adc20970c8b Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] Centralize tool-choice and function-calling modes
+
+---
+ open-sse/executors/antigravity.js             |  5 ++--
+ .../translator/request/openai-to-gemini.js    | 23 +++++++++++--------
+ open-sse/translator/schema/blocks.js          | 10 +++++++-
+ open-sse/translator/schema/index.js           |  4 +++-
+ tests/unit/chat-to-gemini-contract.test.js    | 14 +++++++++++
+ 5 files changed, 43 insertions(+), 13 deletions(-)
+
+diff --git a/open-sse/executors/antigravity.js b/open-sse/executors/antigravity.js
+index 9cdd7f7abd28472ee8db4a3f82e1cbab994db002..adac267c17c7823bb04acefd5301e810848921e4 100644
+--- a/open-sse/executors/antigravity.js
++++ b/open-sse/executors/antigravity.js
+@@ -3,6 +3,7 @@ import { BaseExecutor } from "./base.js";
+ import { PROVIDERS } from "../config/providers.js";
+ import { OAUTH_ENDPOINTS, ANTIGRAVITY_HEADERS, AG_DEFAULT_TOOLS, AG_TOOL_SUFFIX, ANTIGRAVITY_PROMPT_REWRITES } from "../config/appConstants.js";
+ import { HTTP_STATUS } from "../config/runtimeConfig.js";
++import { GEMINI_FUNCTION_CALLING_MODE_NONE, GEMINI_FUNCTION_CALLING_MODE_VALIDATED } from "../translator/schema/index.js";
+ import { resolveSessionId, toNumericSessionId } from "../utils/sessionManager.js";
+ import { proxyAwareFetch } from "../utils/proxyFetch.js";
+ import { cleanJSONSchemaForAntigravity, normalizeGeminiContents } from "../translator/formats/gemini.js";
+@@ -84,7 +85,7 @@ function nativeGeminiDisablesFunctionCalling(request) {
+   return [request.toolConfig, request.tool_config].some(toolConfig => {
+     if (!toolConfig || typeof toolConfig !== "object") return false;
+     return [toolConfig.functionCallingConfig, toolConfig.function_calling_config].some(config =>
+-      config && typeof config === "object" && config.mode === "NONE"
++      config && typeof config === "object" && config.mode === GEMINI_FUNCTION_CALLING_MODE_NONE
+     );
+   });
+ }
+@@ -399,7 +400,7 @@ export class AntigravityExecutor extends BaseExecutor {
+       ...(tools && { tools }),
+       sessionId,
+       safetySettings: undefined,
+-      ...(tools?.length > 0 && { toolConfig: (geminiBacked && _originalToolConfig) || { functionCallingConfig: { mode: "VALIDATED" } } })
++      ...(tools?.length > 0 && { toolConfig: (geminiBacked && _originalToolConfig) || { functionCallingConfig: { mode: GEMINI_FUNCTION_CALLING_MODE_VALIDATED } } })
+     };
+ 
+     // Strip blacklisted thinking fields from top-level body (set by thinkingUnified.js at root, not body.request)
+diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
+index 5e2876e114df22619f82b187409991c120ffd51b..93c6684cc5a3c70ae759024d3a811332c0d23375 100644
+--- a/open-sse/translator/request/openai-to-gemini.js
++++ b/open-sse/translator/request/openai-to-gemini.js
+@@ -23,7 +23,12 @@ import {
+   GEMINI_RESERVED_RESPONSE_KEYS
+ } from "../formats/gemini.js";
+ import { deriveSessionId, toNumericSessionId } from "../../utils/sessionManager.js";
+-import { ROLE, GEMINI_ROLE, OPENAI_BLOCK, CLAUDE_BLOCK, OPENAI_TOOL_CHOICE_NONE } from "../schema/index.js";
++import {
++  ROLE, GEMINI_ROLE, OPENAI_BLOCK, CLAUDE_BLOCK,
++  OPENAI_TOOL_CHOICE_AUTO, OPENAI_TOOL_CHOICE_NONE, OPENAI_TOOL_CHOICE_REQUIRED,
++  GEMINI_FUNCTION_CALLING_MODE_AUTO, GEMINI_FUNCTION_CALLING_MODE_NONE,
++  GEMINI_FUNCTION_CALLING_MODE_ANY, GEMINI_FUNCTION_CALLING_MODE_VALIDATED,
++} from "../schema/index.js";
+ import { isGemini4Model } from "../../providers/capabilities.js";
+ 
+ // Sanitize function names for Gemini API.
+@@ -336,18 +341,18 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+       result.tools = [{ functionDeclarations }];
+ 
+       const choice = body.tool_choice;
+-      if (choice === "auto") {
+-        result.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
++      if (choice === OPENAI_TOOL_CHOICE_AUTO) {
++        result.toolConfig = { functionCallingConfig: { mode: GEMINI_FUNCTION_CALLING_MODE_AUTO } };
+       } else if (choice === OPENAI_TOOL_CHOICE_NONE) {
+-        result.toolConfig = { functionCallingConfig: { mode: "NONE" } };
+-      } else if (choice === "required") {
+-        result.toolConfig = { functionCallingConfig: { mode: "ANY" } };
++        result.toolConfig = { functionCallingConfig: { mode: GEMINI_FUNCTION_CALLING_MODE_NONE } };
++      } else if (choice === OPENAI_TOOL_CHOICE_REQUIRED) {
++        result.toolConfig = { functionCallingConfig: { mode: GEMINI_FUNCTION_CALLING_MODE_ANY } };
+       } else if (choice && typeof choice === "object") {
+         const named = choice.function?.name ?? choice.name;
+         if (typeof named === "string" && named) {
+           result.toolConfig = {
+             functionCallingConfig: {
+-              mode: "ANY",
++              mode: GEMINI_FUNCTION_CALLING_MODE_ANY,
+               allowedFunctionNames: [sanitizeGeminiFunctionName(named)]
+             }
+           };
+@@ -418,7 +423,7 @@ function wrapInCloudCodeEnvelope(model, geminiCLI, credentials = null, isAntigra
+ 
+   if (geminiCLI.tools?.length > 0) {
+     envelope.request.toolConfig = geminiCLI.toolConfig || {
+-      functionCallingConfig: { mode: "VALIDATED" }
++      functionCallingConfig: { mode: GEMINI_FUNCTION_CALLING_MODE_VALIDATED }
+     };
+   }
+ 
+@@ -536,7 +541,7 @@ function wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials = nu
+     if (functionDeclarations.length > 0) {
+       envelope.request.tools = [{ functionDeclarations }];
+       envelope.request.toolConfig = {
+-        functionCallingConfig: { mode: "VALIDATED" }
++        functionCallingConfig: { mode: GEMINI_FUNCTION_CALLING_MODE_VALIDATED }
+       };
+     }
+   }
+diff --git a/open-sse/translator/schema/blocks.js b/open-sse/translator/schema/blocks.js
+index e136bab6a65c947db143529d07726f84357c79b0..dd00546108c9d5f93636d177bc4b9783f9f0e105 100644
+--- a/open-sse/translator/schema/blocks.js
++++ b/open-sse/translator/schema/blocks.js
+@@ -53,8 +53,16 @@ export const RESPONSES_TOOL = {
+   ALLOWED_TOOLS: "allowed_tools",
+ };
+ 
+-// The client-facing tool_choice value that prohibits every tool call.
++// OpenAI client-facing tool_choice selectors.
++export const OPENAI_TOOL_CHOICE_AUTO = "auto";
+ export const OPENAI_TOOL_CHOICE_NONE = "none";
++export const OPENAI_TOOL_CHOICE_REQUIRED = "required";
++
++// Gemini function-calling modes.
++export const GEMINI_FUNCTION_CALLING_MODE_AUTO = "AUTO";
++export const GEMINI_FUNCTION_CALLING_MODE_NONE = "NONE";
++export const GEMINI_FUNCTION_CALLING_MODE_ANY = "ANY";
++export const GEMINI_FUNCTION_CALLING_MODE_VALIDATED = "VALIDATED";
+ 
+ // Valid OpenAI block types (used by filterToOpenAIFormat).
+ export const VALID_OPENAI_CONTENT_TYPES = [
+diff --git a/open-sse/translator/schema/index.js b/open-sse/translator/schema/index.js
+index 3e4d43c08cfe86fb5605ef2db07e9e5011c516d6..2cc9cda1332cf93d1b0154444819620ec5b46090 100644
+--- a/open-sse/translator/schema/index.js
++++ b/open-sse/translator/schema/index.js
+@@ -3,7 +3,9 @@ export { ROLE, GEMINI_ROLE } from "./roles.js";
+ export {
+   OPENAI_BLOCK, CLAUDE_BLOCK, RESPONSES_ITEM, RESPONSES_TOOL,
+   VALID_OPENAI_CONTENT_TYPES, VALID_OPENAI_MESSAGE_TYPES,
+-  OPENAI_TOOL_CHOICE_NONE,
++  OPENAI_TOOL_CHOICE_AUTO, OPENAI_TOOL_CHOICE_NONE, OPENAI_TOOL_CHOICE_REQUIRED,
++  GEMINI_FUNCTION_CALLING_MODE_AUTO, GEMINI_FUNCTION_CALLING_MODE_NONE,
++  GEMINI_FUNCTION_CALLING_MODE_ANY, GEMINI_FUNCTION_CALLING_MODE_VALIDATED,
+ } from "./blocks.js";
+ export { OPENAI_FINISH, CLAUDE_STOP, GEMINI_FINISH } from "./finishReasons.js";
+ export { MODEL_FALLBACK, DEFAULT_IMAGE_MIME } from "./defaults.js";
+diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
+index 2d27dac81e3109a85923d18f7d356216d9116723..a9bb1971d6f082710f015e3ad69e1d3c94bcbd3a 100644
+--- a/tests/unit/chat-to-gemini-contract.test.js
++++ b/tests/unit/chat-to-gemini-contract.test.js
+@@ -24,6 +24,11 @@ vi.mock("@/lib/db/helpers/kvStore.js", () => ({
+ import "../translator/registerAll.js";
+ import { translateRequest } from "../../open-sse/translator/index.js";
+ import { FORMATS } from "../../open-sse/translator/formats.js";
++import {
++  OPENAI_TOOL_CHOICE_AUTO, OPENAI_TOOL_CHOICE_NONE, OPENAI_TOOL_CHOICE_REQUIRED,
++  GEMINI_FUNCTION_CALLING_MODE_AUTO, GEMINI_FUNCTION_CALLING_MODE_NONE,
++  GEMINI_FUNCTION_CALLING_MODE_ANY, GEMINI_FUNCTION_CALLING_MODE_VALIDATED,
++} from "../../open-sse/translator/schema/index.js";
+ import {
+   openaiToGeminiRequest,
+   openaiToGeminiCLIRequest,
+@@ -361,6 +366,15 @@ describe("cleanJSONSchemaForAntigravity traversal is schema-position aware", ()
+ });
+ 
+ describe("tool choice mapping", () => {
++  it("shared tool selectors and modes retain the exact wire values", () => {
++    expect([OPENAI_TOOL_CHOICE_AUTO, OPENAI_TOOL_CHOICE_NONE, OPENAI_TOOL_CHOICE_REQUIRED])
++      .toEqual(["auto", "none", "required"]);
++    expect([
++      GEMINI_FUNCTION_CALLING_MODE_AUTO, GEMINI_FUNCTION_CALLING_MODE_NONE,
++      GEMINI_FUNCTION_CALLING_MODE_ANY, GEMINI_FUNCTION_CALLING_MODE_VALIDATED,
++    ]).toEqual(["AUTO", "NONE", "ANY", "VALIDATED"]);
++  });
++
+   const tools = [{ type: "function", function: { name: "pick_me", parameters: { type: "object", properties: {} } } }];
+   const modeOf = (out) => (out.toolConfig || out.request?.toolConfig)?.functionCallingConfig?.mode;
+   const namesOf = (out) => (out.toolConfig || out.request?.toolConfig)?.functionCallingConfig?.allowedFunctionNames;
