@@ -36,6 +36,7 @@ import {
   convertOpenAIContentToParts,
   cleanJSONSchemaForAntigravity,
   isLegacyGeminiSchema,
+  lowerProtoSchemaTypes,
 } from "../../open-sse/translator/formats/gemini.js";
 import { AntigravityExecutor } from "../../open-sse/executors/antigravity.js";
 import { handleChatCore } from "../../open-sse/handlers/chatCore.js";
@@ -291,6 +292,36 @@ describe("cleanJSONSchemaForAntigravity traversal is schema-position aware", () 
     const cleaned = cleanJSONSchemaForAntigravity(structuredClone(schema));
     expect(cleaned.properties).toEqual(schema.properties);
     expect(cleaned.required).toEqual(schema.required);
+  });
+
+  it("proto schema tables normalize types and gate legacy proto shapes", () => {
+    const input = {
+      type: "OBJECT",
+      properties: {
+        name: { type: "STRING" },
+        count: { type: "ARRAY", items: { type: "INTEGER" } },
+      },
+      anyOf: [{ type: "NULL" }],
+    };
+    const lowered = lowerProtoSchemaTypes(input);
+    expect(lowered).toBe(input);
+    expect(lowered).toEqual({
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        count: { type: "array", items: { type: "integer" } },
+      },
+      anyOf: [{ type: "null" }],
+    });
+    expect(isLegacyGeminiSchema({
+      type: "OBJECT",
+      properties: { name: { type: "STRING" } },
+      required: ["name"],
+    })).toBe(true);
+    expect(isLegacyGeminiSchema({
+      type: "OBJECT",
+      anyOf: [{ type: "STRING" }],
+    })).toBe(false);
   });
 
   it("isLegacyGeminiSchema accepts proto shapes and rejects non-proto ones", () => {
