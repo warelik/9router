@@ -344,7 +344,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
 
   reqLogger.logProviderResponse(providerResponse.status, providerResponse.statusText, providerResponse.headers, responseBody);
   if (isNativeGeminiResponse) {
-    if (!isValidNativeGeminiResponse(responseBody, nativeResponseProjection)) {
+    if (!isValidNativeGeminiResponse(responseBody, nativeResponseProjection, false, true)) {
       const message = `Invalid native Gemini response from ${provider}`;
       appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
       return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, message);
