@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { SERVER_PARTS_PREFIX } from "../config/defaultThinkingSignature.js";
 import { makeKv } from "../../src/lib/db/helpers/kvStore.js";
 
 const MAX_SIGNATURES = 2000;
@@ -260,7 +261,6 @@ export function findGeminiTurnSignature({ reasoning, content, scope, sessionId =
   return null;
 }
 
-const SERVER_PARTS_PREFIX = "serverparts:";
 
 const isNonEmptyString = (value) => typeof value === "string" && value.length > 0;
 

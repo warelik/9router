@@ -2,6 +2,7 @@ import { FORMATS } from "../translator/formats.js";
 import { fallbackToolCallId } from "../translator/concerns/toolCall.js";
 import { buildErrorBody } from "./error.js";
 import { SSE_DONE } from "./sseConstants.js";
+import { NATIVE_GEMINI_RESPONSE_FIELDS, NATIVE_GEMINI_BRIDGE_FIELDS } from "../config/runtimeConfig.js";
 
 const sharedEncoder = new TextEncoder();
 
@@ -25,8 +26,8 @@ export function isValidNativeGeminiResponse(response, projection = null, allowUn
   // GenerateContent metadata can be the whole reply. Keep unknown extensions
   // opaque for non-streaming replies. An SSE transport-only frame must not
   // become successful response evidence at EOF.
-  const nativeFields = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
-  const bridgeFields = new Set(["message", "event", "data", "status", "code", "success", "response"]);
+  const nativeFields = NATIVE_GEMINI_RESPONSE_FIELDS;
+  const bridgeFields = NATIVE_GEMINI_BRIDGE_FIELDS;
   const hasOpaqueExtension = Object.keys(nativeResponse).some(field => !bridgeFields.has(field));
   if (!allowsEmpty && !allowUnrecognized && !nativeFields.some(field => Object.hasOwn(nativeResponse, field)) && !(allowOpaqueExtensions && hasOpaqueExtension)) return false;
   if (nativeResponse.candidates !== undefined) {
