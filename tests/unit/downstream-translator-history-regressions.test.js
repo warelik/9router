@@ -69,7 +69,7 @@ describe("Gemini historical turns retain their own instruction prefix", () => {
     const reasoning = `earlier reasoning-${role}`;
     const content = `earlier answer-${role}`;
     const signature = `exact-turn-signature-${role}`;
-    const turn = { reasoning, content, scope: credentials._geminiTurnScope };
+    const turn = { reasoning, content, scope: credentials._geminiTurnScope, sessionId };
     const searchPart = {
       thoughtSignature: `exact-search-signature-${role}`,
       toolCall: { id: `search-${role}`, toolType: "GOOGLE_SEARCH_WEB", args: { queries: [role] } },
