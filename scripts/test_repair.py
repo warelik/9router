@@ -1796,6 +1796,24 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         self.assertEqual(selected, [pinned_upstream])
         self.assertNotIn(f"repos/{release.UPSTREAM}/commits/{release.UPSTREAM_BRANCH}", api_calls)
 
+    def test_archived_review_threads_are_not_inputs_to_current_work(self):
+        candidate, _baseline, pulls, _comments = self._open_candidate_pair()
+        active = {**pulls[0], "number": 1, "state": "open",
+                  "user": {"login": "warelik", "type": "User"},
+                  "updated_at": "2026-10-21T12:00:00Z"}
+        archived = {**active, "number": 99, "state": "closed",
+                    "head": {**active["head"], "sha": "9" * 40, "ref": "review/" + "9" * 40}}
+        with patch.object(release, "api", return_value=[archived, active]):
+            result = release._shared_history_pull_inventory(
+                REPO, "2026-10-19T10:00:00Z", candidate=candidate)
+        self.assertEqual([pull["number"] for pull in result], [1])
+        current_closed = {**active, "number": 100, "state": "closed",
+                          "head": {**active["head"], "sha": candidate["configuration_sha"]}}
+        with patch.object(release, "api", return_value=[archived, current_closed, active]):
+            result = release._shared_history_pull_inventory(
+                REPO, "2026-10-19T10:00:00Z", candidate=candidate)
+        self.assertEqual([pull["number"] for pull in result], [1, 100])
+
     def test_history_inventory_reads_past_cutoff_inversions_and_preserves_all_recent_rows(self):
         _candidate, _baseline, pulls, _comments = self._open_candidate_pair()
         template = {**pulls[0], "user": {"login": "warelik", "type": "User"},

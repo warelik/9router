@@ -242,3 +242,5 @@ refreshed in patch0010 when registry preflight reports it stale. Source selectio
 is emitted before assembly, so a failed preparation repairs the held upstream
 commit instead of selecting a different live HEAD. The source-selection
 regression covers the failure path before assembly completes.
+
+Maintenance review input is open carried work and the exact current candidate. Archived closed discussions are excluded. The existing unresolved snapshot is written before superseded pairs are retired; `fixed` and `disproved` decisions are not reopened in later cycles. Native final-attempt accounting remains independent.

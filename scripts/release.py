@@ -2112,7 +2112,7 @@ def _is_shared_history_pull(repo, pull):
             or (head_ref.startswith("repair/") and base_ref == "downstream"))
 
 
-def _shared_history_pull_inventory(repo, published_at):
+def _shared_history_pull_inventory(repo, published_at, *, candidate=None):
     """Read every bounded page and canonicalize relevant exact PR identities."""
     if not isinstance(published_at, str):
         raise ValueError("Native review history requires a publication cutoff")
@@ -2132,7 +2132,13 @@ def _shared_history_pull_inventory(repo, published_at):
             if number in seen_numbers:
                 raise ValueError("Native history pagination repeated a pull request")
             seen_numbers.add(number)
-            if timestamp >= cutoff and _is_shared_history_pull(repo, pull):
+            exact_current = bool(candidate and (
+                (pull.get("head") or {}).get("sha") == candidate["configuration_sha"]
+                or (pull.get("head") or {}).get("ref", "").endswith(
+                    "-" + hashlib.sha256(json.dumps(candidate, ensure_ascii=False,
+                        sort_keys=True, separators=(",", ":")).encode()).hexdigest())))
+            if (timestamp >= cutoff and _is_shared_history_pull(repo, pull)
+                    and (pull.get("state") == "open" or exact_current)):
                 result.append(pull)
         if len(batch) < 100:
             return sorted(result, key=lambda pull: pull["number"])
@@ -2143,7 +2149,7 @@ def _native_shared_history(repo, candidate, lifecycle, published_at, pulls=None,
                            verify_inventory=None):
     """Gather complete native PR evidence and normalize it through ABI 1."""
     if pulls is None:
-        pulls = _shared_history_pull_inventory(repo, published_at)
+        pulls = _shared_history_pull_inventory(repo, published_at, candidate=candidate)
         verify_inventory = True if verify_inventory is None else verify_inventory
     elif verify_inventory is None:
         verify_inventory = False
@@ -2170,7 +2176,7 @@ def _native_shared_history(repo, candidate, lifecycle, published_at, pulls=None,
             if _history_pull_signature(repo, current) != _history_pull_signature(repo, pull):
                 raise ValueError("Native history pull changed during complete comment collection")
     if verify_inventory:
-        final_pulls = _shared_history_pull_inventory(repo, published_at)
+        final_pulls = _shared_history_pull_inventory(repo, published_at, candidate=candidate)
         final_signature = [_history_pull_signature(repo, pull) for pull in final_pulls]
         if final_signature != initial_signature:
             raise ValueError("Native review-history inventory changed during collection")
@@ -2179,7 +2185,7 @@ def _native_shared_history(repo, candidate, lifecycle, published_at, pulls=None,
 
 def _carried_shared_findings(repo, candidate, lifecycle, published_at, *,
                              pulls=None, additional=()):
-    pulls = _shared_history_pull_inventory(repo, published_at) if pulls is None else pulls
+    pulls = _shared_history_pull_inventory(repo, published_at, candidate=candidate) if pulls is None else pulls
     native_history = _native_shared_history(
         repo, candidate, lifecycle, published_at, pulls=pulls, verify_inventory=True)
     findings = _merge_findings(
