@@ -157,7 +157,7 @@ describe("native Gemini requests through real chat core and executor", () => {
       const result = await run(provider, body(), {
         stream: true,
         queryParams: [["key", "client-router-key"], ["alt", "json"], ["future_param", "one"], ["future_param", "two"], ["prettyPrint", "false"]],
-        clientHeaders: { Authorization: "Bearer client-router-key", "x-goog-api-key": "client-router-key", "x-goog-user-project": "fixture-project", "x-future-native": "fixture-value", cookie: "client-session=fixture" },
+        clientHeaders: { Authorization: "Bearer client-router-key", "x-goog-api-key": "client-router-key", "x-goog-user-project": "fixture-project", "x-future-native": "fixture-value", cookie: "client-session=fixture", "x-9r-peer-token": "peer-fixture", "x-9r-cli-token": "cli-fixture", "x-9r-real-ip": "127.0.0.1" },
       });
       const url = new URL(network.mock.calls[0][0]);
       expect(url.searchParams.has("key")).toBe(false);
@@ -168,6 +168,9 @@ describe("native Gemini requests through real chat core and executor", () => {
       expect(headers.get("x-goog-api-key")).toBe("offline-provider-key");
       expect(headers.get("authorization")).toBeNull();
       expect(headers.get("cookie")).toBeNull();
+      expect(headers.get("x-9r-peer-token")).toBeNull();
+      expect(headers.get("x-9r-cli-token")).toBeNull();
+      expect(headers.get("x-9r-real-ip")).toBeNull();
       expect(headers.get("x-goog-user-project")).toBe("fixture-project");
       expect(headers.get("x-future-native")).toBe("fixture-value");
       await result.response.text();
@@ -294,7 +297,6 @@ describe("native Gemini requests through real chat core and executor", () => {
       ["false response wrapper", { response: false }],
       ["zero response wrapper", { response: 0 }],
       ["empty-string response wrapper", { response: "" }],
-      ["unprojected unknown-only extension", { futureNativeResult: { task: { type: "customer", value: 9 } } }],
       ["non-array candidates", { candidates: {} }],
       ["null candidate entry", { candidates: [null] }],
     ])(`${provider}: rejects invalid native JSON response shape %s rather than a successful empty SDK result`, async (_shape, response) => {
@@ -345,11 +347,18 @@ describe("native Gemini requests through real chat core and executor", () => {
     ])(`${provider}: preserves native blocked, finished zero-content and nonempty future responses`, async response => {
       const succeeded = vi.fn();
       network.mockImplementationOnce(async () => Response.json(response));
-      // A future-only reply is legitimate when the client explicitly projects
-      // out the existing response fields. Preserve the original body/assertions.
-      const queryParams = response.futureNativeResult && !response.responseId
-        ? [["fields", "futureNativeResult"]] : [];
-      const result = await run(provider, body(), { onRequestSuccess: succeeded, queryParams });
+      const result = await run(provider, body(), { onRequestSuccess: succeeded });
+      expect(result.success).toBe(true);
+      expect(await result.response.json()).toEqual(response);
+      await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+    });
+
+    it(`${provider}: preserves a separately projected future-only response`, async () => {
+      const response = { futureNativeResult: { task: { type: "customer", value: 9 } } };
+      const succeeded = vi.fn();
+      network.mockImplementationOnce(async () => Response.json(response));
+      const result = await run(provider, body(), { onRequestSuccess: succeeded,
+        queryParams: [["fields", "futureNativeResult"]] });
       expect(result.success).toBe(true);
       expect(await result.response.json()).toEqual(response);
       await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
