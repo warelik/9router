@@ -12,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
 import { PROVIDERS } from "../config/providers.js";
 import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
 import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
-import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET } from "../config/runtimeConfig.js";
+import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET, REWRITTEN_RESPONSE_HEADERS, AISTUDIO_NATIVE_GEMINI_API_VERSION, NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES, NATIVE_GEMINI_FIELD_MASK_HEADER_NAME } from "../config/runtimeConfig.js";
 import { handleBypassRequest } from "../utils/bypassHandler.js";
 import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { getExecutor } from "../executors/index.js";
@@ -124,10 +124,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const nativeResponseProjection = nativeGemini ? {
     masks: [
       ...(clientRawRequest?.queryParams || [])
-        .filter(([name]) => name === "fields" || name === "$fields")
+        .filter(([name]) => NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.includes(name))
         .map(([, value]) => value),
       ...Object.entries(clientRawRequest?.headers || {})
-        .filter(([name]) => name.toLowerCase() === "x-goog-fieldmask")
+        .filter(([name]) => name.toLowerCase() === NATIVE_GEMINI_FIELD_MASK_HEADER_NAME)
         .map(([, value]) => value),
     ],
   } : null;
@@ -219,7 +219,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       headers: clientRawRequest?.headers || {},
       // Client and provider versions are separate routing decisions. The
       // browser-authenticated AIStudio generation API uses its beta wire.
-      apiVersion: provider === "aistudio" ? "v1beta" : clientRawRequest?.apiVersion,
+      apiVersion: provider === "aistudio" ? AISTUDIO_NATIVE_GEMINI_API_VERSION : clientRawRequest?.apiVersion,
     };
   }
 
@@ -561,7 +561,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       const headers = new Headers(providerResponse.headers);
       // fetch exposes decoded bytes; forwarding compressed-length headers makes
       // native clients decompress them twice or wait for bytes that cannot arrive.
-      for (const name of ["content-encoding", "content-length", "transfer-encoding"]) headers.delete(name);
+      for (const name of REWRITTEN_RESPONSE_HEADERS) headers.delete(name);
       headers.set("Access-Control-Allow-Origin", "*");
       nativeErrorResponse = new Response(providerResponse.clone().body, {
         status: providerResponse.status, statusText: providerResponse.statusText, headers,

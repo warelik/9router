@@ -7,7 +7,7 @@ import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTrackin
 import { createErrorResult } from "../../utils/error.js";
 import { upstreamResponseHeaders } from "../../utils/upstreamHeaders.js";
 import { isValidNativeGeminiResponse } from "../../utils/streamHelpers.js";
-import { HTTP_STATUS } from "../../config/runtimeConfig.js";
+import { HTTP_STATUS, REWRITTEN_RESPONSE_HEADERS } from "../../config/runtimeConfig.js";
 import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
 import { unwrapClineEnvelope } from "../../shared/clineEnvelope.js";
 import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, saveUsageStats, formatDoneLine } from "./requestDetail.js";
@@ -30,7 +30,7 @@ function parseToolArguments(value) {
 
 function nativeGeminiErrorResult(providerResponse, status, message, responseBody = null) {
   const headers = new Headers(providerResponse.headers);
-  for (const name of ["content-encoding", "content-length", "transfer-encoding"]) headers.delete(name);
+  for (const name of REWRITTEN_RESPONSE_HEADERS) headers.delete(name);
   headers.set("Content-Type", "application/json");
   headers.set("Access-Control-Allow-Origin", "*");
   const result = createErrorResult(status, message);

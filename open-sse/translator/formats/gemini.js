@@ -3,7 +3,7 @@
 import { safeParseJSON } from "../concerns/json.js";
 import { OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
 import { isGemini4Model } from "../../providers/capabilities.js";
-import { FILE_EXTENSION_MIME, SCHEMA_MAP_KEYS, SCHEMA_ARRAY_KEYS, SCHEMA_SINGLE_KEYS,
+import { FILE_EXTENSION_MIME, GEMINI_DEFAULT_FILE_MIME_TYPE, SCHEMA_MAP_KEYS, SCHEMA_ARRAY_KEYS, SCHEMA_SINGLE_KEYS,
   PROTO_SCHEMA_TYPES, LEGACY_PROTO_SCHEMA_KEYS } from "../../config/runtimeConfig.js";
 
 // Unsupported JSON Schema constraints that should be removed for Antigravity
@@ -78,7 +78,7 @@ function appendFilePart(parts, file) {
   } else if (typeof data === "string" && /^https?:\/\//.test(data)) {
     parts.push({ fileData: { fileUri: data, ...(mime ? { mimeType: mime } : {}) } });
   } else if (typeof data === "string" && data) {
-    parts.push({ inlineData: { mime_type: mime || "application/octet-stream", data } });
+    parts.push({ inlineData: { mime_type: mime || GEMINI_DEFAULT_FILE_MIME_TYPE, data } });
   } else if (typeof file.file_url === "string" && /^https?:\/\//.test(file.file_url)) {
     parts.push({ fileData: { fileUri: file.file_url, ...(mime ? { mimeType: mime } : {}) } });
   }

@@ -3,7 +3,7 @@ import { needsTranslation } from "../../translator/index.js";
 import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } from "../../utils/stream.js";
 import { pipeWithDisconnect } from "../../utils/streamHandler.js";
 import { PROVIDERS } from "../../config/providers.js";
-import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
+import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS, NATIVE_GEMINI_ERROR_STATUSES } from "../../config/runtimeConfig.js";
 import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
 import { buildStreamErrorBytes } from "../../utils/streamHelpers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
@@ -80,7 +80,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
         message: `[${status}]: ${shortMsg}`,
         ...(sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI ? {
           code: status,
-          status: ({ 400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED", 404: "NOT_FOUND", 429: "RESOURCE_EXHAUSTED", 503: "UNAVAILABLE", 504: "DEADLINE_EXCEEDED" })[status] || "INTERNAL",
+          status: NATIVE_GEMINI_ERROR_STATUSES[status] || "INTERNAL",
         } : {}),
       } }), {
         status,
@@ -139,7 +139,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
   const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, nativeGeminiJson,
     typeof transformStream.finalizeNativeResponse === "function" ? (error, clientCancelled) => transformStream.finalizeNativeResponse({
-      status: clientCancelled ? 499 : HTTP_STATUS.GATEWAY_TIMEOUT,
+      status: clientCancelled ? HTTP_STATUS.CLIENT_CLOSED_REQUEST : HTTP_STATUS.GATEWAY_TIMEOUT,
       error: error.message,
       clientCancelled,
     }) : null);
