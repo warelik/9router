@@ -3,6 +3,7 @@
 import { safeParseJSON } from "../concerns/json.js";
 import { OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
 import { isGemini4Model } from "../../providers/capabilities.js";
+import { FILE_EXTENSION_MIME } from "../../config/runtimeConfig.js";
 
 // Unsupported JSON Schema constraints that should be removed for Antigravity
 export const UNSUPPORTED_SCHEMA_CONSTRAINTS = [
@@ -51,13 +52,6 @@ export const DEFAULT_SAFETY_SETTINGS = [
   { category: "HARM_CATEGORY_HARASSMENT", threshold: "OFF" },
   { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "OFF" }
 ];
-
-const FILE_EXTENSION_MIME = {
-  pdf: "application/pdf", json: "application/json",
-  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
-  mp3: "audio/mpeg", wav: "audio/wav", mp4: "video/mp4",
-  txt: "text/plain", md: "text/markdown", csv: "text/csv",
-};
 
 function fileMimeType(filename, explicit) {
   if (typeof explicit === "string" && explicit.includes("/")) return explicit;
