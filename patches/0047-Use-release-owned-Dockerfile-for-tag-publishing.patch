@@ -1,0 +1,99 @@
+From c8f2d7e184e8f60aecbfecc3ba2f4d530ae936e5 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] Use release-owned Dockerfile for tag publishing
+
+---
+ .github/workflows/docker-publish.yml          | 10 ----
+ .../unit/docker-publish-source-recipe.test.js | 53 +++++++++++++++++++
+ 2 files changed, 53 insertions(+), 10 deletions(-)
+ create mode 100644 tests/unit/docker-publish-source-recipe.test.js
+
+diff --git a/.github/workflows/docker-publish.yml b/.github/workflows/docker-publish.yml
+index 64be9c1ce33fe1cf1be14b02fe8f06459e3750be..7387d5019246b600d6173ef70e91dfd864f9a0a5 100644
+--- a/.github/workflows/docker-publish.yml
++++ b/.github/workflows/docker-publish.yml
+@@ -152,15 +152,6 @@ jobs:
+           path: source
+           fetch-depth: 1
+ 
+-      - name: Check out publishing Dockerfile
+-        uses: actions/checkout@v4
+-        with:
+-          ref: ${{ github.workflow_sha }}
+-          path: workflow
+-          sparse-checkout: |
+-            Dockerfile
+-          fetch-depth: 1
+-
+       - name: Set up Docker Buildx
+         uses: docker/setup-buildx-action@v3
+ 
+@@ -176,7 +167,6 @@ jobs:
+         uses: docker/build-push-action@v6
+         with:
+           context: source
+-          file: workflow/Dockerfile
+           platforms: ${{ matrix.platform }}
+           outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+           build-args: |
+diff --git a/tests/unit/docker-publish-source-recipe.test.js b/tests/unit/docker-publish-source-recipe.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..bae2f87255ae9768dc39ded82dec0feb45b69e73
+--- /dev/null
++++ b/tests/unit/docker-publish-source-recipe.test.js
+@@ -0,0 +1,53 @@
++import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { describe, expect, it } from "vitest";
++
++const workflow = readFileSync(new URL("../../.github/workflows/docker-publish.yml", import.meta.url), "utf8");
++const currentRecipe = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
++const sourceCheckout = workflow.match(
++  /      - name: Check out release source at validated commit\n([\s\S]*?)(?=\n      - name:)/
++)?.[1];
++const imageBuild = workflow.match(
++  /      - name: Build and push platform image by digest\n([\s\S]*?)(?=\n      - name:)/
++)?.[1];
++
++describe("Docker publishing uses the selected release's recipe", () => {
++  it("keeps source checkout pinned to the validated commit", () => {
++    expect(sourceCheckout).toContain("ref: ${{ needs.prepare.outputs.commit }}");
++    expect(sourceCheckout).toContain("path: source");
++    expect(sourceCheckout).not.toContain("ref: ${{ github.ref_name }}");
++    expect(sourceCheckout).not.toContain("ref: ${{ github.workflow_sha }}");
++  });
++
++  it.each([
++    { label: "a pre-shrinkwrap release", hasShrinkwrap: false },
++    { label: "a locked release", hasShrinkwrap: true },
++  ])("uses the release-owned Dockerfile for $label", ({ hasShrinkwrap }) => {
++    expect(imageBuild).toBeDefined();
++    const context = imageBuild.match(/^          context: (\S+)$/m)?.[1];
++    const configuredFile = imageBuild.match(/^          file: (\S+)$/m)?.[1];
++    expect(context).toBe("source");
++    // The existing v6 action defaults its file input to {context}/Dockerfile.
++    const selectedFile = configuredFile ?? `${context}/Dockerfile`;
++    const fixture = mkdtempSync(join(tmpdir(), "9router-publish-source-"));
++    try {
++      mkdirSync(join(fixture, "source"));
++      mkdirSync(join(fixture, "workflow"));
++      const releaseRecipe = hasShrinkwrap
++        ? currentRecipe
++        : "FROM node:22-alpine\nCOPY package.json ./\nRUN npm install\n";
++      writeFileSync(join(fixture, "source", "Dockerfile"), releaseRecipe);
++      writeFileSync(join(fixture, "source", "package.json"), "{}\n");
++      writeFileSync(join(fixture, "workflow", "Dockerfile"), currentRecipe);
++      if (hasShrinkwrap) {
++        writeFileSync(join(fixture, "source", "npm-shrinkwrap.json"), "{}\n");
++      }
++      expect(existsSync(join(fixture, "source", "npm-shrinkwrap.json"))).toBe(hasShrinkwrap);
++      expect(selectedFile).toBe(`${context}/Dockerfile`);
++      expect(readFileSync(join(fixture, selectedFile), "utf8")).toBe(releaseRecipe);
++    } finally {
++      rmSync(fixture, { recursive: true, force: true });
++    }
++  });
++});
