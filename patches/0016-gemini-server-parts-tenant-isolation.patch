@@ -1,0 +1,368 @@
+From a16311fa5ceb10bff604cc9dc9e6fe66d295da94 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Scope Gemini server-part history to authenticated callers
+
+---
+ open-sse/handlers/chatCore.js                 |  5 +-
+ open-sse/translator/index.js                  |  9 +-
+ src/dashboardGuard.js                         |  2 +-
+ src/sse/handlers/chat.js                      | 37 +++++++-
+ tests/unit/gemini-native-core.test.js         | 17 +++-
+ .../unit/openai-responses-web-search.test.js  | 93 +++++++++++++++++--
+ 6 files changed, 145 insertions(+), 18 deletions(-)
+
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index cdf1bc8..b5c13a8 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -62,7 +62,8 @@ export function stripContinuityFields(body) {
+   return body;
+ }
+ 
+-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
++export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, serverPartsTenant = null, providerThinking, providerOverrides }) {
++  if (credentials) credentials._geminiServerPartsSessionId = null;
+   const { provider, model } = modelInfo;
+   if (clientSignal?.aborted) return createErrorResult(499, "Request aborted");
+   const requestStartTime = Date.now();
+@@ -260,7 +261,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+     // Normalize newer Cowork/CC beta shapes (adaptive thinking, mid-conversation system) the API rejects
+     if (clientTool === "claude") normalizeClaudePassthrough(translatedBody, translatedBody.model);
+   } else {
+-    translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool);
++    translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool, serverPartsTenant);
+     if (!translatedBody) {
+       trackPendingRequest(model, provider, connectionId, false, true);
+       return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Failed to translate request for ${sourceFormat} → ${targetFormat}`);
+diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
+index 96de324..ba69ee1 100644
+--- a/open-sse/translator/index.js
++++ b/open-sse/translator/index.js
+@@ -66,7 +66,7 @@ function detectClientLastRole(body) {
+ }
+ 
+ // Translate request: source -> openai -> target
+-export function translateRequest(sourceFormat, targetFormat, model, body, stream = true, credentials = null, provider = null, reqLogger = null, stripList = [], connectionId = null, clientTool = null) {
++export function translateRequest(sourceFormat, targetFormat, model, body, stream = true, credentials = null, provider = null, reqLogger = null, stripList = [], connectionId = null, clientTool = null, serverPartsTenant = null) {
+   ensureInitialized();
+   let result = body;
+   // Role the client actually ended on, before any translator drops an emptied turn.
+@@ -99,7 +99,12 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+   const clientSessionId = captureSessionId(result, credentials, connectionId, targetFormat);
+   // Expose to downstream translators (gemini-cli/antigravity envelopes) that run after envelope is stripped
+   if (credentials) credentials._clientSessionId = clientSessionId;
+-  if (credentials) credentials._geminiServerPartsSessionId = captureConversationId(result, credentials);
++  const conversationId = captureConversationId(result, credentials);
++  if (credentials) {
++    credentials._geminiServerPartsSessionId = serverPartsTenant && conversationId
++      ? JSON.stringify([serverPartsTenant, conversationId])
++      : null;
++  }
+ 
+   let sourceToolNameMap = null;
+ 
+diff --git a/src/dashboardGuard.js b/src/dashboardGuard.js
+index 5bb2445..e592d76 100644
+--- a/src/dashboardGuard.js
++++ b/src/dashboardGuard.js
+@@ -13,7 +13,7 @@ async function getCliToken() {
+   return cachedCliToken;
+ }
+ 
+-async function hasValidCliToken(request) {
++export async function hasValidCliToken(request) {
+   const token = request.headers.get(CLI_TOKEN_HEADER);
+   if (!token) return false;
+   return token === await getCliToken();
+diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
+index bafdc97..4b7096f 100644
+--- a/src/sse/handlers/chat.js
++++ b/src/sse/handlers/chat.js
+@@ -1,4 +1,6 @@
++import { createHash } from "node:crypto";
+ import "open-sse/index.js";
++import { hasValidCliToken, isLocalRequest } from "@/dashboardGuard.js";
+ 
+ import {
+   getProviderCredentials,
+@@ -25,7 +27,7 @@ import * as log from "../utils/logger.js";
+ import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
+ import { getProjectIdForConnection } from "open-sse/services/projectId.js";
+ import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
+-import { getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
++import { extractClientApiKey, getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
+ 
+ /**
+  * Handle chat completion request
+@@ -70,6 +72,8 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+ 
+   // Enforce API key if enabled in settings
+   const settings = await getSettings();
++  let authenticatedApiKey = false;
++  let serverPartsApiKey = null;
+   if (settings.requireApiKey) {
+     if (!apiKey) {
+       log.warn("AUTH", "Missing API key (requireApiKey=true)");
+@@ -80,7 +84,37 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
+       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
+     }
++    authenticatedApiKey = true;
++    serverPartsApiKey = apiKey;
++  } else {
++    // Optional API keys do not gate the request, but a valid one still provides
++    // a trustworthy tenant boundary for plaintext Gemini server parts.
++    const optionalApiKey = extractClientApiKey(request);
++    if (optionalApiKey) {
++      try {
++        authenticatedApiKey = await isValidApiKey(optionalApiKey);
++        if (authenticatedApiKey) serverPartsApiKey = optionalApiKey;
++      } catch {
++        // Cache identity must not change the acceptance of optional-key requests.
++      }
++    }
++  }
++
++  // Gemini server-side tool parts are plaintext history. Bind their cache to
++  // an authenticated API-key tenant or the existing trusted local/CLI caller.
++  // A client-declared conversation id alone is not a caller identity.
++  let serverPartsTenant = authenticatedApiKey
++    ? createHash("sha256").update("gemini-server-parts-tenant\0").update(serverPartsApiKey).digest("hex")
++    : null;
++  if (!serverPartsTenant) {
++    try {
++      if (isLocalRequest(request)) serverPartsTenant = "trusted-local";
++      else if (await hasValidCliToken(request)) serverPartsTenant = "trusted-cli";
++    } catch {
++      // Failure to resolve a trusted principal disables caching only.
++    }
+   }
++  options = { ...options, serverPartsTenant };
+ 
+   if (!modelStr) {
+     log.warn("CHAT", "Missing model");
+@@ -311,6 +345,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+       clientSignal: request?.signal,
+       // Detect source format by endpoint + body
+       sourceFormatOverride: options.sourceFormatOverride || (request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null),
++      serverPartsTenant: options.serverPartsTenant,
+       onCredentialsRefreshed: async (newCreds) => {
+         await updateProviderCredentials(credentials.connectionId, {
+           ...newCreds,
+diff --git a/tests/unit/gemini-native-core.test.js b/tests/unit/gemini-native-core.test.js
+index 4c7d4c7..3d42ce3 100644
+--- a/tests/unit/gemini-native-core.test.js
++++ b/tests/unit/gemini-native-core.test.js
+@@ -48,13 +48,13 @@ function body(generation = { maxOutputTokens: 2048, thinkingConfig: { thinkingLe
+   };
+ }
+ const quiet = Object.fromEntries(["debug", "info", "warn", "error", "line", "errorLine"].map(name => [name, vi.fn()]));
+-async function run(provider, requestBody = body(), { suffix = "", stream = false, mode = "high", signal, ua = "Some arbitrary Gemini client", queryParams = [], clientHeaders = {}, onRequestSuccess, apiVersion = "v1beta", rawRequest } = {}) {
++async function run(provider, requestBody = body(), { suffix = "", stream = false, mode = "high", signal, ua = "Some arbitrary Gemini client", queryParams = [], clientHeaders = {}, onRequestSuccess, apiVersion = "v1beta", rawRequest, credentials: suppliedCredentials } = {}) {
+   return handleChatCore({
+     body: { ...structuredClone(requestBody), model: `${provider}/${model}${suffix}`, stream },
+     modelInfo: { provider, model: model + suffix }, sourceFormatOverride: FORMATS.GEMINI,
+     userAgent: ua, log: quiet, clientSignal: signal,
+     onRequestSuccess,
+-    credentials: { apiKey: "offline-provider-key", connectionId: "offline-native-test", providerSpecificData: { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy.invalid:18080", strictProxy: true } },
++    credentials: suppliedCredentials || { apiKey: "offline-provider-key", connectionId: "offline-native-test", providerSpecificData: { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy.invalid:18080", strictProxy: true } },
+     connectionId: "offline-native-test", providerThinking: { mode },
+     rtkEnabled: false, headroomEnabled: false, cavemanEnabled: false, ponytailEnabled: false, pxpipeEnabled: false,
+     clientRawRequest: rawRequest || { endpoint: `/${apiVersion}/models/${provider}/${model}${suffix}:${stream ? "streamGenerateContent" : "generateContent"}`, apiVersion, body: structuredClone(requestBody), queryParams, headers: { "user-agent": ua, ...clientHeaders } },
+@@ -72,6 +72,19 @@ describe("native Gemini requests through real chat core and executor", () => {
+   afterEach(() => vi.unstubAllGlobals());
+ 
+   for (const provider of ["gemini", "aistudio"]) {
++    it(`${provider}: does not reuse a stale server-parts tenant scope in native passthrough`, async () => {
++      const credentials = {
++        apiKey: "offline-provider-key",
++        connectionId: "offline-native-test",
++        providerSpecificData: { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy.invalid:18080", strictProxy: true },
++        _geminiServerPartsSessionId: JSON.stringify(["previous-tenant", "previous-conversation"]),
++      };
++      const result = await run(provider, body(), { credentials });
++      expect(result.success).toBe(true);
++      expect(credentials._geminiServerPartsSessionId).toBeNull();
++      await result.response.text();
++    });
++
+     it(`${provider}: arbitrary client retains all history/tools/settings and strict proxy on the provider wire`, async () => {
+       const original = body();
+       const result = await run(provider, original);
+diff --git a/tests/unit/openai-responses-web-search.test.js b/tests/unit/openai-responses-web-search.test.js
+index 5851979..35a9282 100644
+--- a/tests/unit/openai-responses-web-search.test.js
++++ b/tests/unit/openai-responses-web-search.test.js
+@@ -7,6 +7,13 @@ import { translateNonStreamingResponse } from "../../open-sse/handlers/chatCore/
+ import { getGeminiThoughtSignatureSync } from "../../open-sse/services/thoughtSignatureStore.js";
+ 
+ const MODEL = "gemini-3.8-flash";
++const TENANT_A = "authenticated-api-key-tenant-a";
++const TENANT_B = "authenticated-api-key-tenant-b";
++const TRUSTED_LOCAL = "trusted-local";
++const TRUSTED_CLI = "trusted-cli";
++
++const translateForTenant = (source, target, model, body, credentials, provider, tenant = TENANT_A, connectionId = null) =>
++  translateRequest(source, target, model, body, true, credentials, provider, null, [], connectionId, null, tenant);
+ 
+ const recordVersion = () => ({
+   type: "function",
+@@ -113,7 +120,7 @@ describe("Responses web_search request translation", () => {
+ describe("server-executed tool parts in responses", () => {
+   const session = (sessionId = "web-search-conversation-fixture") => {
+     const credentials = { rawHeaders: { session_id: sessionId } };
+-    translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([recordVersion(), webSearch]), true, credentials, "aistudio");
++    translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([recordVersion(), webSearch]), credentials, "aistudio");
+     return credentials;
+   };
+ 
+@@ -159,7 +166,7 @@ describe("server-executed tool parts in responses", () => {
+         { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
+       ],
+     };
+-    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, true, credentials, "aistudio");
++    const translated = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, credentials, "aistudio");
+     const modelTurn = translated.contents.find(c => c.role === "model");
+     const fcIndex = modelTurn.parts.findIndex(p => p.functionCall);
+     expect(fcIndex).toBeGreaterThan(0);
+@@ -191,7 +198,7 @@ describe("server-executed tool parts in responses", () => {
+         { type: "message", role: "user", content: [{ type: "input_text", text: "Thanks." }] },
+       ],
+     };
+-    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, true, credentials, "aistudio");
++    const translated = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, credentials, "aistudio");
+     const modelTurn = translated.contents.find(c => c.role === "model");
+     const textIndex = modelTurn.parts.findIndex(p => p.text === "The LTS version is 24.21.0.");
+     const stored = textParts.filter(p => p.toolCall || p.toolResponse);
+@@ -212,16 +219,82 @@ describe("server-executed tool parts in responses", () => {
+         { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
+       ],
+     };
+-    const replayed = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), true, { rawHeaders: { session_id: "web-search-session-a" } }, "aistudio");
++    const replayed = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), { rawHeaders: { session_id: "web-search-session-a" } }, "aistudio");
+     const turnA = replayed.contents.find(c => c.role === "model");
+     expect(turnA.parts.slice(0, turnA.parts.findIndex(p => p.functionCall))).toEqual(serverParts);
+-    const other = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), true, { rawHeaders: { session_id: "web-search-session-b" } }, "aistudio");
++    const other = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), { rawHeaders: { session_id: "web-search-session-b" } }, "aistudio");
+     const parts = other.contents.flatMap(c => c.parts);
+     expect(parts.some(p => p.toolCall || p.toolResponse)).toBe(false);
+     expect(JSON.stringify(other)).not.toContain("GOOGLE_SEARCH_WEB");
+     expect(parts.find(p => p.functionCall).functionCall.id).toBe("call_393372");
+   });
+ 
++  it("does not replay server parts across authenticated API-key tenants sharing one session", async () => {
++    const sessionId = "shared-client-declared-session";
++    const tenantA = session(sessionId);
++    await runStream([nativeResponse(probeParts)], tenantA);
++    const history = {
++      model: MODEL,
++      instructions: "You are a precise assistant.",
++      tools: [recordVersion(), webSearch],
++      input: [
++        userMessage(),
++        { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
++        { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
++        { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
++      ],
++    };
++    const sameTenant = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), { rawHeaders: { session_id: sessionId } }, "aistudio", TENANT_A);
++    const replayedParts = sameTenant.contents.flatMap(entry => entry.parts || []);
++    expect(replayedParts.some(part => part.toolCall || part.toolResponse)).toBe(true);
++
++    const otherTenant = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), { rawHeaders: { session_id: sessionId } }, "aistudio", TENANT_B);
++    const isolatedParts = otherTenant.contents.flatMap(entry => entry.parts || []);
++    expect(isolatedParts.some(part => part.toolCall || part.toolResponse)).toBe(false);
++    expect(isolatedParts.find(part => part.functionCall).functionCall.id).toBe("call_393372");
++  });
++
++  it("replays for the trusted local principal without sharing with a distinct authenticated caller", async () => {
++    const sessionId = "trusted-local-session";
++    const localCredentials = { rawHeaders: { session_id: sessionId } };
++    translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([recordVersion(), webSearch]), localCredentials, "aistudio", TRUSTED_LOCAL);
++    await runStream([nativeResponse(probeParts)], localCredentials);
++    const history = {
++      model: MODEL,
++      instructions: "You are a precise assistant.",
++      tools: [recordVersion(), webSearch],
++      input: [
++        userMessage(),
++        { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
++        { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
++        { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
++      ],
++    };
++    const localReplay = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), { rawHeaders: { session_id: sessionId } }, "aistudio", TRUSTED_LOCAL);
++    expect(localReplay.contents.flatMap(entry => entry.parts || []).some(part => part.toolCall || part.toolResponse)).toBe(true);
++
++    const cliReplay = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), { rawHeaders: { session_id: sessionId } }, "aistudio", TRUSTED_CLI);
++    expect(cliReplay.contents.flatMap(entry => entry.parts || []).some(part => part.toolCall || part.toolResponse)).toBe(false);
++  });
++
++  it("does not cache server parts from a client session without an authenticated tenant", async () => {
++    const credentials = { rawHeaders: { session_id: "untrusted-shared-session" } };
++    translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([recordVersion(), webSearch]), true, credentials, "aistudio");
++    expect(credentials._geminiServerPartsSessionId).toBeNull();
++    await runStream([nativeResponse(probeParts)], credentials);
++
++    const next = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, {
++      ...requestBody([recordVersion(), webSearch]),
++      input: [
++        userMessage(),
++        { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
++        { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
++        { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
++      ],
++    }, true, credentials, "aistudio");
++    expect(next.contents.flatMap(entry => entry.parts || []).some(part => part.toolCall || part.toolResponse)).toBe(false);
++  });
++
+   it("never shares plaintext server parts between headerless conversations on one provider credential", async () => {
+     const CONNECTION = "selected-provider-credential";
+     const history = () => ({
+@@ -237,7 +310,7 @@ describe("server-executed tool parts in responses", () => {
+     });
+     const open = (body) => {
+       const credentials = {};
+-      const out = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, body, true, credentials, "aistudio", null, [], CONNECTION);
++      const out = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, body, credentials, "aistudio", TENANT_A, CONNECTION);
+       return { credentials, out };
+     };
+     const first = open(requestBody([recordVersion(), webSearch]));
+@@ -266,7 +339,7 @@ describe("server-executed tool parts in responses", () => {
+   it("strips replayed server parts when the target cannot serve web search", async () => {
+     const credentials = session();
+     await runStream([nativeResponse(probeParts)], credentials);
+-    const ag = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.ANTIGRAVITY, "gemini-3.8-flash-high", historyWithCall([recordVersion(), webSearch]), true, credentials, "antigravity");
++    const ag = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.ANTIGRAVITY, "gemini-3.8-flash-high", historyWithCall([recordVersion(), webSearch]), credentials, "antigravity");
+     const agParts = ag.request.contents.flatMap(c => c.parts);
+     expect(agParts.some(p => p.toolCall || p.toolResponse)).toBe(false);
+     const fc = agParts.find(p => p.functionCall);
+@@ -274,12 +347,12 @@ describe("server-executed tool parts in responses", () => {
+     expect(fc.thoughtSignature).toBe(CALL_SIG);
+     expect(JSON.stringify(ag)).not.toContain("googleSearch");
+     expect(JSON.stringify(ag)).not.toContain("includeServerSideToolInvocations");
+-    const noSearch = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, historyWithCall([recordVersion()]), true, credentials, "gemini");
++    const noSearch = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, historyWithCall([recordVersion()]), credentials, "gemini");
+     const geminiParts = noSearch.contents.flatMap(c => c.parts);
+     expect(geminiParts.some(p => p.toolCall || p.toolResponse)).toBe(false);
+     expect(JSON.stringify(noSearch)).not.toContain("googleSearch");
+     expect(JSON.stringify(noSearch)).not.toContain("includeServerSideToolInvocations");
+-    const enabled = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, historyWithCall([recordVersion(), webSearch]), true, credentials, "gemini");
++    const enabled = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, historyWithCall([recordVersion(), webSearch]), credentials, "gemini");
+     const modelTurn = enabled.contents.find(c => c.role === "model");
+     const fcIndex = modelTurn.parts.findIndex(p => p.functionCall);
+     expect(modelTurn.parts.slice(0, fcIndex)).toEqual(serverParts);
+@@ -302,7 +375,7 @@ describe("server-executed tool parts in responses", () => {
+         { type: "message", role: "user", content: [{ type: "input_text", text: "Done?" }] },
+       ],
+     };
+-    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, true, credentials, "aistudio");
++    const translated = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, credentials, "aistudio");
+     const modelTurn = translated.contents.find(c => c.role === "model");
+     const fcIndex = modelTurn.parts.findIndex(p => p.functionCall);
+     expect(modelTurn.parts.slice(0, fcIndex)).toEqual(serverParts);
+-- 
+2.55.0
+
