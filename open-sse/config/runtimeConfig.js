@@ -123,3 +123,18 @@ export function resolveRetryEntry(entry) {
 export const SKIP_PATTERNS = [
   "Please write a 5-10 word title for the following conversation:"
 ];
+
+export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
+
+export const SSE_DONE_PAYLOAD = "[DONE]";
+export const SSE_DONE = `data: ${SSE_DONE_PAYLOAD}\n\n`;
+
+export const NATIVE_GEMINI_PRIVATE_HEADERS = new Set([
+  "authorization", "proxy-authorization", "x-goog-api-key", "x-api-key", "cookie", "set-cookie",
+  "host", "content-length", "connection", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer",
+]);
+
+export const NATIVE_GEMINI_THINKING_KEYS = ["thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"];
+
+export const NATIVE_GEMINI_RESPONSE_FIELDS = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
+export const NATIVE_GEMINI_BRIDGE_FIELDS = new Set(["message", "event", "data", "status", "code", "success", "response"]);

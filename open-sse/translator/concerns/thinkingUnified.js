@@ -6,7 +6,7 @@ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 import { getThinkingLevels } from "../../providers/thinkingLevels.js";
 import { PROVIDERS } from "../../providers/index.js";
 import { LEVEL_TO_BUDGET, budgetToLevel, effortToBudget, effortToThinkingLevel } from "./thinking.js";
-import { DEFAULT_PROVIDER_THINKING_BUDGET } from "../../config/runtimeConfig.js";
+import { DEFAULT_PROVIDER_THINKING_BUDGET, NATIVE_GEMINI_THINKING_KEYS } from "../../config/runtimeConfig.js";
 
 // Map a target wire-format to its native thinking format (when capability has none).
 const FORMAT_TO_NATIVE = {
@@ -480,8 +480,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
   const generation = body[generationKey] || {};
   const thinkingKey = generation.thinking_config ? "thinking_config" : "thinkingConfig";
   const clientThinking = generation[thinkingKey] || {};
-  const explicit = ["thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"]
-    .some(key => Object.hasOwn(clientThinking, key));
+  const explicit = NATIVE_GEMINI_THINKING_KEYS.some(key => Object.hasOwn(clientThinking, key));
   if (!override && explicit) return body;
   const mode = providerThinking?.mode;
   const intent = override || (!mode || mode === "auto" ? null
@@ -495,7 +494,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
   const mapped = applyThinking("gemini", model, {}, provider, intent).generationConfig?.thinkingConfig;
   if (!mapped) return body;
   const thinking = { ...clientThinking };
-  for (const key of ["thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"]) delete thinking[key];
+  for (const key of NATIVE_GEMINI_THINKING_KEYS) delete thinking[key];
   if (mapped.thinkingLevel !== undefined) thinking.thinkingLevel = String(mapped.thinkingLevel).toUpperCase();
   if (mapped.thinkingBudget !== undefined) thinking.thinkingBudget = mapped.thinkingBudget;
   if (!Object.hasOwn(thinking, "includeThoughts") && !Object.hasOwn(thinking, "include_thoughts") && mapped.includeThoughts !== undefined) {

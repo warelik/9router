@@ -1,4 +1,5 @@
 import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
+import { FERNET_ENCRYPTED_CONTENT_PREFIX } from "../../config/runtimeConfig.js";
 
 /**
  * Normalize Responses API input to array format.
@@ -28,7 +29,7 @@ export const MAX_RESPONSES_CALL_ID_LEN = 64;
 
 // OpenAI reasoning items carry Fernet-encrypted blobs; other providers' own
 // encrypted_content values use different ciphertexts and must be preserved.
-export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
+export { FERNET_ENCRYPTED_CONTENT_PREFIX };
 
 // Codex's observed plaintext task carrier (an agent_message encrypted_content part) is converted
 // here to input_text; known OpenAI Fernet ciphertext stays opaque.

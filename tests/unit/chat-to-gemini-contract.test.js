@@ -44,7 +44,10 @@ import { storeGeminiThoughtSignature } from "../../open-sse/services/thoughtSign
 import {
   DEFAULT_THINKING_VERTEX_SIGNATURE,
   DEFAULT_THINKING_AG_SIGNATURE,
+  DEFAULT_THINKING_GEMINI_CLI_SIGNATURE,
 } from "../../open-sse/config/defaultThinkingSignature.js";
+import { SSE_DONE_PAYLOAD, SSE_DONE } from "../../open-sse/utils/sseConstants.js";
+import { FERNET_ENCRYPTED_CONTENT_PREFIX } from "../../open-sse/translator/formats/responsesApi.js";
 
 const MODEL = "gemini-3.5-flash-lite";
 const user = (content) => ({ role: "user", content });
@@ -626,6 +629,22 @@ describe("Vertex post-processing", () => {
     expect(defaultCall.thoughtSignature).toBe(DEFAULT_THINKING_VERTEX_SIGNATURE);
     expect(defaultCall.thoughtSignature).not.toBe(DEFAULT_THINKING_AG_SIGNATURE);
     expect(defaultCall.functionCall.id).toBeUndefined();
+
+    for (const synthetic of [DEFAULT_THINKING_AG_SIGNATURE, DEFAULT_THINKING_GEMINI_CLI_SIGNATURE]) {
+      storeGeminiThoughtSignature("call-synthetic", synthetic, "sess-vertex", MODEL);
+      const out = openaiToVertexRequest(MODEL, body("call-synthetic"), true, { _clientSessionId: "sess-vertex" });
+      const call = out.contents.flatMap((c) => c.parts).find((p) => p.functionCall);
+      expect(call.thoughtSignature).toBe(DEFAULT_THINKING_VERTEX_SIGNATURE);
+      expect(call.functionCall.id).toBeUndefined();
+    }
+  });
+});
+
+describe("shared wire constants", () => {
+  it("public SSE and Fernet markers keep their exact upstream values", () => {
+    expect(SSE_DONE_PAYLOAD).toBe("[DONE]");
+    expect(SSE_DONE).toBe("data: [DONE]\n\n");
+    expect(FERNET_ENCRYPTED_CONTENT_PREFIX).toBe("gAAAAA");
   });
 });
 

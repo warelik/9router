@@ -4,6 +4,7 @@ import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE, selectAnthropicBeta, mergeAnthropicBeta } from "../providers/shared.js";
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
 import { OAUTH_ENDPOINTS, buildKimiHeaders, NOUS_ATTRIBUTION } from "../config/appConstants.js";
+import { NATIVE_GEMINI_PRIVATE_HEADERS } from "../config/runtimeConfig.js";
 import { buildClineHeaders } from "../shared/clineAuth.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
@@ -250,10 +251,7 @@ export class DefaultExecutor extends BaseExecutor {
     applyAuth(headers, desc, credentials);
     if (credentials?.nativeGeminiPassthrough) {
       const reserved = new Set(Object.keys(headers).map(key => key.toLowerCase()));
-      const privateHeaders = new Set([
-        "authorization", "proxy-authorization", "x-goog-api-key", "x-api-key", "cookie", "set-cookie",
-        "host", "content-length", "connection", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer",
-      ]);
+      const privateHeaders = NATIVE_GEMINI_PRIVATE_HEADERS;
       for (const [name, value] of Object.entries(credentials.nativeGeminiRequest?.headers || {})) {
         const lower = name.toLowerCase();
         if (!privateHeaders.has(lower) && !reserved.has(lower) && !lower.startsWith("x-forwarded-") && !lower.startsWith("x-9router-") && !lower.startsWith("x-9r-")) {
