@@ -2951,6 +2951,8 @@ def _verified_disposition_proposals(repo, candidate, full_evidence, known,
                 patches, code_path, fields["code_source"], require_added=fixed)
             test_carrier = _proposal_carrier(
                 patches, test_path, fields["regression_source"], require_added=fixed)
+            if fixed and code_carrier != test_carrier:
+                raise ValueError("Fixed application source and regression must share one ordered patch carrier")
             code_section = _embedded_patch_section(patches[code_carrier], code_path)[0]
             test_section = _embedded_patch_section(patches[test_carrier], test_path)[0]
             _patch_hunk_for_snippet(code_section, fields["code_source"], require_added=fixed)
@@ -3838,7 +3840,9 @@ def _transition_review_candidates(repo, config_sha, lifecycle, *, accepted_basel
     return [group for group in groups.values() if isinstance(group.get("full"), dict)]
 
 
-def _adopted_workflow_candidate(repo, config_sha, lifecycle):
+def _adopted_workflow_candidate(repo, config_sha, lifecycle, *, accepted_candidate=None):
+    if accepted_candidate is not None and accepted_candidate.get("configuration_sha") == config_sha:
+        return None
     identity = _sanitized_repair_identity(repo, config_sha)
     if identity is None:
         return None
@@ -3855,8 +3859,12 @@ def _adopted_workflow_candidate(repo, config_sha, lifecycle):
     if not records:
         raise ValueError("Sanitized workflow transition has no exact prior native review pair")
     accepted = []
+    retired = False
     for record in records:
         candidate = record["candidate"]
+        if accepted_candidate is not None and lifecycle.candidate_identity(candidate) == lifecycle.candidate_identity(accepted_candidate):
+            retired = True
+            continue
         full_pull = record["full"]["pull"]
         dockerfile = _shared_file(repo, "Dockerfile", record["full"]["review_sha"])
         if (_recipe_sha256(dockerfile, current_workflow, lifecycle)
@@ -3880,6 +3888,8 @@ def _adopted_workflow_candidate(repo, config_sha, lifecycle):
                              "policy_validation": native_receipt,
                              "bundle_proof": bundle,
                              "repair_identity": identity})
+    if not accepted and retired:
+        return None
     if len(accepted) != 1:
         raise ValueError("Sanitized workflow transition has no unique verified prior candidate receipt")
     return accepted[0]
@@ -4661,15 +4671,18 @@ def prepare_shared(directory):
         output(review_ready=False, ready=False, mode="waiting", reason=repair["reason"],
                repair_pr=repair["state"]["number"], repair_head=repair["state"]["head"])
         return
-    transition_hint = (_adopted_workflow_candidate(repo, config, lifecycle)
-                       if repair["state"] is None and repair["config_sha"] == config else None)
-    baseline_data = None
+    baseline_data = (_shared_prepare_baseline(repo, lifecycle, repair)
+                     if repair["state"] is None and repair["config_sha"] == config else None)
+    transition_hint = (_adopted_workflow_candidate(repo, config, lifecycle,
+                       accepted_candidate=baseline_data["accepted_candidate"])
+                       if baseline_data is not None else None)
     retained_review = None
     if (repair["state"] is None and repair["config_sha"] == config
             and transition_hint is None):
         # Resolve the protected baseline before asking upstream for its live head:
         # an exact open pair owns its pinned upstream until both reviews complete.
-        baseline_data = _shared_prepare_baseline(repo, lifecycle, repair)
+        if baseline_data is None:
+            baseline_data = _shared_prepare_baseline(repo, lifecycle, repair)
         pending = _transition_review_candidates(
             repo, config, lifecycle, accepted_baseline=baseline_data["accepted_candidate"])
         if len(pending) > 1:

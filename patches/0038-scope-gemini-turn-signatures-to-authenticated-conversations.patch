@@ -1,0 +1,142 @@
+From c15e4158b3b8789937a4d4a93d633c1b47b64dc7 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] Scope Gemini turn signatures to authenticated conversations
+
+---
+ .../handlers/chatCore/nonStreamingHandler.js  |  1 +
+ open-sse/services/thoughtSignatureStore.js    | 14 +++++++++----
+ .../translator/request/openai-to-gemini.js    |  2 +-
+ .../translator/response/gemini-to-openai.js   |  2 +-
+ ...eam-translator-history-regressions.test.js |  2 +-
+ tests/unit/gemini-turn-signature.test.js      | 21 ++++++++++++++-----
+ 6 files changed, 30 insertions(+), 12 deletions(-)
+
+diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
+index 67f92db..e21d797 100644
+--- a/open-sse/handlers/chatCore/nonStreamingHandler.js
++++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
+@@ -197,6 +197,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
+         reasoning: reasoningContent,
+         content: textContent,
+         scope: turnScope,
++        sessionId: serverPartsSessionId,
+       }, turnSignature, response.modelVersion);
+     }
+     if (serverParts.length) {
+diff --git a/open-sse/services/thoughtSignatureStore.js b/open-sse/services/thoughtSignatureStore.js
+index 906cffc..78feb88 100644
+--- a/open-sse/services/thoughtSignatureStore.js
++++ b/open-sse/services/thoughtSignatureStore.js
+@@ -240,14 +240,20 @@ function turnKey(kind, text, scope) {
+   return `turn:${digest}`;
+ }
+ 
+-export function storeGeminiTurnSignature({ reasoning, content, scope }, signature, model = null) {
+-  for (const key of [turnKey("r", reasoning, scope), turnKey("c", content, scope)]) {
++function scopedTurnKey(kind, text, scope, sessionId) {
++  if (typeof sessionId !== "string" || !sessionId) return null;
++  const anchor = turnKey(kind, text, scope);
++  return anchor ? `turn-scoped:${createHash("sha256").update(sessionId).update("\0").update(anchor).digest("hex")}` : null;
++}
++
++export function storeGeminiTurnSignature({ reasoning, content, scope, sessionId = null }, signature, model = null) {
++  for (const key of [scopedTurnKey("r", reasoning, scope, sessionId), scopedTurnKey("c", content, scope, sessionId)]) {
+     if (key) storeGeminiThoughtSignature(key, signature, null, model);
+   }
+ }
+ 
+-export function findGeminiTurnSignature({ reasoning, content, scope }, model = null) {
+-  for (const key of [turnKey("r", reasoning, scope), turnKey("c", content, scope)]) {
++export function findGeminiTurnSignature({ reasoning, content, scope, sessionId = null }, model = null) {
++  for (const key of [scopedTurnKey("r", reasoning, scope, sessionId), scopedTurnKey("c", content, scope, sessionId)]) {
+     const sig = key ? getGeminiThoughtSignatureSync(key, null, model) : null;
+     if (sig) return sig;
+   }
+diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
+index dd757d4..89b027d 100644
+--- a/open-sse/translator/request/openai-to-gemini.js
++++ b/open-sse/translator/request/openai-to-gemini.js
+@@ -212,7 +212,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+         // Signature the provider issued for this tool-free turn (Gemini only accepts its own).
+         const turnSig = msg.tool_calls?.length
+           ? null
+-          : findGeminiTurnSignature({ reasoning: msg.reasoning_content, content: text, scope: turnScope }, model);
++          : findGeminiTurnSignature({ reasoning: msg.reasoning_content, content: text, scope: turnScope, sessionId: serverPartsSessionId }, model);
+         // Server-side tool parts (googleSearch toolCall/toolResponse) that preceded the
+         // text of this turn must go back verbatim or Gemini 3 rejects the request.
+         const serverTurnParts = findGeminiServerPartsForTurn({ reasoning: msg.reasoning_content, content: text, scope: turnScope, sessionId: serverPartsSessionId }, model);
+diff --git a/open-sse/translator/response/gemini-to-openai.js b/open-sse/translator/response/gemini-to-openai.js
+index c2b6b82..1e9da0b 100644
+--- a/open-sse/translator/response/gemini-to-openai.js
++++ b/open-sse/translator/response/gemini-to-openai.js
+@@ -167,7 +167,7 @@ export function geminiToOpenAIResponse(chunk, state) {
+     // thinking that produced this text; keep it so the next request can replay it.
+     if (state.pendingThoughtSignature && state.geminiToolCallCount === 0) {
+       storeGeminiTurnSignature(
+-        { reasoning: state.turnReasoning, content: state.turnContent, scope: state.turnScope },
++        { reasoning: state.turnReasoning, content: state.turnContent, scope: state.turnScope, sessionId: state.serverPartsSessionId },
+         state.pendingThoughtSignature,
+         state.model
+       );
+diff --git a/tests/unit/downstream-translator-history-regressions.test.js b/tests/unit/downstream-translator-history-regressions.test.js
+index c78f4e7..6c895f3 100644
+--- a/tests/unit/downstream-translator-history-regressions.test.js
++++ b/tests/unit/downstream-translator-history-regressions.test.js
+@@ -69,7 +69,7 @@ describe("Gemini historical turns retain their own instruction prefix", () => {
+     const reasoning = `earlier reasoning-${role}`;
+     const content = `earlier answer-${role}`;
+     const signature = `exact-turn-signature-${role}`;
+-    const turn = { reasoning, content, scope: credentials._geminiTurnScope };
++    const turn = { reasoning, content, scope: credentials._geminiTurnScope, sessionId };
+     const searchPart = {
+       thoughtSignature: `exact-search-signature-${role}`,
+       toolCall: { id: `search-${role}`, toolType: "GOOGLE_SEARCH_WEB", args: { queries: [role] } },
+diff --git a/tests/unit/gemini-turn-signature.test.js b/tests/unit/gemini-turn-signature.test.js
+index 455c36f..5cfcbcd 100644
+--- a/tests/unit/gemini-turn-signature.test.js
++++ b/tests/unit/gemini-turn-signature.test.js
+@@ -24,24 +24,35 @@ const chunk = (parts, finishReason) => ({
+ 
+ // Translate the request that starts a turn, then stream the provider's answer to it, exactly as
+ // the router does: the request translator leaves the history identity on `credentials`.
+-function turn(history, chunks) {
+-  const credentials = {};
++function turn(history, chunks, sessionId = "authenticated-fixture-conversation") {
++  const credentials = { _geminiServerPartsSessionId: sessionId };
+   openaiToGeminiRequest(MODEL, { messages: history }, true, credentials);
+-  const state = { model: MODEL, turnScope: credentials._geminiTurnScope };
++  const state = { model: MODEL, turnScope: credentials._geminiTurnScope, serverPartsSessionId: sessionId };
+   const out = [];
+   for (const c of chunks) out.push(...(geminiToOpenAIResponse(c, state) || []));
+   const delta = (k) => out.map((o) => o.choices?.[0]?.delta?.[k]).filter(Boolean).join("");
+   return { reasoning: delta("reasoning_content"), content: delta("content") };
+ }
+ 
+-function modelParts(body) {
+-  const req = openaiToGeminiRequest(MODEL, body, false, null);
++function modelParts(body, sessionId = "authenticated-fixture-conversation") {
++  const req = openaiToGeminiRequest(MODEL, body, false, { _geminiServerPartsSessionId: sessionId });
+   return req.contents.filter((c) => c.role === "model").flatMap((c) => c.parts);
+ }
+ 
+ const ask = (text) => ({ role: "user", content: text });
+ 
+ describe("signature of a tool-free thinking turn survives the round trip", () => {
++  it("separates identical turns across trusted tenants/conversations and refuses an unscoped lookup", () => {
++    const history = [ask("identical request")];
++    turn(history, [chunk([{ text: "identical answer", thoughtSignature: "tenant-one-signature" }], "STOP")], "tenant-one/conversation");
++    turn(history, [chunk([{ text: "identical answer", thoughtSignature: "tenant-two-signature" }], "STOP")], "tenant-two/conversation");
++    const body = { messages: [...history, { role: "assistant", content: "identical answer" }, ask("next")] };
++    expect(modelParts(body, "tenant-one/conversation")).toContainEqual({ text: "identical answer", thoughtSignature: "tenant-one-signature" });
++    expect(modelParts(body, "tenant-two/conversation")).toContainEqual({ text: "identical answer", thoughtSignature: "tenant-two-signature" });
++    expect(JSON.stringify(modelParts(body, null))).not.toContain("tenant-one-signature");
++    expect(JSON.stringify(modelParts(body, null))).not.toContain("tenant-two-signature");
++  });
++
+   it("replays the provider's signature (on the answer part) when the client echoes reasoning + answer", () => {
+     const sig = "real-signature-1";
+     const { reasoning, content } = turn([ask("q1")], [
+-- 
+2.43.0

@@ -3055,6 +3055,13 @@ class SharedHistoryAdapterTests(unittest.TestCase):
                 self._read_native_proposal(
                     fixture, [fixture["comments"][0], newer_request, current])
 
+    def test_fixed_application_rejects_split_source_and_regression_carriers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._disposition_proposal_fixture(temporary)
+            with patch.object(release, "_proposal_carrier", side_effect=["patches/code.patch", "patches/test.patch"]):
+                with self.assertRaisesRegex(ValueError, "share one ordered patch carrier"):
+                    self._read_disposition_fixture(fixture)
+
     def test_explicit_codex_proposal_binds_fixed_source_patch_and_application(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self._disposition_proposal_fixture(temporary)
@@ -5881,3 +5888,9 @@ class PolicyEngineEnvironmentTests(unittest.TestCase):
             env = release.policy_engine_environment()
         self.assertEqual(env, {"HOME": "/host/home", "XDG_DATA_HOME": "/host/data",
                                "XDG_RUNTIME_DIR": "/run/user/1000"})
+
+class AcceptedWorkflowTransitionTests(unittest.TestCase):
+    def test_already_accepted_configuration_does_not_pin_upstream_again(self):
+        with patch.object(release, "_sanitized_repair_identity", side_effect=AssertionError("accepted transition must not be replayed")):
+            self.assertIsNone(release._adopted_workflow_candidate("owner/repo", "a" * 40, object(),
+                accepted_candidate={"configuration_sha": "a" * 40}))
