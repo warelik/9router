@@ -1,0 +1,142 @@
+From 816840627ae4db3855fb37c45b2f2117ec5df510 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] Provide real crypto to native route fixtures and preserve raw
+ upstream errors
+
+---
+ open-sse/utils/antigravityNative.js             |  8 ++++++--
+ ...ntigravity-native-disabled-functions.test.js |  3 +++
+ tests/unit/antigravity-native-gemini.test.js    |  3 +++
+ .../unit/antigravity-native-json-output.test.js |  3 +++
+ tests/unit/gemini-native-entry-contract.test.js | 17 +++++++++++++++++
+ 5 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
+index 228e344..b987c3d 100644
+--- a/open-sse/utils/antigravityNative.js
++++ b/open-sse/utils/antigravityNative.js
+@@ -384,9 +384,13 @@ export async function unwrapAntigravityResponse(response, stream, nativeRequest
+     const text = await response.text();
+     let body = text;
+     try {
+-      const nativeResponse = unwrap(JSON.parse(text));
++      const parsed = JSON.parse(text);
++      const nativeResponse = unwrap(parsed);
+       const normalized = response.ok && jsonOutput ? normalizeNativeJsonResponse(nativeResponse) : nativeResponse;
+-      body = JSON.stringify(response.ok ? applyNativeResponseMasks(normalized, masks) : normalized);
++      // An already-native upstream error is opaque, including its wire bytes.
++      // Only an actual Cloud Code envelope needs serialization after unwrapping.
++      body = !response.ok && nativeResponse === parsed ? text
++        : JSON.stringify(response.ok ? applyNativeResponseMasks(normalized, masks) : normalized);
+     } catch { /* Native core reports invalid JSON. */ }
+     return new Response(body, {
+       status: response.status, statusText: response.statusText,
+diff --git a/tests/unit/antigravity-native-disabled-functions.test.js b/tests/unit/antigravity-native-disabled-functions.test.js
+index 0468535..dd39ea3 100644
+--- a/tests/unit/antigravity-native-disabled-functions.test.js
++++ b/tests/unit/antigravity-native-disabled-functions.test.js
+@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import fs from "node:fs";
+ import path from "node:path";
+ import vm from "node:vm";
++import { createHash } from "node:crypto";
+ import { fileURLToPath } from "node:url";
+ 
+ const { network, executorInstances } = vi.hoisted(() => ({
+@@ -204,6 +205,8 @@ function loadPublicNativeRoute() {
+     updateProviderCredentials: services.updateProviderCredentials,
+     unavailableResponse: services.unavailableResponse,
+   };
++  // Production crypto is real; these remote fixtures have no trusted local/CLI principal.
++  Object.assign(context, { createHash, isLocalRequest: () => false, hasValidCliToken: async () => false });
+   vm.createContext(context);
+ 
+   const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
+diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
+index c169367..e26c577 100644
+--- a/tests/unit/antigravity-native-gemini.test.js
++++ b/tests/unit/antigravity-native-gemini.test.js
+@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import fs from "node:fs";
+ import path from "node:path";
+ import vm from "node:vm";
++import { createHash } from "node:crypto";
+ import { fileURLToPath } from "node:url";
+ 
+ const { network, executorInstances } = vi.hoisted(() => ({
+@@ -233,6 +234,8 @@ function loadRouteHarness() {
+     updateProviderCredentials: services.updateProviderCredentials,
+     unavailableResponse: services.unavailableResponse,
+   };
++  // Production crypto is real; these remote fixtures have no trusted local/CLI principal.
++  Object.assign(context, { createHash, isLocalRequest: () => false, hasValidCliToken: async () => false });
+   vm.createContext(context);
+ 
+   const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
+diff --git a/tests/unit/antigravity-native-json-output.test.js b/tests/unit/antigravity-native-json-output.test.js
+index 3e2dbcb..7b60bd6 100644
+--- a/tests/unit/antigravity-native-json-output.test.js
++++ b/tests/unit/antigravity-native-json-output.test.js
+@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import fs from "node:fs";
+ import path from "node:path";
+ import vm from "node:vm";
++import { createHash } from "node:crypto";
+ import { fileURLToPath } from "node:url";
+ 
+ const { network, executorInstances } = vi.hoisted(() => ({
+@@ -165,6 +166,8 @@ function loadPublicNativeRoute() {
+     updateProviderCredentials: services.updateProviderCredentials,
+     unavailableResponse: services.unavailableResponse,
+   };
++  // Production crypto is real; these remote fixtures have no trusted local/CLI principal.
++  Object.assign(context, { createHash, isLocalRequest: () => false, hasValidCliToken: async () => false });
+   vm.createContext(context);
+ 
+   const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
+diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
+index da74666..e6cea34 100644
+--- a/tests/unit/gemini-native-entry-contract.test.js
++++ b/tests/unit/gemini-native-entry-contract.test.js
+@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
+ import fs from "node:fs";
+ import path from "node:path";
+ import vm from "node:vm";
++import { createHash } from "node:crypto";
+ import { fileURLToPath } from "node:url";
+ 
+ // Real endpoint + handler control flow. Only imported service boundaries are
+@@ -76,6 +77,8 @@ function load() {
+     errorResponse: (status, message, headers) => Response.json({ error: { message } }, { status, headers }),
+     unavailableResponse: (status, message) => Response.json({ error: { message } }, { status }),
+   };
++  // Production crypto is real; these remote fixtures have no trusted local/CLI principal.
++  Object.assign(context, { createHash, isLocalRequest: () => false, hasValidCliToken: async () => false });
+   vm.createContext(context);
+   // Reuse the real key extraction implementation, not a permissive test copy.
+   const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
+@@ -118,6 +121,20 @@ function audioRequest(action = "streamGenerateContent") {
+ describe("native Gemini endpoint entry contract", () => {
+   beforeEach(load);
+ 
++  it("isolates native server-parts tenancy between authenticated client keys", async () => {
++    services.isValidApiKey.mockResolvedValue(true);
++    for (const key of ["first-fixture-key", "second-fixture-key"]) {
++      const response = await call("gemini", "generateContent", nativeBody(),
++        { headers: { Authorization: `Bearer ${key}` } });
++      expect(response.status).toBe(200);
++    }
++    const tenants = services.handleChatCore.mock.calls.map(([options]) => options.serverPartsTenant);
++    expect(tenants).toHaveLength(2);
++    for (const tenant of tenants) expect(tenant).toMatch(/^[0-9a-f]{64}$/);
++    expect(tenants[0]).not.toBe(tenants[1]);
++  });
++
++
+ it("loads the real client-key accessor for every supported credential location", () => {
+   for (const [headers, query, expected] of [
+     [{ Authorization: "Bearer bearer-fixture", "x-goog-api-key": "ignored" }, "?key=ignored", "bearer-fixture"],
+-- 
+2.43.0
