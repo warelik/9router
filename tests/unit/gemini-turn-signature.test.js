@@ -24,24 +24,35 @@ const chunk = (parts, finishReason) => ({
 
 // Translate the request that starts a turn, then stream the provider's answer to it, exactly as
 // the router does: the request translator leaves the history identity on `credentials`.
-function turn(history, chunks) {
-  const credentials = {};
+function turn(history, chunks, sessionId = "authenticated-fixture-conversation") {
+  const credentials = { _geminiServerPartsSessionId: sessionId };
   openaiToGeminiRequest(MODEL, { messages: history }, true, credentials);
-  const state = { model: MODEL, turnScope: credentials._geminiTurnScope };
+  const state = { model: MODEL, turnScope: credentials._geminiTurnScope, serverPartsSessionId: sessionId };
   const out = [];
   for (const c of chunks) out.push(...(geminiToOpenAIResponse(c, state) || []));
   const delta = (k) => out.map((o) => o.choices?.[0]?.delta?.[k]).filter(Boolean).join("");
   return { reasoning: delta("reasoning_content"), content: delta("content") };
 }
 
-function modelParts(body) {
-  const req = openaiToGeminiRequest(MODEL, body, false, null);
+function modelParts(body, sessionId = "authenticated-fixture-conversation") {
+  const req = openaiToGeminiRequest(MODEL, body, false, { _geminiServerPartsSessionId: sessionId });
   return req.contents.filter((c) => c.role === "model").flatMap((c) => c.parts);
 }
 
 const ask = (text) => ({ role: "user", content: text });
 
 describe("signature of a tool-free thinking turn survives the round trip", () => {
+  it("separates identical turns across trusted tenants/conversations and refuses an unscoped lookup", () => {
+    const history = [ask("identical request")];
+    turn(history, [chunk([{ text: "identical answer", thoughtSignature: "tenant-one-signature" }], "STOP")], "tenant-one/conversation");
+    turn(history, [chunk([{ text: "identical answer", thoughtSignature: "tenant-two-signature" }], "STOP")], "tenant-two/conversation");
+    const body = { messages: [...history, { role: "assistant", content: "identical answer" }, ask("next")] };
+    expect(modelParts(body, "tenant-one/conversation")).toContainEqual({ text: "identical answer", thoughtSignature: "tenant-one-signature" });
+    expect(modelParts(body, "tenant-two/conversation")).toContainEqual({ text: "identical answer", thoughtSignature: "tenant-two-signature" });
+    expect(JSON.stringify(modelParts(body, null))).not.toContain("tenant-one-signature");
+    expect(JSON.stringify(modelParts(body, null))).not.toContain("tenant-two-signature");
+  });
+
   it("replays the provider's signature (on the answer part) when the client echoes reasoning + answer", () => {
     const sig = "real-signature-1";
     const { reasoning, content } = turn([ask("q1")], [

@@ -240,14 +240,20 @@ function turnKey(kind, text, scope) {
   return `turn:${digest}`;
 }
 
-export function storeGeminiTurnSignature({ reasoning, content, scope }, signature, model = null) {
-  for (const key of [turnKey("r", reasoning, scope), turnKey("c", content, scope)]) {
+function scopedTurnKey(kind, text, scope, sessionId) {
+  if (typeof sessionId !== "string" || !sessionId) return null;
+  const anchor = turnKey(kind, text, scope);
+  return anchor ? `turn-scoped:${createHash("sha256").update(sessionId).update("\0").update(anchor).digest("hex")}` : null;
+}
+
+export function storeGeminiTurnSignature({ reasoning, content, scope, sessionId = null }, signature, model = null) {
+  for (const key of [scopedTurnKey("r", reasoning, scope, sessionId), scopedTurnKey("c", content, scope, sessionId)]) {
     if (key) storeGeminiThoughtSignature(key, signature, null, model);
   }
 }
 
-export function findGeminiTurnSignature({ reasoning, content, scope }, model = null) {
-  for (const key of [turnKey("r", reasoning, scope), turnKey("c", content, scope)]) {
+export function findGeminiTurnSignature({ reasoning, content, scope, sessionId = null }, model = null) {
+  for (const key of [scopedTurnKey("r", reasoning, scope, sessionId), scopedTurnKey("c", content, scope, sessionId)]) {
     const sig = key ? getGeminiThoughtSignatureSync(key, null, model) : null;
     if (sig) return sig;
   }

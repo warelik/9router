@@ -167,7 +167,7 @@ export function geminiToOpenAIResponse(chunk, state) {
     // thinking that produced this text; keep it so the next request can replay it.
     if (state.pendingThoughtSignature && state.geminiToolCallCount === 0) {
       storeGeminiTurnSignature(
-        { reasoning: state.turnReasoning, content: state.turnContent, scope: state.turnScope },
+        { reasoning: state.turnReasoning, content: state.turnContent, scope: state.turnScope, sessionId: state.serverPartsSessionId },
         state.pendingThoughtSignature,
         state.model
       );

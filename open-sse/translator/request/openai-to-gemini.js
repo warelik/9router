@@ -212,7 +212,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
         // Signature the provider issued for this tool-free turn (Gemini only accepts its own).
         const turnSig = msg.tool_calls?.length
           ? null
-          : findGeminiTurnSignature({ reasoning: msg.reasoning_content, content: text, scope: turnScope }, model);
+          : findGeminiTurnSignature({ reasoning: msg.reasoning_content, content: text, scope: turnScope, sessionId: serverPartsSessionId }, model);
         // Server-side tool parts (googleSearch toolCall/toolResponse) that preceded the
         // text of this turn must go back verbatim or Gemini 3 rejects the request.
         const serverTurnParts = findGeminiServerPartsForTurn({ reasoning: msg.reasoning_content, content: text, scope: turnScope, sessionId: serverPartsSessionId }, model);
