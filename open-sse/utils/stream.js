@@ -1,5 +1,6 @@
 import { translateResponse, initState } from "../translator/index.js";
 import { FORMATS } from "../translator/formats.js";
+import { GEMINI_FINISH } from "../translator/schema/index.js";
 import { PROVIDERS } from "../config/providers.js";
 import { HTTP_STATUS, NATIVE_GEMINI_FINISH_REASON_FIELDS, NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES, NATIVE_GEMINI_FORMATS } from "../config/runtimeConfig.js";
 import { liftReasoningAliases } from "../translator/concerns/reasoning.js";
@@ -207,7 +208,7 @@ export function createSSEStream(options = {}) {
     for (const [position, candidate] of candidates.entries()) {
       if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
       const finished = typeof candidate.finishReason === "string"
-        && candidate.finishReason.length > 0 && candidate.finishReason !== "FINISH_REASON_UNSPECIFIED";
+        && candidate.finishReason.length > 0 && candidate.finishReason !== GEMINI_FINISH.UNSPECIFIED;
       if (finished) {
         nativeGeminiAnyFinishSeen = true;
       }
