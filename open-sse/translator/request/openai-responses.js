@@ -7,6 +7,7 @@
 import { createHash } from "crypto";
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
+import { RESPONSES_NAMESPACE_ALIAS } from "../../config/runtimeConfig.js";
 import {
   normalizeResponsesInput,
   normalizeResponsesAgentMessage,
@@ -54,13 +55,13 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
   const aliasFor = (namespace, name, type) => {
     const identity = JSON.stringify([namespace, name, type]);
     if (aliasCache.has(identity)) return aliasCache.get(identity);
-    const stem = `ns_${namespace}_${name}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40);
-    const hash = createHash("sha256").update(identity).digest("hex").slice(0, 16);
+    const stem = `${RESPONSES_NAMESPACE_ALIAS.prefix}${namespace}_${name}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, RESPONSES_NAMESPACE_ALIAS.stemLength);
+    const hash = createHash("sha256").update(identity).digest("hex").slice(0, RESPONSES_NAMESPACE_ALIAS.hashLength);
     const base = `${stem}_${hash}`;
     let alias = base;
     for (let i = 1; reservedNames.has(alias); i++) {
       const suffix = `_${i}`;
-      alias = `${base.slice(0, 64 - suffix.length)}${suffix}`;
+      alias = `${base.slice(0, RESPONSES_NAMESPACE_ALIAS.maxLength - suffix.length)}${suffix}`;
     }
     reservedNames.add(alias);
     aliasCache.set(identity, alias);
