@@ -596,6 +596,6 @@ describe("native Gemini JSON output through public Antigravity route", () => {
     expect((await reader.read()).done).toBe(false);
     await reader.cancel("fixture client cancelled during JSON fence");
     await vi.waitFor(() => expect(executorSignal.aborted).toBe(true));
-    await expect(cancelled).resolves.toBeUndefined();
+    await expect(cancelled).resolves.toBe("fixture client cancelled during JSON fence");
   });
 });
