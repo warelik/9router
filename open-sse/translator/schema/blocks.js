@@ -39,6 +39,7 @@ export const RESPONSES_ITEM = {
   FUNCTION_CALL_OUTPUT: "function_call_output",
   CUSTOM_TOOL_CALL: "custom_tool_call",
   CUSTOM_TOOL_CALL_OUTPUT: "custom_tool_call_output",
+  WEB_SEARCH_CALL: "web_search_call",
   ADDITIONAL_TOOLS: "additional_tools",
   REASONING: "reasoning",
   OUTPUT_TEXT: "output_text",
@@ -54,8 +55,12 @@ export const RESPONSES_TOOL = {
   NAMESPACE: "namespace",
   FUNCTION: "function",
   CUSTOM: "custom",
+  WEB_SEARCH: "web_search",
   ALLOWED_TOOLS: "allowed_tools",
 };
+
+// The client-facing tool_choice value that prohibits every tool call.
+export const OPENAI_TOOL_CHOICE_NONE = "none";
 
 // Valid OpenAI block types (used by filterToOpenAIFormat).
 export const VALID_OPENAI_CONTENT_TYPES = [

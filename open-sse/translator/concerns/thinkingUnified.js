@@ -7,6 +7,7 @@ import { getThinkingLevels } from "../../providers/thinkingLevels.js";
 import { PROVIDERS } from "../../providers/index.js";
 import { LEVEL_TO_BUDGET, budgetToLevel, effortToBudget, effortToThinkingLevel } from "./thinking.js";
 import { DEFAULT_PROVIDER_THINKING_BUDGET, NATIVE_GEMINI_THINKING_KEYS } from "../../config/runtimeConfig.js";
+import { FORMATS } from "../formats.js";
 
 // Map a target wire-format to its native thinking format (when capability has none).
 const FORMAT_TO_NATIVE = {
@@ -454,7 +455,7 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
   const fmt = resolveFormat(targetFormat, cleanModel, provider);
   const supportedLevels = getThinkingLevels(provider, cleanModel);
   // A translated/native Responses request already owns its wire options; preserve explicit effort and opaque reasoning fields without inventing a summary.
-  if (preserveResponsesOptions && targetFormat === "openai-responses") {
+  if (preserveResponsesOptions && targetFormat === FORMATS.OPENAI_RESPONSES) {
     const current = body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning) ? body.reasoning : {};
     const rawEffort = body.reasoning_effort ?? current.effort;
     const inferred = cfg.mode === "none" ? "none" : toLevel(cfg);
@@ -491,7 +492,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
 
   // Reuse the capability-aware mapping, without its translated-request output
   // floor or its replacement of client-native options such as includeThoughts.
-  const mapped = applyThinking("gemini", model, {}, provider, intent).generationConfig?.thinkingConfig;
+  const mapped = applyThinking(FORMATS.GEMINI, model, {}, provider, intent).generationConfig?.thinkingConfig;
   if (!mapped) return body;
   const thinking = { ...clientThinking };
   for (const key of NATIVE_GEMINI_THINKING_KEYS) delete thinking[key];

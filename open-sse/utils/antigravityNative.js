@@ -4,7 +4,9 @@ import {
   NATIVE_GEMINI_JSON_FENCE_PENDING_STATES,
   REWRITTEN_RESPONSE_HEADERS,
   SSE_DONE_PAYLOAD,
+  HTTP_STATUS,
 } from "../config/runtimeConfig.js";
+import { GEMINI_FINISH } from "../translator/schema/index.js";
 
 // Adapt Cloud Code's response envelope, keeping the Gemini payload available
 // to the existing native response validation, usage observer and client.
@@ -13,7 +15,7 @@ function unwrap(value) {
   if (value && typeof value === "object" && Object.hasOwn(value, "response") && !value.error) {
     const { response, ...metadata } = value;
     if (response === null || typeof response !== "object" || Array.isArray(response) || !Object.keys(response).length) {
-      return { error: { code: 502, status: "INTERNAL", message: "Invalid Antigravity response envelope" } };
+      return { error: { code: HTTP_STATUS.BAD_GATEWAY, status: "INTERNAL", message: "Invalid Antigravity response envelope" } };
     }
     return { ...metadata, ...response };
   }
@@ -292,7 +294,7 @@ function normalizeNativeJsonResponse(value) {
   }
   if (!value || typeof value !== "object" || isNativeError(value) || !Array.isArray(value.candidates)) return value;
   for (const candidate of value.candidates) {
-    if (!candidate || (candidate.finishReason ?? candidate.finish_reason) !== "STOP") continue;
+    if (!candidate || (candidate.finishReason ?? candidate.finish_reason) !== GEMINI_FINISH.STOP) continue;
     const { text, spans } = nativeCandidateText(candidate);
     const ranges = nativeJsonFenceRemovalRanges(text);
     if (ranges) removeNativeJsonFenceRanges(spans, ranges);
@@ -332,7 +334,7 @@ function updateNativeJsonStreamStates(value, states) {
     }
 
     const finishReason = candidate.finishReason ?? candidate.finish_reason;
-    if (finishReason === "STOP") {
+    if (finishReason === GEMINI_FINISH.STOP) {
       if (state.status === "open") {
         const ranges = nativeJsonFenceRemovalRanges(state.text);
         if (ranges) {
@@ -362,7 +364,7 @@ export function validateAntigravityFieldMask(nativeRequest = {}) {
   } catch (error) {
     return {
       error: {
-        code: 400,
+        code: HTTP_STATUS.BAD_REQUEST,
         status: "INVALID_ARGUMENT",
         message: error.message,
       },
@@ -378,9 +380,9 @@ export async function unwrapAntigravityResponse(response, stream, nativeRequest 
     if (!response.ok) return response;
     response.body?.cancel().catch(() => {});
     return new Response(JSON.stringify({
-      error: { code: 400, status: "INVALID_ARGUMENT", message: error.message },
+      error: { code: HTTP_STATUS.BAD_REQUEST, status: "INVALID_ARGUMENT", message: error.message },
     }), {
-      status: 400,
+      status: HTTP_STATUS.BAD_REQUEST,
       statusText: "Bad Request",
       headers: responseHeaders(response, "application/json"),
     });
@@ -458,7 +460,7 @@ export async function unwrapAntigravityResponse(response, stream, nativeRequest 
     catch {
       failed = true;
       flushPendingNativeResponses(controller);
-      emit({ error: { code: 502, status: "INTERNAL", message: "Invalid Antigravity stream event" } }, controller);
+      emit({ error: { code: HTTP_STATUS.BAD_GATEWAY, status: "INTERNAL", message: "Invalid Antigravity stream event" } }, controller);
     }
   };
   const line = (value, controller) => {

@@ -8,7 +8,7 @@ import { buildChunk } from "../concerns/chunk.js";
 import { buildUsage } from "../concerns/usage.js";
 import { fallbackToolCallId } from "../concerns/toolCall.js";
 import { reasoningDelta, extractReasoningText } from "../concerns/reasoning.js";
-import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, OPENAI_FINISH, MODEL_FALLBACK } from "../schema/index.js";
+import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, RESPONSES_TOOL, OPENAI_FINISH, MODEL_FALLBACK } from "../schema/index.js";
 import { resolveToolName } from "../../utils/opencodeFingerprint.js";
 
 /**
@@ -344,7 +344,7 @@ function isCustomTool(state, name) {
   if (!name) return false;
   if (state.customToolNames?.has(name)) return true;
   const resolved = resolveToolName(name, state.toolNameMap);
-  if (resolved.descriptor) return resolved.descriptor.type === "custom";
+  if (resolved.descriptor) return resolved.descriptor.type === RESPONSES_TOOL.CUSTOM;
   return !!resolved.name && state.customToolNames?.has(resolved.name) === true;
 }
 
@@ -595,7 +595,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
   // merges parallel calls into index 0 whenever upstream emits all addeds
   // before dones — the client then concatenates N JSON payloads into one
   // tool input and fails validation. The server item id is the correlator.
-  if (eventType === "response.output_item.added" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
+  if (eventType === "response.output_item.added" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL)) {
     const item = data.item;
     state.currentToolCallId = item.call_id || fallbackToolCallId();
     state.respToolChatIndex ??= new Map();
@@ -640,7 +640,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
   // Function call done (standard or custom_tool_call variant).
   // Index was assigned at added-time; nothing to advance. Some upstreams send
   // complete arguments only here (no deltas) — emit them once in that case.
-  if (eventType === "response.output_item.done" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
+  if (eventType === "response.output_item.done" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL)) {
     const key = data.item?.id || data.item_id;
     const idx = (key && state.respToolChatIndex?.get(key)) ?? Math.max(0, (state.toolCallIndex || 1) - 1);
     const fullArgs = data.item?.arguments;

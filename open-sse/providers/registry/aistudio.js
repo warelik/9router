@@ -3,6 +3,8 @@
 // `thoughtSignature` of a thinking turn; its OpenAI and Claude surfaces drop it (or fake it), and
 // without it the model cannot use its own earlier reasoning. So this provider talks Gemini wire.
 // The model list is whatever the bridge serves, hence passthroughModels and no seeded ids.
+import { FORMATS } from "../../translator/formats.js";
+
 export default {
   id: "aistudio",
   priority: 60,
@@ -22,7 +24,7 @@ export default {
   authModes: ["apikey"],
   transport: {
     baseUrl: "http://127.0.0.1:7860/v1beta/models",
-    format: "gemini",
+    format: FORMATS.GEMINI,
     validateUrl: "http://127.0.0.1:7860/v1/models",
     auth: {
       apiKey: {

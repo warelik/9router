@@ -1,4 +1,5 @@
 import { FORMATS } from "./formats.js";
+import { OPENAI_TOOL_CHOICE_NONE } from "./schema/index.js";
 import { ensureToolCallIds, fixMissingToolResponses, isGeminiFamilyTarget } from "./concerns/toolCall.js";
 import { prepareClaudeRequest, ensureTrailingUserTurn } from "./formats/claude.js";
 import { cloakClaudeTools, decloakStreamChunk } from "../utils/claudeCloaking.js";
@@ -73,6 +74,9 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   let result = body;
   // Role the client actually ended on, before any translator drops an emptied turn.
   const clientLastRole = detectClientLastRole(body);
+  // The original client may have prohibited all tools; downstream conversion
+  // can drop tool_choice, so the intent is captured before any mutation.
+  const clientDisablesTools = body?.tool_choice === OPENAI_TOOL_CHOICE_NONE;
 
   // Strip explicit content types (opt-in via strip[] in PROVIDER_MODELS entry)
   stripContentTypes(result, stripList);
@@ -164,7 +168,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   // unverified, so the flag is consumed without effect for them. The internal
   // marker must never reach a provider body.
   if (sourceFormat !== targetFormat && result && typeof result === "object") {
-    const wantsWebSearch = result._webSearch === true;
+    const wantsWebSearch = result._webSearch === true && !clientDisablesTools;
     delete result._webSearch;
     const webSearchEnabled = wantsWebSearch && targetFormat === FORMATS.GEMINI && (provider === "gemini" || provider === "aistudio")
       && getCapabilitiesForModel(provider, stripThinkingSuffix(String(model ?? ""))).serverSideToolInvocations === true;

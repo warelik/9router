@@ -1,3 +1,4 @@
+import { RESPONSES_ITEM, RESPONSES_TOOL } from "../../open-sse/translator/schema/index.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CodexExecutor } from "../../open-sse/executors/codex.js";
@@ -9,6 +10,11 @@ const USER_MSG = { type: "message", role: "user", content: [{ type: "input_text"
 const HOSTED_SEARCH = { type: "web_search_call", id: "ws_1", status: "completed" };
 
 describe("Codex hosted search history forces regular transport", () => {
+  it("schema discriminators carry the exact wire names", () => {
+    expect(RESPONSES_TOOL.WEB_SEARCH).toBe("web_search");
+    expect(RESPONSES_ITEM.WEB_SEARCH_CALL).toBe("web_search_call");
+  });
+
   it("declares web_search when a Lite request history contains web_search_call items", () => {
     const executor = new CodexExecutor();
     const body = executor.transformRequest("gpt-6.1-sol", {
