@@ -1,18 +1,18 @@
-From 31dd7e2419d932146b15f3b16ef281d0212ce816 Mon Sep 17 00:00:00 2001
+From 6ca8c7c3988097512a9ee7327e0de4dea53860a2 Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]"
  <41898282+github-actions[bot]@users.noreply.github.com>
 Date: Thu, 22 Oct 2026 19:26:08 +0000
 Subject: [PATCH] Preserve native Gemini errors on router failures
 
 ---
- src/app/api/v1beta/models/[...path]/route.js  |  2 +-
- src/sse/handlers/chat.js                      | 84 ++++++++++++++---
- tests/unit/antigravity-native-gemini.test.js  | 91 +++++++++++++++++++
- .../unit/gemini-native-entry-contract.test.js |  2 +-
- 4 files changed, 164 insertions(+), 15 deletions(-)
+ src/app/api/v1beta/models/[...path]/route.js  |   2 +-
+ src/sse/handlers/chat.js                      |  84 ++++++++++--
+ tests/unit/antigravity-native-gemini.test.js  | 129 ++++++++++++++++++
+ .../unit/gemini-native-entry-contract.test.js |   2 +-
+ 4 files changed, 202 insertions(+), 15 deletions(-)
 
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index 08b4ab7215d53b38a25cda4b7980c260f370d29b..4641589527bb187da6637e5234757bab47bd94e0 100644
+index 08b4ab72..46415895 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -144,7 +144,7 @@ export async function POST(request, { params }) {
@@ -25,7 +25,7 @@ index 08b4ab7215d53b38a25cda4b7980c260f370d29b..4641589527bb187da6637e5234757bab
      );
    }
 diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
-index 4b7096f7ada0b508cf9d49d0865fbc54d3e71b2b..ce9dd49959a4fd635c233dd7d161db2c1e5917e8 100644
+index 4b7096f7..253d020d 100644
 --- a/src/sse/handlers/chat.js
 +++ b/src/sse/handlers/chat.js
 @@ -29,6 +29,63 @@ import { getProjectIdForConnection } from "open-sse/services/projectId.js";
@@ -182,7 +182,7 @@ index 4b7096f7ada0b508cf9d49d0865fbc54d3e71b2b..ce9dd49959a4fd635c233dd7d161db2c
        lastStatus = result.status;
        lastHeaders = upstreamResponseHeaders(result.response?.headers);
 -      if (result.nativeResponse || options.sourceFormatOverride === "gemini") lastNativeResponse = result.response;
-+      if (result.nativeResponse === true) lastNativeResponse = result.response;
++      lastNativeResponse = result.nativeResponse === true ? result.response : null;
        continue;
      }
  
@@ -191,7 +191,7 @@ index 4b7096f7ada0b508cf9d49d0865fbc54d3e71b2b..ce9dd49959a4fd635c233dd7d161db2c
    }
  }
 diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
-index 64764d26a873b7696c7d7a9a83252d565d465cd7..3df3fa65c902ecca328080c9483ebdb81abfaee2 100644
+index 64764d26..3d2c9a00 100644
 --- a/tests/unit/antigravity-native-gemini.test.js
 +++ b/tests/unit/antigravity-native-gemini.test.js
 @@ -42,6 +42,7 @@ const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
@@ -220,7 +220,7 @@ index 64764d26a873b7696c7d7a9a83252d565d465cd7..3df3fa65c902ecca328080c9483ebdb8
  describe("native Gemini through Antigravity", () => {
    beforeEach(() => {
      network.mockReset();
-@@ -576,4 +588,83 @@ describe("Gemini endpoint source selection for Antigravity", () => {
+@@ -576,4 +588,121 @@ describe("Gemini endpoint source selection for Antigravity", () => {
        thoughtSignature: "native-call-signature",
      });
    });
@@ -259,6 +259,44 @@ index 64764d26a873b7696c7d7a9a83252d565d465cd7..3df3fa65c902ecca328080c9483ebdb8
 +      status: "UNAVAILABLE",
 +      message: expect.stringContaining("second account fetch failed"),
 +    } });
++    expect(network).toHaveBeenCalledTimes(2);
++    expect(services.getProviderCredentials).toHaveBeenCalledTimes(3);
++  });
++
++  it("uses the latest transport failure after an earlier native quota error", async () => {
++    const { context, services } = loadRouteHarness();
++    const executor = new AntigravityExecutor();
++    executor.config = {
++      ...executor.config,
++      retry: { ...(executor.config.retry || {}),
++        429: { attempts: 0, delayMs: 0 }, 502: { attempts: 0, delayMs: 0 } },
++    };
++    executorInstances.set("antigravity", executor);
++    const credentials = connectionId => ({
++      accessToken: `offline-token-${connectionId}`, projectId: "fixture-project",
++      connectionId, providerSpecificData: {},
++    });
++    services.getProviderCredentials.mockReset()
++      .mockResolvedValueOnce(credentials("quota-account"))
++      .mockResolvedValueOnce(credentials("transport-account"))
++      .mockResolvedValueOnce(null);
++    services.markAccountUnavailable.mockReset()
++      .mockResolvedValueOnce({ shouldFallback: true })
++      .mockResolvedValueOnce({ shouldFallback: true });
++    network.mockReset()
++      .mockResolvedValueOnce(Response.json({ error: {
++        code: 429, status: "RESOURCE_EXHAUSTED", message: "earlier quota error",
++      } }, { status: 429, headers: { "Retry-After": "13" } }))
++      .mockRejectedValueOnce(new Error("latest account transport failed"));
++
++    const response = await postNativeGemini(context);
++
++    expect(response.status).toBe(502);
++    expect(await response.json()).toEqual({ error: {
++      code: 502, status: "UNAVAILABLE",
++      message: expect.stringContaining("latest account transport failed"),
++    } });
++    expect(response.headers.get("retry-after")).toBeNull();
 +    expect(network).toHaveBeenCalledTimes(2);
 +    expect(services.getProviderCredentials).toHaveBeenCalledTimes(3);
 +  });
@@ -305,7 +343,7 @@ index 64764d26a873b7696c7d7a9a83252d565d465cd7..3df3fa65c902ecca328080c9483ebdb8
 +  });
  });
 diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
-index 6e3a47e462a82fd5cc54e3c329ac5b9d38bee4c8..4afe24f1d01eb99161857175470f7d6b43d0cf51 100644
+index 6e3a47e4..4afe24f1 100644
 --- a/tests/unit/gemini-native-entry-contract.test.js
 +++ b/tests/unit/gemini-native-entry-contract.test.js
 @@ -171,7 +171,7 @@ describe("native Gemini endpoint entry contract", () => {
@@ -317,6 +355,3 @@ index 6e3a47e462a82fd5cc54e3c329ac5b9d38bee4c8..4afe24f1d01eb99161857175470f7d6b
        const response = await call(provider, "generateContent");
        expect(response.status).toBe(429);
        expect(response.headers.get("retry-after")).toBe("17");
--- 
-2.55.0
-

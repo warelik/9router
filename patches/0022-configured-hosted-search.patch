@@ -1,0 +1,120 @@
+From 5d38ac2994f0a79f34db295a06a2a9b6482068ce Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 20:37:44 +0000
+Subject: [PATCH] Resolve hosted search from configured model capabilities
+
+---
+ open-sse/providers/capabilities.js            | 11 ++++----
+ open-sse/translator/index.js                  |  8 ++++--
+ .../unit/openai-responses-web-search.test.js  | 28 +++++++++++++++++++
+ 3 files changed, 39 insertions(+), 8 deletions(-)
+
+diff --git a/open-sse/providers/capabilities.js b/open-sse/providers/capabilities.js
+index 1c3764ed..dcf4bdde 100644
+--- a/open-sse/providers/capabilities.js
++++ b/open-sse/providers/capabilities.js
+@@ -53,6 +53,7 @@ export const DEFAULT_CAPABILITIES = {
+   audioOutput: false,   // generate audio
+   // features
+   search: false,        // built-in web search tool / grounding
++  serverSideToolInvocations: false, // expose hosted-tool calls alongside function calls
+   tools: true,          // function / tool calling
+   reasoning: false,     // thinking / reasoning
+   // thinking wire format (only meaningful when reasoning:true). null → derive from transport.format.
+@@ -407,11 +408,11 @@ export const PATTERN_CAPABILITIES = [
+   // ── Gemini (all 2.0+ multimodal + google_search grounding, 1M ctx) ─
+   { pattern: "*gemini*image*",  caps: { vision: true, imageOutput: true, contextWindow: 1048576 } },
+   // Gemini 4 (Argon): no "minimal" tier (400) and no thinkingBudget — LOW/MEDIUM/HIGH only, cannot disable.
+-  { pattern: "*gemini-4*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
+-  { pattern: "*gemini-3.8*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
+-  { pattern: "*gemini-3.7*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
+-  { pattern: "*gemini-3*pro*",  caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65535 } },
+-  { pattern: "*gemini-3*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
++  { pattern: "*gemini-4*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
++  { pattern: "*gemini-3.8*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
++  { pattern: "*gemini-3.7*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
++  { pattern: "*gemini-3*pro*",  caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65535 } },
++  { pattern: "*gemini-3*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
+   { pattern: "*gemini-2.5*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-budget", thinkingRange: { min: 0, max: 24576 }, contextWindow: 1048576, maxOutput: 65536 } },
+   { pattern: "*gemini-2*",      caps: { vision: true, audioInput: true, videoInput: true, search: true, contextWindow: 1048576, maxOutput: 65536 } },
+   { pattern: "*gemini*",        caps: { vision: true, search: true, contextWindow: 1048576 } },
+diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
+index ba69ee1a..14460727 100644
+--- a/open-sse/translator/index.js
++++ b/open-sse/translator/index.js
+@@ -10,6 +10,7 @@ import { applyThinking, captureThinking, stripThinkingSuffix } from "./concerns/
+ import { captureSessionId, captureConversationId } from "../utils/sessionManager.js";
+ import { AntigravityExecutor } from "../executors/antigravity.js";
+ import { PROVIDERS } from "../providers/index.js";
++import { getCapabilitiesForModel } from "../providers/capabilities.js";
+ import { ROLE, GEMINI_ROLE } from "./schema/roles.js";
+ 
+ // Registry for translators. Lazy-init guards against circular-import order:
+@@ -154,8 +155,9 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+     result = adaptAIStudioStructuredOutput(result);
+   }
+ 
+-  // Hosted web_search (Codex Responses tools): only Gemini-3 models on the
+-  // generateContent API can serve it — as a googleSearch tool entry plus
++  // Hosted web_search (Codex Responses tools): supported models on the
++  // generateContent API declare server-side invocations in model capabilities.
++  // Send a googleSearch tool entry plus
+   // toolConfig.includeServerSideToolInvocations. Antigravity/Gemini-CLI share the
+   // Cloud Code internal API which rejects that combination, and Vertex is
+   // unverified, so the flag is consumed without effect for them. The internal
+@@ -164,7 +166,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+     const wantsWebSearch = result._webSearch === true;
+     delete result._webSearch;
+     const webSearchEnabled = wantsWebSearch && targetFormat === FORMATS.GEMINI && (provider === "gemini" || provider === "aistudio")
+-      && /^gemini-3/.test(stripThinkingSuffix(String(model ?? "").split("/").pop() || "") || "");
++      && getCapabilitiesForModel(provider, stripThinkingSuffix(String(model ?? ""))).serverSideToolInvocations === true;
+     if (webSearchEnabled) {
+       result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
+       result.toolConfig = {
+diff --git a/tests/unit/openai-responses-web-search.test.js b/tests/unit/openai-responses-web-search.test.js
+index 35a92824..aef21c1d 100644
+--- a/tests/unit/openai-responses-web-search.test.js
++++ b/tests/unit/openai-responses-web-search.test.js
+@@ -5,6 +5,7 @@ import { FORMATS } from "../../open-sse/translator/formats.js";
+ import { createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.js";
+ import { translateNonStreamingResponse } from "../../open-sse/handlers/chatCore/nonStreamingHandler.js";
+ import { getGeminiThoughtSignatureSync } from "../../open-sse/services/thoughtSignatureStore.js";
++import { MODEL_CAPABILITIES } from "../../open-sse/providers/capabilities.js";
+ 
+ const MODEL = "gemini-3.8-flash";
+ const TENANT_A = "authenticated-api-key-tenant-a";
+@@ -66,6 +67,33 @@ async function runStream(chunks, credentials) {
+ }
+ 
+ describe("Responses web_search request translation", () => {
++  it.each(["gemini", "aistudio"])("keeps hosted search available on configured Gemini 4 through %s", provider => {
++    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI,
++      "gemini/gemini-4-argon", requestBody([recordVersion(), webSearch]), true, {}, provider);
++    expect(translated.tools).toContainEqual({ googleSearch: {} });
++    expect(translated.toolConfig.includeServerSideToolInvocations).toBe(true);
++    expect("_webSearch" in translated).toBe(false);
++  });
++
++  it("uses the declared model capability rather than a model-name pattern", () => {
++    const model = "configured-hosted-search-fixture";
++    const previous = MODEL_CAPABILITIES[model];
++    try {
++      MODEL_CAPABILITIES[model] = { search: true, serverSideToolInvocations: true };
++      const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI,
++        model, requestBody([webSearch]), true, {}, "gemini");
++      expect(translated.tools).toContainEqual({ googleSearch: {} });
++      expect(translated.toolConfig.includeServerSideToolInvocations).toBe(true);
++      MODEL_CAPABILITIES[model] = { search: true, serverSideToolInvocations: false };
++      const unsupported = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI,
++        model, requestBody([webSearch]), true, {}, "gemini");
++      expect(unsupported.tools || []).not.toContainEqual({ googleSearch: {} });
++    } finally {
++      if (previous === undefined) delete MODEL_CAPABILITIES[model];
++      else MODEL_CAPABILITIES[model] = previous;
++    }
++  });
++
+   for (const provider of ["gemini", "aistudio"]) {
+     it(`enables googleSearch with server-side invocations for ${provider}`, () => {
+       const credentials = {};

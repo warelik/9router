@@ -1,0 +1,76 @@
+From 802b030eb0497da21c422d8d64b2057f65c09f3f Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 20:38:05 +0000
+Subject: [PATCH] Accept upstream DONE without invalidating native SSE
+ responses
+
+---
+ open-sse/utils/sseConstants.js          |  3 ++-
+ open-sse/utils/stream.js                |  3 ++-
+ tests/unit/gemini-native-stream.test.js | 19 +++++++++++++++++++
+ 3 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/open-sse/utils/sseConstants.js b/open-sse/utils/sseConstants.js
+index 680a05ca..220ae332 100644
+--- a/open-sse/utils/sseConstants.js
++++ b/open-sse/utils/sseConstants.js
+@@ -1,5 +1,6 @@
+ // Shared SSE primitives (no imports → safe for executors + stream.js)
+-export const SSE_DONE = "data: [DONE]\n\n";
++export const SSE_DONE_PAYLOAD = "[DONE]";
++export const SSE_DONE = `data: ${SSE_DONE_PAYLOAD}\n\n`;
+ 
+ export const SSE_HEADERS = {
+   "Content-Type": "text/event-stream",
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index b188bd8b..a608c70e 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -11,7 +11,7 @@ import { restoreToolNames } from "./opencodeFingerprint.js";
+ import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
+ import { dbg, isDebugEnabled } from "./debugLog.js";
+ 
+-import { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER } from "./sseConstants.js";
++import { SSE_DONE, SSE_DONE_PAYLOAD, SSE_HEADERS, SSE_HEADERS_NO_BUFFER } from "./sseConstants.js";
+ 
+ export { COLORS, formatSSE };
+ export { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER };
+@@ -205,6 +205,7 @@ export function createSSEStream(options = {}) {
+     if (line.trim() || !nativeGeminiData.length) return;
+     const payload = nativeGeminiData.join("\n");
+     nativeGeminiData = [];
++    if (payload.trim() === SSE_DONE_PAYLOAD) return;
+     let parsed;
+     try { parsed = JSON.parse(payload); }
+     catch {
+diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
+index 051b599a..17f2e92f 100644
+--- a/tests/unit/gemini-native-stream.test.js
++++ b/tests/unit/gemini-native-stream.test.js
+@@ -58,6 +58,25 @@ describe("native Gemini SSE preserves provider payload and follows the client pr
+     expect(completed.mock.calls[0][1].cached_tokens).toBe(2048);
+   });
+ 
++  it("accepts upstream DONE after a complete Antigravity-native response", async () => {
++    const original = frame({ response: chunk }) + frame({ response: lateUsage }) + "data: [DONE]\r\n\r\n";
++    const output = await readText(inputStream(Array.from(encode(original), byte => Uint8Array.of(byte)))
++      .pipeThrough(nativeTransform("antigravity", FORMATS.ANTIGRAVITY)));
++    expect(output).toBe(original);
++    expect(output).not.toContain('"code":502');
++  });
++
++  it("does not let upstream DONE complete an unfinished native candidate", async () => {
++    const original = frame({ response: { candidates: [{ index: 0,
++      content: { role: "model", parts: [{ text: "unfinished" }] },
++    }] } }) + "data: [DONE]\r\n\r\n";
++    const output = await readText(inputStream([encode(original)])
++      .pipeThrough(nativeTransform("antigravity", FORMATS.ANTIGRAVITY)));
++    expect(output.startsWith(original)).toBe(true);
++    expect(output.slice(original.length)).toContain('"code":502');
++    expect(output.slice(original.length)).toContain("before a candidate finished");
++  });
++
+   it("preserves unknown fields, SSE comments and multiline JSON exactly", async () => {
+     const partial = frame({ candidates: [{ index: 0, content: { parts: [{ text: "prefix" }] } }] });
+     const original = partial + ': heartbeat\n\ndata: {"candidates":[\ndata: {"index":0,"finishReason":"STOP","futureField":true}]}\n\n';
