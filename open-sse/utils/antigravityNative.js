@@ -384,9 +384,13 @@ export async function unwrapAntigravityResponse(response, stream, nativeRequest 
     const text = await response.text();
     let body = text;
     try {
-      const nativeResponse = unwrap(JSON.parse(text));
+      const parsed = JSON.parse(text);
+      const nativeResponse = unwrap(parsed);
       const normalized = response.ok && jsonOutput ? normalizeNativeJsonResponse(nativeResponse) : nativeResponse;
-      body = JSON.stringify(response.ok ? applyNativeResponseMasks(normalized, masks) : normalized);
+      // An already-native upstream error is opaque, including its wire bytes.
+      // Only an actual Cloud Code envelope needs serialization after unwrapping.
+      body = !response.ok && nativeResponse === parsed ? text
+        : JSON.stringify(response.ok ? applyNativeResponseMasks(normalized, masks) : normalized);
     } catch { /* Native core reports invalid JSON. */ }
     return new Response(body, {
       status: response.status, statusText: response.statusText,
