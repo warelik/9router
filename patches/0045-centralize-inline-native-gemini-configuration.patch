@@ -1,0 +1,389 @@
+From 94be77a35c4999cae7fc267e9f4a7d85b82e44ee Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] Centralize inline native Gemini configuration
+
+---
+ open-sse/config/runtimeConfig.js              | 23 +++++++++++
+ open-sse/executors/codex.js                   |  4 +-
+ open-sse/executors/default.js                 |  4 +-
+ open-sse/handlers/chatCore.js                 |  6 +--
+ .../handlers/chatCore/nonStreamingHandler.js  |  4 +-
+ .../handlers/chatCore/streamingHandler.js     |  6 +--
+ open-sse/translator/formats/gemini.js         |  4 +-
+ open-sse/utils/antigravityNative.js           | 15 +++++--
+ open-sse/utils/stream.js                      | 10 ++---
+ open-sse/utils/streamHelpers.js               |  4 +-
+ tests/unit/chat-to-gemini-contract.test.js    | 41 +++++++++++++++++++
+ 11 files changed, 96 insertions(+), 25 deletions(-)
+
+diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
+index 489863a6d6202f235369c237892ca81225790823..8cd69a2e92d5cfb8295621a6c3c7be026537596c 100644
+--- a/open-sse/config/runtimeConfig.js
++++ b/open-sse/config/runtimeConfig.js
+@@ -1,3 +1,5 @@
++import { FORMATS } from "../translator/formats.js";
++
+ // HTTP status codes
+ export const HTTP_STATUS = {
+   BAD_REQUEST: 400,
+@@ -8,6 +10,7 @@ export const HTTP_STATUS = {
+   NOT_ACCEPTABLE: 406,
+   REQUEST_TIMEOUT: 408,
+   RATE_LIMITED: 429,
++  CLIENT_CLOSED_REQUEST: 499,
+   SERVER_ERROR: 500,
+   BAD_GATEWAY: 502,
+   SERVICE_UNAVAILABLE: 503,
+@@ -133,3 +136,23 @@ export const NATIVE_GEMINI_THINKING_KEYS = ["thinkingLevel", "thinking_level", "
+ 
+ export const NATIVE_GEMINI_RESPONSE_FIELDS = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
+ export const NATIVE_GEMINI_BRIDGE_FIELDS = new Set(["message", "event", "data", "status", "code", "success", "response"]);
++
++export const NATIVE_GEMINI_ERROR_STATUSES = {
++  400: "INVALID_ARGUMENT",
++  401: "UNAUTHENTICATED",
++  403: "PERMISSION_DENIED",
++  404: "NOT_FOUND",
++  429: "RESOURCE_EXHAUSTED",
++  503: "UNAVAILABLE",
++  504: "DEADLINE_EXCEEDED",
++};
++
++export const NATIVE_GEMINI_API_VERSIONS = ["v1", "v1alpha"];
++export const NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES = ["fields", "$fields"];
++export const NATIVE_GEMINI_JSON_FENCE_PENDING_STATES = ["start", "possible", "open"];
++export const NATIVE_GEMINI_FINISH_REASON_FIELDS = ["finishReason", "finish_reason"];
++export const NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES = ["*", "candidates", "candidates/*"];
++export const NATIVE_GEMINI_FORMATS = [FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY];
++export const REWRITTEN_RESPONSE_HEADERS = ["content-encoding", "content-length", "transfer-encoding"];
++export const AISTUDIO_NATIVE_GEMINI_API_VERSION = "v1beta";
++export const GEMINI_DEFAULT_FILE_MIME_TYPE = "application/octet-stream";
+diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
+index 56aae02c5d825f6fe647379edf0023eeb5f362e5..da0824495ac7e602afbce2b922dd592e37679eee 100644
+--- a/open-sse/executors/codex.js
++++ b/open-sse/executors/codex.js
+@@ -9,7 +9,7 @@ import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
+ import { fetchImageAsBase64 } from "../translator/concerns/image.js";
+ import { getModelUpstreamId, getProviderModels } from "../config/providerModels.js";
+ import { getThinkingLevels } from "../providers/thinkingLevels.js";
+-import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry } from "../config/runtimeConfig.js";
++import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry, SSE_DONE_PAYLOAD } from "../config/runtimeConfig.js";
+ import { dbg } from "../utils/debugLog.js";
+ import { resolveSessionId } from "../utils/sessionManager.js";
+ import { stripCodexUnsupportedPatterns } from "../utils/codexToolSchema.js";
+@@ -370,7 +370,7 @@ export class CodexExecutor extends BaseExecutor {
+           lineScanOffset = nl + 1;
+           if (!line.startsWith("data:")) continue;
+           const data = line.slice(5).trim();
+-          if (!data || data === "[DONE]") continue;
++          if (!data || data === SSE_DONE_PAYLOAD) continue;
+           try {
+             const event = JSON.parse(data);
+             if (event?.type === "error" || event?.type === "response.failed") {
+diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
+index 93f8a233ad7f84a901c8a5ba0f22608476b23704..3c8cbaaf77989d41f6147e45e665d7a7b38ee61e 100644
+--- a/open-sse/executors/default.js
++++ b/open-sse/executors/default.js
+@@ -4,7 +4,7 @@ import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
+ import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE, selectAnthropicBeta, mergeAnthropicBeta } from "../providers/shared.js";
+ import { resolveOpenAICompatibleApiType } from "../services/provider.js";
+ import { OAUTH_ENDPOINTS, buildKimiHeaders, NOUS_ATTRIBUTION } from "../config/appConstants.js";
+-import { NATIVE_GEMINI_PRIVATE_HEADERS } from "../config/runtimeConfig.js";
++import { NATIVE_GEMINI_PRIVATE_HEADERS, NATIVE_GEMINI_API_VERSIONS } from "../config/runtimeConfig.js";
+ import { buildClineHeaders } from "../shared/clineAuth.js";
+ import { proxyAwareFetch } from "../utils/proxyFetch.js";
+ import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
+@@ -188,7 +188,7 @@ export class DefaultExecutor extends BaseExecutor {
+       // The caller has resolved the provider wire version. Format it without
+       // overriding that routing decision for any Gemini-format provider.
+       const nativeVersion = credentials?.nativeGeminiPassthrough
+-        && ["v1", "v1alpha"].includes(credentials.nativeGeminiRequest?.apiVersion)
++        && NATIVE_GEMINI_API_VERSIONS.includes(credentials.nativeGeminiRequest?.apiVersion)
+         ? credentials.nativeGeminiRequest.apiVersion : null;
+       const baseUrl = nativeVersion
+         ? this.config.baseUrl.replace("/v1beta/", `/${nativeVersion}/`) : this.config.baseUrl;
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index 42d151df5cc9538c32cd7407d9cd02f82c2e1a75..3706ea5d979bd9049c1fd067d851cf836b785eb8 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -12,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
+ import { PROVIDERS } from "../config/providers.js";
+ import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
+ import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
+-import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET } from "../config/runtimeConfig.js";
++import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET, REWRITTEN_RESPONSE_HEADERS, AISTUDIO_NATIVE_GEMINI_API_VERSION } from "../config/runtimeConfig.js";
+ import { handleBypassRequest } from "../utils/bypassHandler.js";
+ import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+ import { getExecutor } from "../executors/index.js";
+@@ -217,7 +217,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+       headers: clientRawRequest?.headers || {},
+       // Client and provider versions are separate routing decisions. The
+       // browser-authenticated AIStudio generation API uses its beta wire.
+-      apiVersion: provider === "aistudio" ? "v1beta" : clientRawRequest?.apiVersion,
++      apiVersion: provider === "aistudio" ? AISTUDIO_NATIVE_GEMINI_API_VERSION : clientRawRequest?.apiVersion,
+     };
+   }
+ 
+@@ -554,7 +554,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+       const headers = new Headers(providerResponse.headers);
+       // fetch exposes decoded bytes; forwarding compressed-length headers makes
+       // native clients decompress them twice or wait for bytes that cannot arrive.
+-      for (const name of ["content-encoding", "content-length", "transfer-encoding"]) headers.delete(name);
++      for (const name of REWRITTEN_RESPONSE_HEADERS) headers.delete(name);
+       headers.set("Access-Control-Allow-Origin", "*");
+       nativeErrorResponse = new Response(providerResponse.clone().body, {
+         status: providerResponse.status, statusText: providerResponse.statusText, headers,
+diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
+index e21d797f1a664169d7ef6865dc0e633acf9145c5..f46bddd6cbebf920087efa3a4292d9eb185268f4 100644
+--- a/open-sse/handlers/chatCore/nonStreamingHandler.js
++++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
+@@ -7,7 +7,7 @@ import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTrackin
+ import { createErrorResult } from "../../utils/error.js";
+ import { upstreamResponseHeaders } from "../../utils/upstreamHeaders.js";
+ import { isValidNativeGeminiResponse } from "../../utils/streamHelpers.js";
+-import { HTTP_STATUS } from "../../config/runtimeConfig.js";
++import { HTTP_STATUS, REWRITTEN_RESPONSE_HEADERS } from "../../config/runtimeConfig.js";
+ import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
+ import { unwrapClineEnvelope } from "../../shared/clineEnvelope.js";
+ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, saveUsageStats, formatDoneLine } from "./requestDetail.js";
+@@ -30,7 +30,7 @@ function parseToolArguments(value) {
+ 
+ function nativeGeminiErrorResult(providerResponse, status, message, responseBody = null) {
+   const headers = new Headers(providerResponse.headers);
+-  for (const name of ["content-encoding", "content-length", "transfer-encoding"]) headers.delete(name);
++  for (const name of REWRITTEN_RESPONSE_HEADERS) headers.delete(name);
+   headers.set("Content-Type", "application/json");
+   headers.set("Access-Control-Allow-Origin", "*");
+   const result = createErrorResult(status, message);
+diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
+index 39cff3e02eea1292bc7889bfab9c545e69a97dba..f9ee8f3d0e954b8b95ea5ccd745bec0e81e68cf5 100644
+--- a/open-sse/handlers/chatCore/streamingHandler.js
++++ b/open-sse/handlers/chatCore/streamingHandler.js
+@@ -3,7 +3,7 @@ import { needsTranslation } from "../../translator/index.js";
+ import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } from "../../utils/stream.js";
+ import { pipeWithDisconnect } from "../../utils/streamHandler.js";
+ import { PROVIDERS } from "../../config/providers.js";
+-import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
++import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS, NATIVE_GEMINI_ERROR_STATUSES } from "../../config/runtimeConfig.js";
+ import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
+ import { buildStreamErrorBytes } from "../../utils/streamHelpers.js";
+ import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
+@@ -77,7 +77,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+         message: `[${status}]: ${shortMsg}`,
+         ...(sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI ? {
+           code: status,
+-          status: ({ 400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED", 404: "NOT_FOUND", 429: "RESOURCE_EXHAUSTED", 503: "UNAVAILABLE", 504: "DEADLINE_EXCEEDED" })[status] || "INTERNAL",
++          status: NATIVE_GEMINI_ERROR_STATUSES[status] || "INTERNAL",
+         } : {}),
+       } }), {
+         status,
+@@ -136,7 +136,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
+   const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, nativeGeminiJson,
+     typeof transformStream.finalizeNativeResponse === "function" ? (error, clientCancelled) => transformStream.finalizeNativeResponse({
+-      status: clientCancelled ? 499 : HTTP_STATUS.GATEWAY_TIMEOUT,
++      status: clientCancelled ? HTTP_STATUS.CLIENT_CLOSED_REQUEST : HTTP_STATUS.GATEWAY_TIMEOUT,
+       error: error.message,
+       clientCancelled,
+     }) : null);
+diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
+index 48f2c612e9065d91b52065b2c2bd35171eb8b56e..7721a4ca9e22e08be51eb37af3bc26da6482bd0c 100644
+--- a/open-sse/translator/formats/gemini.js
++++ b/open-sse/translator/formats/gemini.js
+@@ -3,7 +3,7 @@
+ import { safeParseJSON } from "../concerns/json.js";
+ import { OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
+ import { isGemini4Model } from "../../providers/capabilities.js";
+-import { FILE_EXTENSION_MIME, SCHEMA_MAP_KEYS, SCHEMA_ARRAY_KEYS, SCHEMA_SINGLE_KEYS,
++import { FILE_EXTENSION_MIME, GEMINI_DEFAULT_FILE_MIME_TYPE, SCHEMA_MAP_KEYS, SCHEMA_ARRAY_KEYS, SCHEMA_SINGLE_KEYS,
+   PROTO_SCHEMA_TYPES, LEGACY_PROTO_SCHEMA_KEYS } from "../../config/runtimeConfig.js";
+ 
+ // Unsupported JSON Schema constraints that should be removed for Antigravity
+@@ -78,7 +78,7 @@ function appendFilePart(parts, file) {
+   } else if (typeof data === "string" && /^https?:\/\//.test(data)) {
+     parts.push({ fileData: { fileUri: data, ...(mime ? { mimeType: mime } : {}) } });
+   } else if (typeof data === "string" && data) {
+-    parts.push({ inlineData: { mime_type: mime || "application/octet-stream", data } });
++    parts.push({ inlineData: { mime_type: mime || GEMINI_DEFAULT_FILE_MIME_TYPE, data } });
+   } else if (typeof file.file_url === "string" && /^https?:\/\//.test(file.file_url)) {
+     parts.push({ fileData: { fileUri: file.file_url, ...(mime ? { mimeType: mime } : {}) } });
+   }
+diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
+index b987c3d8996b4e4201580aa47b30e4c9dcdfc710..5444168fe3fb6529b3aac5d11970733b176eda45 100644
+--- a/open-sse/utils/antigravityNative.js
++++ b/open-sse/utils/antigravityNative.js
+@@ -1,3 +1,10 @@
++import {
++  NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES,
++  NATIVE_GEMINI_JSON_FENCE_PENDING_STATES,
++  REWRITTEN_RESPONSE_HEADERS,
++  SSE_DONE_PAYLOAD,
++} from "../config/runtimeConfig.js";
++
+ // Adapt Cloud Code's response envelope, keeping the Gemini payload available
+ // to the existing native response validation, usage observer and client.
+ function unwrap(value) {
+@@ -14,7 +21,7 @@ function unwrap(value) {
+ 
+ function responseHeaders(response, contentType) {
+   const headers = new Headers(response.headers);
+-  for (const name of ["content-length", "content-encoding", "transfer-encoding"]) headers.delete(name);
++  for (const name of REWRITTEN_RESPONSE_HEADERS) headers.delete(name);
+   headers.set("Content-Type", contentType);
+   return headers;
+ }
+@@ -127,7 +134,7 @@ function parseFieldMask(rawMask, source) {
+ function nativeResponseMasks(nativeRequest = {}) {
+   const query = new URLSearchParams(nativeRequest.query || []);
+   const masks = [];
+-  for (const name of ["fields", "$fields"]) {
++  for (const name of NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES) {
+     for (const value of query.getAll(name)) {
+       const parsed = parseFieldMask(value, name);
+       if (parsed) masks.push(parsed);
+@@ -308,7 +315,7 @@ function updateNativeJsonStreamStates(value, states) {
+       states.set(candidateIndex, state);
+     }
+ 
+-    if (["start", "possible", "open"].includes(state.status)) {
++    if (NATIVE_GEMINI_JSON_FENCE_PENDING_STATES.includes(state.status)) {
+       const parts = candidate.content?.parts;
+       if (Array.isArray(parts)) {
+         for (const part of parts) {
+@@ -442,7 +449,7 @@ export async function unwrapAntigravityResponse(response, stream, nativeRequest
+     const value = data.join("\n");
+     data = [];
+     // Gemini terminates at EOF. Its finishReason is preserved independently.
+-    if (value.trim() === "[DONE]") {
++    if (value.trim() === SSE_DONE_PAYLOAD) {
+       flushPendingNativeResponses(controller);
+       return;
+     }
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index 1b286b74dacaaf58fe6fa397251b540e94954aa1..9bcab8c8d8b55c614ac4215e0811ca37b95162b0 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -6,7 +6,7 @@ import {
+   parseSSELine, hasValuableContent, fixInvalidId, formatSSE, buildStreamErrorBytes,
+   isValidNativeGeminiResponse,
+ } from "./streamHelpers.js";
+-import { HTTP_STATUS } from "../config/runtimeConfig.js";
++import { HTTP_STATUS, NATIVE_GEMINI_FINISH_REASON_FIELDS, NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES, NATIVE_GEMINI_FORMATS } from "../config/runtimeConfig.js";
+ import { restoreToolNames } from "./opencodeFingerprint.js";
+ import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
+ import { dbg, isDebugEnabled } from "./debugLog.js";
+@@ -59,8 +59,8 @@ function nativeCandidateFieldIsVisible(projection, field) {
+     }
+     if (prefixes.length) return false;
+     if (token) paths.push(path());
+-    const aliases = field === "finishReason" ? ["finishReason", "finish_reason"] : [field];
+-    return paths.some(selected => ["*", "candidates", "candidates/*", ...aliases.map(name => `candidates/${name}`)].includes(selected));
++    const aliases = field === "finishReason" ? NATIVE_GEMINI_FINISH_REASON_FIELDS : [field];
++    return paths.some(selected => [...NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES, ...aliases.map(name => `candidates/${name}`)].includes(selected));
+   });
+ }
+ 
+@@ -105,7 +105,7 @@ export function createSSEStream(options = {}) {
+   // provider serves it. Native Gemini SSE ends at EOF and carries arbitrary
+   // Parts/metadata that must not pass through Chat normalization.
+   const nativeGeminiPassthrough = mode === STREAM_MODE.PASSTHROUGH &&
+-    [FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY].includes(sourceFormat);
++    NATIVE_GEMINI_FORMATS.includes(sourceFormat);
+   const observeNativeGeminiTransform = mode === STREAM_MODE.TRANSLATE
+     && sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
+     && typeof onNativeResponseSuccess === "function";
+@@ -817,7 +817,7 @@ export function createSSEStream(options = {}) {
+         // upstream's own [DONE] is consumed above and Gemini/Claude streams have none. Nothing
+         // else in this mode emits it, so one is written here.
+         if (sourceFormat === FORMATS.OPENAI && sseEmittedCount > 0) {
+-          const doneOutput = "data: [DONE]\n\n";
++          const doneOutput = SSE_DONE;
+           reqLogger?.appendConvertedChunk?.(doneOutput);
+           controller.enqueue(sharedEncoder.encode(doneOutput));
+           streamDoneSent = true;
+diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
+index 1bcfb93fbcee576c56314ea1f6227c56df07deeb..4284d2853f67e64547f7e7bdbd508ec0c09f6635 100644
+--- a/open-sse/utils/streamHelpers.js
++++ b/open-sse/utils/streamHelpers.js
+@@ -1,7 +1,7 @@
+ import { FORMATS } from "../translator/formats.js";
+ import { buildErrorBody } from "./error.js";
+ import { SSE_DONE } from "./sseConstants.js";
+-import { NATIVE_GEMINI_RESPONSE_FIELDS, NATIVE_GEMINI_BRIDGE_FIELDS } from "../config/runtimeConfig.js";
++import { NATIVE_GEMINI_RESPONSE_FIELDS, NATIVE_GEMINI_BRIDGE_FIELDS, NATIVE_GEMINI_FORMATS } from "../config/runtimeConfig.js";
+ 
+ const sharedEncoder = new TextEncoder();
+ 
+@@ -181,7 +181,7 @@ export function formatSSE(data, sourceFormat) {
+ export function buildStreamErrorBytes(statusCode, message, clientFormat) {
+   const { error } = buildErrorBody(statusCode, message);
+ 
+-  if ([FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY].includes(clientFormat)) {
++  if (NATIVE_GEMINI_FORMATS.includes(clientFormat)) {
+     // Gemini clients decode every data payload as JSON and terminate at EOF.
+     // Keep the numeric failure code instead of an OpenAI symbolic error code.
+     return sharedEncoder.encode(formatSSE({ error: { code: statusCode, message: error.message } }, clientFormat));
+diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
+index 0b92ab8977ac6dcada99c3e1c937dcd421876ec7..2d27dac81e3109a85923d18f7d356216d9116723 100644
+--- a/tests/unit/chat-to-gemini-contract.test.js
++++ b/tests/unit/chat-to-gemini-contract.test.js
+@@ -48,6 +48,19 @@ import {
+ } from "../../open-sse/config/defaultThinkingSignature.js";
+ import { SSE_DONE_PAYLOAD, SSE_DONE } from "../../open-sse/utils/sseConstants.js";
+ import { FERNET_ENCRYPTED_CONTENT_PREFIX } from "../../open-sse/translator/formats/responsesApi.js";
++import {
++  HTTP_STATUS,
++  NATIVE_GEMINI_ERROR_STATUSES,
++  NATIVE_GEMINI_API_VERSIONS,
++  NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES,
++  NATIVE_GEMINI_JSON_FENCE_PENDING_STATES,
++  NATIVE_GEMINI_FINISH_REASON_FIELDS,
++  NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES,
++  NATIVE_GEMINI_FORMATS,
++  REWRITTEN_RESPONSE_HEADERS,
++  AISTUDIO_NATIVE_GEMINI_API_VERSION,
++  GEMINI_DEFAULT_FILE_MIME_TYPE,
++} from "../../open-sse/config/runtimeConfig.js";
+ 
+ const MODEL = "gemini-3.5-flash-lite";
+ const user = (content) => ({ role: "user", content });
+@@ -646,6 +659,34 @@ describe("shared wire constants", () => {
+     expect(SSE_DONE).toBe("data: [DONE]\n\n");
+     expect(FERNET_ENCRYPTED_CONTENT_PREFIX).toBe("gAAAAA");
+   });
++
++  it("native Gemini config keeps exact lookup values, array types and order", () => {
++    expect(Object.getPrototypeOf(NATIVE_GEMINI_ERROR_STATUSES)).toBe(Object.prototype);
++    expect(NATIVE_GEMINI_ERROR_STATUSES).toStrictEqual({
++      400: "INVALID_ARGUMENT",
++      401: "UNAUTHENTICATED",
++      403: "PERMISSION_DENIED",
++      404: "NOT_FOUND",
++      429: "RESOURCE_EXHAUSTED",
++      503: "UNAVAILABLE",
++      504: "DEADLINE_EXCEEDED",
++    });
++    for (const [actual, expected] of [
++      [NATIVE_GEMINI_API_VERSIONS, ["v1", "v1alpha"]],
++      [NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES, ["fields", "$fields"]],
++      [NATIVE_GEMINI_JSON_FENCE_PENDING_STATES, ["start", "possible", "open"]],
++      [NATIVE_GEMINI_FINISH_REASON_FIELDS, ["finishReason", "finish_reason"]],
++      [NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES, ["*", "candidates", "candidates/*"]],
++      [NATIVE_GEMINI_FORMATS, [FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY]],
++      [REWRITTEN_RESPONSE_HEADERS, ["content-encoding", "content-length", "transfer-encoding"]],
++    ]) {
++      expect(Array.isArray(actual)).toBe(true);
++      expect(actual).toStrictEqual(expected);
++    }
++    expect(AISTUDIO_NATIVE_GEMINI_API_VERSION).toBe("v1beta");
++    expect(GEMINI_DEFAULT_FILE_MIME_TYPE).toBe("application/octet-stream");
++    expect(HTTP_STATUS.CLIENT_CLOSED_REQUEST).toBe(499);
++  });
+ });
+ 
+ describe("Antigravity executor contract on translated Gemini bodies", () => {
+-- 
+2.43.0
+
