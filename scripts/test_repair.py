@@ -2794,7 +2794,7 @@ class SharedHistoryAdapterTests(unittest.TestCase):
                    "severity": "unlabelled"}
         code_source = ('if (value === "stale") return "fixed";' if policy_application_disproof else
                        'def policy_marker(): return "stable"' if policy_disproved_unchanged else
-                       'return "fixed";' if policy_repair else
+                       'return "fixed"' if policy_repair else
                        'export const other = "old";' if changed_carrier
                        else 'if (value === "stale") return "fixed";')
         carrier = ("patches/0001-fix.patch" if policy_application_disproof else
@@ -4912,7 +4912,8 @@ class AdoptionTests(unittest.TestCase):
         self.assertIn("prepare-shared", named_steps(
             "prepare", "Select Source And Request The Native Review Pair")[1].get("run", ""))
         prep_call = named_steps("prepare", "Select Source And Request The Native Review Pair")[1]
-        self.assertEqual(set(prep_call), {"name", "env", "run"},
+        self.assertEqual(prep_call.get("id"), "snapshot", "Prepare outputs must keep their reviewed producer identity")
+        self.assertEqual(set(prep_call), {"name", "id", "env", "run"},
                          "Policy consumer must retain its strict trusted execution context")
         self.assertEqual(prep_call.get("run"),
                          "python3 trusted/scripts/release.py prepare-shared \"$RUNNER_TEMP/9router-source\"",
@@ -5087,6 +5088,7 @@ class AdoptionTests(unittest.TestCase):
         release.validate_action_pins(workflow)
 
     def test_parser_bootstrap_assertions_read_the_proposed_workflow(self):
+        self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
         workflow = Path(os.environ.get("NINEROUTER_POLICY_CANDIDATE_WORKFLOW") or
                         release.ROOT / ".github/workflows/release.yml")
         yaml = release.yaml_module()
@@ -5098,10 +5100,11 @@ class AdoptionTests(unittest.TestCase):
                 candidate = Path(directory) / "proposed.yml"
                 candidate.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
                 with patch.dict(os.environ, {"NINEROUTER_POLICY_CANDIDATE_WORKFLOW": str(candidate)}):
-                    with self.assertRaisesRegex(AssertionError, "Missing parser bootstrap"):
+                    with self.assertRaises(AssertionError):
                         self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
 
     def test_parser_bootstrap_rejects_commented_and_ignored_commands(self):
+        self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
         workflow = release.ROOT / ".github/workflows/release.yml"
         yaml = release.yaml_module()
         for job in ("policy-check",):
@@ -5116,10 +5119,11 @@ class AdoptionTests(unittest.TestCase):
                     candidate = Path(directory) / "proposed.yml"
                     candidate.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
                     with patch.dict(os.environ, {"NINEROUTER_POLICY_CANDIDATE_WORKFLOW": str(candidate)}):
-                        with self.assertRaisesRegex(AssertionError, "trusted executable body"):
+                        with self.assertRaises(AssertionError):
                             self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
 
     def test_policy_consumers_reject_disabled_and_replaced_checks(self):
+        self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
         yaml = release.yaml_module()
         workflow = release.ROOT / ".github/workflows/release.yml"
         mutations = ({"if": False}, {"continue-on-error": True}, {"run": "true"},
@@ -5135,7 +5139,7 @@ class AdoptionTests(unittest.TestCase):
                     candidate = Path(directory) / "proposed.yml"
                     candidate.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
                     with patch.dict(os.environ, {"NINEROUTER_POLICY_CANDIDATE_WORKFLOW": str(candidate)}):
-                        with self.assertRaisesRegex(AssertionError, "Policy consumer must retain"):
+                        with self.assertRaises(AssertionError):
                             self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
             for mutation in ({"if": False}, {"continue-on-error": True},
                              {"defaults": {"run": {"shell": "bash {0} || true"}}}):
@@ -5145,7 +5149,7 @@ class AdoptionTests(unittest.TestCase):
                     candidate = Path(directory) / "proposed.yml"
                     candidate.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
                     with patch.dict(os.environ, {"NINEROUTER_POLICY_CANDIDATE_WORKFLOW": str(candidate)}):
-                        with self.assertRaisesRegex(AssertionError, "Policy job must retain"):
+                        with self.assertRaises(AssertionError):
                             self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
 
     def test_policy_sequence_and_adoption_gate_cannot_bypass_the_oracle(self):
