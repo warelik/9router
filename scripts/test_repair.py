@@ -5812,3 +5812,15 @@ class NativeUpstreamAncestryTests(unittest.TestCase):
             self.assertTrue(release._native_upstream_ancestor(UPSTREAM, HEAD))
         native.assert_called_once_with(
             f"repos/{release.UPSTREAM}/compare/{UPSTREAM}...{HEAD}")
+
+
+class FinalReservationPermissionTests(unittest.TestCase):
+    def test_each_native_reservation_job_can_comment_on_its_review_pr(self):
+        import re
+        root = Path(release.__file__).resolve().parents[1]
+        text = (root / '.github/workflows/release.yml').read_text()
+        for job in ['finalize']:
+            block = re.search(r"(?ms)^  " + re.escape(job) + r":\s*\n.*?(?=^  [A-Za-z0-9_-]+:\s*$|\Z)", text)
+            self.assertIsNotNone(block)
+            self.assertRegex(block[0], r"(?m)^      pull-requests: write$")
+            self.assertNotRegex(block[0], r"(?m)^      contents: write$")

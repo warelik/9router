@@ -227,7 +227,7 @@ jobs:
     permissions:
       contents: read
       issues: write
-      pull-requests: read
+      pull-requests: write
       actions: read
     outputs:
       ready: ${{ steps.final.outputs.final_ready }}
