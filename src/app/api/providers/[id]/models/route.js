@@ -9,6 +9,7 @@ import { resolveKiroModels } from "open-sse/services/kiroModels.js";
 import { resolveKimchiModels } from "open-sse/services/kimchiModels.js";
 import { resolveQoderModels } from "open-sse/services/qoderModels.js";
 import { resolveGrokCliModels } from "open-sse/services/grokCliModels.js";
+import { resolveAIStudioModels } from "open-sse/services/aistudioModels.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { resolveCursorModels } from "open-sse/services/cursorModels.js";
 import { resolveZedModels } from "open-sse/shared/zedAuth.js";
@@ -179,6 +180,11 @@ function buildQoderModelsResolver(providerId) {
 
 // Provider models endpoints configuration
 const PROVIDER_MODELS_CONFIG = {
+  aistudio: {
+    customResolver: async (connection) => resolveAIStudioModels(connection, {
+      proxyOptions: await resolveConnectionProxyConfig(connection.providerSpecificData || {}),
+    }),
+  },
   "muse": {
     url: "https://api.meta.ai/v1/models",
     method: "GET",

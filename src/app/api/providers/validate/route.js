@@ -382,6 +382,7 @@ export async function POST(request) {
           break;
         }
 
+        case "aistudio":
         case "deepseek":
         case "groq":
         case "xai":
