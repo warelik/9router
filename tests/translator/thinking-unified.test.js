@@ -5,7 +5,9 @@ import {
   parseSuffix,
   extractThinking,
   applyThinking,
+  applyNativeGeminiThinking,
 } from "../../open-sse/translator/concerns/thinkingUnified.js";
+import { DEFAULT_PROVIDER_THINKING_BUDGET } from "../../open-sse/config/runtimeConfig.js";
 import { extractReasoningText } from "../../open-sse/translator/concerns/reasoning.js";
 
 const apply = (targetFormat, model, body, provider) => {
@@ -352,5 +354,20 @@ describe("transport-declared thinkingFormat (Responses endpoints)", () => {
   it("a provider without the declaration keeps its existing Responses behaviour (control)", () => {
     const out = apply("openai-responses", "oc/space-bunny-free", chatBody("high"), "oc");
     expect(out.reasoning_effort).toBe("high");
+  });
+});
+
+describe("applyNativeGeminiThinking provider default", () => {
+  it("provider mode on fills the shared default budget and keeps includeThoughts", () => {
+    const body = { generationConfig: { thinkingConfig: { includeThoughts: false } } };
+    const out = applyNativeGeminiThinking("gemini-2.5-flash", body, "gemini", { mode: "on" });
+    expect(out.generationConfig.thinkingConfig.thinkingBudget).toBe(DEFAULT_PROVIDER_THINKING_BUDGET);
+    expect(out.generationConfig.thinkingConfig.includeThoughts).toBe(false);
+  });
+
+  it("keeps an explicit client zero thinking budget", () => {
+    const body = { generationConfig: { thinkingConfig: { thinkingBudget: 0 } } };
+    const out = applyNativeGeminiThinking("gemini-2.5-flash", body, "gemini", { mode: "on" });
+    expect(out.generationConfig.thinkingConfig.thinkingBudget).toBe(0);
   });
 });

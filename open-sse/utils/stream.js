@@ -101,6 +101,7 @@ export function createSSEStream(options = {}) {
   } = options;
 
   let buffer = "";
+  let pendingTrailingCr = false;
   let usage = null;
   // The client's wire protocol determines termination, regardless of which
   // provider serves it. Native Gemini SSE ends at EOF and carries arbitrary
@@ -319,7 +320,18 @@ export function createSSEStream(options = {}) {
         nativeGeminiJson += text;
         return;
       }
-      buffer += text;
+      let parserText = text;
+      if ((nativeGeminiPassthrough || observeNativeGeminiTransform) && !nativeJson
+          && parserText.length > 0) {
+        // Native Gemini events may also end with a bare CR; normalize only the
+        // parser text so forwarded bytes and decoded payloads stay untouched.
+        if (pendingTrailingCr && parserText.startsWith("\n")) {
+          parserText = parserText.slice(1);
+        }
+        pendingTrailingCr = text.endsWith("\r");
+        parserText = parserText.replace(/\r\n|\r/g, "\n");
+      }
+      buffer += parserText;
 
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
@@ -690,7 +702,14 @@ export function createSSEStream(options = {}) {
           await finalizeStream();
           return;
         }
-        if (remaining) buffer += remaining;
+        if (remaining) {
+          let tail = remaining;
+          if ((nativeGeminiPassthrough || observeNativeGeminiTransform) && !nativeJson) {
+            if (pendingTrailingCr && tail.startsWith("\n")) tail = tail.slice(1);
+            tail = tail.replace(/\r\n|\r/g, "\n");
+          }
+          buffer += tail;
+        }
 
         if (observeNativeGeminiTransform) {
           if (buffer.trim()) captureNativeGeminiLine(buffer);

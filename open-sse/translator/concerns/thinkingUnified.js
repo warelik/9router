@@ -6,6 +6,7 @@ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 import { getThinkingLevels } from "../../providers/thinkingLevels.js";
 import { PROVIDERS } from "../../providers/index.js";
 import { LEVEL_TO_BUDGET, budgetToLevel, effortToBudget, effortToThinkingLevel } from "./thinking.js";
+import { DEFAULT_PROVIDER_THINKING_BUDGET } from "../../config/runtimeConfig.js";
 
 // Map a target wire-format to its native thinking format (when capability has none).
 const FORMAT_TO_NATIVE = {
@@ -484,7 +485,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
   if (!override && explicit) return body;
   const mode = providerThinking?.mode;
   const intent = override || (!mode || mode === "auto" ? null
-    : mode === "on" ? { mode: "budget", budget: 10000 }
+    : mode === "on" ? { mode: "budget", budget: DEFAULT_PROVIDER_THINKING_BUDGET }
     : mode === "off" || mode === "none" ? { mode: "none" }
     : { mode: "level", level: mode });
   if (!intent) return body;
