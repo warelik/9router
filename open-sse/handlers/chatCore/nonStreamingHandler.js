@@ -197,6 +197,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
         reasoning: reasoningContent,
         content: textContent,
         scope: turnScope,
+        sessionId: serverPartsSessionId,
       }, turnSignature, response.modelVersion);
     }
     if (serverParts.length) {
