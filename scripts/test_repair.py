@@ -2618,7 +2618,7 @@ class SharedHistoryAdapterTests(unittest.TestCase):
     def test_history_inventory_includes_repair_prs_but_excludes_unrelated_branches(self):
         def pull(number, user, head_ref, base_ref, *, head_repo=REPO):
             return {
-                "number": number, "state": "closed", "updated_at": "2026-10-19T12:30:00Z",
+                "number": number, "state": "open", "updated_at": "2026-10-19T12:30:00Z",
                 "user": user,
                 "head": {"repo": {"full_name": head_repo}, "ref": head_ref, "sha": HEAD},
                 "base": {"repo": {"full_name": REPO}, "ref": base_ref, "sha": UPSTREAM},
@@ -2667,7 +2667,10 @@ class SharedHistoryAdapterTests(unittest.TestCase):
               patch.object(release, "pages", return_value=[]),
               self.assertRaisesRegex(ValueError, "inventory changed")):
             release._native_shared_history(
-                REPO, {"schema": 1}, Lifecycle(), "2026-10-19T12:00:00Z")
+                REPO, {"schema": 1, "repository": REPO, "configuration_sha": CONFIG,
+                       "application_sha": HEAD, "upstream_sha": UPSTREAM,
+                       "patchset_sha256": "d" * 64, "recipe_sha256": "e" * 64,
+                       "platform": "linux/amd64"}, Lifecycle(), "2026-10-19T12:00:00Z")
 
     def _disposition_proposal_fixture(self, temporary, *, existing_carrier=False,
                                       changed_carrier=False, policy_repair=False,
