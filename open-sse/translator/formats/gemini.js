@@ -3,7 +3,8 @@
 import { safeParseJSON } from "../concerns/json.js";
 import { OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
 import { isGemini4Model } from "../../providers/capabilities.js";
-import { FILE_EXTENSION_MIME } from "../../config/runtimeConfig.js";
+import { FILE_EXTENSION_MIME, SCHEMA_MAP_KEYS, SCHEMA_ARRAY_KEYS, SCHEMA_SINGLE_KEYS,
+  PROTO_SCHEMA_TYPES, LEGACY_PROTO_SCHEMA_KEYS } from "../../config/runtimeConfig.js";
 
 // Unsupported JSON Schema constraints that should be removed for Antigravity
 export const UNSUPPORTED_SCHEMA_CONSTRAINTS = [
@@ -169,10 +170,6 @@ export function generateProjectId() {
   const noun = nouns[Math.floor(Math.random() * nouns.length)];
   return `${adj}-${noun}-${crypto.randomUUID().slice(0, 5)}`;
 }
-
-const SCHEMA_MAP_KEYS = new Set(["properties", "$defs", "definitions", "patternProperties", "dependentSchemas"]);
-const SCHEMA_ARRAY_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
-const SCHEMA_SINGLE_KEYS = new Set(["items", "additionalProperties", "contains", "not", "if", "then", "else"]);
 
 function eachChildSchema(node, fn) {
   for (const key of Object.keys(node)) {
@@ -521,7 +518,6 @@ export function cleanJSONSchemaForAntigravity(schema) {
   return cleaned;
 }
 
-const PROTO_SCHEMA_TYPES = new Set(["OBJECT", "ARRAY", "STRING", "NUMBER", "INTEGER", "BOOLEAN", "NULL"]);
 export function lowerProtoSchemaTypes(schema) {
   if (!schema || typeof schema !== "object") return schema;
   if (Array.isArray(schema)) {
@@ -535,7 +531,6 @@ export function lowerProtoSchemaTypes(schema) {
   return schema;
 }
 
-const LEGACY_PROTO_SCHEMA_KEYS = new Set(["type", "format", "description", "nullable", "enum", "items", "properties", "required", "propertyOrdering"]);
 export function isLegacyGeminiSchema(schema) {
   if (!schema || typeof schema !== "object" || Array.isArray(schema)) return false;
   for (const key of Object.keys(schema)) {

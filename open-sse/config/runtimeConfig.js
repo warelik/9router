@@ -78,6 +78,13 @@ export const FILE_EXTENSION_MIME = {
   txt: "text/plain", md: "text/markdown", csv: "text/csv",
 };
 
+export const SCHEMA_MAP_KEYS = new Set(["properties", "$defs", "definitions", "patternProperties", "dependentSchemas"]);
+export const SCHEMA_ARRAY_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
+export const SCHEMA_SINGLE_KEYS = new Set(["items", "additionalProperties", "contains", "not", "if", "then", "else"]);
+export const PROTO_SCHEMA_TYPES = new Set(["OBJECT", "ARRAY", "STRING", "NUMBER", "INTEGER", "BOOLEAN", "NULL"]);
+export const LEGACY_PROTO_SCHEMA_KEYS = new Set(["type", "format", "description", "nullable", "enum", "items", "properties", "required", "propertyOrdering"]);
+
+
 export const TOKEN_SAVER_HEADER = "x-9router-token-saver";
 
 export const PORTABLE_COLLABORATION = {
