@@ -243,7 +243,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
         // Hosted web_search has no function declaration. Flag it for Gemini-native
         // targets that can serve googleSearch; cached-only (external_web_access:false)
         // and domain-restricted variants cannot be honored upstream, so they stay dropped.
-        if (tool.type === "web_search") {
+        if (tool.type === RESPONSES_TOOL.WEB_SEARCH) {
           const restricted = Array.isArray(tool.filters?.allowed_domains) && tool.filters.allowed_domains.length > 0;
           if (tool.external_web_access !== false && !restricted) result._webSearch = true;
           return null;
@@ -324,7 +324,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
       }
     }
     if (choiceType === RESPONSES_TOOL.CUSTOM) customToolNames.add(choiceName);
-    result.tool_choice = { type: "function", function: { name: choiceName } };
+    result.tool_choice = { type: OPENAI_BLOCK.FUNCTION, function: { name: choiceName } };
   }
   if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
   if (namespaceToolMap.size > 0) result._toolNameMap = namespaceToolMap;

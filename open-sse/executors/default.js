@@ -9,6 +9,7 @@ import { buildClineHeaders } from "../shared/clineAuth.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
+import { FORMATS } from "../translator/formats.js";
 import { adaptAIStudioStructuredOutput } from "../translator/formats/gemini.js";
 import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
 
@@ -94,11 +95,11 @@ const REFRESH_GRANTS = Object.fromEntries(
 
 function isResponsesWire(provider, config, credentials) {
   const runtimeFormat = credentials?.runtimeTransport?.format;
-  if (runtimeFormat) return runtimeFormat === "openai-responses";
+  if (runtimeFormat) return runtimeFormat === FORMATS.OPENAI_RESPONSES;
   if (provider?.startsWith?.("openai-compatible-")) {
     return resolveOpenAICompatibleApiType(provider, credentials) === "responses";
   }
-  return config?.format === "openai-responses";
+  return config?.format === FORMATS.OPENAI_RESPONSES;
 }
 
 function normalizeResponsesReasoning(body) {

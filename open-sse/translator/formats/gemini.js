@@ -1,7 +1,7 @@
 // Gemini helper functions for translator
 
 import { safeParseJSON } from "../concerns/json.js";
-import { OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
+import { OPENAI_BLOCK, RESPONSES_ITEM, GEMINI_ROLE } from "../schema/index.js";
 import { isGemini4Model } from "../../providers/capabilities.js";
 import { FILE_EXTENSION_MIME, GEMINI_DEFAULT_FILE_MIME_TYPE, SCHEMA_MAP_KEYS, SCHEMA_ARRAY_KEYS, SCHEMA_SINGLE_KEYS,
   PROTO_SCHEMA_TYPES, LEGACY_PROTO_SCHEMA_KEYS } from "../../config/runtimeConfig.js";
@@ -639,7 +639,7 @@ export function normalizeGeminiContents(contents, modelOrOptions = null, extraOp
           if (call.id) fr.id = call.id;
           return { functionResponse: fr };
         });
-        out.push({ role: "user", parts: responses });
+        out.push({ role: GEMINI_ROLE.USER, parts: responses });
       }
     } else {
       out.push({ role: "user", parts: [{ text: "Continue." }] });

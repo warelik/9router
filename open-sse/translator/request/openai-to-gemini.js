@@ -23,7 +23,7 @@ import {
   GEMINI_RESERVED_RESPONSE_KEYS
 } from "../formats/gemini.js";
 import { deriveSessionId, toNumericSessionId } from "../../utils/sessionManager.js";
-import { ROLE, GEMINI_ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
+import { ROLE, GEMINI_ROLE, OPENAI_BLOCK, CLAUDE_BLOCK, OPENAI_TOOL_CHOICE_NONE } from "../schema/index.js";
 import { isGemini4Model } from "../../providers/capabilities.js";
 
 // Sanitize function names for Gemini API.
@@ -338,7 +338,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
       const choice = body.tool_choice;
       if (choice === "auto") {
         result.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
-      } else if (choice === "none") {
+      } else if (choice === OPENAI_TOOL_CHOICE_NONE) {
         result.toolConfig = { functionCallingConfig: { mode: "NONE" } };
       } else if (choice === "required") {
         result.toolConfig = { functionCallingConfig: { mode: "ANY" } };

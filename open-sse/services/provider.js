@@ -1,5 +1,6 @@
 import { PROVIDERS } from "../config/providers.js";
 import { OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
+import { FORMATS } from "../translator/formats.js";
 
 const OPENAI_COMPATIBLE_PREFIX = "openai-compatible-";
 const OPENAI_COMPATIBLE_DEFAULTS = {
@@ -146,7 +147,7 @@ export function getTargetFormat(provider, credentials = null) {
 // Its executor can adapt that envelope without translating the Gemini payload.
 // Other Antigravity models (including image generation) keep their own path.
 export function supportsNativeGemini(provider, model) {
-  if (getTargetFormat(provider) === "gemini") return true;
+  if (getTargetFormat(provider) === FORMATS.GEMINI) return true;
   return provider === "antigravity" && typeof model === "string"
     && model.startsWith("gemini-") && !/image|imagen/i.test(model);
 }

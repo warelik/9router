@@ -433,7 +433,7 @@ export class AntigravityExecutor extends BaseExecutor {
     const jsonOutput = Boolean(options.credentials?.nativeGeminiPassthrough && nativeGeminiRequestsJsonOutput(options.body));
     if (options.credentials?.nativeGeminiPassthrough) {
       const error = validateAntigravityFieldMask(options.credentials.nativeGeminiRequest);
-      if (error) return { response: Response.json(error, { status: 400 }), headers: {}, url: null, transformedBody: null };
+      if (error) return { response: Response.json(error, { status: HTTP_STATUS.BAD_REQUEST }), headers: {}, url: null, transformedBody: null };
     }
     const result = await super.execute(options);
     if (options.credentials?.nativeGeminiPassthrough) {

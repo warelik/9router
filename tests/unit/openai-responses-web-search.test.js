@@ -117,6 +117,12 @@ describe("Responses web_search request translation", () => {
     expect(translated.toolConfig).toEqual({ includeServerSideToolInvocations: true });
   });
 
+  it("enables googleSearch for aistudio when web_search is the only tool", () => {
+    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([webSearch]), true, {}, "aistudio");
+    expect(translated.tools).toEqual([{ googleSearch: {} }]);
+    expect(translated.toolConfig).toEqual({ includeServerSideToolInvocations: true });
+  });
+
   for (const [label, format, provider, model, tools] of [
     ["antigravity", FORMATS.ANTIGRAVITY, "antigravity", MODEL, undefined],
     ["gemini-cli", FORMATS.GEMINI_CLI, "gemini-cli", MODEL, undefined],
@@ -134,6 +140,26 @@ describe("Responses web_search request translation", () => {
       expect(strip(withSearch)).toEqual(strip(withoutSearch));
       expect(JSON.stringify(withSearch)).not.toContain("googleSearch");
       expect(JSON.stringify(withSearch)).not.toContain("includeServerSideToolInvocations");
+    });
+  }
+
+  for (const [provider, tools] of [
+    ["gemini", [webSearch]],
+    ["aistudio", [webSearch]],
+    ["gemini", [recordVersion(), webSearch]],
+    ["aistudio", [recordVersion(), webSearch]],
+  ]) {
+    it(`honors client tool_choice none for ${provider} (${tools.length > 1 ? "mixed" : "search-only"} tools)`, () => {
+      const body = structuredClone(requestBody(tools));
+      body.tool_choice = "none";
+      const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, body, true, { projectId: "p" }, provider);
+      expect(translated.tools ?? []).not.toContainEqual({ googleSearch: {} });
+      expect(translated.toolConfig?.includeServerSideToolInvocations).not.toBe(true);
+      expect("_webSearch" in translated).toBe(false);
+      if (tools.length > 1) {
+        expect(translated.tools ?? []).toContainEqual(expect.objectContaining({ functionDeclarations: expect.arrayContaining([expect.objectContaining({ name: "record_version" })]) }));
+        expect(translated.toolConfig?.functionCallingConfig).toEqual({ mode: "NONE" });
+      }
     });
   }
 
@@ -203,6 +229,32 @@ describe("server-executed tool parts in responses", () => {
     expect(modelTurn.parts[fcIndex]).toEqual({ functionCall: { id: "call_393372", name: "record_version", args: { version: "24.21.0" } }, thoughtSignature: CALL_SIG });
     const toolTurn = translated.contents.find(c => c.parts?.[0]?.functionResponse);
     expect(toolTurn.parts[0].functionResponse).toMatchObject({ id: "call_393372", name: "record_version" });
+  });
+
+  it("does not replay server parts when the client disabled tools", async () => {
+    const credentials = session("web-search-disabled-replay-fixture");
+    await runStream([nativeResponse(probeParts)], credentials);
+    const next = {
+      model: MODEL,
+      instructions: "You are a precise assistant.",
+      tools: [recordVersion(), webSearch],
+      tool_choice: "none",
+      input: [
+        userMessage(),
+        { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
+        { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
+      ],
+    };
+    const translated = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, credentials, "aistudio");
+    const allParts = (translated.contents ?? []).flatMap(c => c.parts ?? []);
+    expect(allParts.filter(p => p.toolCall || p.toolResponse)).toEqual([]);
+    expect(translated.tools ?? []).not.toContainEqual({ googleSearch: {} });
+    expect(translated.toolConfig?.includeServerSideToolInvocations).not.toBe(true);
+    expect("_webSearch" in translated).toBe(false);
+    const modelTurn = translated.contents.find(c => c.role === "model");
+    const fc = modelTurn.parts.find(p => p.functionCall);
+    expect(fc).toEqual({ functionCall: { id: "call_393372", name: "record_version", args: { version: "24.21.0" } }, thoughtSignature: CALL_SIG });
   });
 
   it("anchors server parts to the turn key when the turn ends on text", async () => {

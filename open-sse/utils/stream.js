@@ -194,7 +194,7 @@ export function createSSEStream(options = {}) {
       nativeGeminiErrorSeen = true;
       const error = parsed.error || response.error;
       nativeGeminiError = {
-        status: Number.isInteger(error.code) && error.code >= 400 && error.code <= 599
+        status: Number.isInteger(error.code) && error.code >= HTTP_STATUS.BAD_REQUEST && error.code <= 599
           ? error.code : HTTP_STATUS.BAD_GATEWAY,
         error: typeof error.message === "string" ? error.message : "Upstream Gemini stream failed",
       };
