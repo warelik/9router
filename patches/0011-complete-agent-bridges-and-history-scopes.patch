@@ -1,0 +1,250 @@
+From ab66bf37823b178dea8d96a693f020d6dfe4a894 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Fix mixed agent messages and Gemini instruction-prefix replay
+
+---
+ open-sse/translator/formats/responsesApi.js   |  11 +-
+ .../translator/request/openai-responses.js    |   2 +-
+ .../translator/request/openai-to-gemini.js    |  34 +++---
+ ...eam-translator-history-regressions.test.js | 103 ++++++++++++++++++
+ 4 files changed, 133 insertions(+), 17 deletions(-)
+ create mode 100644 tests/unit/downstream-translator-history-regressions.test.js
+
+diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
+index ca2e59a..1b63d64 100644
+--- a/open-sse/translator/formats/responsesApi.js
++++ b/open-sse/translator/formats/responsesApi.js
+@@ -32,7 +32,7 @@ export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
+ 
+ // Codex's observed plaintext task carrier (an agent_message encrypted_content part) is converted
+ // here to input_text; known OpenAI Fernet ciphertext stays opaque.
+-export function normalizeResponsesAgentMessage(item) {
++export function normalizeResponsesAgentMessage(item, { dropOpaqueContent = false } = {}) {
+   if (!item || typeof item !== "object" || Array.isArray(item) || item.type !== "agent_message") return item;
+   const content = Array.isArray(item.content)
+     ? item.content.map((part) => (part?.type === "encrypted_content"
+@@ -41,7 +41,12 @@ export function normalizeResponsesAgentMessage(item) {
+       ? { type: RESPONSES_ITEM.INPUT_TEXT, text: part.encrypted_content }
+       : part))
+     : item.content;
+-  return { ...item, type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content };
++  const normalizedContent = dropOpaqueContent && Array.isArray(content)
++    ? content.filter((part) => !(part?.type === "encrypted_content"
++        && typeof part.encrypted_content === "string"
++        && part.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX)))
++    : content;
++  return { ...item, type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content: normalizedContent };
+ }
+ 
+ function reasoningHasReadableText(item) {
+@@ -182,7 +187,7 @@ export function convertResponsesApiFormat(body) {
+   if (!inputItems) return body;
+ 
+   for (const rawItem of inputItems) {
+-    const item = normalizeResponsesAgentMessage(rawItem);
++    const item = normalizeResponsesAgentMessage(rawItem, { dropOpaqueContent: true });
+     // Determine item type - Droid CLI sends role-based items without 'type' field
+     // Fallback: if no type but has role property, treat as message
+     const itemType = item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);
+diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
+index ddddd41..1545b89 100644
+--- a/open-sse/translator/request/openai-responses.js
++++ b/open-sse/translator/request/openai-responses.js
+@@ -101,7 +101,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+   };
+ 
+   for (const rawItem of inputItems) {
+-    const item = normalizeResponsesAgentMessage(rawItem);
++    const item = normalizeResponsesAgentMessage(rawItem, { dropOpaqueContent: true });
+     // Determine item type - Droid CLI sends role-based items without 'type' field
+     // Fallback: if no type but has role property, treat as message
+     const itemType = item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);
+diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
+index 5ca519c..dd757d4 100644
+--- a/open-sse/translator/request/openai-to-gemini.js
++++ b/open-sse/translator/request/openai-to-gemini.js
+@@ -93,6 +93,18 @@ function createToolCallIdUniquifier() {
+   };
+ }
+ 
++function appendInstructionParts(parts, content) {
++  if (typeof content === "string") {
++    if (content) parts.push({ text: content });
++  } else if (Array.isArray(content)) {
++    for (const block of content) {
++      if (block?.type === OPENAI_BLOCK.TEXT && typeof block.text === "string") {
++        parts.push({ text: block.text });
++      }
++    }
++  }
++}
++
+ // Core: Convert OpenAI request to Gemini format (base for all variants)
+ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG_SIGNATURE, sessionId = null, serverPartsSessionId = null) {
+   const result = {
+@@ -153,20 +165,11 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+   if (Array.isArray(body.messages)) {
+     for (const m of body.messages) {
+       if (m.role !== ROLE.SYSTEM && m.role !== ROLE.DEVELOPER) continue;
+-      if (typeof m.content === "string") {
+-        if (m.content) instructionParts.push({ text: m.content });
+-      } else if (Array.isArray(m.content)) {
+-        for (const block of m.content) {
+-          if (block?.type === OPENAI_BLOCK.TEXT && typeof block.text === "string") {
+-            instructionParts.push({ text: block.text });
+-          }
+-        }
+-      }
++      appendInstructionParts(instructionParts, m.content);
+     }
+   }
+-  // The system instruction the finished request will carry (all system/developer blocks aggregate in order); the
+-  // turn scope of every earlier assistant message must see the same value as the request that
+-  // produced that turn did.
++  // The outgoing request carries all instructions. Earlier cached turns use only
++  // the instruction prefix that existed when their responses were produced.
+   const finalSystem = instructionParts.length > 0
+     ? { role: GEMINI_ROLE.USER, parts: instructionParts }
+     : null;
+@@ -181,6 +184,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+   const pendingToolCalls = new Map();
+   // Emitted functionCall ids must be unique across the whole history.
+   const toolCallIdUniquifier = createToolCallIdUniquifier();
++  const turnInstructionParts = [];
+ 
+   // Convert messages
+   if (body.messages && Array.isArray(body.messages)) {
+@@ -190,6 +194,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+       const content = msg.content;
+ 
+       if (role === ROLE.SYSTEM || role === ROLE.DEVELOPER) {
++        appendInstructionParts(turnInstructionParts, content);
+         continue;
+       } else if (role === ROLE.USER) {
+         const parts = convertOpenAIContentToParts(content);
+@@ -200,7 +205,10 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+         const parts = [];
+ 
+         const text = content ? (typeof content === "string" ? content : extractTextContent(content)) : "";
+-        const turnScope = geminiTurnScope(result.contents, finalSystem);
++        const turnSystem = turnInstructionParts.length > 0
++          ? { role: GEMINI_ROLE.USER, parts: turnInstructionParts }
++          : null;
++        const turnScope = geminiTurnScope(result.contents, turnSystem);
+         // Signature the provider issued for this tool-free turn (Gemini only accepts its own).
+         const turnSig = msg.tool_calls?.length
+           ? null
+diff --git a/tests/unit/downstream-translator-history-regressions.test.js b/tests/unit/downstream-translator-history-regressions.test.js
+new file mode 100644
+index 0000000..29d983a
+--- /dev/null
++++ b/tests/unit/downstream-translator-history-regressions.test.js
+@@ -0,0 +1,103 @@
++import { describe, expect, it, vi } from "vitest";
++import "../translator/registerAll.js";
++
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({
++    get: async () => null,
++    set: async () => {},
++    remove: async () => {},
++    getAll: async () => ({}),
++  }),
++}));
++
++const { normalizeResponsesAgentMessage, convertResponsesApiFormat } = await import("../../open-sse/translator/formats/responsesApi.js");
++const { openaiResponsesToOpenAIRequest } = await import("../../open-sse/translator/request/openai-responses.js");
++const { hasUndeliverableAgentMessage } = await import("../../open-sse/translator/concerns/portableCollaboration.js");
++const { openaiToGeminiRequest } = await import("../../open-sse/translator/request/openai-to-gemini.js");
++const { storeGeminiTurnSignature, storeGeminiServerPartsForTurn } = await import("../../open-sse/services/thoughtSignatureStore.js");
++
++describe("readable agent messages cross both Chat bridges without Fernet blocks", () => {
++  it.each([
++    ["format bridge", (body) => convertResponsesApiFormat(body)],
++    ["request bridge", (body) => openaiResponsesToOpenAIRequest("m", body, true, {})],
++  ])("keeps exact readable content and caller bytes in the %s", (_label, bridge) => {
++    const item = {
++      type: "agent_message",
++      content: [
++        { type: "input_text", text: "Readable task\n" },
++        { type: "encrypted_content", encrypted_content: "gAAAAA-opaque-token" },
++        { type: "encrypted_content", encrypted_content: "plaintext task carrier  " },
++      ],
++    };
++    const body = { model: "m", input: [item] };
++    const before = JSON.stringify(body);
++    expect(hasUndeliverableAgentMessage(body.input)).toBe(false);
++    expect(bridge(body).messages).toEqual([{
++      role: "user",
++      content: [
++        { type: "text", text: "Readable task\n" },
++        { type: "text", text: "plaintext task carrier  " },
++      ],
++    }]);
++    expect(JSON.stringify(body)).toBe(before);
++  });
++
++  it("preserves opaque-only detection and the default normalization contract", () => {
++    const opaque = {
++      type: "agent_message",
++      content: [{ type: "encrypted_content", encrypted_content: "gAAAAA-opaque-token" }],
++    };
++    expect(hasUndeliverableAgentMessage([opaque])).toBe(true);
++    expect(normalizeResponsesAgentMessage(opaque).content).toEqual(opaque.content);
++  });
++});
++
++describe("Gemini historical turns retain their own instruction prefix", () => {
++  it.each([
++    ["system", "later system rule"],
++    ["developer", [{ type: "text", text: "later developer rule" }]],
++  ])("replays signatures and search parts after a later %s instruction", (role, lateContent) => {
++    const model = "gemini-downstream-history-regression";
++    const sessionId = `history-prefix-${role}`;
++    const initial = [
++      { role: "system", content: "original rule" },
++      { role: "user", content: `question-${role}` },
++    ];
++    const credentials = { _geminiServerPartsSessionId: sessionId };
++    openaiToGeminiRequest(model, { messages: initial }, true, credentials);
++    const reasoning = `earlier reasoning-${role}`;
++    const content = `earlier answer-${role}`;
++    const signature = `exact-turn-signature-${role}`;
++    const turn = { reasoning, content, scope: credentials._geminiTurnScope };
++    const searchPart = {
++      thoughtSignature: `exact-search-signature-${role}`,
++      toolCall: { id: `search-${role}`, toolType: "GOOGLE_SEARCH_WEB", args: { queries: [role] } },
++    };
++    storeGeminiTurnSignature(turn, signature, model);
++    storeGeminiServerPartsForTurn({ ...turn, sessionId }, [searchPart], model);
++
++    const body = { messages: [
++      ...initial,
++      { role: "assistant", reasoning_content: reasoning, content },
++      { role, content: lateContent },
++      { role: "user", content: "continue with the new instruction" },
++    ] };
++    const before = JSON.stringify(body);
++    const out = openaiToGeminiRequest(model, body, false, credentials);
++    const parts = out.contents.filter((entry) => entry.role === "model").flatMap((entry) => entry.parts);
++    expect(parts).toContainEqual({ text: content, thoughtSignature: signature });
++    expect(parts).toContainEqual(searchPart);
++    expect(out.systemInstruction.parts).toEqual([
++      { text: "original rule" },
++      { text: role === "system" ? lateContent : lateContent[0].text },
++    ]);
++    expect(JSON.stringify(body)).toBe(before);
++
++    const unrelated = structuredClone(body);
++    unrelated.messages[0].content = "different original rule";
++    const isolated = openaiToGeminiRequest(model, unrelated, false, credentials);
++    const isolatedParts = isolated.contents.filter((entry) => entry.role === "model").flatMap((entry) => entry.parts);
++    expect(isolatedParts.some((part) => part.thoughtSignature === signature)).toBe(false);
++    expect(isolatedParts).not.toContainEqual(searchPart);
++  });
++});
+-- 
+2.55.0
+

@@ -1,0 +1,121 @@
+From df8869c550d2265f292337cc12e5523ffe0d585a Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <noreply@openai.com>
+Date: Tue, 20 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Preserve custom Responses tool choice identity
+
+---
+ .../translator/request/openai-responses.js    | 25 ++++++++--
+ ...eam-translator-history-regressions.test.js | 50 +++++++++++++++++++
+ 2 files changed, 72 insertions(+), 3 deletions(-)
+
+diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
+index 1545b89..8bf93aa 100644
+--- a/open-sse/translator/request/openai-responses.js
++++ b/open-sse/translator/request/openai-responses.js
+@@ -295,16 +295,35 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+       })
+       .filter(Boolean);
+   }
+-  if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
+ 
+   if (result.tool_choice && typeof result.tool_choice === "object" && !Array.isArray(result.tool_choice)
+-    && result.tool_choice.type === "function" && typeof result.tool_choice.name === "string") {
++    && (result.tool_choice.type === "function" || result.tool_choice.type === "custom")
++    && typeof result.tool_choice.name === "string") {
+     const choice = result.tool_choice;
+     const choiceNs = typeof choice.namespace === "string" && choice.namespace.trim() ? choice.namespace.trim() : null;
+     const choiceName = choiceNs ? aliasFor(choiceNs, choice.name) : choice.name;
+-    if (choiceNs) namespaceToolMap.set(choiceName, { name: choice.name, namespace: choiceNs, type: "function" });
++    if (choiceNs) {
++      const existing = namespaceToolMap.get(choiceName);
++      if (choice.type === "custom") {
++        const declaration = responseTools.find(({ child, ns }) =>
++          child?.type === "custom" && ns?.name?.trim() === choiceNs && child.name === choice.name);
++        const descriptor = existing?.type === "custom"
++          ? existing
++          : { name: choice.name, namespace: choiceNs, type: "custom" };
++        const format = declaration?.child.format ?? choice.format;
++        if (format !== undefined) {
++          namespaceToolMap.set(choiceName, { ...descriptor, format });
++        } else if (!existing) {
++          namespaceToolMap.set(choiceName, descriptor);
++        }
++      } else if (!existing) {
++        namespaceToolMap.set(choiceName, { name: choice.name, namespace: choiceNs, type: "function" });
++      }
++    }
++    if (choice.type === "custom") customToolNames.add(choiceName);
+     result.tool_choice = { type: "function", function: { name: choiceName } };
+   }
++  if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
+   if (namespaceToolMap.size > 0) result._toolNameMap = namespaceToolMap;
+ 
+   // Cleanup Responses API specific fields
+diff --git a/tests/unit/downstream-translator-history-regressions.test.js b/tests/unit/downstream-translator-history-regressions.test.js
+index 29d983a..c78f4e7 100644
+--- a/tests/unit/downstream-translator-history-regressions.test.js
++++ b/tests/unit/downstream-translator-history-regressions.test.js
+@@ -12,6 +12,7 @@ vi.mock("@/lib/db/helpers/kvStore.js", () => ({
+ 
+ const { normalizeResponsesAgentMessage, convertResponsesApiFormat } = await import("../../open-sse/translator/formats/responsesApi.js");
+ const { openaiResponsesToOpenAIRequest } = await import("../../open-sse/translator/request/openai-responses.js");
++const { restoreToolNames } = await import("../../open-sse/utils/opencodeFingerprint.js");
+ const { hasUndeliverableAgentMessage } = await import("../../open-sse/translator/concerns/portableCollaboration.js");
+ const { openaiToGeminiRequest } = await import("../../open-sse/translator/request/openai-to-gemini.js");
+ const { storeGeminiTurnSignature, storeGeminiServerPartsForTurn } = await import("../../open-sse/services/thoughtSignatureStore.js");
+@@ -101,3 +102,52 @@ describe("Gemini historical turns retain their own instruction prefix", () => {
+     expect(isolatedParts).not.toContainEqual(searchPart);
+   });
+ });
++
++describe("forced Responses custom tool choices preserve custom identity", () => {
++  const format = { type: "grammar", syntax: "lark", definition: "start: TEXT" };
++
++  it("uses the declaration alias and keeps its custom descriptor for successful calls", () => {
++    const body = {
++      model: "m",
++      tools: [{ type: "namespace", name: "automation", tools: [
++        { type: "custom", name: "patch", description: "Apply raw input.", format },
++      ] }],
++      input: [],
++      tool_choice: { type: "custom", name: "patch", namespace: "automation" },
++    };
++    const out = openaiResponsesToOpenAIRequest(body.model, body, true, {});
++    const [wireName, descriptor] = [...out._toolNameMap].find(([, value]) =>
++      value?.name === "patch" && value.namespace === "automation");
++
++    expect(wireName).toBeTruthy();
++    expect(descriptor).toEqual({
++      name: "patch", namespace: "automation", type: "custom", format,
++    });
++    expect(out.tool_choice).toEqual({ type: "function", function: { name: wireName } });
++    expect(out._customToolNames).toContain(wireName);
++    expect(restoreToolNames({
++      type: "function_call", name: wireName, call_id: "call_patch", arguments: "RAW_PATCH",
++    }, out._toolNameMap)).toEqual({
++      type: "custom_tool_call", name: "patch", namespace: "automation",
++      call_id: "call_patch", input: "RAW_PATCH",
++    });
++    const refusal = {
++      output: [{ type: "message", role: "assistant", content: [
++        { type: "refusal", refusal: "I can't help with that request." },
++      ] }],
++    };
++    expect(restoreToolNames(refusal, out._toolNameMap)).toEqual(refusal);
++  });
++
++  it("normalizes a root custom choice and leaves refusal output untouched", () => {
++    const body = {
++      model: "m",
++      tools: [{ type: "custom", name: "apply_patch", format }],
++      input: [],
++      tool_choice: { type: "custom", name: "apply_patch" },
++    };
++    const out = openaiResponsesToOpenAIRequest(body.model, body, true, {});
++    expect(out.tool_choice).toEqual({ type: "function", function: { name: "apply_patch" } });
++    expect(out._customToolNames).toContain("apply_patch");
++  });
++});
+-- 
+2.55.0
+
