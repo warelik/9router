@@ -6262,11 +6262,15 @@ def _cleanup_shared_refs(repo, lifecycle, *, repair_only=False):
                 refs.append((name, item))
     records = []
     for name, ref in refs:
+        if name in active_refs:
+            continue
         expected = (ref.get("object") or {}).get("sha")
         if not SHA.fullmatch(expected or ""):
             continue
         matching = []
         for pull in pulls:
+            if pull.get("state") != "closed":
+                continue
             user = pull.get("user") or {}
             owner = repo.split("/", 1)[0]
             if not ((user.get("login") == owner and user.get("type") == "User")
@@ -6276,6 +6280,7 @@ def _cleanup_shared_refs(repo, lifecycle, *, repair_only=False):
             if ((name == head.get("ref") and expected == head.get("sha"))
                     or (name == base.get("ref") and expected == base.get("sha"))):
                 matching.append(pull)
+                break
         for pull in matching:
             try:
                 archive = api(f"repos/{repo}/git/ref/pull/{pull['number']}/head")
@@ -6321,9 +6326,19 @@ def _cleanup_shared_refs(repo, lifecycle, *, repair_only=False):
                 fresh_open_refs.update(ref for ref in (head.get("ref"), base.get("ref"))
                                        if isinstance(ref, str))
                 open_pull_refs.append({"head_ref": head.get("ref"), "base_ref": base.get("ref")})
+        if name in fresh_open_refs:
+            continue
         fresh_records = []
         for listed in fresh_pulls:
+            if listed.get("state") != "closed":
+                continue
+            listed_head, listed_base = listed.get("head") or {}, listed.get("base") or {}
+            if not ((name == listed_head.get("ref") and expected == listed_head.get("sha"))
+                    or (name == listed_base.get("ref") and expected == listed_base.get("sha"))):
+                continue
             current_pull = api(f"repos/{repo}/pulls/{listed['number']}")
+            if current_pull.get("state") != "closed":
+                continue
             pull_user = current_pull.get("user") or {}
             owner = repo.split("/", 1)[0]
             if not ((pull_user.get("login") == owner and pull_user.get("type") == "User")
@@ -6352,6 +6367,7 @@ def _cleanup_shared_refs(repo, lifecycle, *, repair_only=False):
                 except subprocess.CalledProcessError:
                     continue
             fresh_records.append(evidence)
+            break
         fresh_plan = lifecycle.cleanup_plan(
             fresh_records, active_refs=fresh_open_refs,
             protected_refs={"main", "downstream"})

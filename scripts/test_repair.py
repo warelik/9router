@@ -5488,6 +5488,7 @@ class RepairRefCleanupTests(unittest.TestCase):
                 self.plans = []
 
             def cleanup_plan(self, records, *, active_refs, protected_refs):
+                assert all(record["pull"]["state"] == "closed" for record in records)
                 self.plans.append({
                     "names": {record["name"] for record in records},
                     "active_refs": active_refs,
@@ -5503,10 +5504,9 @@ class RepairRefCleanupTests(unittest.TestCase):
         self.assertEqual(calls, [
             f"repos/{REPO}/git/matching-refs/heads/repair",
             f"repos/{REPO}/git/ref/pull/2/head",
-            f"repos/{REPO}/git/ref/pull/3/head",
         ])
         self.assertEqual(repair_lifecycle.plans[0]["names"],
-                         {"repair/expired", "repair/current"})
+                         {"repair/expired"})
         self.assertTrue({"repair/current", "review/full", f"review-base/{UPSTREAM}",
                          "oracle/current", "downstream"} <= repair_lifecycle.plans[0]["active_refs"])
         self.assertEqual(repair_lifecycle.plans[0]["protected_refs"], {"main", "downstream"})
@@ -5522,7 +5522,7 @@ class RepairRefCleanupTests(unittest.TestCase):
             f"repos/{REPO}/git/matching-refs/heads/repair",
         ])
         self.assertEqual(default_lifecycle.plans[0]["names"],
-                         {"repair/expired", "repair/current"})
+                         {"repair/expired"})
 
     def test_scheduled_prepare_cleans_before_candidate_selection(self):
         events = []
