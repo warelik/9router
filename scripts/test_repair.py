@@ -2674,6 +2674,7 @@ class SharedHistoryAdapterTests(unittest.TestCase):
 
     def _disposition_proposal_fixture(self, temporary, *, existing_carrier=False,
                                       changed_carrier=False, policy_repair=False,
+                                      carrier_metadata_only=False,
                                       policy_disproved_unchanged=False,
                                       policy_application_disproof=False,
                                       status="fixed", source_sha=None,
@@ -2795,6 +2796,9 @@ class SharedHistoryAdapterTests(unittest.TestCase):
         elif existing_carrier:
             (config_root / "patches/0002-followup.patch").write_bytes(
                 patch_contents["patches/0002-followup.patch"])
+            if carrier_metadata_only:
+                patch_contents["patches/0001-fix.patch"] += b"\n"
+                (config_root / "patches/0001-fix.patch").write_bytes(patch_contents["patches/0001-fix.patch"])
             changed_path = "patches/0002-followup.patch"
         else:
             (config_root / "patches/0001-fix.patch").write_bytes(fixed_patch)
@@ -2830,7 +2834,7 @@ class SharedHistoryAdapterTests(unittest.TestCase):
             patchset_digest.update(Path(path).name.encode() + b"\0" + content + b"\0")
         patchset = patchset_digest.hexdigest()
         candidate_id = "f" * 64
-        candidate = {"schema": 1, "repository": REPO, "upstream_sha": UPSTREAM,
+        candidate = {"schema": 1, "repository": REPO, "upstream_sha": app_base,
                      "application_sha": app_final, "configuration_sha": candidate_config,
                      "patchset_sha256": patchset, "recipe_sha256": "a" * 64,
                      "platform": "linux/amd64", "_candidate_id": candidate_id}
@@ -2844,7 +2848,7 @@ class SharedHistoryAdapterTests(unittest.TestCase):
             "review_sha": review_sha,
         }}
         repair_state = {
-            "schema": 1, "config": config_sha, "upstream": UPSTREAM, "seed": seed_sha,
+            "schema": 1, "config": config_sha, "upstream": app_base, "seed": seed_sha,
             "head": head_sha, "number": 17, "branch": "repair/example",
             "cycle": "e" * 64, "window": "run-42",
         }
@@ -2866,8 +2870,8 @@ class SharedHistoryAdapterTests(unittest.TestCase):
                    "candidate_id": "e" * 64,
                    "scope": "full" if policy_disproved_unchanged or not policy_repair else "delta",
                    "source": "review" if policy_disproved_unchanged else "inline",
-                   "source_sha": UPSTREAM if policy_disproved_unchanged else
-                                 config_sha if policy_repair else UPSTREAM,
+                   "source_sha": app_base if policy_disproved_unchanged else
+                                 config_sha if policy_repair else app_base,
                    "native_id": 13, "body": "A carried code finding",
                    "path": finding_path, "line": None if policy_disproved_unchanged else 4,
                    "severity": "unlabelled"}
@@ -3061,6 +3065,13 @@ class SharedHistoryAdapterTests(unittest.TestCase):
         self.assertEqual(result[0]["source_sha"], fixture["candidate"]["application_sha"])
         self.assertEqual(result[0]["status"], "fixed")
         self.assertIn("code location `src/fix.js`", result[0]["evidence"])
+
+    def test_changed_patch_metadata_cannot_claim_an_unchanged_application_fix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._disposition_proposal_fixture(
+                temporary, existing_carrier=True, carrier_metadata_only=True)
+            with self.assertRaisesRegex(ValueError, "actual seed-to-candidate"):
+                self._read_disposition_fixture(fixture)
 
     def test_disproved_proposal_accepts_exact_unchanged_patch_carrier(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -5855,3 +5866,13 @@ class OptionalPolicyLaneAdmissionTests(unittest.TestCase):
             for parent in (("prepare", "finalize", "test") if job == "build" else ("prepare", "finalize")):
                 self.assertFalse(enabled(condition, {**fields, "needs." + parent + ".result": "failure"}), (job, parent))
             self.assertFalse(enabled(condition, {**fields, "needs.finalize.outputs.mode": "policy-only"}), job)
+
+
+class PolicyEngineEnvironmentTests(unittest.TestCase):
+    def test_host_engine_paths_are_separate_from_container_fixture_paths_and_credentials(self):
+        with patch.dict(os.environ, {"HOME": "/host/home", "XDG_DATA_HOME": "/host/data",
+                                    "XDG_RUNTIME_DIR": "/run/user/1000",
+                                    "GH_TOKEN": "fixture-secret", "CODEX_REQUEST_TOKEN": "fixture-secret"}, clear=True):
+            env = release.policy_engine_environment()
+        self.assertEqual(env, {"HOME": "/host/home", "XDG_DATA_HOME": "/host/data",
+                               "XDG_RUNTIME_DIR": "/run/user/1000"})

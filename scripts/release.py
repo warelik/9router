@@ -2799,6 +2799,24 @@ def _current_owner_disposition_rows(rows, candidate, repo):
     return result
 
 
+def _repair_application_base_tree(state, app_root):
+    """Assemble the seed patch index locally; never execute the application."""
+    seed_paths = run("git", "-c", "protocol.allow=never", "ls-tree", "-r", "--name-only",
+                     state["seed"], "--", "patches", cwd=ROOT).splitlines()
+    patches = _repair_patch_files(state["seed"])[0] if any(p.endswith(".patch") for p in seed_paths) else {}
+    with tempfile.TemporaryDirectory(prefix="9router-repair-delta-") as temporary:
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / "index"),
+                   GIT_NO_LAZY_FETCH="1")
+        run("git", "-c", "protocol.allow=never", "read-tree", state["upstream"],
+            cwd=app_root, env=env)
+        for _path, content in sorted(patches.items()):
+            subprocess.run(["git", "-c", "protocol.allow=never", "apply", "--cached",
+                            "--whitespace=nowarn", "-"], input=content, cwd=app_root,
+                           env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           check=True, timeout=30)
+        return run("git", "-c", "protocol.allow=never", "write-tree", cwd=app_root, env=env)
+
+
 def _verified_disposition_proposals(repo, candidate, full_evidence, known,
                                     fresh_ids, already_disposed, patch_root, *,
                                     repair=None, app_root=None, fresh_findings=()):
@@ -2862,6 +2880,7 @@ def _verified_disposition_proposals(repo, candidate, full_evidence, known,
         raise ValueError("Codex proposal must explicitly cover every carried finding exactly once")
 
     output = []
+    repair_application_tree = None
     disposition_source_sha = (candidate["configuration_sha"] if policy
                               else candidate["application_sha"])
     for item in entries:
@@ -2958,6 +2977,23 @@ def _verified_disposition_proposals(repo, candidate, full_evidence, known,
             if (not _repair_file_diff(state["seed"], state["head"], code_carrier)
                     or not _repair_file_diff(state["seed"], state["head"], test_carrier)):
                 raise ValueError("Fixed disposition lacks an exact changed source and named regression")
+            if not policy_code:
+                if repair_application_tree is None:
+                    repair_application_tree = _repair_application_base_tree(state, app_root)
+                actual_sections = {}
+                for path in {code_path, test_path}:
+                    delta = run("git", "-c", "protocol.allow=never", "diff", "--no-ext-diff",
+                                "--no-renames", "--binary", repair_application_tree,
+                                candidate["application_sha"], "--", path, cwd=app_root)
+                    sections = _embedded_patch_section(delta.encode("utf-8"), path)
+                    if len(sections) != 1:
+                        raise ValueError("Fixed application disposition has no actual seed-to-candidate source/test delta")
+                    actual_sections[path] = sections[0]
+                _patch_hunk_for_snippet(actual_sections[code_path], fields["code_source"], require_added=True)
+                _patch_hunk_for_source_span(
+                    actual_sections[test_path], test_text, assertion_start,
+                    assertion_start + len(fields["regression_source"]),
+                    fields["regression_source"], require_added=True)
         code_diff_sha = hashlib.sha256(_repair_file_diff(
             state["seed"], state["head"], code_carrier)).hexdigest()
         test_diff_sha = hashlib.sha256(_repair_file_diff(
@@ -5178,6 +5214,14 @@ def request_repair(directory, *, config=None, upstream=None, evidence=None):
     print(f"Requested native Codex fix on PR #{state['number']}; no deployment")
 
 
+def policy_engine_environment():
+    """Keep engine storage/socket paths on the host, separate from test HOME."""
+    names = ("PATH", "LANG", "LC_ALL", "TZ", "HOME", "USER", "LOGNAME",
+             "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR",
+             "DOCKER_HOST", "CONTAINER_HOST")
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
 def policy_container_engine():
     """Select a working rootless Podman or Docker runner for isolated policy tests."""
     attempts = []
@@ -5656,12 +5700,12 @@ def check_policy(candidate, *, shared=False):
                 completion = writable / "policy-suite-completion.json"
                 if completion.exists() or completion.is_symlink():
                     raise ValueError("Policy completion path is unexpectedly occupied")
-                result = subprocess.run(command, cwd=writable, env=env, check=False,
+                result = subprocess.run(command, cwd=writable, env=policy_engine_environment(), check=False,
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                         timeout=300)
                 _verify_policy_test_completion(completion, result.returncode)
             else:
-                result = subprocess.run(command, cwd=writable, env=env, check=False,
+                result = subprocess.run(command, cwd=writable, env=policy_engine_environment(), check=False,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
                 if result.returncode != 0:
                     detail = (result.stdout + "\n" + result.stderr)[-4000:]
