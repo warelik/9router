@@ -1,0 +1,110 @@
+From 3ef4aa4ab90b183a93fc75383c3ad4372a683ee8 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] Load real client-key extraction in native route regression
+ harnesses
+
+---
+ ...igravity-native-disabled-functions.test.js |  7 +++++++
+ tests/unit/antigravity-native-gemini.test.js  |  7 +++++++
+ .../antigravity-native-json-output.test.js    |  7 +++++++
+ .../unit/gemini-native-entry-contract.test.js | 21 +++++++++++++++++++
+ 4 files changed, 42 insertions(+)
+
+diff --git a/tests/unit/antigravity-native-disabled-functions.test.js b/tests/unit/antigravity-native-disabled-functions.test.js
+index a3c2fd7..0468535 100644
+--- a/tests/unit/antigravity-native-disabled-functions.test.js
++++ b/tests/unit/antigravity-native-disabled-functions.test.js
+@@ -210,6 +210,13 @@ function loadPublicNativeRoute() {
+   const start = auth.indexOf("export function extractApiKey(");
+   const end = auth.indexOf("/**", start);
+   vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  // Upstream added the wider client-key accessor; load its real pure implementation
++  // just like the legacy auth accessor, without importing DB/account boundaries.
++  const keyAccess = fs.readFileSync(path.join(root, "src/sse/services/keyAccess.js"), "utf8");
++  const keyStart = keyAccess.indexOf("export function extractClientApiKey(");
++  const keyEnd = keyAccess.indexOf("/**", keyStart);
++  if (keyStart < 0 || keyEnd <= keyStart) throw new Error("Real client-key accessor is missing");
++  vm.runInContext(keyAccess.slice(keyStart, keyEnd).replace("export ", ""), context);
+   vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
+   vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
+   return { context, services };
+diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
+index 1ec2e53..c169367 100644
+--- a/tests/unit/antigravity-native-gemini.test.js
++++ b/tests/unit/antigravity-native-gemini.test.js
+@@ -239,6 +239,13 @@ function loadRouteHarness() {
+   const start = auth.indexOf("export function extractApiKey(");
+   const end = auth.indexOf("/**", start);
+   vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  // Upstream added the wider client-key accessor; load its real pure implementation
++  // just like the legacy auth accessor, without importing DB/account boundaries.
++  const keyAccess = fs.readFileSync(path.join(root, "src/sse/services/keyAccess.js"), "utf8");
++  const keyStart = keyAccess.indexOf("export function extractClientApiKey(");
++  const keyEnd = keyAccess.indexOf("/**", keyStart);
++  if (keyStart < 0 || keyEnd <= keyStart) throw new Error("Real client-key accessor is missing");
++  vm.runInContext(keyAccess.slice(keyStart, keyEnd).replace("export ", ""), context);
+   vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
+   vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
+   return { context, services };
+diff --git a/tests/unit/antigravity-native-json-output.test.js b/tests/unit/antigravity-native-json-output.test.js
+index 2fe63a6..3e2dbcb 100644
+--- a/tests/unit/antigravity-native-json-output.test.js
++++ b/tests/unit/antigravity-native-json-output.test.js
+@@ -171,6 +171,13 @@ function loadPublicNativeRoute() {
+   const start = auth.indexOf("export function extractApiKey(");
+   const end = auth.indexOf("/**", start);
+   vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  // Upstream added the wider client-key accessor; load its real pure implementation
++  // just like the legacy auth accessor, without importing DB/account boundaries.
++  const keyAccess = fs.readFileSync(path.join(root, "src/sse/services/keyAccess.js"), "utf8");
++  const keyStart = keyAccess.indexOf("export function extractClientApiKey(");
++  const keyEnd = keyAccess.indexOf("/**", keyStart);
++  if (keyStart < 0 || keyEnd <= keyStart) throw new Error("Real client-key accessor is missing");
++  vm.runInContext(keyAccess.slice(keyStart, keyEnd).replace("export ", ""), context);
+   vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
+   vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
+   return { context, services };
+diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
+index c0a2016..da74666 100644
+--- a/tests/unit/gemini-native-entry-contract.test.js
++++ b/tests/unit/gemini-native-entry-contract.test.js
+@@ -82,6 +82,13 @@ function load() {
+   const start = auth.indexOf("export function extractApiKey(");
+   const end = auth.indexOf("/**", start);
+   vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  // Upstream added the wider client-key accessor; load its real pure implementation
++  // just like the legacy auth accessor, without importing DB/account boundaries.
++  const keyAccess = fs.readFileSync(path.join(root, "src/sse/services/keyAccess.js"), "utf8");
++  const keyStart = keyAccess.indexOf("export function extractClientApiKey(");
++  const keyEnd = keyAccess.indexOf("/**", keyStart);
++  if (keyStart < 0 || keyEnd <= keyStart) throw new Error("Real client-key accessor is missing");
++  vm.runInContext(keyAccess.slice(keyStart, keyEnd).replace("export ", ""), context);
+   vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
+   vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
+ }
+@@ -111,6 +118,20 @@ function audioRequest(action = "streamGenerateContent") {
+ describe("native Gemini endpoint entry contract", () => {
+   beforeEach(load);
+ 
++it("loads the real client-key accessor for every supported credential location", () => {
++  for (const [headers, query, expected] of [
++    [{ Authorization: "Bearer bearer-fixture", "x-goog-api-key": "ignored" }, "?key=ignored", "bearer-fixture"],
++    [{ "x-api-key": "header-fixture" }, "", "header-fixture"],
++    [{ "x-goog-api-key": "google-fixture" }, "", "google-fixture"],
++    [{}, "?key=query-fixture", "query-fixture"],
++    [{}, "?$key=dollar-fixture", "dollar-fixture"],
++  ]) {
++    const { req } = request("gemini", "generateContent", nativeBody(), { headers, query });
++    expect(context.extractClientApiKey(req)).toBe(expected);
++  }
++});
++
++
+   it.each(["generateContent", "streamGenerateContent"])("TTS %s waits for EOF and its account update", async action => {
+     let releaseAccount;
+     const accountUpdated = new Promise(resolve => { releaseAccount = resolve; });
+-- 
+2.43.0
+
