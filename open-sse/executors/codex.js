@@ -9,7 +9,7 @@ import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
 import { fetchImageAsBase64 } from "../translator/concerns/image.js";
 import { getModelUpstreamId, getProviderModels } from "../config/providerModels.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
-import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry } from "../config/runtimeConfig.js";
+import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry, SSE_DONE_PAYLOAD } from "../config/runtimeConfig.js";
 import { dbg } from "../utils/debugLog.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { stripCodexUnsupportedPatterns } from "../utils/codexToolSchema.js";
@@ -370,7 +370,7 @@ export class CodexExecutor extends BaseExecutor {
           lineScanOffset = nl + 1;
           if (!line.startsWith("data:")) continue;
           const data = line.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
+          if (!data || data === SSE_DONE_PAYLOAD) continue;
           try {
             const event = JSON.parse(data);
             if (event?.type === "error" || event?.type === "response.failed") {

@@ -1,7 +1,7 @@
 import { translateResponse, initState } from "../translator/index.js";
 import { FORMATS } from "../translator/formats.js";
 import { PROVIDERS } from "../config/providers.js";
-import { HTTP_STATUS } from "../config/runtimeConfig.js";
+import { HTTP_STATUS, NATIVE_GEMINI_FINISH_REASON_FIELDS, NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES, NATIVE_GEMINI_FORMATS } from "../config/runtimeConfig.js";
 import { liftReasoningAliases } from "../translator/concerns/reasoning.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
 import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
@@ -61,8 +61,8 @@ function nativeCandidateFieldIsVisible(projection, field) {
     }
     if (prefixes.length) return false;
     if (token) paths.push(path());
-    const aliases = field === "finishReason" ? ["finishReason", "finish_reason"] : [field];
-    return paths.some(selected => ["*", "candidates", "candidates/*", ...aliases.map(name => `candidates/${name}`)].includes(selected));
+    const aliases = field === "finishReason" ? NATIVE_GEMINI_FINISH_REASON_FIELDS : [field];
+    return paths.some(selected => [...NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES, ...aliases.map(name => `candidates/${name}`)].includes(selected));
   });
 }
 
@@ -107,7 +107,7 @@ export function createSSEStream(options = {}) {
   // provider serves it. Native Gemini SSE ends at EOF and carries arbitrary
   // Parts/metadata that must not pass through Chat normalization.
   const nativeGeminiPassthrough = mode === STREAM_MODE.PASSTHROUGH &&
-    [FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY].includes(sourceFormat);
+    NATIVE_GEMINI_FORMATS.includes(sourceFormat);
   const observeNativeGeminiTransform = mode === STREAM_MODE.TRANSLATE
     && sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
     && typeof onNativeResponseSuccess === "function";
@@ -863,7 +863,7 @@ export function createSSEStream(options = {}) {
         // upstream's own [DONE] is consumed above and Gemini/Claude streams have none. Nothing
         // else in this mode emits it, so one is written here.
         if (sourceFormat === FORMATS.OPENAI && sseEmittedCount > 0) {
-          const doneOutput = "data: [DONE]\n\n";
+          const doneOutput = SSE_DONE;
           reqLogger?.appendConvertedChunk?.(doneOutput);
           controller.enqueue(sharedEncoder.encode(doneOutput));
           streamDoneSent = true;

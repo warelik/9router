@@ -1,3 +1,11 @@
+import {
+  NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES,
+  NATIVE_GEMINI_FIELD_MASK_HEADER_NAME,
+  NATIVE_GEMINI_JSON_FENCE_PENDING_STATES,
+  REWRITTEN_RESPONSE_HEADERS,
+  SSE_DONE_PAYLOAD,
+} from "../config/runtimeConfig.js";
+
 // Adapt Cloud Code's response envelope, keeping the Gemini payload available
 // to the existing native response validation, usage observer and client.
 function unwrap(value) {
@@ -14,7 +22,7 @@ function unwrap(value) {
 
 function responseHeaders(response, contentType) {
   const headers = new Headers(response.headers);
-  for (const name of ["content-length", "content-encoding", "transfer-encoding"]) headers.delete(name);
+  for (const name of REWRITTEN_RESPONSE_HEADERS) headers.delete(name);
   headers.set("Content-Type", contentType);
   return headers;
 }
@@ -57,7 +65,7 @@ function parseFieldMask(rawMask, source) {
     }
     return child;
   };
-  const isPathSeparator = character => source === "x-goog-fieldmask"
+  const isPathSeparator = character => source === NATIVE_GEMINI_FIELD_MASK_HEADER_NAME
     ? character === "."
     : character === "/" || character === ".";
 
@@ -127,7 +135,7 @@ function parseFieldMask(rawMask, source) {
 function nativeResponseMasks(nativeRequest = {}) {
   const query = new URLSearchParams(nativeRequest.query || []);
   const masks = [];
-  for (const name of ["fields", "$fields"]) {
+  for (const name of NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES) {
     for (const value of query.getAll(name)) {
       const parsed = parseFieldMask(value, name);
       if (parsed) masks.push(parsed);
@@ -137,16 +145,16 @@ function nativeResponseMasks(nativeRequest = {}) {
   const headers = nativeRequest.headers;
   let headerMask = null;
   if (headers && typeof headers.get === "function") {
-    headerMask = headers.get("x-goog-fieldmask");
+    headerMask = headers.get(NATIVE_GEMINI_FIELD_MASK_HEADER_NAME);
   } else if (headers && typeof headers === "object") {
     for (const [name, value] of Object.entries(headers)) {
-      if (name.toLowerCase() !== "x-goog-fieldmask") continue;
+      if (name.toLowerCase() !== NATIVE_GEMINI_FIELD_MASK_HEADER_NAME) continue;
       headerMask = Array.isArray(value) ? value.join(",") : value;
       break;
     }
   }
   if (headerMask != null) {
-    const parsed = parseFieldMask(headerMask, "x-goog-fieldmask");
+    const parsed = parseFieldMask(headerMask, NATIVE_GEMINI_FIELD_MASK_HEADER_NAME);
     if (parsed) masks.push(parsed);
   }
   return masks;
@@ -308,7 +316,7 @@ function updateNativeJsonStreamStates(value, states) {
       states.set(candidateIndex, state);
     }
 
-    if (["start", "possible", "open"].includes(state.status)) {
+    if (NATIVE_GEMINI_JSON_FENCE_PENDING_STATES.includes(state.status)) {
       const parts = candidate.content?.parts;
       if (Array.isArray(parts)) {
         for (const part of parts) {
@@ -442,7 +450,7 @@ export async function unwrapAntigravityResponse(response, stream, nativeRequest 
     const value = data.join("\n");
     data = [];
     // Gemini terminates at EOF. Its finishReason is preserved independently.
-    if (value.trim() === "[DONE]") {
+    if (value.trim() === SSE_DONE_PAYLOAD) {
       flushPendingNativeResponses(controller);
       return;
     }

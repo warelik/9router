@@ -1,6 +1,7 @@
 // Real chat core + DefaultExecutor HTTP preparation. Only network/accounting
 // boundaries are replaced. No provider requests, secrets, or live DB writes.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES } from "../../open-sse/config/runtimeConfig.js";
 
 const { network, executors } = vi.hoisted(() => ({ network: vi.fn(), executors: new Map() }));
 vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: network }));
@@ -188,6 +189,7 @@ describe("native Gemini requests through real chat core and executor", () => {
       ["fields query", [["fields", "candidates/content/parts/text"]], {}],
       ["$fields query", [["$fields", "candidates(content(parts(text)))"]], {}],
       ["fieldmask header", [], { "X-Goog-FieldMask": "candidates.content.parts.text" }],
+      ["mixed-case fieldmask header", [], { "X-gOoG-fIeLdMaSk": "candidates.content.parts.text" }],
     ])(`${provider}: %s projection remains transparent through the real core and stream observer`, async (_name, queryParams, clientHeaders) => {
       const projected = { candidates: [{ content: { parts: [{ text: "completed projected output" }] } }] };
       for (const nativeJson of [false, true]) {
@@ -319,6 +321,24 @@ describe("native Gemini requests through real chat core and executor", () => {
       expect(result.success).toBe(true);
       expect(result.response.status).toBe(200);
       expect(await result.response.json()).toEqual({});
+    });
+
+    it(`${provider}: reads configured field-mask query names through the real core`, async () => {
+      const saved = [...NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES];
+      try {
+        NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.push("configuredProjection");
+        network.mockImplementationOnce(async () => Response.json({}));
+        const original = body();
+        const result = await run(provider, original, { queryParams: [["configuredProjection", "modelStatus"]] });
+        expect(result.success).toBe(true);
+        expect(result.response.status).toBe(200);
+        expect(await result.response.json()).toEqual({});
+        expect(wireBody()).toEqual(original);
+        const upstreamURL = new URL(network.mock.calls.at(-1)[0]);
+        expect(upstreamURL.searchParams.get("configuredProjection")).toBe("modelStatus");
+      } finally {
+        NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.splice(0, NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.length, ...saved);
+      }
     });
 
     it(`${provider}: preserves a projected null wrapper without inventing a failure`, async () => {

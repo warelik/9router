@@ -4,7 +4,7 @@ import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE, selectAnthropicBeta, mergeAnthropicBeta } from "../providers/shared.js";
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
 import { OAUTH_ENDPOINTS, buildKimiHeaders, NOUS_ATTRIBUTION } from "../config/appConstants.js";
-import { NATIVE_GEMINI_PRIVATE_HEADERS } from "../config/runtimeConfig.js";
+import { NATIVE_GEMINI_PRIVATE_HEADERS, NATIVE_GEMINI_API_VERSIONS } from "../config/runtimeConfig.js";
 import { buildClineHeaders } from "../shared/clineAuth.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
@@ -203,7 +203,7 @@ export class DefaultExecutor extends BaseExecutor {
       // The caller has resolved the provider wire version. Format it without
       // overriding that routing decision for any Gemini-format provider.
       const nativeVersion = credentials?.nativeGeminiPassthrough
-        && ["v1", "v1alpha"].includes(credentials.nativeGeminiRequest?.apiVersion)
+        && NATIVE_GEMINI_API_VERSIONS.includes(credentials.nativeGeminiRequest?.apiVersion)
         ? credentials.nativeGeminiRequest.apiVersion : null;
       const baseUrl = nativeVersion
         ? this.config.baseUrl.replace("/v1beta/", `/${nativeVersion}/`) : this.config.baseUrl;

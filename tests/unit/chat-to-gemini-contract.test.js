@@ -48,6 +48,19 @@ import {
 } from "../../open-sse/config/defaultThinkingSignature.js";
 import { SSE_DONE_PAYLOAD, SSE_DONE } from "../../open-sse/utils/sseConstants.js";
 import { FERNET_ENCRYPTED_CONTENT_PREFIX } from "../../open-sse/translator/formats/responsesApi.js";
+import {
+  HTTP_STATUS,
+  NATIVE_GEMINI_ERROR_STATUSES,
+  NATIVE_GEMINI_API_VERSIONS,
+  NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES,
+  NATIVE_GEMINI_JSON_FENCE_PENDING_STATES,
+  NATIVE_GEMINI_FINISH_REASON_FIELDS,
+  NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES,
+  NATIVE_GEMINI_FORMATS,
+  REWRITTEN_RESPONSE_HEADERS,
+  AISTUDIO_NATIVE_GEMINI_API_VERSION,
+  GEMINI_DEFAULT_FILE_MIME_TYPE,
+} from "../../open-sse/config/runtimeConfig.js";
 
 const MODEL = "gemini-3.5-flash-lite";
 const user = (content) => ({ role: "user", content });
@@ -645,6 +658,34 @@ describe("shared wire constants", () => {
     expect(SSE_DONE_PAYLOAD).toBe("[DONE]");
     expect(SSE_DONE).toBe("data: [DONE]\n\n");
     expect(FERNET_ENCRYPTED_CONTENT_PREFIX).toBe("gAAAAA");
+  });
+
+  it("native Gemini config keeps exact lookup values, array types and order", () => {
+    expect(Object.getPrototypeOf(NATIVE_GEMINI_ERROR_STATUSES)).toBe(Object.prototype);
+    expect(NATIVE_GEMINI_ERROR_STATUSES).toStrictEqual({
+      400: "INVALID_ARGUMENT",
+      401: "UNAUTHENTICATED",
+      403: "PERMISSION_DENIED",
+      404: "NOT_FOUND",
+      429: "RESOURCE_EXHAUSTED",
+      503: "UNAVAILABLE",
+      504: "DEADLINE_EXCEEDED",
+    });
+    for (const [actual, expected] of [
+      [NATIVE_GEMINI_API_VERSIONS, ["v1", "v1alpha"]],
+      [NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES, ["fields", "$fields"]],
+      [NATIVE_GEMINI_JSON_FENCE_PENDING_STATES, ["start", "possible", "open"]],
+      [NATIVE_GEMINI_FINISH_REASON_FIELDS, ["finishReason", "finish_reason"]],
+      [NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES, ["*", "candidates", "candidates/*"]],
+      [NATIVE_GEMINI_FORMATS, [FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY]],
+      [REWRITTEN_RESPONSE_HEADERS, ["content-encoding", "content-length", "transfer-encoding"]],
+    ]) {
+      expect(Array.isArray(actual)).toBe(true);
+      expect(actual).toStrictEqual(expected);
+    }
+    expect(AISTUDIO_NATIVE_GEMINI_API_VERSION).toBe("v1beta");
+    expect(GEMINI_DEFAULT_FILE_MIME_TYPE).toBe("application/octet-stream");
+    expect(HTTP_STATUS.CLIENT_CLOSED_REQUEST).toBe(499);
   });
 });
 
