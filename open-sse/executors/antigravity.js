@@ -3,6 +3,7 @@ import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { OAUTH_ENDPOINTS, ANTIGRAVITY_HEADERS, AG_DEFAULT_TOOLS, AG_TOOL_SUFFIX, ANTIGRAVITY_PROMPT_REWRITES } from "../config/appConstants.js";
 import { HTTP_STATUS } from "../config/runtimeConfig.js";
+import { GEMINI_FUNCTION_CALLING_MODE_NONE, GEMINI_FUNCTION_CALLING_MODE_VALIDATED } from "../translator/schema/index.js";
 import { resolveSessionId, toNumericSessionId } from "../utils/sessionManager.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { cleanJSONSchemaForAntigravity, normalizeGeminiContents } from "../translator/formats/gemini.js";
@@ -84,7 +85,7 @@ function nativeGeminiDisablesFunctionCalling(request) {
   return [request.toolConfig, request.tool_config].some(toolConfig => {
     if (!toolConfig || typeof toolConfig !== "object") return false;
     return [toolConfig.functionCallingConfig, toolConfig.function_calling_config].some(config =>
-      config && typeof config === "object" && config.mode === "NONE"
+      config && typeof config === "object" && config.mode === GEMINI_FUNCTION_CALLING_MODE_NONE
     );
   });
 }
@@ -403,7 +404,7 @@ export class AntigravityExecutor extends BaseExecutor {
       ...(tools && { tools }),
       sessionId,
       safetySettings: undefined,
-      ...(tools?.length > 0 && { toolConfig: (geminiBacked && _originalToolConfig) || { functionCallingConfig: { mode: "VALIDATED" } } })
+      ...(tools?.length > 0 && { toolConfig: (geminiBacked && _originalToolConfig) || { functionCallingConfig: { mode: GEMINI_FUNCTION_CALLING_MODE_VALIDATED } } })
     };
 
     // Strip blacklisted thinking fields from top-level body (set by thinkingUnified.js at root, not body.request)
