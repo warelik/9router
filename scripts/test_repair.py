@@ -1937,7 +1937,11 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         self.assertEqual(pending_review.call_args_list,
                          [((request_time,), {}), ((request_time,), {}),
                           ((request_time,), {}), ((request_time,), {})])
-        self.assertEqual(output.call_count, 2)
+        emitted = [call.kwargs for call in output.call_args_list]
+        self.assertEqual([values for values in emitted if set(values) == {"upstream"}],
+                         [{"upstream": candidate["upstream_sha"]}] * 2)
+        self.assertEqual(len([values for values in emitted if "mode" in values]), 2)
+        self.assertEqual(len(emitted), 4)
         self.assertEqual(output.call_args.kwargs["mode"], "waiting")
 
     def test_retained_request_id_is_not_replaced_or_duplicated(self):
