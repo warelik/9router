@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 // Real endpoint + handler control flow. Only imported service boundaries are
@@ -76,6 +77,8 @@ function load() {
     errorResponse: (status, message, headers) => Response.json({ error: { message } }, { status, headers }),
     unavailableResponse: (status, message) => Response.json({ error: { message } }, { status }),
   };
+  // Production crypto is real; these remote fixtures have no trusted local/CLI principal.
+  Object.assign(context, { createHash, isLocalRequest: () => false, hasValidCliToken: async () => false });
   vm.createContext(context);
   // Reuse the real key extraction implementation, not a permissive test copy.
   const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
@@ -117,6 +120,20 @@ function audioRequest(action = "streamGenerateContent") {
 
 describe("native Gemini endpoint entry contract", () => {
   beforeEach(load);
+
+  it("isolates native server-parts tenancy between authenticated client keys", async () => {
+    services.isValidApiKey.mockResolvedValue(true);
+    for (const key of ["first-fixture-key", "second-fixture-key"]) {
+      const response = await call("gemini", "generateContent", nativeBody(),
+        { headers: { Authorization: `Bearer ${key}` } });
+      expect(response.status).toBe(200);
+    }
+    const tenants = services.handleChatCore.mock.calls.map(([options]) => options.serverPartsTenant);
+    expect(tenants).toHaveLength(2);
+    for (const tenant of tenants) expect(tenant).toMatch(/^[0-9a-f]{64}$/);
+    expect(tenants[0]).not.toBe(tenants[1]);
+  });
+
 
 it("loads the real client-key accessor for every supported credential location", () => {
   for (const [headers, query, expected] of [
