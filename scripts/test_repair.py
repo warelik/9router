@@ -547,7 +547,36 @@ class RegressionSelectionTests(unittest.TestCase):
 
 
 class PolicyBundleTests(unittest.TestCase):
-    def test_closed_review_pair_reuse_requires_policy_only_and_exact_bundle_proof(self):
+    def test_policy_bundle_reuse_is_bound_for_allowed_final_decisions(self):
+        candidate = {"schema": 1, "application_sha": HEAD}
+        candidate_id = "f" * 64
+        full = {"number": 3}
+        proof = {"decision": "reuse-policy-validation", "candidate_id": candidate_id,
+                 "manifest_sha256": "a" * 64}
+
+        for decision in ("allow", "policy-only", "already-validated"):
+            with self.subTest(decision=decision), \
+                    patch.object(release, "_validated_policy_bundle", return_value=proof) as validate:
+                self.assertEqual(release._policy_bundle_for_final_decision(
+                    REPO, candidate, candidate_id, full, decision), proof)
+                validate.assert_called_once_with(REPO, candidate, full)
+
+        for wrong_proof in (
+                {**proof, "candidate_id": "0" * 64},
+                {**proof, "manifest_sha256": "invalid"},
+        ):
+            with self.subTest(wrong_proof=wrong_proof), \
+                    patch.object(release, "_validated_policy_bundle", return_value=wrong_proof), \
+                    self.assertRaisesRegex(ValueError, "exact policy candidate"):
+                release._policy_bundle_for_final_decision(
+                    REPO, candidate, candidate_id, full, "allow")
+
+        with patch.object(release, "_validated_policy_bundle") as validate:
+            self.assertIsNone(release._policy_bundle_for_final_decision(
+                REPO, candidate, candidate_id, full, "blocked"))
+        validate.assert_not_called()
+
+    def test_closed_review_pair_reuse_requires_an_allowed_decision_and_exact_bundle_proof(self):
         candidate = {"schema": 1, "application_sha": HEAD}
         candidate_id = "f" * 64
         baseline = {"release_id": 5}
@@ -600,6 +629,13 @@ class PolicyBundleTests(unittest.TestCase):
             (trusted / ".github/workflows").mkdir(parents=True)
             (trusted / "scripts/release.py").write_text("pass\n")
             (trusted / "scripts/test_baseline.py").write_text("pass\n")
+            (trusted / "scripts/maintenance.py").write_text("pass\n")
+            maintenance_lock = {
+                "schema": 1, "repository": "warelik/machine-maintenance",
+                "revision": "a" * 40, "module_sha256": "b" * 64, "api_version": 1,
+            }
+            (trusted / "scripts/maintenance.lock.json").write_text(
+                json.dumps(maintenance_lock))
             (trusted / "patches/source.json").write_text("{}\n")
             (trusted / ".github/workflows/release.yml").write_text("jobs: {}\n")
 
@@ -609,10 +645,7 @@ class PolicyBundleTests(unittest.TestCase):
             (candidate_scripts / "release.py").write_text("pass\n")
             (candidate_scripts / "test_baseline.py").write_text("pass\n")
             (candidate_scripts / "test_candidate.py").write_text("raise RuntimeError('private source')\n")
-            (candidate_scripts / "maintenance.lock.json").write_text(json.dumps({
-                "schema": 1, "repository": "warelik/machine-maintenance",
-                "revision": "a" * 40, "module_sha256": "b" * 64, "api_version": 1,
-            }))
+            (candidate_scripts / "maintenance.lock.json").write_text(json.dumps(maintenance_lock))
             workflow = candidate / ".github/workflows/release.yml"
             workflow.parent.mkdir(parents=True)
             workflow.write_text("jobs: {}\n")
@@ -632,9 +665,10 @@ class PolicyBundleTests(unittest.TestCase):
 
             env = {
                 "NINEROUTER_POLICY_PARSER": str(parser),
+                "NINEROUTER_POLICY_BASELINE_MAINTENANCE": str(root / "private-maintenance-baseline"),
                 "FORK_MAINTENANCE_ROOT": str(root / "private-maintenance"),
             }
-            with (patch.object(release, "ROOT", trusted), patch.dict(os.environ, env),
+            with (patch.object(release, "ROOT", trusted), patch.dict(os.environ, env, clear=True),
                   patch.object(release, "yaml_module", return_value=yaml),
                   patch.object(release, "_candidate_private_lifecycle",
                                return_value=(b"private module", b"private receipt")),
@@ -653,13 +687,38 @@ class PolicyBundleTests(unittest.TestCase):
         self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
         self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
         launcher = args[args.index("-c") + 1]
+        self.assertIn("baseline_launcher=", launcher)
+        self.assertIn("baseline=subprocess.run([sys.executable,'-I','-B','-c',baseline_launcher", launcher)
+        self.assertIn("baseline_env=os.environ.copy()", launcher)
+        self.assertIn("baseline_private_root=oracle.parent.parent/'private-maintenance-baseline'", launcher)
+        self.assertIn("'NINEROUTER_SOURCE_ROOT':str(oracle.parent)", launcher)
+        self.assertIn("'NINEROUTER_POLICY_PARSER':str(parser)", launcher)
+        self.assertIn("'NINEROUTER_POLICY_CANDIDATE_RELEASE':str(oracle/'release.py')", launcher)
+        self.assertIn("'NINEROUTER_POLICY_CANDIDATE_WORKFLOW':str(oracle.parent/'.github/workflows/release.yml')", launcher)
+        self.assertIn("'NINEROUTER_POLICY_BASELINE_WORKFLOW':str(oracle.parent/'.github/workflows/release.yml')", launcher)
+        self.assertIn("'FORK_MAINTENANCE_ROOT':str(baseline_private_root)", launcher)
+        self.assertIn("env=baseline_env", launcher)
+        self.assertIn("sys.path.insert(0,str(oracle))", launcher)
+        self.assertIn("import release", launcher)
+        self.assertIn("Trusted baseline release module was not imported first", launcher)
         self.assertIn("oracle_tests=sorted(oracle.glob('test_*.py'))", launcher)
-        self.assertIn("candidate_tests=[pathlib.Path(p) for p in sys.argv[4:-1]]", launcher)
+        self.assertIn("candidate_tests=[pathlib.Path(p) for p in sys.argv[4:-2]]", launcher)
+        self.assertIn("unittest.TestSuite([load(oracle_tests,'immutable_a'),load(candidate_tests,'candidate_b')])",
+                      launcher)
+        candidate_import = launcher.index("sys.path.insert(0,str(candidate))")
+        self.assertLess(launcher.index("baseline.returncode!=0"), candidate_import)
+        self.assertLess(launcher.index("baseline=subprocess.run"), candidate_import)
+        self.assertLess(launcher.index("baseline_result=json.loads"),
+                        candidate_import)
+        self.assertIn("baseline_result['executed_count']!=baseline_result['expected_count']", launcher)
+        self.assertIn("baseline_result.get('successful') is not True", launcher)
         self.assertIn("result.testsRun", launcher)
         self.assertIn("completion.write_text", launcher)
+        self.assertIn("baseline_result['executed_count']+result.testsRun", launcher)
         self.assertLess(launcher.index("result=runner.run(suite)"),
                         launcher.index("completion.write_text"))
-        self.assertEqual(Path(args[-2]).name, "test_candidate.py")
+        self.assertEqual(Path(args[-3]).name, "test_candidate.py")
+        self.assertEqual(Path(args[-2]).name, "oracle-policy-suite-completion.json")
         self.assertEqual(Path(args[-1]).name, "policy-suite-completion.json")
 
     def test_shared_policy_suite_requires_trusted_full_completion_evidence(self):
@@ -899,6 +958,371 @@ class NativeMarkerAuthorizationTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 release._authorized_final_marker_comments(
                     [bad], REPO, "fork-final:v1", allow_workflow_bot=True)
+
+
+class WorkflowTransitionEvidenceTests(unittest.TestCase):
+    timestamp = "2026-10-20T06:00:00Z"
+
+    def setUp(self):
+        self.candidate_id = "a" * 64
+        self.candidate = {
+            "schema": 1, "repository": REPO, "upstream_sha": UPSTREAM,
+            "application_sha": HEAD, "configuration_sha": CONFIG,
+            "patchset_sha256": "e" * 64, "recipe_sha256": "f" * 64,
+            "platform": "linux/amd64",
+        }
+        self.parent = "9" * 40
+        self.payload = {
+            "schema": 1, "candidate_id": self.candidate_id, "run_id": 90,
+            "run_attempt": 2, "workflow_sha": self.parent,
+            "trusted_policy_sha": self.parent,
+        }
+        body = (
+            "<!-- fork-candidate:v1 " + release._candidate_json(self.candidate) + " -->\n"
+            "<!-- fork-policy-validation:v1 " + json.dumps(self.payload, separators=(",", ":")) + " -->")
+        self.comment = {
+            "id": 901, "created_at": self.timestamp, "updated_at": self.timestamp,
+            "user": {"login": "github-actions[bot]", "type": "Bot"}, "body": body,
+        }
+        self.run = {
+            "id": 90, "run_attempt": 2, "head_sha": self.parent,
+            "path": ".github/workflows/release.yml", "status": "completed",
+            "conclusion": "failure",
+        }
+        self.private_lock = {
+            "schema": 1, "repository": "warelik/machine-maintenance",
+            "revision": "c" * 40, "module_sha256": "d" * 64, "api_version": 1,
+        }
+        self.private_lock_bytes = json.dumps(
+            self.private_lock, sort_keys=True, separators=(",", ":")).encode()
+        self.policy_job = {
+            "id": 9010, "name": release.SHARED_POLICY_JOB, "status": "completed",
+            "conclusion": "success", "started_at": self.timestamp,
+            "steps": [
+                {"name": "Read The Candidate Private Module Pin", "status": "completed",
+                 "conclusion": "success"},
+                {"name": "Read The Trusted Baseline Private Module Pin", "status": "completed",
+                 "conclusion": "success"},
+                {"name": "Checkout The Trusted Baseline Private Module", "status": "completed",
+                 "conclusion": "skipped", "started_at": self.timestamp,
+                 "completed_at": self.timestamp},
+                {"name": "Record The Exact Trusted Baseline Private Checkout Receipt",
+                 "status": "completed", "conclusion": "skipped",
+                 "started_at": self.timestamp, "completed_at": self.timestamp},
+                {"name": "Enforce Trusted Tests And Validate Proposed YAML",
+                 "status": "completed", "conclusion": "success"},
+            ],
+        }
+        self.jobs = [
+            self.policy_job,
+            {"name": "Test The Historical Application Contracts", "status": "completed",
+             "conclusion": "skipped", "started_at": "2026-10-20T06:00:02Z",
+             "completed_at": "2026-10-20T06:00:01Z", "steps": []},
+            {"name": "Build And Smoke Test One Container", "status": "completed",
+             "conclusion": "skipped", "started_at": "2026-10-20T06:00:02Z",
+             "completed_at": "2026-10-20T06:00:01Z", "steps": []},
+        ]
+        self.record = {
+            "run": self.run, "marker": self.payload, "reservation": self.comment,
+        }
+        self.lifecycle = SimpleNamespace(candidate_identity=lambda _candidate: self.candidate_id)
+
+    def test_transition_replays_parent_policy_pass_after_late_publish_failure(self):
+        history = {"state": "verified", "record": self.record}
+        baseline_lock = {**self.private_lock, "revision": self.parent,
+                         "module_sha256": "e" * 64}
+        for same_private_revision in (True, False):
+            with self.subTest(same_private_revision=same_private_revision):
+                baseline_lock_for_case = (self.private_lock if same_private_revision
+                                          else baseline_lock)
+                steps = [dict(step) for step in self.policy_job["steps"]]
+                for step in steps:
+                    if step["name"] in {
+                            "Checkout The Trusted Baseline Private Module",
+                            "Record The Exact Trusted Baseline Private Checkout Receipt"}:
+                        step["conclusion"] = "skipped" if same_private_revision else "success"
+                        if not same_private_revision:
+                            step["started_at"] = self.timestamp
+                jobs = [{**self.policy_job, "steps": steps}, *self.jobs[1:]]
+                with (patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
+                      patch.object(release, "_shared_review_comments", return_value=[self.comment]),
+                      patch.object(release, "_policy_validation_history", return_value=history) as proof,
+                      patch.object(release, "_native_attempt_jobs", return_value=(jobs, "jobs-endpoint")),
+                      patch.object(release, "_shared_file", side_effect=[
+                          self.private_lock_bytes,
+                          json.dumps(baseline_lock_for_case, sort_keys=True,
+                                     separators=(",", ":")).encode()])):
+                    receipt = release._transition_policy_receipt(
+                        REPO, self.candidate, self.parent, self.lifecycle)
+                proof.assert_called_once_with(
+                    REPO, self.candidate, self.lifecycle,
+                    trusted_policy_sha=self.parent, workflow_sha=self.parent)
+                self.assertEqual(receipt, {
+                    "candidate_id": self.candidate_id, "source": "native-run", "verified": True,
+                    "run_id": 90, "run_attempt": 2, "reservation_id": 901,
+                    "workflow_sha": self.parent, "trusted_policy_sha": self.parent,
+                })
+        mismatched_pin = {**self.private_lock, "revision": self.parent,
+                          "module_sha256": "e" * 64}
+        with (patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
+              patch.object(release, "_shared_review_comments", return_value=[self.comment]),
+              patch.object(release, "_policy_validation_history",
+                           return_value={"state": "verified", "record": self.record}),
+              patch.object(release, "_native_attempt_jobs", return_value=(self.jobs, "jobs-endpoint")),
+              patch.object(release, "_shared_file", side_effect=[
+                  self.private_lock_bytes,
+                  json.dumps(mismatched_pin, sort_keys=True, separators=(",", ":")).encode()]),
+              self.assertRaisesRegex(ValueError, "wrong baseline-private checkout path")):
+            release._transition_policy_receipt(
+                REPO, self.candidate, self.parent, self.lifecycle)
+
+    def test_transition_receipt_refuses_a_failed_policy_step_or_started_heavy_job(self):
+        history = {"state": "verified", "record": self.record}
+        for jobs in (
+                [{**self.policy_job, "steps": [{"status": "completed", "conclusion": "failure"}]},
+                 *self.jobs[1:]],
+                [self.policy_job, {**self.jobs[1], "started_at": self.timestamp,
+                                   "steps": [{"name": "test", "status": "completed",
+                                              "conclusion": "success"}]}, self.jobs[2]],
+        ):
+            with (patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
+                  patch.object(release, "_shared_review_comments", return_value=[self.comment]),
+                  patch.object(release, "_policy_validation_history", return_value=history),
+                  patch.object(release, "_native_attempt_jobs", return_value=(jobs, "jobs-endpoint")),
+                  patch.object(release, "_shared_file", return_value=self.private_lock_bytes),
+                  self.assertRaisesRegex(ValueError, "mandatory step|heavy application job")):
+                release._transition_policy_receipt(
+                    REPO, self.candidate, self.parent, self.lifecycle)
+
+    def test_transition_retry_uses_only_post_pin_h_runs_and_excludes_current_run(self):
+        pin_updated_at = "2026-10-20T06:00:00Z"
+        current_stale = {
+            "id": 90, "head_sha": HEAD, "head_branch": "downstream",
+            "event": "workflow_dispatch", "path": ".github/workflows/release.yml",
+            "created_at": "2026-10-20T06:00:02Z", "run_attempt": 1,
+        }
+        safe_next = {
+            "id": 91, "head_sha": HEAD, "head_branch": "downstream",
+            "event": "push", "path": ".github/workflows/release.yml",
+            "created_at": "2026-10-20T06:00:01Z", "run_attempt": 1,
+            "status": "queued",
+        }
+        with (patch.dict(os.environ, {"GITHUB_RUN_ID": "90"}),
+              patch.object(release, "_workflow_run_records",
+                           return_value=([current_stale, safe_next], True)),
+              patch.object(release, "_native_workflow_source") as source,
+              patch.object(release, "api", side_effect=AssertionError("fresh H run already exists"))):
+            selected = release._ensure_native_workflow_transition_run(
+                REPO, HEAD, trusted_pin_updated_at=pin_updated_at)
+        self.assertEqual(selected, safe_next)
+        source.assert_called_once_with(REPO, safe_next, HEAD)
+
+    def test_transition_retry_dispatches_after_stale_self_run_but_refuses_consumed_attempts(self):
+        pin_updated_at = "2026-10-20T06:00:00Z"
+        stale = {
+            "id": 91, "head_sha": HEAD, "head_branch": "downstream",
+            "event": "push", "path": ".github/workflows/release.yml",
+            "created_at": "2026-10-20T05:59:59Z", "run_attempt": 1,
+            "status": "completed", "conclusion": "failure",
+        }
+        calls = []
+
+        def dispatch(path, *, method="GET", data=None, token=None):
+            calls.append((path, method, data, token))
+            return None
+
+        with (patch.dict(os.environ, {"GITHUB_RUN_ID": "90"}),
+              patch.object(release, "_workflow_run_records", return_value=([stale], True)),
+              patch.object(release, "_native_workflow_source"),
+              patch.object(release, "owner_token", return_value="fixture-owner"),
+              patch.object(release, "api", side_effect=dispatch)):
+            self.assertIsNone(release._ensure_native_workflow_transition_run(
+                REPO, HEAD, trusted_pin_updated_at=pin_updated_at))
+        self.assertEqual(calls, [(
+            f"repos/{REPO}/actions/workflows/release.yml/dispatches", "POST",
+            {"ref": "downstream"}, "fixture-owner")])
+
+        for evidence in ("heavy", "final"):
+            safe_shape = {**stale, "id": 92,
+                          "created_at": "2026-10-20T06:00:01Z"}
+            calls.clear()
+            jobs = [{"name": "Test The Historical Application Contracts",
+                     "started_at": "2026-10-20T06:00:02Z", "steps": [{"name": "test"}]}]
+            comments = []
+            if evidence == "final":
+                jobs = [{"name": release.SHARED_POLICY_JOB, "status": "completed",
+                         "conclusion": "skipped", "steps": []}]
+                marker = {"run_id": 92, "run_attempt": 1}
+                comments = [{"id": 902, "created_at": self.timestamp,
+                             "updated_at": self.timestamp,
+                             "user": {"login": "github-actions[bot]", "type": "Bot"},
+                             "body": "<!-- fork-final:v1 " + json.dumps(marker) + " -->"}]
+            with (patch.dict(os.environ, {"GITHUB_RUN_ID": "90"}),
+                  patch.object(release, "_workflow_run_records", return_value=([safe_shape], True)),
+                  patch.object(release, "_native_workflow_source"),
+                  patch.object(release, "_native_attempt_jobs", return_value=(jobs, "jobs")),
+                  patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
+                  patch.object(release, "_shared_review_comments", return_value=comments),
+                  patch.object(release, "api", side_effect=dispatch)):
+                selected = release._ensure_native_workflow_transition_run(
+                    REPO, HEAD, trusted_pin_updated_at=pin_updated_at)
+            self.assertEqual(selected, safe_shape)
+            self.assertEqual(calls, [], evidence)
+
+    def test_transition_retry_treats_timestamped_skipped_heavy_jobs_as_unstarted(self):
+        pin_updated_at = "2026-10-20T06:00:00Z"
+        safe_run = {
+            "id": 92, "head_sha": HEAD, "head_branch": "downstream",
+            "event": "push", "path": ".github/workflows/release.yml",
+            "created_at": "2026-10-20T06:00:01Z", "run_attempt": 1,
+            "status": "completed", "conclusion": "failure",
+        }
+        jobs = [
+            {"name": release.SHARED_POLICY_JOB, "status": "completed",
+             "conclusion": "success", "started_at": "2026-10-20T06:00:01Z", "steps": []},
+            {"name": "Test The Historical Application Contracts", "status": "completed",
+             "conclusion": "skipped", "started_at": "2026-10-20T06:00:02Z",
+             "completed_at": "2026-10-20T06:00:01Z", "steps": []},
+            {"name": "Build And Smoke Test One Container", "status": "completed",
+             "conclusion": "skipped", "started_at": "2026-10-20T06:00:02Z",
+             "completed_at": "2026-10-20T06:00:01Z", "steps": []},
+        ]
+        calls = []
+
+        def dispatch(path, *, method="GET", data=None, token=None):
+            calls.append((path, method, data, token))
+            return None
+
+        with (patch.dict(os.environ, {"GITHUB_RUN_ID": "90"}),
+              patch.object(release, "_workflow_run_records", return_value=([safe_run], True)),
+              patch.object(release, "_native_workflow_source"),
+              patch.object(release, "_native_attempt_jobs", return_value=(jobs, "jobs")),
+              patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
+              patch.object(release, "_shared_review_comments", return_value=[]),
+              patch.object(release, "owner_token", return_value="fixture-owner"),
+              patch.object(release, "api", side_effect=dispatch)):
+            selected = release._ensure_native_workflow_transition_run(
+                REPO, HEAD, trusted_pin_updated_at=pin_updated_at)
+        self.assertIsNone(selected)
+        self.assertEqual(calls, [(
+            f"repos/{REPO}/actions/workflows/release.yml/dispatches", "POST",
+            {"ref": "downstream"}, "fixture-owner")])
+
+    def test_transition_candidate_scan_ignores_unrelated_historical_review_prose(self):
+        candidate_id = self.candidate_id
+        full_sha, delta_base = "1" * 40, SEED
+        marker = lambda scope, review_sha, base_sha: (
+            "<!-- fork-review:v1 " + json.dumps({
+                "schema": 1, "candidate_id": candidate_id, "scope": scope,
+                "review_sha": review_sha, "base_sha": base_sha,
+            }, separators=(",", ":")) + " -->")
+
+        def request(scope, review_sha, base_sha):
+            body = (
+                f"Exact candidate `{candidate_id}`; scope `{scope}`; "
+                f"source `{review_sha}`; base `{base_sha}`.\n"
+                f"Upstream: `{release.UPSTREAM}@{UPSTREAM}`. Application: `{HEAD}`. "
+                f"Configuration: `{CONFIG}`. Patches: `{'e' * 64}`. "
+                f"Container recipe: `{'f' * 64}`; platform: `linux/amd64`\n\n"
+                + marker(scope, review_sha, base_sha))
+            return {"id": 100 if scope == "delta" else 101, "created_at": self.timestamp,
+                    "updated_at": self.timestamp,
+                    "user": {"login": "warelik", "type": "User"}, "body": body}
+
+        delta_pull = {
+            "number": 12, "state": "open",
+            "head": {"ref": f"review/changes-{CONFIG}", "sha": CONFIG,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": f"review-base/{delta_base}", "sha": delta_base,
+                     "repo": {"full_name": REPO}},
+        }
+        full_pull = {
+            "number": 13, "state": "open",
+            "head": {"ref": f"review/{UPSTREAM}-{candidate_id}", "sha": full_sha,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": f"review-base/{UPSTREAM}", "sha": UPSTREAM,
+                     "repo": {"full_name": REPO}},
+        }
+        historical_delta = {
+            "number": 14, "state": "closed",
+            "head": {"ref": f"review/changes-{'2' * 40}", "sha": "2" * 40,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": f"review-base/{'3' * 40}", "sha": "3" * 40,
+                     "repo": {"full_name": REPO}},
+        }
+        historical_full = {
+            "number": 15, "state": "closed",
+            "head": {"ref": f"review/{'4' * 40}-{'5' * 64}", "sha": "6" * 40,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": f"review-base/{'4' * 40}", "sha": "4" * 40,
+                     "repo": {"full_name": REPO}},
+        }
+        comments = {
+            12: [request("delta", CONFIG, delta_base)],
+            13: [request("full", full_sha, UPSTREAM)],
+            14: [{"id": 114, "created_at": self.timestamp, "updated_at": self.timestamp,
+                  "user": {"login": "warelik", "type": "User"},
+                  "body": marker("delta", "2" * 40, "3" * 40)
+                  + " Old bootstrap review prompt with a different native format."}],
+            15: [{"id": 115, "created_at": self.timestamp, "updated_at": self.timestamp,
+                  "user": {"login": "warelik", "type": "User"},
+                  "body": marker("full", "6" * 40, "4" * 40)
+                  + " Old bootstrap review prompt with a different native format."}],
+        }
+        lifecycle = SimpleNamespace(candidate_identity=lambda _candidate: candidate_id)
+        calls = []
+
+        def native_pages(path):
+            number = int(path.rsplit("/", 1)[-1])
+            calls.append(number)
+            return comments[number]
+
+        with (patch.object(release, "_all_shared_review_pulls",
+                           return_value=[historical_full, historical_delta, full_pull, delta_pull]),
+              patch.object(release, "pages", side_effect=native_pages)):
+            result = release._transition_review_candidates(REPO, CONFIG, lifecycle)
+        self.assertEqual([item["pull"]["number"] for item in (result[0]["full"], result[0]["delta"])],
+                         [13, 12])
+        self.assertEqual(sorted(calls), [12, 13])
+
+    def test_workflow_test_job_change_transitions_even_when_container_recipe_is_unchanged(self):
+        candidate = {**self.candidate, "configuration_sha": HEAD}
+        context = {"candidate": candidate, "base_config_sha": CONFIG,
+                   "reviews": {"full": {"review_sha": UPSTREAM}}}
+        parent_identity = {"parent_sha": CONFIG, "repair_pr": 2}
+        active_workflow = b"jobs:\n  test:\n    steps:\n      - run: npm test\n"
+        candidate_workflow = (
+            b"jobs:\n  test:\n    timeout-minutes: 30\n    steps:\n      - run: npm test\n")
+        native_run = {"id": 90, "run_attempt": 1, "path": ".github/workflows/release.yml"}
+        lifecycle = SimpleNamespace(candidate_identity=lambda _candidate: self.candidate_id)
+        with (patch.dict(os.environ, {"GITHUB_SHA": CONFIG, "GITHUB_RUN_ID": "90",
+                                     "GITHUB_RUN_ATTEMPT": "1"}),
+              patch.object(release, "_sanitized_repair_identity", return_value=parent_identity),
+              patch.object(release, "_shared_file", side_effect=[
+                  b"Dockerfile\n", candidate_workflow, active_workflow]),
+              patch.object(release, "_recipe_sha256", return_value=candidate["recipe_sha256"]),
+              patch.object(release, "api", return_value=native_run),
+              patch.object(release, "_native_workflow_source") as source):
+            transition = release._workflow_recipe_transition(REPO, context, lifecycle)
+        self.assertTrue(transition["transition"])
+        self.assertEqual(transition["kind"], "adopt")
+        self.assertFalse(transition["recipe_changed"])
+        source.assert_called_once_with(REPO, native_run, CONFIG)
+
+    def test_unchanged_release_workflow_does_not_start_a_transition(self):
+        candidate = {**self.candidate, "configuration_sha": CONFIG}
+        context = {"candidate": candidate, "base_config_sha": CONFIG,
+                   "reviews": {"full": {"review_sha": UPSTREAM}}}
+        identity = {"parent_sha": self.parent, "repair_pr": 2}
+        workflow = b"jobs:\n  build:\n    steps:\n      - run: docker build\n"
+        lifecycle = SimpleNamespace(candidate_identity=lambda _candidate: self.candidate_id)
+        with (patch.dict(os.environ, {"GITHUB_SHA": CONFIG}),
+              patch.object(release, "_sanitized_repair_identity", return_value=identity),
+              patch.object(release, "_shared_file", side_effect=[b"Dockerfile\n", workflow, workflow]),
+              patch.object(release, "_recipe_sha256", return_value=candidate["recipe_sha256"]),
+              patch.object(release, "api", side_effect=AssertionError("unchanged workflow must not hand off"))):
+            transition = release._workflow_recipe_transition(REPO, context, lifecycle)
+        self.assertFalse(transition["transition"])
 
     def _final_reservation_inputs(self):
         candidate = {
@@ -2452,6 +2876,31 @@ class NativeAttemptEvidenceTests(unittest.TestCase):
 
 
 class RecipeIdentityTests(unittest.TestCase):
+    def test_release_tags_bind_recipe_and_keep_legacy_tags_readable(self):
+        version = "1.2.3"
+        upstream = "a" * 40
+        patchset = "b" * 64
+        recipe = "c" * 64
+        changed_recipe = "d" * 64
+
+        tag = release._release_tag(version, upstream, patchset, recipe)
+        self.assertEqual(tag, f"build-{version}-{'a' * 12}-{'b' * 12}-r{'c' * 12}")
+        self.assertNotEqual(tag, release._release_tag(version, upstream, patchset, changed_recipe))
+
+        legacy_tag = release._legacy_release_tag(version, upstream, patchset)
+        legacy = release._parse_release_tag(legacy_tag)
+        current = release._parse_release_tag(tag)
+        self.assertIsNotNone(legacy)
+        self.assertIsNotNone(current)
+        self.assertIsNone(legacy.group("recipe"))
+        self.assertEqual(current.group("recipe"), recipe[:12])
+        release._validate_recipe_tag(legacy, {})
+        release._validate_recipe_tag(current, {"recipe_sha256": recipe})
+        with self.assertRaisesRegex(ValueError, "does not match its provenance recipe"):
+            release._validate_recipe_tag(current, {"recipe_sha256": changed_recipe})
+        with self.assertRaisesRegex(ValueError, "does not match its provenance recipe"):
+            release._validate_recipe_tag(current, {})
+
     def test_buildx_action_and_effective_configuration_are_in_recipe_identity(self):
         class Lifecycle:
             @staticmethod
@@ -2686,6 +3135,48 @@ class AdoptionTests(unittest.TestCase):
             release._validate_and_adopt_config(REPO, context, Lifecycle())
         self.assertFalse(any("ZED_TRUSTED_POLICY" in path and method == "PATCH"
                              for path, method, _data in calls))
+
+    def test_workflow_recipe_fast_forward_uses_owner_token_to_trigger_native_push(self):
+        product = {"mode": "100644", "blob_sha": HEAD}
+        tree = {"Dockerfile": product, "patches/0001-fix.patch": product,
+                "patches/source.json": {"mode": "100644", "blob_sha": UPSTREAM}}
+        policy_id, trusted_pin = "f" * 64, "9" * 40
+        calls = []
+        adopted = False
+
+        def native(path, *, method="GET", data=None, token=None):
+            nonlocal adopted
+            calls.append((path, method, data, token))
+            if path == f"repos/{REPO}/commits/downstream":
+                return {"sha": HEAD if adopted else CONFIG}
+            if path == f"repos/{REPO}/git/commits/{HEAD}":
+                return {"sha": HEAD, "parents": [{"sha": CONFIG}],
+                        "message": "Review sanitized 9router repair #2 at " + "a" * 40}
+            if path == f"repos/{REPO}/git/refs/heads/downstream":
+                adopted = True
+                return {"ref": "refs/heads/downstream", "object": {
+                    "type": "commit", "sha": HEAD}}
+            self.fail(f"Unexpected native API request: {method} {path}")
+
+        class Lifecycle:
+            def validate_adoption(self, *_args):
+                return True
+
+        context = {"candidate": {"configuration_sha": HEAD}, "base_config_sha": CONFIG,
+                   "candidate_id": policy_id,
+                   "policy_validation": {"candidate_id": policy_id, "source": "native-run",
+                                         "verified": True}}
+        with (patch.dict(os.environ, {"TRUSTED_POLICY": trusted_pin}),
+              patch.object(release, "owner_token", return_value="fixture-owner"),
+              patch.object(release, "api", side_effect=native),
+              patch.object(release, "_native_full_tree", return_value=tree),
+              patch.object(release, "_advance_trusted_policy_pin", return_value={})):
+            release._validate_and_adopt_config(
+                REPO, context, Lifecycle(), workflow_transition=True)
+        adoption = next(call for call in calls if call[0].endswith("/git/refs/heads/downstream")
+                        and call[1] == "PATCH")
+        self.assertEqual(adoption[2], {"sha": HEAD, "force": False})
+        self.assertEqual(adoption[3], "fixture-owner")
 
     def test_unverified_policy_proof_cannot_reach_config_adoption_or_pin_update(self):
         context = {"candidate": {"configuration_sha": HEAD}, "base_config_sha": CONFIG,
@@ -4004,6 +4495,8 @@ class AdoptionTests(unittest.TestCase):
                         self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
 
     def test_policy_workflow_allows_pinned_action_refresh_and_operational_parameters(self):
+        # Preserve the original O test identity. The current oracle allows only
+        # exact action-pin refresh; it separately binds runner and timeout values.
         workflow = release.ROOT / ".github/workflows/release.yml"
         with tempfile.TemporaryDirectory() as directory:
             source = workflow.read_text(encoding="utf-8")
