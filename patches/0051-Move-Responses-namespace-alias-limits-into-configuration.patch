@@ -1,0 +1,58 @@
+From efdbc333429594b3cc5eb83ae390208d93b80d6e Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] Move Responses namespace alias limits into configuration
+
+---
+ open-sse/config/runtimeConfig.js                | 7 +++++++
+ open-sse/translator/request/openai-responses.js | 7 ++++---
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
+index c2d05b9e24d1aa80a64d480df46a30ef0255e9d9..afc5306eb248b962e1c84f36358470210aac092c 100644
+--- a/open-sse/config/runtimeConfig.js
++++ b/open-sse/config/runtimeConfig.js
+@@ -95,6 +95,13 @@ export const PORTABLE_COLLABORATION = {
+   aliasCollisionBaseLength: 58,
+ };
+ 
++export const RESPONSES_NAMESPACE_ALIAS = {
++  prefix: "ns_",
++  stemLength: 40,
++  hashLength: 16,
++  maxLength: 64,
++};
++
+ // Retry config for 429 responses (legacy - kept for backward compatibility)
+ export const RETRY_CONFIG = {
+   maxAttempts: 2,
+diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
+index 59f01c09bdb4c55d5f0bd0961afa90cc268b3148..1f2b4a7d3eb7952aaf0e2fc3cf672b5056b70268 100644
+--- a/open-sse/translator/request/openai-responses.js
++++ b/open-sse/translator/request/openai-responses.js
+@@ -7,6 +7,7 @@
+ import { createHash } from "crypto";
+ import { register } from "../index.js";
+ import { FORMATS } from "../formats.js";
++import { RESPONSES_NAMESPACE_ALIAS } from "../../config/runtimeConfig.js";
+ import {
+   normalizeResponsesInput,
+   normalizeResponsesAgentMessage,
+@@ -54,13 +55,13 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+   const aliasFor = (namespace, name, type) => {
+     const identity = JSON.stringify([namespace, name, type]);
+     if (aliasCache.has(identity)) return aliasCache.get(identity);
+-    const stem = `ns_${namespace}_${name}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40);
+-    const hash = createHash("sha256").update(identity).digest("hex").slice(0, 16);
++    const stem = `${RESPONSES_NAMESPACE_ALIAS.prefix}${namespace}_${name}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, RESPONSES_NAMESPACE_ALIAS.stemLength);
++    const hash = createHash("sha256").update(identity).digest("hex").slice(0, RESPONSES_NAMESPACE_ALIAS.hashLength);
+     const base = `${stem}_${hash}`;
+     let alias = base;
+     for (let i = 1; reservedNames.has(alias); i++) {
+       const suffix = `_${i}`;
+-      alias = `${base.slice(0, 64 - suffix.length)}${suffix}`;
++      alias = `${base.slice(0, RESPONSES_NAMESPACE_ALIAS.maxLength - suffix.length)}${suffix}`;
+     }
+     reservedNames.add(alias);
+     aliasCache.set(identity, alias);
