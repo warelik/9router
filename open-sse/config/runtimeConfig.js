@@ -71,6 +71,13 @@ export const DEFAULT_MAX_TOKENS = 64000;
 export const DEFAULT_MIN_TOKENS = 32000;
 export const DEFAULT_PROVIDER_THINKING_BUDGET = 10000;
 
+export const FILE_EXTENSION_MIME = {
+  pdf: "application/pdf", json: "application/json",
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+  mp3: "audio/mpeg", wav: "audio/wav", mp4: "video/mp4",
+  txt: "text/plain", md: "text/markdown", csv: "text/csv",
+};
+
 export const TOKEN_SAVER_HEADER = "x-9router-token-saver";
 
 export const PORTABLE_COLLABORATION = {

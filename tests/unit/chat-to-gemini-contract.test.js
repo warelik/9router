@@ -482,6 +482,19 @@ describe("media content", () => {
     expect(parts[3]).toEqual({ fileData: { fileUri: "https://files.example/c.pdf", mimeType: "application/pdf" } });
   });
 
+  it("file parts resolve MIME by explicit type, then extension, then octet-stream", () => {
+    const parts = convertOpenAIContentToParts([
+      { type: "file", file: { filename: "data.JSON", file_data: "YWJj" } },
+      { type: "file", file: { filename: "override.pdf", mime_type: "application/x-custom", file_data: "ZGVm" } },
+      { type: "file", file: { filename: "unknown.zzz", file_data: "Z2hp" } },
+    ]);
+    expect(parts).toEqual([
+      { inlineData: { mime_type: "application/json", data: "YWJj" } },
+      { inlineData: { mime_type: "application/x-custom", data: "ZGVm" } },
+      { inlineData: { mime_type: "application/octet-stream", data: "Z2hp" } },
+    ]);
+  });
+
   it("assistant multimodal content keeps its media parts instead of flattening to text", () => {
     const out = o2g({
       messages: [
