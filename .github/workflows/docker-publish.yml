@@ -152,15 +152,6 @@ jobs:
           path: source
           fetch-depth: 1
 
-      - name: Check out publishing Dockerfile
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: workflow
-          sparse-checkout: |
-            Dockerfile
-          fetch-depth: 1
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -176,7 +167,6 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: source
-          file: workflow/Dockerfile
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
