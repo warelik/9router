@@ -59,8 +59,16 @@ export const RESPONSES_TOOL = {
   ALLOWED_TOOLS: "allowed_tools",
 };
 
-// The client-facing tool_choice value that prohibits every tool call.
+// OpenAI client-facing tool_choice selectors.
+export const OPENAI_TOOL_CHOICE_AUTO = "auto";
 export const OPENAI_TOOL_CHOICE_NONE = "none";
+export const OPENAI_TOOL_CHOICE_REQUIRED = "required";
+
+// Gemini function-calling modes.
+export const GEMINI_FUNCTION_CALLING_MODE_AUTO = "AUTO";
+export const GEMINI_FUNCTION_CALLING_MODE_NONE = "NONE";
+export const GEMINI_FUNCTION_CALLING_MODE_ANY = "ANY";
+export const GEMINI_FUNCTION_CALLING_MODE_VALIDATED = "VALIDATED";
 
 // Valid OpenAI block types (used by filterToOpenAIFormat).
 export const VALID_OPENAI_CONTENT_TYPES = [
