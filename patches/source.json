@@ -71,5 +71,7 @@
     "tests/unit/undeclared-responses-sse.test.js",
     "tests/unit/zed-completions-wire.test.js"
   ],
-  "regression_files": []
+  "regression_files": [
+    "tests/unit/downstream-translator-history-regressions.test.js"
+  ]
 }

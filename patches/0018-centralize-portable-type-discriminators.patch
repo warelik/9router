@@ -1,0 +1,150 @@
+From ae19281df4fb071bd8ce0aa554900dd711ea0830 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Centralize existing portable collaboration type
+ discriminators
+
+---
+ .../concerns/portableCollaboration.js         | 29 ++++++++++---------
+ open-sse/translator/schema/blocks.js          | 12 +++++++-
+ open-sse/translator/schema/index.js           |  2 +-
+ 3 files changed, 27 insertions(+), 16 deletions(-)
+
+diff --git a/open-sse/translator/concerns/portableCollaboration.js b/open-sse/translator/concerns/portableCollaboration.js
+index 9de159113b32885848f3516c7c8f4ceeead058b3..00b6043062914ddd7504e4f002359acb141097b0 100644
+--- a/open-sse/translator/concerns/portableCollaboration.js
++++ b/open-sse/translator/concerns/portableCollaboration.js
+@@ -1,18 +1,19 @@
+ import { createHash } from "node:crypto";
+ import { PORTABLE_COLLABORATION } from "../../config/runtimeConfig.js";
+ import { FERNET_ENCRYPTED_CONTENT_PREFIX } from "../formats/responsesApi.js";
++import { RESPONSES_ITEM, RESPONSES_TOOL } from "../schema/index.js";
+ 
+ /** True when opaque agent content would leave no readable task after translation. */
+ export function hasUndeliverableAgentMessage(input) {
+   return Array.isArray(input) && input.some(item => {
+-    if (item?.type !== "agent_message" || !Array.isArray(item.content)) return false;
+-    const opaque = item.content.some(part => part?.type === "encrypted_content"
++    if (item?.type !== RESPONSES_ITEM.AGENT_MESSAGE || !Array.isArray(item.content)) return false;
++    const opaque = item.content.some(part => part?.type === RESPONSES_ITEM.ENCRYPTED_CONTENT
+       && typeof part.encrypted_content === "string"
+       && part.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX));
+     if (!opaque) return false;
+     let text = item.content.flatMap(part => {
+-      if (part?.type === "input_text" && typeof part.text === "string") return [part.text];
+-      if (part?.type === "encrypted_content" && typeof part.encrypted_content === "string"
++      if (part?.type === RESPONSES_ITEM.INPUT_TEXT && typeof part.text === "string") return [part.text];
++      if (part?.type === RESPONSES_ITEM.ENCRYPTED_CONTENT && typeof part.encrypted_content === "string"
+         && !part.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX)) return [part.encrypted_content];
+       return [];
+     }).join("\n").trim();
+@@ -31,12 +32,12 @@ export function preparePortableCollaboration(body) {
+   const aliases = new Map();
+   const reserved = new Set();
+   const inputs = Array.isArray(body.input) ? body.input : [];
+-  const lists = [body.tools, ...inputs.filter(item => item?.type === "additional_tools").map(item => item.tools)];
++  const lists = [body.tools, ...inputs.filter(item => item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS).map(item => item.tools)];
+   for (const tools of lists) for (const tool of Array.isArray(tools) ? tools : []) {
+-    if (tool?.type !== "namespace" && typeof tool?.name === "string") reserved.add(tool.name);
++    if (tool?.type !== RESPONSES_TOOL.NAMESPACE && typeof tool?.name === "string") reserved.add(tool.name);
+   }
+   for (const item of inputs) if (!item?.namespace && typeof item?.name === "string") reserved.add(item.name);
+-  const aliasFor = (name, type = "function") => {
++  const aliasFor = (name, type = RESPONSES_TOOL.FUNCTION) => {
+     if (aliases.has(name)) return aliases.get(name);
+     const hash = createHash("sha256").update(JSON.stringify([namespace, name])).digest("hex").slice(0, 16);
+     const base = PORTABLE_COLLABORATION.aliasPrefix + String(name).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 30) + "_" + hash;
+@@ -47,9 +48,9 @@ export function preparePortableCollaboration(body) {
+     return alias;
+   };
+   const rewriteTools = tools => !Array.isArray(tools) ? tools : tools.flatMap(tool => {
+-    if (tool?.type !== "namespace" || tool.name !== namespace || !Array.isArray(tool.tools)) return [tool];
++    if (tool?.type !== RESPONSES_TOOL.NAMESPACE || tool.name !== namespace || !Array.isArray(tool.tools)) return [tool];
+     return tool.tools.map(child => {
+-      if (child?.type !== "function" && child?.type !== "custom") return child;
++      if (child?.type !== RESPONSES_TOOL.FUNCTION && child?.type !== RESPONSES_TOOL.CUSTOM) return child;
+       const description = [tool.description, child.description].filter(text => typeof text === "string" && text).join("\n");
+       const out = { ...child, name: aliasFor(child.name, child.type), ...(description ? { description } : {}) };
+       const message = child.parameters?.properties?.message;
+@@ -62,22 +63,22 @@ export function preparePortableCollaboration(body) {
+   });
+   // Allocate declarations before history so collisions resolve consistently.
+   const tools = rewriteTools(body.tools);
+-  const input = inputs.map(item => item?.type === "additional_tools" ? { ...item, tools: rewriteTools(item.tools) } : item);
++  const input = inputs.map(item => item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS ? { ...item, tools: rewriteTools(item.tools) } : item);
+   const rewriteChoice = choice => {
+     if (!choice || typeof choice !== "object" || Array.isArray(choice)) return choice;
+     if (choice.namespace === namespace && typeof choice.name === "string") {
+       const { namespace: _, ...rest } = choice;
+-      return { ...rest, name: aliasFor(choice.name, choice.type === "custom" ? "custom" : "function") };
++      return { ...rest, name: aliasFor(choice.name, choice.type === RESPONSES_TOOL.CUSTOM ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION) };
+     }
+-    if (choice.type === "allowed_tools" && Array.isArray(choice.tools)) return { ...choice, tools: choice.tools.map(rewriteChoice) };
++    if (choice.type === RESPONSES_TOOL.ALLOWED_TOOLS && Array.isArray(choice.tools)) return { ...choice, tools: choice.tools.map(rewriteChoice) };
+     return choice;
+   };
+   const rewritten = { ...body };
+   if (Array.isArray(body.tools)) rewritten.tools = tools;
+   if (Array.isArray(body.input)) rewritten.input = input.map(item => {
+-    if ((item?.type === "function_call" || item?.type === "custom_tool_call") && item.namespace === namespace && typeof item.name === "string") {
++    if ((item?.type === RESPONSES_ITEM.FUNCTION_CALL || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL) && item.namespace === namespace && typeof item.name === "string") {
+       const { namespace: _, ...rest } = item;
+-      return { ...rest, name: aliasFor(item.name, item.type === "custom_tool_call" ? "custom" : "function") };
++      return { ...rest, name: aliasFor(item.name, item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION) };
+     }
+     return item;
+   });
+diff --git a/open-sse/translator/schema/blocks.js b/open-sse/translator/schema/blocks.js
+index 31ced5f0eec0ac109dca613bd5a33470244d1634..dc2b09109dece637ca5906f240a42036cbf91acd 100644
+--- a/open-sse/translator/schema/blocks.js
++++ b/open-sse/translator/schema/blocks.js
+@@ -25,9 +25,10 @@ export const CLAUDE_BLOCK = {
+   WEB_SEARCH_TOOL_RESULT: "web_search_tool_result",
+ };
+ 
+-// OpenAI Responses API item types.
++// OpenAI Responses API item types and observed collaboration compatibility types.
+ export const RESPONSES_ITEM = {
+   MESSAGE: "message",
++  AGENT_MESSAGE: "agent_message",
+   FUNCTION_CALL: "function_call",
+   FUNCTION_CALL_OUTPUT: "function_call_output",
+   CUSTOM_TOOL_CALL: "custom_tool_call",
+@@ -36,11 +37,20 @@ export const RESPONSES_ITEM = {
+   REASONING: "reasoning",
+   OUTPUT_TEXT: "output_text",
+   INPUT_TEXT: "input_text",
++  ENCRYPTED_CONTENT: "encrypted_content",
+   INPUT_IMAGE: "input_image",
+   INPUT_FILE: "input_file",
+   SUMMARY_TEXT: "summary_text",
+ };
+ 
++// OpenAI Responses tool declaration and tool-choice discriminator types.
++export const RESPONSES_TOOL = {
++  NAMESPACE: "namespace",
++  FUNCTION: "function",
++  CUSTOM: "custom",
++  ALLOWED_TOOLS: "allowed_tools",
++};
++
+ // Valid OpenAI block types (used by filterToOpenAIFormat).
+ export const VALID_OPENAI_CONTENT_TYPES = [
+   OPENAI_BLOCK.TEXT, OPENAI_BLOCK.IMAGE_URL, OPENAI_BLOCK.IMAGE, OPENAI_BLOCK.INPUT_AUDIO, OPENAI_BLOCK.AUDIO_URL, OPENAI_BLOCK.FILE,
+diff --git a/open-sse/translator/schema/index.js b/open-sse/translator/schema/index.js
+index 3fada8c9080b751e0cd008cb173a1a996c225c66..6cacd21de95f1c28fa3383b6bfdaab2e878f157a 100644
+--- a/open-sse/translator/schema/index.js
++++ b/open-sse/translator/schema/index.js
+@@ -1,7 +1,7 @@
+ // Translator schema barrel — pure data enums (roles, blocks). No logic here.
+ export { ROLE, GEMINI_ROLE } from "./roles.js";
+ export {
+-  OPENAI_BLOCK, CLAUDE_BLOCK, RESPONSES_ITEM,
++  OPENAI_BLOCK, CLAUDE_BLOCK, RESPONSES_ITEM, RESPONSES_TOOL,
+   VALID_OPENAI_CONTENT_TYPES, VALID_OPENAI_MESSAGE_TYPES,
+ } from "./blocks.js";
+ export { OPENAI_FINISH, CLAUDE_STOP, GEMINI_FINISH } from "./finishReasons.js";
+-- 
+2.43.0
+
