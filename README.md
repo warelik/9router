@@ -246,3 +246,7 @@ regression covers the failure path before assembly completes.
 Maintenance review input is open carried work and the exact current candidate. Archived closed discussions are excluded. The existing unresolved snapshot is written before superseded pairs are retired; `fixed` and `disproved` decisions are not reopened in later cycles. Native final-attempt accounting remains independent.
 
 Authorized application test/build lanes use explicit status checks and required-parent success: a skipped optional policy ancestor cannot silently suppress them. Cancellation and failed required jobs still block execution.
+
+The policy container receives isolated fixture HOME/XDG paths. The host container-engine process retains its own storage and socket paths through a credential-free engine environment; fixture paths never become engine storage.
+
+Native forwarding drops x-9r peer/CLI credentials. Historical unprojected future-only JSON replies remain covered separately from projected replies; opaque-only SSE termination remains a refusal. Machine fixed-disposition evidence is checked against the assembled seed-to-candidate source and test diff, not merely a changed patch carrier.
