@@ -256,7 +256,7 @@ export class DefaultExecutor extends BaseExecutor {
       ]);
       for (const [name, value] of Object.entries(credentials.nativeGeminiRequest?.headers || {})) {
         const lower = name.toLowerCase();
-        if (!privateHeaders.has(lower) && !reserved.has(lower) && !lower.startsWith("x-forwarded-") && !lower.startsWith("x-9router-")) {
+        if (!privateHeaders.has(lower) && !reserved.has(lower) && !lower.startsWith("x-forwarded-") && !lower.startsWith("x-9router-") && !lower.startsWith("x-9r-")) {
           headers[name] = value;
         }
       }
