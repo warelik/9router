@@ -410,7 +410,7 @@ class GoldenBaselineTests(unittest.TestCase):
 
 
 class PublicationTests(unittest.TestCase):
-    def artifacts(self, root):
+    def artifacts(self, root, *, recipe=None):
         archive = root / "9router-image.tar.gz"
         archive.write_bytes(b"test archive")
         metadata = {
@@ -420,6 +420,12 @@ class PublicationTests(unittest.TestCase):
             "archive": archive.name, "archive_sha256": release.file_digest(archive),
             "image_id": "sha256:" + "e" * 64,
         }
+        if recipe is not None:
+            metadata.update({
+                "recipe_sha256": recipe, "candidate_id": "a" * 64,
+                "full_review_pr": 2, "delta_review_pr": 3,
+                "run_id": 4, "run_attempt": 1,
+            })
         provenance = root / "provenance.json"
         provenance.write_text(json.dumps(metadata))
         (root / "SHA256SUMS").write_text(
@@ -428,7 +434,9 @@ class PublicationTests(unittest.TestCase):
             "GITHUB_REPOSITORY": "warelik/9router", "GITHUB_SHA": "c" * 40,
             "CANDIDATE_SHA": HEAD, "CANDIDATE_PR": "1", "UPSTREAM_SHA": OTHER,
             "PATCHSET_SHA256": "d" * 64, "APP_VERSION": "0.5.104",
-            "RELEASE_TAG": f"build-0.5.104-{OTHER[:12]}-{'d' * 12}",
+            "RELEASE_TAG": (release._release_tag("0.5.104", OTHER, "d" * 64, recipe)
+                            if recipe is not None else
+                            release._legacy_release_tag("0.5.104", OTHER, "d" * 64)),
         }
         return env
 
@@ -471,10 +479,13 @@ class PublicationTests(unittest.TestCase):
 
         return request
 
-    def test_verified_existing_draft_is_published_without_clobbering_assets(self):
+    def test_verified_legacy_twelve_field_draft_is_published_without_clobbering_assets(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             env = self.artifacts(root)
+            metadata = json.loads((root / "provenance.json").read_text())
+            self.assertEqual(len(metadata), 12)
+            self.assertNotIn("recipe_sha256", metadata)
             calls = []
             with (patch.dict(os.environ, env),
                   patch.object(release, "check_review", return_value=(True, "reviewed")) as review,
@@ -487,6 +498,23 @@ class PublicationTests(unittest.TestCase):
                 ("repos/warelik/9router/releases/7", {"draft": False, "make_latest": "true"}),
                 ("repos/warelik/9router/pulls/1", {"state": "closed"}),
             ])
+
+    def test_verified_recipe_tagged_draft_uses_full_shared_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recipe = "f" * 64
+            env = self.artifacts(root, recipe=recipe)
+            metadata = json.loads((root / "provenance.json").read_text())
+            self.assertEqual(len(metadata), 18)
+            self.assertEqual(metadata["recipe_sha256"], recipe)
+            self.assertTrue(env["RELEASE_TAG"].endswith("-r" + recipe[:12]))
+            calls = []
+            with (patch.dict(os.environ, env),
+                  patch.object(release, "check_review", return_value=(True, "reviewed")) as review,
+                  patch.object(release, "api", side_effect=self.fake_api(root, env, calls)),
+                  patch.object(release, "run", side_effect=AssertionError("Do not overwrite assets"))):
+                release.publish(root)
+            self.assertEqual(review.call_count, 2)
 
     def test_publish_passes_the_captured_repair_head_to_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -575,15 +603,22 @@ class PublicationTests(unittest.TestCase):
                 with patch.dict(os.environ, env), patch.object(release, "run", return_value=json.dumps([image])):
                     if source == "https://github.com/warelik/9router":
                         release.provenance(root / "9router-image.tar.gz")
+                        metadata = json.loads((root / "provenance.json").read_text())
+                        self.assertEqual(set(metadata), {
+                            "schema", "repository", "upstream_repository", "version",
+                            "candidate_sha", "upstream_sha", "config_sha", "patchset_sha256",
+                            "image_id", "platform", "archive", "archive_sha256",
+                        })
                     else:
                         with self.assertRaises(ValueError):
                             release.provenance(root / "9router-image.tar.gz")
 
     def test_cached_release_requires_source_and_remote_asset_integrity(self):
-        for scenario in ("valid", "bad_digest", "bad_candidate", "bad_tag", "bad_target"):
+        for scenario in ("valid", "valid_legacy", "bad_digest", "bad_candidate", "bad_tag", "bad_target"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                env = self.artifacts(root)
+                recipe = None if scenario == "valid_legacy" else "f" * 64
+                env = self.artifacts(root, recipe=recipe)
                 if scenario == "bad_candidate":
                     provenance = root / "provenance.json"
                     metadata = json.loads(provenance.read_text())
@@ -604,9 +639,10 @@ class PublicationTests(unittest.TestCase):
                 fake = self.fake_api(root, env, [], bad_digest=scenario == "bad_digest",
                                      tag_sha=OTHER if scenario == "bad_tag" else HEAD)
                 with patch.object(release, "api", side_effect=fake), patch.object(release, "run", side_effect=download):
-                    if scenario == "valid":
+                    if scenario in {"valid", "valid_legacy"}:
                         release.verify_published_release("warelik/9router", published, HEAD, OTHER,
-                                                         env["PATCHSET_SHA256"], env["APP_VERSION"])
+                                                         env["PATCHSET_SHA256"], env["APP_VERSION"],
+                                                         recipe)
                     else:
                         with self.assertRaises(ValueError):
                             release.verify_published_release("warelik/9router", published, HEAD, OTHER,
