@@ -95,6 +95,9 @@ export const PORTABLE_COLLABORATION = {
   namespace: "collaboration",
   messageTools: ["spawn_agent", "send_message", "followup_task"],
   aliasPrefix: "collab_plain_",
+  aliasHashLength: 16,
+  aliasNameLength: 30,
+  aliasCollisionBaseLength: 58,
 };
 
 // Retry config for 429 responses (legacy - kept for backward compatibility)
