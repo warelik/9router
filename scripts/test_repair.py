@@ -720,6 +720,7 @@ class PolicyBundleTests(unittest.TestCase):
                 "NINEROUTER_POLICY_BASELINE_MAINTENANCE": str(baseline_private),
                 "FORK_MAINTENANCE_ROOT": str(root / "private-maintenance"),
                 "GITHUB_ACTIONS": "true",
+                "TMPDIR": str(root),
             }
             baseline_module.write_bytes(b"wrong baseline private module")
             with (patch.object(release, "ROOT", trusted), patch.dict(os.environ, env, clear=True),
@@ -2780,7 +2781,7 @@ class SharedHistoryAdapterTests(unittest.TestCase):
         }
         finding_path = (None if policy_disproved_unchanged else
                         "src/fix.js" if policy_application_disproof else
-                        "scripts/maintenance.py" if policy_repair else
+                        "scripts/release.py" if policy_repair else
                         "open-sse/other.js" if changed_carrier else "src/fix.js")
         finding = {"finding_id": "review:6:13" if policy_disproved_unchanged else "inline:6:13",
                    "candidate_id": "e" * 64,
@@ -2841,7 +2842,7 @@ class SharedHistoryAdapterTests(unittest.TestCase):
                            test_carrier if policy_repair else
                            "tests/unit/other.test.js" if changed_carrier else "tests/unit/fix.test.js")
         evidence = (
-            f"code location `{finding_path}` at `{code_source}`; code diff SHA-256 `{code_diff_sha}`; "
+            f"code location `{carrier if policy_disproved_unchanged else finding_path}` at `{code_source}`; code diff SHA-256 `{code_diff_sha}`; "
             f"regression path `{regression_path}`; "
             f"regression diff SHA-256 `{test_diff_sha}`; regression case `{regression_case}`; "
             f"regression location `{regression_source}`; explanation `{explanation}`")
@@ -3027,7 +3028,7 @@ class SharedHistoryAdapterTests(unittest.TestCase):
                     + json.dumps(fixture["proposal"], sort_keys=True, separators=(",", ":")) + " -->")
             fixture["proposal_comment"]["body"] = body
             fixture["comments"][1]["body"] = body
-            with self.assertRaisesRegex(ValueError, "changed delta source and Python regression"):
+            with self.assertRaisesRegex(ValueError, "changed source and Python test"):
                 self._read_disposition_fixture(fixture)
 
     def test_full_formal_policy_disproof_accepts_exact_unchanged_code_and_python_test(self):
@@ -4368,6 +4369,8 @@ class AdoptionTests(unittest.TestCase):
                 needs.prepare.outputs.prepared_run_attempt == github.run_attempt)""",
         }
         for job_name, expected in expected_job_conditions.items():
+            self.assertIsInstance(jobs[job_name].get("if"), str,
+                                  "Policy job must retain its exact executable condition")
             self.assertEqual(" ".join(jobs[job_name]["if"].split()), " ".join(expected.split()),
                              f"{job_name} gate must retain its exact reviewed lifecycle condition")
         self.assertEqual(jobs["test"].get("env"), {
@@ -4664,16 +4667,7 @@ class AdoptionTests(unittest.TestCase):
             ("prepare", "Select Source And Request The Native Review Pair"):
                 ['python3 trusted/scripts/release.py prepare-shared "$RUNNER_TEMP/9router-source"'],
             ("prepare", "Report The Actual State"):
-                ["{",
-                 'echo "### Upstream plus patches"',
-                 'printf \'%s\\n\' "- State: ${MODE:-stopped before a decision}"',
-                 'printf \'%s\\n\' "- Review accepted: ${READY:-false}"',
-                 'if [ -n "$SOURCE_SHA" ]; then printf \'%s\\n\' "- Application: $VERSION at $SOURCE_SHA"; fi',
-                 'if [ -n "$FULL_PR" ]; then printf \'%s\\n\' "- Full review PR: #$FULL_PR"; fi',
-                 'if [ -n "$DELTA_PR" ]; then printf \'%s\\n\' "- Delta review PR: #$DELTA_PR"; fi',
-                 'if [ -n "$REASON" ]; then printf \'%s\\n\' "- Detail: $REASON"; fi',
-                 'echo "- GitHub never deploys; the VPS recipe consumes verified releases"',
-                 '} >> "$GITHUB_STEP_SUMMARY"'],
+                ['{', '  echo "### Upstream plus patches"', '  printf \'%s\\n\' "- State: ${MODE:-stopped before a decision}"', '  printf \'%s\\n\' "- Review accepted: ${READY:-false}"', '  if [ -n "$SOURCE_SHA" ]; then printf \'%s\\n\' "- Application: $VERSION at $SOURCE_SHA"; fi', '  if [ -n "$FULL_PR" ]; then printf \'%s\\n\' "- Full review PR: #$FULL_PR"; fi', '  if [ -n "$DELTA_PR" ]; then printf \'%s\\n\' "- Delta review PR: #$DELTA_PR"; fi', '  if [ -n "$REASON" ]; then printf \'%s\\n\' "- Detail: $REASON"; fi', '  echo "- GitHub never deploys; the VPS recipe consumes verified releases"', '} >> "$GITHUB_STEP_SUMMARY"'],
             ("policy-check", "Reject A Job-Only Rerun Before Policy Tests"):
                 ['test "$PREPARED_RUN_ID" = "$GITHUB_RUN_ID"',
                  'test "$PREPARED_RUN_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"',
