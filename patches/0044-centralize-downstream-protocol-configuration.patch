@@ -1,0 +1,245 @@
+From 9887739b33fd042fc7c7c1147de0fdbc4fdf40a1 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] Centralize downstream protocol configuration
+
+---
+ open-sse/config/defaultThinkingSignature.js   |  7 +++++++
+ open-sse/config/runtimeConfig.js              | 15 +++++++++++++++
+ open-sse/executors/default.js                 |  6 ++----
+ open-sse/services/thoughtSignatureStore.js    |  2 +-
+ .../translator/concerns/thinkingUnified.js    |  7 +++----
+ open-sse/translator/formats/responsesApi.js   |  3 ++-
+ .../translator/request/openai-to-vertex.js    |  7 +------
+ open-sse/utils/sseConstants.js                |  5 ++---
+ open-sse/utils/streamHelpers.js               |  5 +++--
+ tests/unit/chat-to-gemini-contract.test.js    | 19 +++++++++++++++++++
+ 10 files changed, 55 insertions(+), 21 deletions(-)
+
+diff --git a/open-sse/config/defaultThinkingSignature.js b/open-sse/config/defaultThinkingSignature.js
+index 50975a43ea8aeefc9845e729d86ec261c9adbfa4..0460b52254f0ceeea16ba05700e89e53dde46ec2 100644
+--- a/open-sse/config/defaultThinkingSignature.js
++++ b/open-sse/config/defaultThinkingSignature.js
+@@ -10,3 +10,10 @@ export const DEFAULT_THINKING_GEMINI_CLI_SIGNATURE = "CiQBjz1rX/AlslZWMe5RgBt4Tv
+ 
+ export const DEFAULT_THINKING_TEXT = "...";
+ 
++
++export const SYNTHETIC_THINKING_SIGNATURES = new Set([
++  DEFAULT_THINKING_AG_SIGNATURE,
++  DEFAULT_THINKING_GEMINI_CLI_SIGNATURE,
++]);
++
++export const SERVER_PARTS_PREFIX = "serverparts:";
+diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
+index 7d0ad546b10491734a0b2ac040de3617d78c644a..489863a6d6202f235369c237892ca81225790823 100644
+--- a/open-sse/config/runtimeConfig.js
++++ b/open-sse/config/runtimeConfig.js
+@@ -118,3 +118,18 @@ export function resolveRetryEntry(entry) {
+ export const SKIP_PATTERNS = [
+   "Please write a 5-10 word title for the following conversation:"
+ ];
++
++export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
++
++export const SSE_DONE_PAYLOAD = "[DONE]";
++export const SSE_DONE = `data: ${SSE_DONE_PAYLOAD}\n\n`;
++
++export const NATIVE_GEMINI_PRIVATE_HEADERS = new Set([
++  "authorization", "proxy-authorization", "x-goog-api-key", "x-api-key", "cookie", "set-cookie",
++  "host", "content-length", "connection", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer",
++]);
++
++export const NATIVE_GEMINI_THINKING_KEYS = ["thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"];
++
++export const NATIVE_GEMINI_RESPONSE_FIELDS = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
++export const NATIVE_GEMINI_BRIDGE_FIELDS = new Set(["message", "event", "data", "status", "code", "success", "response"]);
+diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
+index e82aa9b80c35daff6f7ccb71de892b2ce3fa4cae..93f8a233ad7f84a901c8a5ba0f22608476b23704 100644
+--- a/open-sse/executors/default.js
++++ b/open-sse/executors/default.js
+@@ -4,6 +4,7 @@ import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
+ import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE, selectAnthropicBeta, mergeAnthropicBeta } from "../providers/shared.js";
+ import { resolveOpenAICompatibleApiType } from "../services/provider.js";
+ import { OAUTH_ENDPOINTS, buildKimiHeaders, NOUS_ATTRIBUTION } from "../config/appConstants.js";
++import { NATIVE_GEMINI_PRIVATE_HEADERS } from "../config/runtimeConfig.js";
+ import { buildClineHeaders } from "../shared/clineAuth.js";
+ import { proxyAwareFetch } from "../utils/proxyFetch.js";
+ import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
+@@ -235,10 +236,7 @@ export class DefaultExecutor extends BaseExecutor {
+     applyAuth(headers, desc, credentials);
+     if (credentials?.nativeGeminiPassthrough) {
+       const reserved = new Set(Object.keys(headers).map(key => key.toLowerCase()));
+-      const privateHeaders = new Set([
+-        "authorization", "proxy-authorization", "x-goog-api-key", "x-api-key", "cookie", "set-cookie",
+-        "host", "content-length", "connection", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer",
+-      ]);
++      const privateHeaders = NATIVE_GEMINI_PRIVATE_HEADERS;
+       for (const [name, value] of Object.entries(credentials.nativeGeminiRequest?.headers || {})) {
+         const lower = name.toLowerCase();
+         if (!privateHeaders.has(lower) && !reserved.has(lower) && !lower.startsWith("x-forwarded-") && !lower.startsWith("x-9router-") && !lower.startsWith("x-9r-")) {
+diff --git a/open-sse/services/thoughtSignatureStore.js b/open-sse/services/thoughtSignatureStore.js
+index 78feb8847f3470b70fc7b5ee4eb3e69801d9e00c..f11fc828561b9a0704a52f3ba34d210e376cb10d 100644
+--- a/open-sse/services/thoughtSignatureStore.js
++++ b/open-sse/services/thoughtSignatureStore.js
+@@ -1,4 +1,5 @@
+ import { createHash } from "node:crypto";
++import { SERVER_PARTS_PREFIX } from "../config/defaultThinkingSignature.js";
+ import { makeKv } from "../../src/lib/db/helpers/kvStore.js";
+ 
+ const MAX_SIGNATURES = 2000;
+@@ -260,7 +261,6 @@ export function findGeminiTurnSignature({ reasoning, content, scope, sessionId =
+   return null;
+ }
+ 
+-const SERVER_PARTS_PREFIX = "serverparts:";
+ 
+ const isNonEmptyString = (value) => typeof value === "string" && value.length > 0;
+ 
+diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
+index b3530b2877e64a72057244a5d9ed1b36dbe5554e..d1ff50ae5a26b7ba88657f2ae04e347407365e83 100644
+--- a/open-sse/translator/concerns/thinkingUnified.js
++++ b/open-sse/translator/concerns/thinkingUnified.js
+@@ -6,7 +6,7 @@ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
+ import { getThinkingLevels } from "../../providers/thinkingLevels.js";
+ import { PROVIDERS } from "../../providers/index.js";
+ import { LEVEL_TO_BUDGET, budgetToLevel, effortToBudget, effortToThinkingLevel } from "./thinking.js";
+-import { DEFAULT_PROVIDER_THINKING_BUDGET } from "../../config/runtimeConfig.js";
++import { DEFAULT_PROVIDER_THINKING_BUDGET, NATIVE_GEMINI_THINKING_KEYS } from "../../config/runtimeConfig.js";
+ 
+ // Map a target wire-format to its native thinking format (when capability has none).
+ const FORMAT_TO_NATIVE = {
+@@ -477,8 +477,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
+   const generation = body[generationKey] || {};
+   const thinkingKey = generation.thinking_config ? "thinking_config" : "thinkingConfig";
+   const clientThinking = generation[thinkingKey] || {};
+-  const explicit = ["thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"]
+-    .some(key => Object.hasOwn(clientThinking, key));
++  const explicit = NATIVE_GEMINI_THINKING_KEYS.some(key => Object.hasOwn(clientThinking, key));
+   if (!override && explicit) return body;
+   const mode = providerThinking?.mode;
+   const intent = override || (!mode || mode === "auto" ? null
+@@ -492,7 +491,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
+   const mapped = applyThinking("gemini", model, {}, provider, intent).generationConfig?.thinkingConfig;
+   if (!mapped) return body;
+   const thinking = { ...clientThinking };
+-  for (const key of ["thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"]) delete thinking[key];
++  for (const key of NATIVE_GEMINI_THINKING_KEYS) delete thinking[key];
+   if (mapped.thinkingLevel !== undefined) thinking.thinkingLevel = String(mapped.thinkingLevel).toUpperCase();
+   if (mapped.thinkingBudget !== undefined) thinking.thinkingBudget = mapped.thinkingBudget;
+   if (!Object.hasOwn(thinking, "includeThoughts") && !Object.hasOwn(thinking, "include_thoughts") && mapped.includeThoughts !== undefined) {
+diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
+index ea75cc1fcd3b7268623e971d3bce0905c8960f83..fe3d93ceb53fef61ae958e6eccf22073936f437f 100644
+--- a/open-sse/translator/formats/responsesApi.js
++++ b/open-sse/translator/formats/responsesApi.js
+@@ -1,4 +1,5 @@
+ import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
++import { FERNET_ENCRYPTED_CONTENT_PREFIX } from "../../config/runtimeConfig.js";
+ 
+ /**
+  * Normalize Responses API input to array format.
+@@ -28,7 +29,7 @@ export const MAX_RESPONSES_CALL_ID_LEN = 64;
+ 
+ // OpenAI reasoning items carry Fernet-encrypted blobs; other providers' own
+ // encrypted_content values use different ciphertexts and must be preserved.
+-export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
++export { FERNET_ENCRYPTED_CONTENT_PREFIX };
+ 
+ // Codex's observed plaintext task carrier (an agent_message encrypted_content part) is converted
+ // here to input_text; known OpenAI Fernet ciphertext stays opaque.
+diff --git a/open-sse/translator/request/openai-to-vertex.js b/open-sse/translator/request/openai-to-vertex.js
+index 4572497a2ef24007ec1323ed58caf1a5434f258d..702162958023e650d0751151f2998b13e54837ac 100644
+--- a/open-sse/translator/request/openai-to-vertex.js
++++ b/open-sse/translator/request/openai-to-vertex.js
+@@ -1,12 +1,7 @@
+ import { register } from "../index.js";
+ import { FORMATS } from "../formats.js";
+ import { openaiToGeminiRequest } from "./openai-to-gemini.js";
+-import { DEFAULT_THINKING_VERTEX_SIGNATURE, DEFAULT_THINKING_AG_SIGNATURE, DEFAULT_THINKING_GEMINI_CLI_SIGNATURE } from "../../config/defaultThinkingSignature.js";
+-
+-const SYNTHETIC_THINKING_SIGNATURES = new Set([
+-  DEFAULT_THINKING_AG_SIGNATURE,
+-  DEFAULT_THINKING_GEMINI_CLI_SIGNATURE,
+-]);
++import { DEFAULT_THINKING_VERTEX_SIGNATURE, SYNTHETIC_THINKING_SIGNATURES } from "../../config/defaultThinkingSignature.js";
+ 
+ /**
+  * Post-process a Gemini-format body for Vertex AI compatibility:
+diff --git a/open-sse/utils/sseConstants.js b/open-sse/utils/sseConstants.js
+index 220ae3323289fd5134b418cd082d75dd6676918b..a7ae516d6791883b1fd100b907f216bf67834627 100644
+--- a/open-sse/utils/sseConstants.js
++++ b/open-sse/utils/sseConstants.js
+@@ -1,6 +1,5 @@
+-// Shared SSE primitives (no imports → safe for executors + stream.js)
+-export const SSE_DONE_PAYLOAD = "[DONE]";
+-export const SSE_DONE = `data: ${SSE_DONE_PAYLOAD}\n\n`;
++// Shared SSE primitives re-exported from the central runtime config.
++export { SSE_DONE_PAYLOAD, SSE_DONE } from "../config/runtimeConfig.js";
+ 
+ export const SSE_HEADERS = {
+   "Content-Type": "text/event-stream",
+diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
+index b08fb5c02a2887bb2e3fea350ab641f8e6e737f3..1bcfb93fbcee576c56314ea1f6227c56df07deeb 100644
+--- a/open-sse/utils/streamHelpers.js
++++ b/open-sse/utils/streamHelpers.js
+@@ -1,6 +1,7 @@
+ import { FORMATS } from "../translator/formats.js";
+ import { buildErrorBody } from "./error.js";
+ import { SSE_DONE } from "./sseConstants.js";
++import { NATIVE_GEMINI_RESPONSE_FIELDS, NATIVE_GEMINI_BRIDGE_FIELDS } from "../config/runtimeConfig.js";
+ 
+ const sharedEncoder = new TextEncoder();
+ 
+@@ -24,8 +25,8 @@ export function isValidNativeGeminiResponse(response, projection = null, allowUn
+   // GenerateContent metadata can be the whole reply. Keep unknown extensions
+   // opaque for non-streaming replies. An SSE transport-only frame must not
+   // become successful response evidence at EOF.
+-  const nativeFields = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
+-  const bridgeFields = new Set(["message", "event", "data", "status", "code", "success", "response"]);
++  const nativeFields = NATIVE_GEMINI_RESPONSE_FIELDS;
++  const bridgeFields = NATIVE_GEMINI_BRIDGE_FIELDS;
+   const hasOpaqueExtension = Object.keys(nativeResponse).some(field => !bridgeFields.has(field));
+   if (!allowsEmpty && !allowUnrecognized && !nativeFields.some(field => Object.hasOwn(nativeResponse, field)) && !(allowOpaqueExtensions && hasOpaqueExtension)) return false;
+   if (nativeResponse.candidates !== undefined) {
+diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
+index 3360b862190486c79e1adcbf2984afc0ddecdb76..0b92ab8977ac6dcada99c3e1c937dcd421876ec7 100644
+--- a/tests/unit/chat-to-gemini-contract.test.js
++++ b/tests/unit/chat-to-gemini-contract.test.js
+@@ -44,7 +44,10 @@ import { storeGeminiThoughtSignature } from "../../open-sse/services/thoughtSign
+ import {
+   DEFAULT_THINKING_VERTEX_SIGNATURE,
+   DEFAULT_THINKING_AG_SIGNATURE,
++  DEFAULT_THINKING_GEMINI_CLI_SIGNATURE,
+ } from "../../open-sse/config/defaultThinkingSignature.js";
++import { SSE_DONE_PAYLOAD, SSE_DONE } from "../../open-sse/utils/sseConstants.js";
++import { FERNET_ENCRYPTED_CONTENT_PREFIX } from "../../open-sse/translator/formats/responsesApi.js";
+ 
+ const MODEL = "gemini-3.5-flash-lite";
+ const user = (content) => ({ role: "user", content });
+@@ -626,6 +629,22 @@ describe("Vertex post-processing", () => {
+     expect(defaultCall.thoughtSignature).toBe(DEFAULT_THINKING_VERTEX_SIGNATURE);
+     expect(defaultCall.thoughtSignature).not.toBe(DEFAULT_THINKING_AG_SIGNATURE);
+     expect(defaultCall.functionCall.id).toBeUndefined();
++
++    for (const synthetic of [DEFAULT_THINKING_AG_SIGNATURE, DEFAULT_THINKING_GEMINI_CLI_SIGNATURE]) {
++      storeGeminiThoughtSignature("call-synthetic", synthetic, "sess-vertex", MODEL);
++      const out = openaiToVertexRequest(MODEL, body("call-synthetic"), true, { _clientSessionId: "sess-vertex" });
++      const call = out.contents.flatMap((c) => c.parts).find((p) => p.functionCall);
++      expect(call.thoughtSignature).toBe(DEFAULT_THINKING_VERTEX_SIGNATURE);
++      expect(call.functionCall.id).toBeUndefined();
++    }
++  });
++});
++
++describe("shared wire constants", () => {
++  it("public SSE and Fernet markers keep their exact upstream values", () => {
++    expect(SSE_DONE_PAYLOAD).toBe("[DONE]");
++    expect(SSE_DONE).toBe("data: [DONE]\n\n");
++    expect(FERNET_ENCRYPTED_CONTENT_PREFIX).toBe("gAAAAA");
+   });
+ });
+ 
+-- 
+2.43.0
+
