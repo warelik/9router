@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import release
 
@@ -24,6 +25,106 @@ class CandidatePolicyCliTests(unittest.TestCase):
     def candidate_release(self):
         configured = os.environ.get("NINEROUTER_POLICY_CANDIDATE_RELEASE")
         return Path(configured or release.__file__).resolve()
+
+    def test_hosted_shared_policy_requires_the_trusted_baseline_private_pin(self):
+        with (patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=True),
+              self.assertRaisesRegex(ValueError, "requires its exact trusted baseline pin")):
+            release.check_policy_shared(Path("/unavailable/candidate"))
+
+    def test_shared_policy_launcher_isolates_original_oracle_and_refuses_incomplete_runs(self):
+        source = self.candidate_release().read_text(encoding="utf-8")
+        check_policy_start = source.index("def check_policy(candidate, *, shared=False):")
+        check_policy_end = source.index("\ndef check_policy_shared(", check_policy_start)
+        check_policy = source[check_policy_start:check_policy_end]
+        shared_start = check_policy.index("    if shared:\n        launcher = (\n")
+        legacy_start = check_policy.index("    else:\n        launcher = (\n", shared_start)
+        shared_launcher = check_policy[shared_start:legacy_start]
+
+        for fragment in (
+                'baseline_private_root_text = os.environ.get("NINEROUTER_POLICY_BASELINE_MAINTENANCE", "")',
+                "baseline_private_pin_available = bool(baseline_private_root_text)",
+                "baseline_private_identity_enabled = shared and baseline_private_pin_available",
+                'if shared and os.environ.get("GITHUB_ACTIONS") and not baseline_private_pin_available:',
+                'trusted_maintenance = trusted_scripts / "maintenance.py"',
+                'trusted_maintenance_lock = trusted_scripts / "maintenance.lock.json"',
+                "trusted_lock = _json_object(trusted_maintenance_lock.read_bytes())",
+                "candidate_private_source, candidate_private_receipt = _candidate_private_lifecycle(",
+                "candidate_lock = _json_object((candidate_scripts / \"maintenance.lock.json\").read_bytes())",
+                "if trusted_lock != candidate_lock:",
+                '"NINEROUTER_POLICY_BASELINE_MAINTENANCE", ""',
+                'baseline_module_path = baseline_private_root / "fork_lifecycle.py"',
+                "_json_object(baseline_receipt) != {",
+                'trusted_lock["module_sha256"]',
+                'hashlib.sha256(baseline_module).hexdigest() != trusted_lock["module_sha256"]',
+                "candidate_test_delta = []",
+                "trusted_by_name = {test.name: test for test in trusted_tests}",
+                "if baseline is None or test.read_bytes() != baseline.read_bytes():",
+                "candidate_test_delta.append(test)",
+                "for path in candidate_test_delta",
+                'str(root / "candidate" / path.relative_to(candidate))',
+                "for path in candidate_test_delta)",
+                "candidate_tests=[pathlib.Path(p) for p in sys.argv[4:-1]]",
+                'command.append(str(writable / "policy-suite-completion.json"))',
+                "NINEROUTER_POLICY_PARSER=str(trusted_parser)",
+                "NINEROUTER_POLICY_CANDIDATE_RELEASE=str(candidate_module)",
+                "NINEROUTER_POLICY_CANDIDATE_WORKFLOW=str(proposed_workflow)",
+                'env["NINEROUTER_POLICY_BASELINE_WORKFLOW"] = str(trusted_workflow_path)',
+                'if completion.exists() or completion.is_symlink():',
+                'env["NINEROUTER_SOURCE_ROOT"] = str(sandbox_candidate)',
+                'env["FORK_MAINTENANCE_ROOT"] = str(private_root)',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, source)
+
+        for fragment in (
+                "import importlib.util,json,pathlib,sys,unittest",
+                "parser=pathlib.Path(sys.argv[3]).resolve()",
+                "sys.path.insert(0,str(parser))",
+                "import yaml",
+                "if not pathlib.Path(yaml.__file__).resolve().is_relative_to(parser):",
+                "sys.path[:0]=[str(candidate),str(oracle)]",
+                "oracle_tests=sorted(oracle.glob('test_*.py'))",
+                "candidate_tests=[pathlib.Path(p) for p in sys.argv[4:-1]]",
+                "load(oracle_tests,'immutable_a')",
+                "load(candidate_tests,'candidate_b')",
+                "suite=unittest.TestSuite([load(oracle_tests,'immutable_a'),load(candidate_tests,'candidate_b')])",
+                "expected=suite.countTestCases()",
+                "result=runner.run(suite)",
+                "'expected_count':expected",
+                "'executed_count':result.testsRun",
+                "'successful':result.wasSuccessful()",
+                "completion.write_text(json.dumps(",
+                "sys.exit(not result.wasSuccessful())",
+                "pathlib.Path(release.__file__).resolve()!=candidate/'release.py'",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, shared_launcher)
+
+        launcher_import = shared_launcher.index("import release")
+        self.assertLess(shared_launcher.index("sys.path[:0]=[str(candidate),str(oracle)]"),
+                        launcher_import)
+        self.assertLess(launcher_import,
+                        shared_launcher.index("oracle_tests=sorted(oracle.glob('test_*.py'))"))
+        self.assertLess(shared_launcher.index("expected=suite.countTestCases()"),
+                        shared_launcher.index("result=runner.run(suite)"))
+
+        self.assertIn("_verify_policy_test_completion(completion, result.returncode)", source)
+        completion_start = source.index("def _verify_policy_test_completion(")
+        completion_end = source.index("\ndef _stop_policy_container(", completion_start)
+        completion = source[completion_start:completion_end]
+        for fragment in (
+                "if returncode != 0:",
+                "marker_path.is_symlink() or not marker_path.is_file() or marker_path.stat().st_size > 1024",
+                'set(marker) != {"schema", "expected_count", "executed_count", "successful"}',
+                'type(marker.get("schema")) is not int',
+                'type(marker.get("expected_count")) is not int',
+                'type(marker.get("executed_count")) is not int',
+                'marker["expected_count"] <= 0',
+                'marker["executed_count"] != marker["expected_count"]',
+                'marker.get("successful") is not True',
+        ):
+            with self.subTest(completion_guard=fragment):
+                self.assertIn(fragment, completion)
 
     def _pull(self, *, config=CONFIG, seed=SEED, head=HEAD):
         identity = {"schema": 1, "config": config, "upstream": UPSTREAM,
