@@ -1,0 +1,43 @@
+From 7fddfec1c3e355793cab9d1efc7955dbf69408af Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Use shared schema discriminators in Responses normalization
+
+---
+ open-sse/translator/formats/responsesApi.js | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
+index 1b63d644..ea75cc1f 100644
+--- a/open-sse/translator/formats/responsesApi.js
++++ b/open-sse/translator/formats/responsesApi.js
+@@ -33,16 +33,16 @@ export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
+ // Codex's observed plaintext task carrier (an agent_message encrypted_content part) is converted
+ // here to input_text; known OpenAI Fernet ciphertext stays opaque.
+ export function normalizeResponsesAgentMessage(item, { dropOpaqueContent = false } = {}) {
+-  if (!item || typeof item !== "object" || Array.isArray(item) || item.type !== "agent_message") return item;
++  if (!item || typeof item !== "object" || Array.isArray(item) || item.type !== RESPONSES_ITEM.AGENT_MESSAGE) return item;
+   const content = Array.isArray(item.content)
+-    ? item.content.map((part) => (part?.type === "encrypted_content"
++    ? item.content.map((part) => (part?.type === RESPONSES_ITEM.ENCRYPTED_CONTENT
+         && typeof part.encrypted_content === "string"
+         && !part.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX)
+       ? { type: RESPONSES_ITEM.INPUT_TEXT, text: part.encrypted_content }
+       : part))
+     : item.content;
+   const normalizedContent = dropOpaqueContent && Array.isArray(content)
+-    ? content.filter((part) => !(part?.type === "encrypted_content"
++    ? content.filter((part) => !(part?.type === RESPONSES_ITEM.ENCRYPTED_CONTENT
+         && typeof part.encrypted_content === "string"
+         && part.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX)))
+     : content;
+@@ -79,7 +79,7 @@ export function toPortableResponsesInput(input) {
+       out.push(item);
+       continue;
+     }
+-    if (item.type === "agent_message") {
++    if (item.type === RESPONSES_ITEM.AGENT_MESSAGE) {
+       const message = normalizeResponsesAgentMessage(item);
+       const parts = Array.isArray(message.content)
+         ? message.content.filter((c) => c?.type === RESPONSES_ITEM.INPUT_TEXT)
