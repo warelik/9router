@@ -3021,9 +3021,19 @@ class SharedHistoryAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self._disposition_proposal_fixture(temporary, policy_repair=True)
             item = fixture["proposal"]["findings"][0]
-            item["evidence"] = item["evidence"].replace(
+            # Use a real, unchanged baseline test: failure must be the delta
+            # requirement, not a missing file or a fabricated source excerpt.
+            item["evidence"] = (item["evidence"].replace(
                 "regression path `scripts/test_repair.py`",
-                "regression path `scripts/test_other.py`")
+                "regression path `scripts/test_maintenance.py`").replace(
+                "regression case `test_policy_source_fix`",
+                "regression case `test_policy_marker_is_stable`").replace(
+                'regression location `assert repair_target() == "fixed"`',
+                'regression location `assert policy_marker() == "stable"`'))
+            item["evidence"] = re.sub(
+                r"(regression diff SHA-256 `)[0-9a-f]{64}(`)",
+                lambda match: match[1] + hashlib.sha256(b"").hexdigest() + match[2],
+                item["evidence"])
             body = ("Completed repair.\n<!-- fork-review-disposition:v1 "
                     + json.dumps(fixture["proposal"], sort_keys=True, separators=(",", ":")) + " -->")
             fixture["proposal_comment"]["body"] = body
@@ -4930,7 +4940,8 @@ class AdoptionTests(unittest.TestCase):
                          "Trusted controller pin check cannot be replaced by an untrusted checkout")
         controller = next((step for step in prepare["steps"]
                            if step.get("name") == "Require The Trusted Controller Pin"), {})
-        self.assertIn("ZED_TRUSTED_POLICY", controller.get("env", {}))
+        self.assertEqual(controller.get("env", {}).get("TRUSTED_POLICY"),
+                         "${{ vars.ZED_TRUSTED_POLICY }}")
         self.assertEqual(prep_call.get("env", {}).get("NINEROUTER_SOURCE_ROOT"),
                          "${{ github.workspace }}/candidate")
         self.assertEqual(prep_call.get("env", {}).get("CODEX_REQUEST_TOKEN"),
@@ -4964,7 +4975,8 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(policy.get("needs"), "prepare")
         policy_gate = policy.get("if", "")
         self.assertIn("review_ready == 'true'", policy_gate, "Policy job must retain the native review gate")
-        self.assertEqual(policy_gate.splitlines()[-1].strip(), "needs.prepare.outputs.policy_verified != 'true'")
+        self.assertEqual(" ".join(policy_gate.split()),
+                         " ".join(expected_job_conditions["policy-check"].split()))
         self.assertIn("policy_verified != 'true'", policy_gate,
                       "Policy tests may be skipped only for a verified native bundle")
         policy_guard = named_steps("policy-check", "Reject A Job-Only Rerun Before Policy Tests")[1]
@@ -5033,7 +5045,11 @@ class AdoptionTests(unittest.TestCase):
         self.assertIn("mode == 'already-validated'", jobs["publish"].get("if", ""))
         self.assertIn("build.result == 'success'", jobs["publish"].get("if", ""))
         self.assertIn("policy-check.result == 'success'", jobs["policy-only"].get("if", ""))
-        self.assertIn("run-id:", "\n".join(str(step.get("with", {})) for step in jobs["publish"]["steps"]))
+        self.assertTrue(any(
+            step.get("uses", "").startswith("actions/download-artifact@")
+            and step.get("with", {}).get("run-id") == "${{ needs.finalize.outputs.validated_run_id }}"
+            for step in jobs["publish"]["steps"]),
+            "Publication must select artifacts from the exact authorized validation run")
         self.assertNotIn("CODEX_REQUEST_TOKEN", str(jobs["policy-check"]))
         owner_secret_steps = [
             (job_name, step.get("name", ""))
