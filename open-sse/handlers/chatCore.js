@@ -12,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
 import { PROVIDERS } from "../config/providers.js";
 import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
 import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
-import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER } from "../config/runtimeConfig.js";
+import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET } from "../config/runtimeConfig.js";
 import { handleBypassRequest } from "../utils/bypassHandler.js";
 import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { getExecutor } from "../executors/index.js";
@@ -143,7 +143,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     const mode = providerThinking.mode;
     if (mode === "on" && !body.thinking) {
       console.log("Injecting provider-level thinking config override: on");
-      body = { ...body, thinking: { type: "enabled", budget_tokens: 10000 } };
+      body = { ...body, thinking: { type: "enabled", budget_tokens: DEFAULT_PROVIDER_THINKING_BUDGET } };
     } else if (mode === "off" && !body.thinking) {
       body = { ...body, thinking: { type: "disabled" } };
     } else if (!body.reasoning_effort) {

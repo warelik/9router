@@ -69,6 +69,7 @@ export const GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS = envMs("GEMINI_NATIVE_TTS_FETCH
 // Default token limits
 export const DEFAULT_MAX_TOKENS = 64000;
 export const DEFAULT_MIN_TOKENS = 32000;
+export const DEFAULT_PROVIDER_THINKING_BUDGET = 10000;
 
 export const TOKEN_SAVER_HEADER = "x-9router-token-saver";
 

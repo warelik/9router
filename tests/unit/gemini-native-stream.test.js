@@ -335,6 +335,68 @@ describe("native Gemini SSE preserves provider payload and follows the client pr
     const original = frame(body);
     expect(await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("aistudio")))).toBe(original);
   });
+
+  it.each(["\n", "\r\n", "\r"])("accepts %s-terminated native events whole and byte-fragmented", async separator => {
+    const framed = body => `data: ${JSON.stringify(body)}${separator}${separator}`;
+    const original = framed(chunk) + framed(lateUsage);
+    for (const inputs of [[encode(original)],
+                          Array.from(encode(original), byte => Uint8Array.of(byte))]) {
+      vi.clearAllMocks();
+      const completed = vi.fn();
+      const output = await readText(inputStream(inputs)
+        .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, completed)));
+      expect(output).toBe(original);
+      expect(output).not.toContain("[DONE]");
+      expect(output).not.toContain('"code":502');
+      expect(completed).toHaveBeenCalledOnce();
+      expect(completed.mock.calls[0][1].cached_tokens).toBe(2048);
+      for (const toolNameMap of [null, new Map([["wire_tool", "original_tool"]])]) {
+        vi.clearAllMocks();
+        const succeeded = vi.fn();
+        const failed = vi.fn();
+        const shared = { provider: "aistudio", model: "gemini-native-test", connectionId: "account",
+          body: {}, stream: true, requestStartTime: Date.now(), onRequestFailure: failed };
+        const result = await handleStreamingResponse({
+          ...shared, ...buildOnStreamComplete(shared), toolNameMap, onRequestSuccess: succeeded,
+          providerResponse: new Response(inputStream(inputs), { headers: { "content-type": "text/event-stream" } }),
+          sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+          streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+        });
+        const text = await result.response.text();
+        expect(text).not.toContain('"code":502');
+        expect(text).not.toContain("[DONE]");
+        await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+        expect(failed).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it.each(["\n", "\r\n", "\r"])("reports malformed or unfinished %s-terminated native events as one 502", async separator => {
+    const framed = body => `data: ${JSON.stringify(body)}${separator}${separator}`;
+    const cases = [
+      ["malformed event after a valid one", framed(chunk) + `data: {not-json}${separator}${separator}`],
+      ["candidate without finishReason", framed({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: "partial" }] } }] })],
+    ];
+    for (const [name, raw] of cases) {
+      for (const toolNameMap of [null, new Map([["wire_tool", "original_tool"]])]) {
+        vi.clearAllMocks();
+        const succeeded = vi.fn();
+        const failed = vi.fn();
+        const shared = { provider: "aistudio", model: "gemini-native-test", connectionId: "account",
+          body: {}, stream: true, requestStartTime: Date.now(), onRequestFailure: failed };
+        const result = await handleStreamingResponse({
+          ...shared, ...buildOnStreamComplete(shared), toolNameMap, onRequestSuccess: succeeded,
+          providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "text/event-stream" } }),
+          sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+          streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+        });
+        await result.response.text();
+        await vi.waitFor(() => expect(failed).toHaveBeenCalledOnce(), { timeout: 5000 });
+        expect(failed.mock.calls[0][0]).toMatchObject({ status: 502, error: expect.any(String) });
+        expect(succeeded).not.toHaveBeenCalled();
+      }
+    }
+  });
 });
 
 describe("native response projections preserve requested data without inventing completion failures", () => {
