@@ -82,6 +82,13 @@ function load() {
   const start = auth.indexOf("export function extractApiKey(");
   const end = auth.indexOf("/**", start);
   vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
+  // Upstream added the wider client-key accessor; load its real pure implementation
+  // just like the legacy auth accessor, without importing DB/account boundaries.
+  const keyAccess = fs.readFileSync(path.join(root, "src/sse/services/keyAccess.js"), "utf8");
+  const keyStart = keyAccess.indexOf("export function extractClientApiKey(");
+  const keyEnd = keyAccess.indexOf("/**", keyStart);
+  if (keyStart < 0 || keyEnd <= keyStart) throw new Error("Real client-key accessor is missing");
+  vm.runInContext(keyAccess.slice(keyStart, keyEnd).replace("export ", ""), context);
   vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
   vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
 }
@@ -110,6 +117,20 @@ function audioRequest(action = "streamGenerateContent") {
 
 describe("native Gemini endpoint entry contract", () => {
   beforeEach(load);
+
+it("loads the real client-key accessor for every supported credential location", () => {
+  for (const [headers, query, expected] of [
+    [{ Authorization: "Bearer bearer-fixture", "x-goog-api-key": "ignored" }, "?key=ignored", "bearer-fixture"],
+    [{ "x-api-key": "header-fixture" }, "", "header-fixture"],
+    [{ "x-goog-api-key": "google-fixture" }, "", "google-fixture"],
+    [{}, "?key=query-fixture", "query-fixture"],
+    [{}, "?$key=dollar-fixture", "dollar-fixture"],
+  ]) {
+    const { req } = request("gemini", "generateContent", nativeBody(), { headers, query });
+    expect(context.extractClientApiKey(req)).toBe(expected);
+  }
+});
+
 
   it.each(["generateContent", "streamGenerateContent"])("TTS %s waits for EOF and its account update", async action => {
     let releaseAccount;
