@@ -167,11 +167,11 @@ describe("native Gemini SSE preserves provider payload and follows the client pr
     ["unknown object", { message: "bridge failure" }, 502],
     ["event-only object", { event: "bridge_failure", data: "unavailable" }, 502],
     ["wrapped unknown object", { response: { message: "bridge failure" } }, 502],
+    ["unprojected unknown-only extension", { futureNativeResult: { task: { type: "customer", value: 9 } } }, 502],
     ["null response wrapper", { response: null }, 502],
     ["false response wrapper", { response: false }, 502],
     ["zero response wrapper", { response: 0 }, 502],
     ["empty-string response wrapper", { response: "" }, 502],
-    ["unprojected unknown-only extension", { futureNativeResult: { task: { type: "customer", value: 9 } } }, 502],
     ["unfinished candidate", { candidates: [{ content: { parts: [{ text: "partial" }] } }] }, 502],
   ])("reports %s to account handling and records failed stream completion", async (_name, payload, status) => {
     for (const nativeJson of [false, true]) {

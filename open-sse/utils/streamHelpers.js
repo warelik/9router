@@ -11,7 +11,7 @@ function nativeResponseProjectionAllowsEmpty(projection) {
   }) || false;
 }
 
-export function isValidNativeGeminiResponse(response, projection = null, allowUnrecognized = false) {
+export function isValidNativeGeminiResponse(response, projection = null, allowUnrecognized = false, allowOpaqueExtensions = false) {
   if (!response || typeof response !== "object" || Array.isArray(response)) return false;
   const allowsEmpty = nativeResponseProjectionAllowsEmpty(projection);
   if (!allowsEmpty && Object.keys(response).length === 0) return false;
@@ -22,9 +22,12 @@ export function isValidNativeGeminiResponse(response, projection = null, allowUn
   if (!allowsEmpty && Object.keys(nativeResponse).length === 0) return false;
   if (nativeResponse.error) return true;
   // GenerateContent metadata can be the whole reply. Keep unknown extensions
-  // opaque, while requiring a recognizable reply unless a mask projects it out.
+  // opaque for non-streaming replies. An SSE transport-only frame must not
+  // become successful response evidence at EOF.
   const nativeFields = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
-  if (!allowsEmpty && !allowUnrecognized && !nativeFields.some(field => Object.hasOwn(nativeResponse, field))) return false;
+  const bridgeFields = new Set(["message", "event", "data", "status", "code", "success", "response"]);
+  const hasOpaqueExtension = Object.keys(nativeResponse).some(field => !bridgeFields.has(field));
+  if (!allowsEmpty && !allowUnrecognized && !nativeFields.some(field => Object.hasOwn(nativeResponse, field)) && !(allowOpaqueExtensions && hasOpaqueExtension)) return false;
   if (nativeResponse.candidates !== undefined) {
     if (!Array.isArray(nativeResponse.candidates)) return false;
     for (const candidate of nativeResponse.candidates) {
