@@ -547,7 +547,36 @@ class RegressionSelectionTests(unittest.TestCase):
 
 
 class PolicyBundleTests(unittest.TestCase):
-    def test_closed_review_pair_reuse_requires_policy_only_and_exact_bundle_proof(self):
+    def test_policy_bundle_reuse_is_bound_for_allowed_final_decisions(self):
+        candidate = {"schema": 1, "application_sha": HEAD}
+        candidate_id = "f" * 64
+        full = {"number": 3}
+        proof = {"decision": "reuse-policy-validation", "candidate_id": candidate_id,
+                 "manifest_sha256": "a" * 64}
+
+        for decision in ("allow", "policy-only", "already-validated"):
+            with self.subTest(decision=decision), \
+                    patch.object(release, "_validated_policy_bundle", return_value=proof) as validate:
+                self.assertEqual(release._policy_bundle_for_final_decision(
+                    REPO, candidate, candidate_id, full, decision), proof)
+                validate.assert_called_once_with(REPO, candidate, full)
+
+        for wrong_proof in (
+                {**proof, "candidate_id": "0" * 64},
+                {**proof, "manifest_sha256": "invalid"},
+        ):
+            with self.subTest(wrong_proof=wrong_proof), \
+                    patch.object(release, "_validated_policy_bundle", return_value=wrong_proof), \
+                    self.assertRaisesRegex(ValueError, "exact policy candidate"):
+                release._policy_bundle_for_final_decision(
+                    REPO, candidate, candidate_id, full, "allow")
+
+        with patch.object(release, "_validated_policy_bundle") as validate:
+            self.assertIsNone(release._policy_bundle_for_final_decision(
+                REPO, candidate, candidate_id, full, "blocked"))
+        validate.assert_not_called()
+
+    def test_closed_review_pair_reuse_requires_an_allowed_decision_and_exact_bundle_proof(self):
         candidate = {"schema": 1, "application_sha": HEAD}
         candidate_id = "f" * 64
         baseline = {"release_id": 5}
@@ -563,20 +592,23 @@ class PolicyBundleTests(unittest.TestCase):
                 return {"decision": self.decision}
 
         lifecycle = Lifecycle()
-        with (patch.object(release, "_final_history", return_value={"exact": True}) as history,
-              patch.object(release, "_validated_policy_bundle", return_value=proof) as validate):
-            self.assertTrue(release._closed_policy_pair_has_verified_bundle(
-                REPO, lifecycle, candidate, candidate_id, baseline, full, delta))
-        history.assert_called_once_with(REPO, {"repository": REPO, "baseline": baseline}, lifecycle)
-        validate.assert_called_once_with(REPO, candidate, full)
+        for decision in ("policy-only", "allow", "already-validated"):
+            lifecycle.decision = decision
+            with (self.subTest(decision=decision),
+                  patch.object(release, "_final_history", return_value={"exact": True}) as history,
+                  patch.object(release, "_validated_policy_bundle", return_value=proof) as validate):
+                self.assertTrue(release._closed_policy_pair_has_verified_bundle(
+                    REPO, lifecycle, candidate, candidate_id, baseline, full, delta))
+            history.assert_called_once_with(REPO, {"repository": REPO, "baseline": baseline}, lifecycle)
+            validate.assert_called_once_with(REPO, candidate, full)
 
-        lifecycle.decision = "allow"
+        lifecycle.decision = "blocked"
         with (patch.object(release, "_final_history", return_value={"exact": True}),
               patch.object(release, "_validated_policy_bundle") as validate):
             self.assertFalse(release._closed_policy_pair_has_verified_bundle(
                 REPO, lifecycle, candidate, candidate_id, baseline, full, delta))
         validate.assert_not_called()
-        lifecycle.decision = "policy-only"
+        lifecycle.decision = "allow"
         with (patch.object(release, "_final_history", return_value={"exact": True}),
               patch.object(release, "_validated_policy_bundle", return_value=proof),
               self.assertRaisesRegex(ValueError, "exact policy candidate")):
