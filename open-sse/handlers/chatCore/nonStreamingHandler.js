@@ -14,7 +14,7 @@ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, sav
 import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
 import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
-import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
+import { ROLE, RESPONSES_ITEM, OPENAI_FINISH, GEMINI_FINISH } from "../../translator/schema/index.js";
 import { storeGeminiTurnSignature, storeGeminiThoughtSignature, storeGeminiServerParts, storeGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
 import { toOpenAIFinish } from "../../translator/concerns/finishReason.js";
 
@@ -99,8 +99,8 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
 
   const usage = responseBody.usage || {};
   // Responses has no "length"/"content_filter" status: a cut-off turn is `incomplete` with a reason.
-  const incompleteReason = choice.finish_reason === "length" ? "max_output_tokens"
-    : choice.finish_reason === "content_filter" ? "content_filter" : null;
+  const incompleteReason = choice.finish_reason === OPENAI_FINISH.LENGTH ? "max_output_tokens"
+    : choice.finish_reason === OPENAI_FINISH.CONTENT_FILTER ? "content_filter" : null;
   const status = incompleteReason ? "incomplete" : "completed";
 
   return {
@@ -211,8 +211,8 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
     if (toolCalls.length > 0) message.tool_calls = toolCalls;
     if (!message.content && !message.tool_calls) message.content = "";
 
-    let finishReason = toOpenAIFinish(candidate.finishReason || "STOP", "gemini");
-    if (finishReason === "stop" && toolCalls.length > 0) finishReason = "tool_calls";
+    let finishReason = toOpenAIFinish(candidate.finishReason || GEMINI_FINISH.STOP, FORMATS.GEMINI);
+    if (finishReason === OPENAI_FINISH.STOP && toolCalls.length > 0) finishReason = OPENAI_FINISH.TOOL_CALLS;
 
     const result = {
       id: `chatcmpl-${response.responseId || Date.now()}`,
@@ -223,7 +223,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
     };
 
     if (usage) {
-      result.usage = toOpenAIUsage(usage, "gemini");
+      result.usage = toOpenAIUsage(usage, FORMATS.GEMINI);
     }
     // Same hand-off as the OpenAI-shaped branches above: Claude and Responses clients must not
     // receive a bare chat.completion body.
@@ -352,7 +352,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
     }
     if (responseBody.error) {
       const reportedCode = Number(responseBody.error.code);
-      const status = Number.isInteger(reportedCode) && reportedCode >= 400 && reportedCode <= 599
+      const status = Number.isInteger(reportedCode) && reportedCode >= HTTP_STATUS.BAD_REQUEST && reportedCode <= 599
         ? reportedCode : HTTP_STATUS.BAD_GATEWAY;
       const message = typeof responseBody.error.message === "string"
         ? responseBody.error.message : `Native Gemini error from ${provider}`;

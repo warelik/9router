@@ -1,12 +1,12 @@
 import { PROVIDERS } from "../config/providers.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
-import { FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
+import { FETCH_CONNECT_TIMEOUT_MS, HTTP_STATUS } from "../config/runtimeConfig.js";
 
 // The registry is intentionally unseeded; keep bridge model IDs opaque.
 export async function resolveAIStudioModels(credentials, options = {}) {
   const apiKey = credentials?.apiKey;
   if (!apiKey) {
-    return { error: "No valid token found", status: 401 };
+    return { error: "No valid token found", status: HTTP_STATUS.UNAUTHORIZED };
   }
   const res = await proxyAwareFetch(PROVIDERS.aistudio.validateUrl, {
     headers: {

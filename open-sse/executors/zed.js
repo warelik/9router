@@ -68,7 +68,7 @@ function buildProviderRequest(provider, model, body, stream, credentials) {
   if (provider === ZED_PROVIDER.google) {
     ensureToolCallIds(body, { preserveIds: true });
     const geminiRequest = openaiToGeminiRequest(model, body, true, credentials);
-    applyThinking("gemini", model, geminiRequest, "gemini", captureThinking(body));
+    applyThinking(FORMATS.GEMINI, model, geminiRequest, "gemini", captureThinking(body));
     // Zed's hosted Gemini backend speaks the Vertex safety vocabulary, not the
     // public Gemini API enum the shared translator emits (`OFF`, `CIVIC_INTEGRITY`,
     // `DANGEROUS_CONTENT`). Drop client-side safetySettings for the Zed Google
