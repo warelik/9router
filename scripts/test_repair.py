@@ -4227,9 +4227,14 @@ class AdoptionTests(unittest.TestCase):
         trusted_test_files = []
 
         def execute(args, **kwargs):
-            env = kwargs["env"]
+            engine_env = kwargs["env"]
+            self.assertFalse({"GH_TOKEN", "GITHUB_TOKEN", "CODEX_REQUEST_TOKEN",
+                              "NINEROUTER_KEY", "GITHUB_ENV", "GITHUB_PATH"} & engine_env.keys())
+            env = dict(args[i + 1].split("=", 1) for i, value in enumerate(args) if value == "--env")
             self.assertFalse({"GH_TOKEN", "GITHUB_TOKEN", "CODEX_REQUEST_TOKEN",
                               "NINEROUTER_KEY", "GITHUB_ENV", "GITHUB_PATH"} & env.keys())
+            self.assertEqual(engine_env.get("HOME"), os.environ.get("HOME"))
+            self.assertNotEqual(engine_env.get("HOME"), env["HOME"])
             self.assertEqual(env["CI"], "true")
             self.assertEqual(args[:2], ["docker", "run"])
             self.assertEqual(args[2], "--name")
