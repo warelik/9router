@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import release
 
@@ -24,6 +25,97 @@ class CandidatePolicyCliTests(unittest.TestCase):
     def candidate_release(self):
         configured = os.environ.get("NINEROUTER_POLICY_CANDIDATE_RELEASE")
         return Path(configured or release.__file__).resolve()
+
+    def test_hosted_shared_policy_requires_the_trusted_baseline_private_pin(self):
+        with (patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=True),
+              self.assertRaisesRegex(ValueError, "requires its exact trusted baseline pin")):
+            release.check_policy_shared(Path("/unavailable/candidate"))
+
+    def test_shared_policy_launcher_isolates_original_oracle_and_refuses_incomplete_runs(self):
+        source = self.candidate_release().read_text(encoding="utf-8")
+        baseline_start = source.index("        baseline_launcher = (\n")
+        combined_start = source.index("        launcher = (\n", baseline_start)
+        combined_end = source.index("    else:\n        launcher = (", combined_start)
+        baseline_launcher = source[baseline_start:combined_start]
+        combined_launcher = source[combined_start:combined_end]
+
+        for fragment in (
+                'baseline_private_root_text = os.environ.get("NINEROUTER_POLICY_BASELINE_MAINTENANCE", "")',
+                "baseline_policy_enabled = shared and bool(baseline_private_root_text)",
+                'if shared and os.environ.get("GITHUB_ACTIONS") and not baseline_policy_enabled:',
+                'trusted_maintenance = trusted_scripts / "maintenance.py"',
+                'trusted_maintenance_lock = trusted_scripts / "maintenance.lock.json"',
+                "trusted_lock = _json_object(trusted_maintenance_lock.read_bytes())",
+                "candidate_private_source, candidate_private_receipt = _candidate_private_lifecycle(",
+                "candidate_lock = _json_object((candidate_scripts / \"maintenance.lock.json\").read_bytes())",
+                "if trusted_lock == candidate_lock:",
+                '"NINEROUTER_POLICY_BASELINE_MAINTENANCE", ""',
+                'baseline_module_path = baseline_private_root / "fork_lifecycle.py"',
+                "_json_object(baseline_receipt) != {",
+                'trusted_lock["module_sha256"]',
+                "hashlib.sha256(baseline_private_source).hexdigest()",
+                'shutil.copy2(trusted_maintenance, trusted_scripts / "maintenance.py")',
+                'shutil.copy2(trusted_maintenance_lock, trusted_scripts / "maintenance.lock.json")',
+                'sandbox_private_baseline = root / "private-maintenance-baseline"',
+                '(sandbox_private_baseline / "fork_lifecycle.py").write_bytes(baseline_private_source)',
+                "elif shared:",
+                "candidate_tests=[pathlib.Path(p) for p in sys.argv[4:-1]]",
+                "baseline_private_root=oracle.parent.parent/'private-maintenance-baseline'",
+                "'FORK_MAINTENANCE_ROOT':str(baseline_private_root)",
+                'env["NINEROUTER_SOURCE_ROOT"] = str(sandbox_candidate)',
+                'env["FORK_MAINTENANCE_ROOT"] = str(private_root)',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, source)
+
+        for fragment in (
+                "sys.path.insert(0,str(oracle))",
+                "pathlib.Path(release.__file__).resolve()!=oracle/'release.py'",
+                "oracle.glob('test_*.py')",
+                "expected=suite.countTestCases()",
+                "result=runner.run(suite)",
+                "'expected_count':expected",
+                "'executed_count':result.testsRun",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, baseline_launcher)
+
+        for fragment in (
+                "import importlib.util,json,os,pathlib,subprocess,sys,unittest",
+                "baseline_env=os.environ.copy()",
+                "'NINEROUTER_SOURCE_ROOT':str(oracle.parent)",
+                "'NINEROUTER_POLICY_PARSER':str(parser)",
+                "'NINEROUTER_POLICY_CANDIDATE_RELEASE':str(oracle/'release.py')",
+                "'NINEROUTER_POLICY_CANDIDATE_WORKFLOW':str(oracle.parent/'.github/workflows/release.yml')",
+                "'NINEROUTER_POLICY_BASELINE_WORKFLOW':str(oracle.parent/'.github/workflows/release.yml')",
+                "env=baseline_env",
+                "baseline.returncode!=0",
+                "baseline_completion.is_symlink()",
+                "type(baseline_result.get('schema')) is not int",
+                "type(baseline_result.get('expected_count')) is not int",
+                "type(baseline_result.get('executed_count')) is not int",
+                "baseline_result['executed_count']!=baseline_result['expected_count']",
+                "baseline_result.get('successful') is not True",
+                "sys.path.insert(0,str(candidate))",
+                "pathlib.Path(release.__file__).resolve()!=candidate/'release.py'",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, combined_launcher)
+
+        for fragment in (
+                "oracle_tests=sorted(oracle.glob('test_*.py'))",
+                "candidate_tests=[pathlib.Path(p) for p in sys.argv[4:-2]]",
+                "load(oracle_tests,'immutable_a')",
+                "load(candidate_tests,'candidate_b')",
+                "baseline_result['executed_count']+result.testsRun",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, combined_launcher)
+
+        self.assertIn("_verify_policy_test_completion(completion, result.returncode)", source)
+        self.assertLess(baseline_start, combined_start)
+        self.assertLess(combined_launcher.index("baseline.returncode!=0"),
+                        combined_launcher.index("sys.path.insert(0,str(candidate))"))
 
     def _pull(self, *, config=CONFIG, seed=SEED, head=HEAD):
         identity = {"schema": 1, "config": config, "upstream": UPSTREAM,
