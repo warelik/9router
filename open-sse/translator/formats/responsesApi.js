@@ -83,7 +83,7 @@ export function toPortableResponsesInput(input) {
     if (item.type === RESPONSES_ITEM.AGENT_MESSAGE) {
       const message = normalizeResponsesAgentMessage(item);
       const parts = Array.isArray(message.content)
-        ? message.content.filter((c) => c?.type === RESPONSES_ITEM.INPUT_TEXT)
+        ? message.content.filter((c) => c?.type === RESPONSES_ITEM.INPUT_TEXT || c?.type === RESPONSES_ITEM.INPUT_IMAGE)
         : [];
       if (parts.length > 0) {
         out.push({ type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content: parts });

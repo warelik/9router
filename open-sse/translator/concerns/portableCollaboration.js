@@ -40,10 +40,11 @@ export function preparePortableCollaboration(body) {
   const aliasFor = (name, type = RESPONSES_TOOL.FUNCTION) => {
     const identity = JSON.stringify([namespace, name, type]);
     if (aliases.has(identity)) return aliases.get(identity);
-    const hash = createHash("sha256").update(identity).digest("hex").slice(0, 16);
-    const base = PORTABLE_COLLABORATION.aliasPrefix + String(name).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 30) + "_" + hash;
+    const hash = createHash("sha256").update(identity).digest("hex").slice(0, PORTABLE_COLLABORATION.aliasHashLength);
+    const base = PORTABLE_COLLABORATION.aliasPrefix
+      + String(name).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, PORTABLE_COLLABORATION.aliasNameLength) + "_" + hash;
     let alias = base;
-    for (let n = 1; reserved.has(alias); n++) alias = base.slice(0, 58) + "_" + n;
+    for (let n = 1; reserved.has(alias); n++) alias = base.slice(0, PORTABLE_COLLABORATION.aliasCollisionBaseLength) + "_" + n;
     reserved.add(alias); aliases.set(identity, alias);
     toolNameMap.set(alias, { name, namespace, type });
     return alias;

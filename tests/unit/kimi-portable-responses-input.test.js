@@ -97,6 +97,28 @@ describe("toPortableResponsesInput", () => {
     expect(out).toEqual([]);
   });
 
+  it("keeps input_image parts of agent_message beside its input_text", () => {
+    const image = { type: "input_image", image_url: "data:image/png;base64,x" };
+    const out = toPortableResponsesInput([{
+      type: "agent_message",
+      content: [
+        { type: "input_text", text: "see image" },
+        image,
+        { type: "encrypted_content", encrypted_content: FERNET },
+      ],
+    }]);
+    expect(out).toEqual([{
+      type: "message", role: "user",
+      content: [{ type: "input_text", text: "see image" }, image],
+    }]);
+  });
+
+  it("keeps an image-only agent_message", () => {
+    const image = { type: "input_image", image_url: "data:image/png;base64,x" };
+    const out = toPortableResponsesInput([{ type: "agent_message", content: [image] }]);
+    expect(out).toEqual([{ type: "message", role: "user", content: [image] }]);
+  });
+
   it("rewrites call_id-less function_call_output with a string output", () => {
     const out = toPortableResponsesInput([{
       type: "function_call_output", name: "send_message_to_thread",
