@@ -509,6 +509,45 @@ class RegressionSelectionTests(unittest.TestCase):
                 "unit/new.test.js", "translator/changed.test.js",
             })
 
+    def test_patch_tests_count_preserved_historical_files_without_weakening_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate_root = root / "candidate"
+            patch_root = root / "patches"
+            (candidate_root / "patches").mkdir(parents=True)
+            patch_root.mkdir()
+            (patch_root / "0001-fix.patch").write_text("fixture patch", encoding="utf-8")
+            manifest_path = candidate_root / "patches/source.json"
+            historical = "tests/unit/historical.test.js"
+            added = "tests/unit/new-patch.test.js"
+            touched = {historical, added}
+
+            def validate(baseline, candidate):
+                manifest_path.write_text(json.dumps(candidate), encoding="utf-8")
+                with (patch.object(release, "_shared_file",
+                                   return_value=json.dumps(baseline).encode("utf-8")),
+                      patch.object(release, "patch_regressions", return_value=touched)):
+                    release._validate_regression_manifest(REPO, CONFIG, candidate_root, patch_root)
+
+            preserved = {
+                "schema": 1,
+                "test_files": [historical],
+                "regression_files": [added],
+            }
+            validate(preserved, preserved)
+
+            no_added_regression = {
+                "schema": 1,
+                "test_files": [historical],
+                "regression_files": [],
+            }
+            with self.assertRaisesRegex(ValueError, "omits tests added by its ordered patches"):
+                validate(no_added_regression, no_added_regression)
+
+            overlapping = {**preserved, "regression_files": [historical, added]}
+            with self.assertRaisesRegex(ValueError, "must remain disjoint"):
+                validate(no_added_regression, overlapping)
+
     def test_missing_persistent_regression_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -547,7 +586,36 @@ class RegressionSelectionTests(unittest.TestCase):
 
 
 class PolicyBundleTests(unittest.TestCase):
-    def test_closed_review_pair_reuse_requires_policy_only_and_exact_bundle_proof(self):
+    def test_policy_bundle_reuse_is_bound_for_allowed_final_decisions(self):
+        candidate = {"schema": 1, "application_sha": HEAD}
+        candidate_id = "f" * 64
+        full = {"number": 3}
+        proof = {"decision": "reuse-policy-validation", "candidate_id": candidate_id,
+                 "manifest_sha256": "a" * 64}
+
+        for decision in ("allow", "policy-only", "already-validated"):
+            with self.subTest(decision=decision), \
+                    patch.object(release, "_validated_policy_bundle", return_value=proof) as validate:
+                self.assertEqual(release._policy_bundle_for_final_decision(
+                    REPO, candidate, candidate_id, full, decision), proof)
+                validate.assert_called_once_with(REPO, candidate, full)
+
+        for wrong_proof in (
+                {**proof, "candidate_id": "0" * 64},
+                {**proof, "manifest_sha256": "invalid"},
+        ):
+            with self.subTest(wrong_proof=wrong_proof), \
+                    patch.object(release, "_validated_policy_bundle", return_value=wrong_proof), \
+                    self.assertRaisesRegex(ValueError, "exact policy candidate"):
+                release._policy_bundle_for_final_decision(
+                    REPO, candidate, candidate_id, full, "allow")
+
+        with patch.object(release, "_validated_policy_bundle") as validate:
+            self.assertIsNone(release._policy_bundle_for_final_decision(
+                REPO, candidate, candidate_id, full, "blocked"))
+        validate.assert_not_called()
+
+    def test_closed_review_pair_reuse_requires_an_allowed_decision_and_exact_bundle_proof(self):
         candidate = {"schema": 1, "application_sha": HEAD}
         candidate_id = "f" * 64
         baseline = {"release_id": 5}
@@ -600,6 +668,16 @@ class PolicyBundleTests(unittest.TestCase):
             (trusted / ".github/workflows").mkdir(parents=True)
             (trusted / "scripts/release.py").write_text("pass\n")
             (trusted / "scripts/test_baseline.py").write_text("pass\n")
+            (trusted / "scripts/maintenance.py").write_text("pass\n")
+            trusted_private_module = b"trusted baseline private module"
+            maintenance_lock = {
+                "schema": 1, "repository": "warelik/machine-maintenance",
+                "revision": "a" * 40,
+                "module_sha256": hashlib.sha256(trusted_private_module).hexdigest(),
+                "api_version": 1,
+            }
+            (trusted / "scripts/maintenance.lock.json").write_text(
+                json.dumps(maintenance_lock))
             (trusted / "patches/source.json").write_text("{}\n")
             (trusted / ".github/workflows/release.yml").write_text("jobs: {}\n")
 
@@ -609,9 +687,16 @@ class PolicyBundleTests(unittest.TestCase):
             (candidate_scripts / "release.py").write_text("pass\n")
             (candidate_scripts / "test_baseline.py").write_text("pass\n")
             (candidate_scripts / "test_candidate.py").write_text("raise RuntimeError('private source')\n")
-            (candidate_scripts / "maintenance.lock.json").write_text(json.dumps({
-                "schema": 1, "repository": "warelik/machine-maintenance",
-                "revision": "a" * 40, "module_sha256": "b" * 64, "api_version": 1,
+            candidate_lock = {**maintenance_lock, "revision": "c" * 40,
+                              "module_sha256": "d" * 64}
+            (candidate_scripts / "maintenance.lock.json").write_text(json.dumps(candidate_lock))
+            baseline_private = root / "private-maintenance-baseline"
+            baseline_private.mkdir()
+            baseline_module = baseline_private / "fork_lifecycle.py"
+            baseline_module.write_bytes(trusted_private_module)
+            (baseline_private / ".maintenance-source.json").write_text(json.dumps({
+                "repository": maintenance_lock["repository"],
+                "revision": maintenance_lock["revision"],
             }))
             workflow = candidate / ".github/workflows/release.yml"
             workflow.parent.mkdir(parents=True)
@@ -632,9 +717,20 @@ class PolicyBundleTests(unittest.TestCase):
 
             env = {
                 "NINEROUTER_POLICY_PARSER": str(parser),
+                "NINEROUTER_POLICY_BASELINE_MAINTENANCE": str(baseline_private),
                 "FORK_MAINTENANCE_ROOT": str(root / "private-maintenance"),
+                "GITHUB_ACTIONS": "true",
             }
-            with (patch.object(release, "ROOT", trusted), patch.dict(os.environ, env),
+            baseline_module.write_bytes(b"wrong baseline private module")
+            with (patch.object(release, "ROOT", trusted), patch.dict(os.environ, env, clear=True),
+                  patch.object(release, "yaml_module", return_value=yaml),
+                  patch.object(release, "_candidate_private_lifecycle",
+                               return_value=(b"private module", b"private receipt")),
+                  self.assertRaisesRegex(ValueError, "baseline private checkout source differs")):
+                release.check_policy_shared(candidate)
+            baseline_module.write_bytes(trusted_private_module)
+
+            with (patch.object(release, "ROOT", trusted), patch.dict(os.environ, env, clear=True),
                   patch.object(release, "yaml_module", return_value=yaml),
                   patch.object(release, "_candidate_private_lifecycle",
                                return_value=(b"private module", b"private receipt")),
@@ -653,14 +749,29 @@ class PolicyBundleTests(unittest.TestCase):
         self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
         self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
         launcher = args[args.index("-c") + 1]
+        self.assertNotIn("baseline_launcher=", launcher)
+        self.assertNotIn("baseline=subprocess.run(", launcher)
+        self.assertIn("sys.path[:0]=[str(candidate),str(oracle)]", launcher)
+        self.assertIn("import release", launcher)
+        candidate_import = launcher.index("import release")
+        self.assertLess(launcher.index("sys.path[:0]=[str(candidate),str(oracle)]"), candidate_import)
         self.assertIn("oracle_tests=sorted(oracle.glob('test_*.py'))", launcher)
         self.assertIn("candidate_tests=[pathlib.Path(p) for p in sys.argv[4:-1]]", launcher)
+        self.assertLess(candidate_import, launcher.index("oracle_tests=sorted(oracle.glob('test_*.py'))"))
+        self.assertLess(candidate_import, launcher.index("candidate_tests=[pathlib.Path(p)"))
+        self.assertIn("unittest.TestSuite([load(oracle_tests,'immutable_a'),load(candidate_tests,'candidate_b')])",
+                      launcher)
         self.assertIn("result.testsRun", launcher)
         self.assertIn("completion.write_text", launcher)
         self.assertLess(launcher.index("result=runner.run(suite)"),
                         launcher.index("completion.write_text"))
         self.assertEqual(Path(args[-2]).name, "test_candidate.py")
         self.assertEqual(Path(args[-1]).name, "policy-suite-completion.json")
+
+    def test_shared_hosted_policy_requires_baseline_pin(self):
+        with (patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=True),
+              self.assertRaisesRegex(ValueError, "exact trusted baseline pin")):
+            release.check_policy_shared(Path("unused-candidate"))
 
     def test_shared_policy_suite_requires_trusted_full_completion_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -899,6 +1010,966 @@ class NativeMarkerAuthorizationTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 release._authorized_final_marker_comments(
                     [bad], REPO, "fork-final:v1", allow_workflow_bot=True)
+
+
+class WorkflowTransitionEvidenceTests(unittest.TestCase):
+    timestamp = "2026-10-20T06:00:00Z"
+
+    @staticmethod
+    def _candidate_identity(candidate):
+        canonical = json.dumps(candidate, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def setUp(self):
+        self.candidate_id = "a" * 64
+        self.candidate = {
+            "schema": 1, "repository": REPO, "upstream_sha": UPSTREAM,
+            "application_sha": HEAD, "configuration_sha": CONFIG,
+            "patchset_sha256": "e" * 64, "recipe_sha256": "f" * 64,
+            "platform": "linux/amd64",
+        }
+        self.parent = "9" * 40
+        self.payload = {
+            "schema": 1, "candidate_id": self.candidate_id, "run_id": 90,
+            "run_attempt": 2, "workflow_sha": self.parent,
+            "trusted_policy_sha": self.parent,
+        }
+        body = (
+            "<!-- fork-candidate:v1 " + release._candidate_json(self.candidate) + " -->\n"
+            "<!-- fork-policy-validation:v1 " + json.dumps(self.payload, separators=(",", ":")) + " -->")
+        self.comment = {
+            "id": 901, "created_at": self.timestamp, "updated_at": self.timestamp,
+            "user": {"login": "github-actions[bot]", "type": "Bot"}, "body": body,
+        }
+        self.run = {
+            "id": 90, "run_attempt": 2, "head_sha": self.parent,
+            "path": ".github/workflows/release.yml", "status": "completed",
+            "conclusion": "failure",
+        }
+        self.private_lock = {
+            "schema": 1, "repository": "warelik/machine-maintenance",
+            "revision": "c" * 40, "module_sha256": "d" * 64, "api_version": 1,
+        }
+        self.private_lock_bytes = json.dumps(
+            self.private_lock, sort_keys=True, separators=(",", ":")).encode()
+        self.policy_job = {
+            "id": 9010, "name": release.SHARED_POLICY_JOB, "status": "completed",
+            "conclusion": "success", "started_at": self.timestamp,
+            "steps": [
+                {"name": "Read The Candidate Private Module Pin", "status": "completed",
+                 "conclusion": "success"},
+                {"name": "Read The Trusted Baseline Private Module Pin", "status": "completed",
+                 "conclusion": "success"},
+                {"name": "Checkout The Trusted Baseline Private Module", "status": "completed",
+                 "conclusion": "skipped", "started_at": self.timestamp,
+                 "completed_at": self.timestamp},
+                {"name": "Record The Exact Trusted Baseline Private Checkout Receipt",
+                 "status": "completed", "conclusion": "skipped",
+                 "started_at": self.timestamp, "completed_at": self.timestamp},
+                {"name": "Enforce Trusted Tests And Validate Proposed YAML",
+                 "status": "completed", "conclusion": "success"},
+            ],
+        }
+        self.jobs = [
+            self.policy_job,
+            {"name": "Test The Historical Application Contracts", "status": "completed",
+             "conclusion": "skipped", "started_at": "2026-10-20T06:00:02Z",
+             "completed_at": "2026-10-20T06:00:01Z", "steps": []},
+            {"name": "Build And Smoke Test One Container", "status": "completed",
+             "conclusion": "skipped", "started_at": "2026-10-20T06:00:02Z",
+             "completed_at": "2026-10-20T06:00:01Z", "steps": []},
+        ]
+        self.record = {
+            "run": self.run, "marker": self.payload, "reservation": self.comment,
+        }
+        self.lifecycle = SimpleNamespace(candidate_identity=lambda _candidate: self.candidate_id)
+
+    def test_transition_replays_parent_policy_pass_after_late_publish_failure(self):
+        history = {"state": "verified", "record": self.record}
+        baseline_lock = {**self.private_lock, "revision": self.parent,
+                         "module_sha256": "e" * 64}
+        for same_private_revision in (True, False):
+            with self.subTest(same_private_revision=same_private_revision):
+                baseline_lock_for_case = (self.private_lock if same_private_revision
+                                          else baseline_lock)
+                steps = [dict(step) for step in self.policy_job["steps"]]
+                for step in steps:
+                    if step["name"] in {
+                            "Checkout The Trusted Baseline Private Module",
+                            "Record The Exact Trusted Baseline Private Checkout Receipt"}:
+                        step["conclusion"] = "skipped" if same_private_revision else "success"
+                        if not same_private_revision:
+                            step["started_at"] = self.timestamp
+                jobs = [{**self.policy_job, "steps": steps}, *self.jobs[1:]]
+                with (patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
+                      patch.object(release, "_shared_review_comments", return_value=[self.comment]),
+                      patch.object(release, "_policy_validation_history", return_value=history) as proof,
+                      patch.object(release, "_native_attempt_jobs", return_value=(jobs, "jobs-endpoint")),
+                      patch.object(release, "_shared_file", side_effect=[
+                          self.private_lock_bytes,
+                          json.dumps(baseline_lock_for_case, sort_keys=True,
+                                     separators=(",", ":")).encode()])):
+                    receipt = release._transition_policy_receipt(
+                        REPO, self.candidate, self.parent, self.lifecycle)
+                proof.assert_called_once_with(
+                    REPO, self.candidate, self.lifecycle,
+                    trusted_policy_sha=self.parent, workflow_sha=self.parent)
+                self.assertEqual(receipt, {
+                    "candidate_id": self.candidate_id, "source": "native-run", "verified": True,
+                    "run_id": 90, "run_attempt": 2, "reservation_id": 901,
+                    "workflow_sha": self.parent, "trusted_policy_sha": self.parent,
+                })
+        mismatched_pin = {**self.private_lock, "revision": self.parent,
+                          "module_sha256": "e" * 64}
+        with (patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
+              patch.object(release, "_shared_review_comments", return_value=[self.comment]),
+              patch.object(release, "_policy_validation_history",
+                           return_value={"state": "verified", "record": self.record}),
+              patch.object(release, "_native_attempt_jobs", return_value=(self.jobs, "jobs-endpoint")),
+              patch.object(release, "_shared_file", side_effect=[
+                  self.private_lock_bytes,
+                  json.dumps(mismatched_pin, sort_keys=True, separators=(",", ":")).encode()]),
+              self.assertRaisesRegex(ValueError, "wrong baseline-private checkout path")):
+            release._transition_policy_receipt(
+                REPO, self.candidate, self.parent, self.lifecycle)
+
+    def test_transition_receipt_refuses_a_failed_policy_step_or_started_heavy_job(self):
+        history = {"state": "verified", "record": self.record}
+        for jobs in (
+                [{**self.policy_job, "steps": [{"status": "completed", "conclusion": "failure"}]},
+                 *self.jobs[1:]],
+                [self.policy_job, {**self.jobs[1], "started_at": self.timestamp,
+                                   "steps": [{"name": "test", "status": "completed",
+                                              "conclusion": "success"}]}, self.jobs[2]],
+        ):
+            with (patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
+                  patch.object(release, "_shared_review_comments", return_value=[self.comment]),
+                  patch.object(release, "_policy_validation_history", return_value=history),
+                  patch.object(release, "_native_attempt_jobs", return_value=(jobs, "jobs-endpoint")),
+                  patch.object(release, "_shared_file", return_value=self.private_lock_bytes),
+                  self.assertRaisesRegex(ValueError, "mandatory step|heavy application job")):
+                release._transition_policy_receipt(
+                    REPO, self.candidate, self.parent, self.lifecycle)
+
+    def test_transition_retry_uses_only_post_pin_h_runs_and_excludes_current_run(self):
+        pin_updated_at = "2026-10-20T06:00:00Z"
+        current_stale = {
+            "id": 90, "head_sha": HEAD, "head_branch": "downstream",
+            "event": "workflow_dispatch", "path": ".github/workflows/release.yml",
+            "created_at": "2026-10-20T06:00:02Z", "run_attempt": 1,
+        }
+        safe_next = {
+            "id": 91, "head_sha": HEAD, "head_branch": "downstream",
+            "event": "push", "path": ".github/workflows/release.yml",
+            "created_at": "2026-10-20T06:00:01Z", "run_attempt": 1,
+            "status": "queued",
+        }
+        with (patch.dict(os.environ, {"GITHUB_RUN_ID": "90"}),
+              patch.object(release, "_workflow_run_records",
+                           return_value=([current_stale, safe_next], True)),
+              patch.object(release, "_native_workflow_source") as source,
+              patch.object(release, "api", side_effect=AssertionError("fresh H run already exists"))):
+            selected = release._ensure_native_workflow_transition_run(
+                REPO, HEAD, trusted_pin_updated_at=pin_updated_at)
+        self.assertEqual(selected, safe_next)
+        source.assert_called_once_with(REPO, safe_next, HEAD)
+
+    def test_transition_retry_dispatches_after_stale_self_run_but_refuses_consumed_attempts(self):
+        pin_updated_at = "2026-10-20T06:00:00Z"
+        stale = {
+            "id": 91, "head_sha": HEAD, "head_branch": "downstream",
+            "event": "push", "path": ".github/workflows/release.yml",
+            "created_at": "2026-10-20T05:59:59Z", "run_attempt": 1,
+            "status": "completed", "conclusion": "failure",
+        }
+        calls = []
+
+        def dispatch(path, *, method="GET", data=None, token=None):
+            calls.append((path, method, data, token))
+            return None
+
+        with (patch.dict(os.environ, {"GITHUB_RUN_ID": "90"}),
+              patch.object(release, "_workflow_run_records", return_value=([stale], True)),
+              patch.object(release, "_native_workflow_source"),
+              patch.object(release, "owner_token", return_value="fixture-owner"),
+              patch.object(release, "api", side_effect=dispatch)):
+            self.assertIsNone(release._ensure_native_workflow_transition_run(
+                REPO, HEAD, trusted_pin_updated_at=pin_updated_at))
+        self.assertEqual(calls, [(
+            f"repos/{REPO}/actions/workflows/release.yml/dispatches", "POST",
+            {"ref": "downstream"}, "fixture-owner")])
+
+        for evidence in ("heavy", "final"):
+            safe_shape = {**stale, "id": 92,
+                          "created_at": "2026-10-20T06:00:01Z"}
+            calls.clear()
+            jobs = [{"name": "Test The Historical Application Contracts",
+                     "started_at": "2026-10-20T06:00:02Z", "steps": [{"name": "test"}]}]
+            comments = []
+            if evidence == "final":
+                jobs = [{"name": release.SHARED_POLICY_JOB, "status": "completed",
+                         "conclusion": "skipped", "steps": []}]
+                marker = {"run_id": 92, "run_attempt": 1}
+                comments = [{"id": 902, "created_at": self.timestamp,
+                             "updated_at": self.timestamp,
+                             "user": {"login": "github-actions[bot]", "type": "Bot"},
+                             "body": "<!-- fork-final:v1 " + json.dumps(marker) + " -->"}]
+            with (patch.dict(os.environ, {"GITHUB_RUN_ID": "90"}),
+                  patch.object(release, "_workflow_run_records", return_value=([safe_shape], True)),
+                  patch.object(release, "_native_workflow_source"),
+                  patch.object(release, "_native_attempt_jobs", return_value=(jobs, "jobs")),
+                  patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
+                  patch.object(release, "_shared_review_comments", return_value=comments),
+                  patch.object(release, "api", side_effect=dispatch)):
+                selected = release._ensure_native_workflow_transition_run(
+                    REPO, HEAD, trusted_pin_updated_at=pin_updated_at)
+            self.assertEqual(selected, safe_shape)
+            self.assertEqual(calls, [], evidence)
+
+    def test_transition_retry_treats_timestamped_skipped_heavy_jobs_as_unstarted(self):
+        pin_updated_at = "2026-10-20T06:00:00Z"
+        safe_run = {
+            "id": 92, "head_sha": HEAD, "head_branch": "downstream",
+            "event": "push", "path": ".github/workflows/release.yml",
+            "created_at": "2026-10-20T06:00:01Z", "run_attempt": 1,
+            "status": "completed", "conclusion": "failure",
+        }
+        jobs = [
+            {"name": release.SHARED_POLICY_JOB, "status": "completed",
+             "conclusion": "success", "started_at": "2026-10-20T06:00:01Z", "steps": []},
+            {"name": "Test The Historical Application Contracts", "status": "completed",
+             "conclusion": "skipped", "started_at": "2026-10-20T06:00:02Z",
+             "completed_at": "2026-10-20T06:00:01Z", "steps": []},
+            {"name": "Build And Smoke Test One Container", "status": "completed",
+             "conclusion": "skipped", "started_at": "2026-10-20T06:00:02Z",
+             "completed_at": "2026-10-20T06:00:01Z", "steps": []},
+        ]
+        calls = []
+
+        def dispatch(path, *, method="GET", data=None, token=None):
+            calls.append((path, method, data, token))
+            return None
+
+        with (patch.dict(os.environ, {"GITHUB_RUN_ID": "90"}),
+              patch.object(release, "_workflow_run_records", return_value=([safe_run], True)),
+              patch.object(release, "_native_workflow_source"),
+              patch.object(release, "_native_attempt_jobs", return_value=(jobs, "jobs")),
+              patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
+              patch.object(release, "_shared_review_comments", return_value=[]),
+              patch.object(release, "owner_token", return_value="fixture-owner"),
+              patch.object(release, "api", side_effect=dispatch)):
+            selected = release._ensure_native_workflow_transition_run(
+                REPO, HEAD, trusted_pin_updated_at=pin_updated_at)
+        self.assertIsNone(selected)
+        self.assertEqual(calls, [(
+            f"repos/{REPO}/actions/workflows/release.yml/dispatches", "POST",
+            {"ref": "downstream"}, "fixture-owner")])
+
+    def test_transition_candidate_scan_ignores_unrelated_historical_review_prose(self):
+        candidate_id = self.candidate_id
+        full_sha, delta_base = "1" * 40, SEED
+        marker = lambda scope, review_sha, base_sha: (
+            "<!-- fork-review:v1 " + json.dumps({
+                "schema": 1, "candidate_id": candidate_id, "scope": scope,
+                "review_sha": review_sha, "base_sha": base_sha,
+            }, separators=(",", ":")) + " -->")
+
+        def request(scope, review_sha, base_sha):
+            body = (
+                f"Exact candidate `{candidate_id}`; scope `{scope}`; "
+                f"source `{review_sha}`; base `{base_sha}`.\n"
+                f"Upstream: `{release.UPSTREAM}@{UPSTREAM}`. Application: `{HEAD}`. "
+                f"Configuration: `{CONFIG}`. Patches: `{'e' * 64}`. "
+                f"Container recipe: `{'f' * 64}`; platform: `linux/amd64`\n\n"
+                + marker(scope, review_sha, base_sha))
+            return {"id": 100 if scope == "delta" else 101, "created_at": self.timestamp,
+                    "updated_at": self.timestamp,
+                    "user": {"login": "warelik", "type": "User"}, "body": body}
+
+        delta_pull = {
+            "number": 12, "state": "open",
+            "head": {"ref": f"review/changes-{CONFIG}", "sha": CONFIG,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": f"review-base/{delta_base}", "sha": delta_base,
+                     "repo": {"full_name": REPO}},
+        }
+        full_pull = {
+            "number": 13, "state": "open",
+            "head": {"ref": f"review/{UPSTREAM}-{candidate_id}", "sha": full_sha,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": f"review-base/{UPSTREAM}", "sha": UPSTREAM,
+                     "repo": {"full_name": REPO}},
+        }
+        historical_delta = {
+            "number": 14, "state": "closed",
+            "head": {"ref": f"review/changes-{'2' * 40}", "sha": "2" * 40,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": f"review-base/{'3' * 40}", "sha": "3" * 40,
+                     "repo": {"full_name": REPO}},
+        }
+        historical_full = {
+            "number": 15, "state": "closed",
+            "head": {"ref": f"review/{'4' * 40}-{'5' * 64}", "sha": "6" * 40,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": f"review-base/{'4' * 40}", "sha": "4" * 40,
+                     "repo": {"full_name": REPO}},
+        }
+        comments = {
+            12: [request("delta", CONFIG, delta_base)],
+            13: [request("full", full_sha, UPSTREAM)],
+            14: [{"id": 114, "created_at": self.timestamp, "updated_at": self.timestamp,
+                  "user": {"login": "warelik", "type": "User"},
+                  "body": marker("delta", "2" * 40, "3" * 40)
+                  + " Old bootstrap review prompt with a different native format."}],
+            15: [{"id": 115, "created_at": self.timestamp, "updated_at": self.timestamp,
+                  "user": {"login": "warelik", "type": "User"},
+                  "body": marker("full", "6" * 40, "4" * 40)
+                  + " Old bootstrap review prompt with a different native format."}],
+        }
+        lifecycle = SimpleNamespace(candidate_identity=lambda _candidate: candidate_id)
+        calls = []
+
+        def native_pages(path):
+            number = int(path.rsplit("/", 1)[-1])
+            calls.append(number)
+            return comments[number]
+
+        with (patch.object(release, "_all_shared_review_pulls",
+                           return_value=[historical_full, historical_delta, full_pull, delta_pull]),
+              patch.object(release, "pages", side_effect=native_pages)):
+            result = release._transition_review_candidates(REPO, CONFIG, lifecycle)
+        self.assertEqual([item["pull"]["number"] for item in (result[0]["full"], result[0]["delta"])],
+                         [13, 12])
+        self.assertEqual(sorted(calls), [12, 13])
+
+    def _open_candidate_pair(self, *, application_only=False, delta_head_sha=None):
+        candidate = dict(self.candidate)
+        accepted_config = CONFIG if application_only else SEED
+        accepted_application = SEED if application_only else HEAD
+        if application_only:
+            candidate["configuration_sha"] = accepted_config
+        candidate_id = self._candidate_identity(candidate)
+        full_sha = "1" * 40
+        if candidate["configuration_sha"] == accepted_config:
+            delta_sha = candidate["application_sha"]
+            delta_base = accepted_application
+        else:
+            delta_sha = candidate["configuration_sha"]
+            delta_base = accepted_config
+
+        def owner_request(number, scope, review_sha, base_sha):
+            return {
+                "id": number, "created_at": self.timestamp, "updated_at": self.timestamp,
+                "user": {"login": "warelik", "type": "User"},
+                "body": release.shared_review_text(
+                    candidate, scope, review_sha, base_sha, candidate_id),
+            }
+
+        full_pull = {
+            "number": 13, "state": "open",
+            "head": {"ref": f"review/{UPSTREAM}-{candidate_id}", "sha": full_sha,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": f"review-base/{UPSTREAM}", "sha": UPSTREAM,
+                     "repo": {"full_name": REPO}},
+        }
+        delta_pull = {
+            "number": 12, "state": "open",
+            "head": {"ref": f"review/changes-{delta_sha}",
+                     "sha": delta_sha if delta_head_sha is None else delta_head_sha,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": f"review-base/{delta_base}", "sha": delta_base,
+                     "repo": {"full_name": REPO}},
+        }
+        comments = {
+            13: [owner_request(101, "full", full_sha, UPSTREAM)],
+            12: [owner_request(100, "delta", delta_sha, delta_base)],
+        }
+        baseline = {
+            "schema": 1, "repository": REPO,
+            "configuration_sha": accepted_config, "application_sha": accepted_application,
+        }
+        return candidate, baseline, [full_pull, delta_pull], comments
+
+    def test_pending_pair_retains_config_and_application_delta_candidates(self):
+        for application_only in (False, True):
+            with self.subTest(application_only=application_only):
+                candidate, baseline, pulls, comments = self._open_candidate_pair(
+                    application_only=application_only)
+                lifecycle = SimpleNamespace(candidate_identity=self._candidate_identity)
+
+                def native_pages(path):
+                    number = int(path.rsplit("/", 1)[-1])
+                    return comments[number]
+
+                with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+                      patch.object(release, "pages", side_effect=native_pages)):
+                    result = release._transition_review_candidates(
+                        REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result[0]["candidate"], candidate)
+                self.assertEqual(result[0]["full"]["request_id"], 101)
+                self.assertEqual(result[0]["delta"]["request_id"], 100)
+
+                stale_baseline = {**baseline, "configuration_sha": "f" * 40}
+                with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+                      patch.object(release, "pages", side_effect=native_pages)):
+                    stale = release._transition_review_candidates(
+                        REPO, CONFIG, lifecycle, accepted_baseline=stale_baseline)
+                self.assertEqual(stale, [], "A pair for an obsolete accepted baseline must not be retained")
+                if application_only:
+                    stale_application = {**baseline, "application_sha": "f" * 40}
+                    with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+                          patch.object(release, "pages", side_effect=native_pages)):
+                        stale_source = release._transition_review_candidates(
+                            REPO, CONFIG, lifecycle, accepted_baseline=stale_application)
+                    self.assertEqual(stale_source, [],
+                                     "An application-only pair must be invalidated by an accepted-source advance")
+
+                with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+                      patch.object(release, "pages", side_effect=native_pages)):
+                    stale_config = release._transition_review_candidates(
+                        REPO, "f" * 40, lifecycle, accepted_baseline=baseline)
+                self.assertEqual(stale_config, [], "A pair for an obsolete downstream config must not be retained")
+
+                if application_only:
+                    with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+                          patch.object(release, "pages", side_effect=native_pages)):
+                        published = release._transition_review_candidates(
+                            REPO, CONFIG, lifecycle, accepted_baseline=candidate)
+                    self.assertEqual(published, [], "An already published exact candidate must not be retained")
+
+                moved = [pulls[0], {**pulls[1], "head": {**pulls[1]["head"], "sha": "2" * 40}}]
+                with (patch.object(release, "_open_shared_review_pulls", return_value=moved),
+                      patch.object(release, "pages", side_effect=native_pages),
+                      self.assertRaisesRegex(ValueError, "no longer identifies its exact native PR")):
+                    release._transition_review_candidates(
+                        REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+
+    def test_full_only_pending_candidate_is_retained_after_delta_request_interruption(self):
+        candidate, baseline, pulls, comments = self._open_candidate_pair()
+        other = {**candidate, "upstream_sha": "8" * 40}
+        comments[12] = [{
+            "id": 99, "created_at": "2026-10-20T05:00:00Z",
+            "updated_at": "2026-10-20T05:00:00Z",
+            "user": {"login": "warelik", "type": "User"},
+            "body": release.shared_review_text(
+                other, "delta", candidate["configuration_sha"],
+                baseline["configuration_sha"], self._candidate_identity(other)),
+        }]
+        lifecycle = SimpleNamespace(candidate_identity=self._candidate_identity)
+
+        def native_pages(path):
+            return comments[int(path.rsplit("/", 1)[-1])]
+
+        with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+              patch.object(release, "pages", side_effect=native_pages),
+              patch.object(release, "_exact_review_pull", return_value=pulls[1]) as exact):
+            retained = release._transition_review_candidates(
+                REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]["candidate"], candidate)
+        self.assertEqual(retained[0]["full"]["request_id"], 101)
+        self.assertIsNone(retained[0]["delta"])
+        self.assertEqual(retained[0]["delta_pull"], pulls[1])
+        exact.assert_called_once_with(
+            REPO, head_ref=pulls[1]["head"]["ref"], head_sha=pulls[1]["head"]["sha"],
+            base_ref=pulls[1]["base"]["ref"], base_sha=pulls[1]["base"]["sha"])
+
+        closed = {**pulls[1], "state": "closed"}
+        with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+              patch.object(release, "pages", side_effect=native_pages),
+              patch.object(release, "_exact_review_pull", return_value=closed),
+              self.assertRaisesRegex(ValueError, "closed exact delta review PR")):
+            release._transition_review_candidates(
+                REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+
+        with (patch.object(release, "_open_shared_review_pulls", return_value=[pulls[0]]),
+              patch.object(release, "pages", side_effect=native_pages),
+              patch.object(release, "_exact_review_pull", return_value=None)):
+            absent = release._transition_review_candidates(
+                REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+        self.assertEqual(len(absent), 1)
+        self.assertIsNone(absent[0]["delta_pull"])
+
+    def test_pending_pair_fails_closed_on_duplicate_or_mismatched_active_source(self):
+        candidate, baseline, pulls, comments = self._open_candidate_pair()
+        lifecycle = SimpleNamespace(candidate_identity=self._candidate_identity)
+        duplicate_full = {**pulls[0], "number": 14}
+        duplicate_comments = {
+            **comments,
+            14: [{**comments[13][0], "id": 102}],
+        }
+
+        def duplicate_pages(path):
+            return duplicate_comments[int(path.rsplit("/", 1)[-1])]
+
+        with (patch.object(release, "_open_shared_review_pulls",
+                           return_value=[*pulls, duplicate_full]),
+              patch.object(release, "pages", side_effect=duplicate_pages),
+              self.assertRaisesRegex(ValueError, "Multiple open full PRs")):
+            release._transition_review_candidates(
+                REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+
+    def test_ordinary_candidate_discovery_fetches_open_review_heads_only(self):
+        common = {
+            "number": 13, "head": {"ref": "moved-head", "repo": {"full_name": REPO}},
+            "base": {"ref": "review-base/moved", "repo": {"full_name": REPO}},
+            "user": {"login": "warelik", "type": "User"},
+        }
+        open_pull = {**common, "state": "open"}
+        closed_pull = {**common, "number": 14, "state": "closed"}
+        with patch.object(release, "pages", return_value=[closed_pull, open_pull]) as pages:
+            result = release._open_shared_review_pulls(REPO)
+        pages.assert_called_once_with(f"repos/{REPO}/pulls?state=open")
+        self.assertEqual(result, [open_pull])
+
+    def test_exact_review_pull_fails_closed_when_existing_refs_moved(self):
+        pull = {
+            "number": 13, "state": "open",
+            "head": {"ref": "review/head", "sha": "1" * 40,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": "review-base/base", "sha": "2" * 40,
+                     "repo": {"full_name": REPO}},
+        }
+        with (patch.object(release, "pages", return_value=[pull]),
+              self.assertRaisesRegex(ValueError, "refs changed")):
+            release._exact_review_pull(
+                REPO, head_ref="review/head", head_sha="3" * 40,
+                base_ref="review-base/base", base_sha="2" * 40)
+
+    def test_transition_refuses_canonical_request_without_candidate_text(self):
+        candidate, _baseline, pulls, comments = self._open_candidate_pair()
+        candidate_id = self._candidate_identity(candidate)
+        full_sha = pulls[0]["head"]["sha"]
+        comments[13][0]["body"] = release._review_marker(
+            candidate_id, "full", full_sha, UPSTREAM)
+        lifecycle = SimpleNamespace(candidate_identity=self._candidate_identity)
+
+        def native_pages(path):
+            return comments[int(path.rsplit("/", 1)[-1])]
+
+        with (patch.object(release, "_all_shared_review_pulls", return_value=pulls),
+              patch.object(release, "pages", side_effect=native_pages),
+              self.assertRaisesRegex(ValueError, "omits its exact canonical candidate identity")):
+            release._transition_review_candidates(REPO, CONFIG, lifecycle)
+
+        candidate, baseline, pulls, comments = self._open_candidate_pair()
+        wrong_body = comments[12][0]["body"].replace(
+            f"Exact candidate `{self._candidate_identity(candidate)}`",
+            f"Exact candidate `{'0' * 64}`")
+        mismatched_comments = {
+            **comments,
+            12: [{**comments[12][0],
+                  "body": wrong_body}],
+        }
+
+        def mismatched_pages(path):
+            return mismatched_comments[int(path.rsplit("/", 1)[-1])]
+
+        with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+              patch.object(release, "pages", side_effect=mismatched_pages),
+              self.assertRaisesRegex(ValueError, "review text differs from the exact candidate identity")):
+            release._transition_review_candidates(
+                REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+
+    def test_open_selector_rejects_malformed_full_and_moved_delta_refs(self):
+        candidate, baseline, pulls, comments = self._open_candidate_pair()
+        lifecycle = SimpleNamespace(candidate_identity=self._candidate_identity)
+        malformed_comments = {**comments, 13: [{**comments[13][0],
+            "body": release._review_marker(self._candidate_identity(candidate),
+                                           "full", pulls[0]["head"]["sha"], UPSTREAM)}]}
+
+        def malformed_pages(path):
+            return malformed_comments[int(path.rsplit("/", 1)[-1])]
+
+        with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+              patch.object(release, "pages", side_effect=malformed_pages),
+              self.assertRaisesRegex(ValueError, "omits its exact canonical candidate identity")):
+            release._transition_review_candidates(
+                REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+
+        moved_delta = {**pulls[1], "head": {
+            **pulls[1]["head"], "ref": f"review/changes-{'2' * 40}"}}
+        with (patch.object(release, "_open_shared_review_pulls",
+                           return_value=[pulls[0], moved_delta]),
+              patch.object(release, "pages", side_effect=lambda path:
+                           comments[int(path.rsplit("/", 1)[-1])]),
+              self.assertRaisesRegex(ValueError, "no longer identifies its exact native PR")):
+            release._transition_review_candidates(
+                REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+
+        moved_full = {**pulls[0], "head": {
+            **pulls[0]["head"], "ref": "review/moved-full"}}
+        with (patch.object(release, "_open_shared_review_pulls",
+                           return_value=[moved_full, pulls[1]]),
+              patch.object(release, "pages", side_effect=lambda path:
+                           comments[int(path.rsplit("/", 1)[-1])]),
+              self.assertRaisesRegex(ValueError, "no longer identifies its exact native PR")):
+            release._transition_review_candidates(
+                REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+
+    def test_delta_history_skips_other_candidate_but_not_a_newer_exact_request(self):
+        candidate, baseline, pulls, comments = self._open_candidate_pair()
+        lifecycle = SimpleNamespace(candidate_identity=self._candidate_identity)
+        other = {**candidate, "upstream_sha": "8" * 40}
+        other_id = self._candidate_identity(other)
+        delta_sha = candidate["configuration_sha"]
+        delta_base = baseline["configuration_sha"]
+        older_other = {
+            **comments[12][0], "id": 99, "created_at": "2026-10-20T05:00:00Z",
+            "updated_at": "2026-10-20T05:00:00Z",
+            "body": release.shared_review_text(other, "delta", delta_sha, delta_base, other_id),
+        }
+        comments[12].insert(0, older_other)
+
+        def native_pages(path):
+            return comments[int(path.rsplit("/", 1)[-1])]
+
+        with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+              patch.object(release, "pages", side_effect=native_pages)):
+            retained = release._transition_review_candidates(
+                REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]["delta"]["request_id"], 100)
+
+        newer_other = {
+            **older_other, "id": 102, "created_at": "2026-10-20T07:00:00Z",
+            "updated_at": "2026-10-20T07:00:00Z",
+        }
+        comments[12].append(newer_other)
+        with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
+              patch.object(release, "pages", side_effect=native_pages),
+              self.assertRaisesRegex(ValueError, "superseded by a newer exact delta")):
+            release._transition_review_candidates(
+                REPO, CONFIG, lifecycle, accepted_baseline=baseline)
+
+    def test_prepare_shared_reuses_pending_upstream_before_live_latest(self):
+        class SourceSelectionReached(Exception):
+            pass
+
+        pinned_upstream = "8" * 40
+        latest_upstream = "9" * 40
+        accepted = {**self.candidate, "configuration_sha": SEED}
+        baseline = {"accepted_candidate": accepted}
+        retained = {
+            "candidate": {**self.candidate, "upstream_sha": pinned_upstream},
+            "full": {"request_id": 101, "pull": {"number": 13}},
+            "delta": {"request_id": 100, "pull": {"number": 12}},
+        }
+        selected = []
+        api_calls = []
+
+        def native_api(path, **_kwargs):
+            api_calls.append(path)
+            if path == f"repos/{REPO}":
+                return {"default_branch": "downstream"}
+            if path == f"repos/{REPO}/commits/downstream":
+                return {"sha": CONFIG}
+            if path == f"repos/{release.UPSTREAM}/commits/{release.UPSTREAM_BRANCH}":
+                return {"sha": latest_upstream}
+            raise AssertionError(f"Unexpected native preparation request: {path}")
+
+        def stop_at_source(_app, upstream, _patch_root):
+            selected.append(upstream)
+            raise SourceSelectionReached()
+
+        def run_prepare(pending, ref_candidate=None):
+            selected.clear()
+            api_calls.clear()
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                workflow = root / ".github/workflows/release.yml"
+                workflow.parent.mkdir(parents=True)
+                workflow.write_text("name: Source selection fixture\n", encoding="utf-8")
+                repair = {"waiting": False, "state": None, "config_sha": CONFIG,
+                          "config_root": root, "patch_root": root / "patches"}
+                with (patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GITHUB_SHA": CONFIG,
+                                              "GITHUB_EVENT_NAME": "workflow_dispatch"}),
+                      patch.object(release, "shared_lifecycle",
+                                   return_value=SimpleNamespace(
+                                       candidate_identity=lambda _candidate: self.candidate_id)),
+                      patch.object(release, "api", side_effect=native_api),
+                      patch.object(release, "_published_release_recovery", return_value=None),
+                      patch.object(release, "_shared_repair_candidate", return_value=repair),
+                      patch.object(release, "_adopted_workflow_candidate", return_value=None),
+                      patch.object(release, "_shared_prepare_baseline", return_value=baseline),
+                      patch.object(release, "_transition_review_candidates",
+                                   return_value=[retained] if pending else []),
+                      patch.object(release, "_pending_shared_ref_candidate",
+                                   return_value=ref_candidate),
+                      patch.object(release, "_prepare_source", side_effect=stop_at_source),
+                      self.assertRaises(SourceSelectionReached)):
+                    release.prepare_shared(root)
+
+        run_prepare(True)
+        self.assertEqual(selected, [pinned_upstream])
+        self.assertNotIn(f"repos/{release.UPSTREAM}/commits/{release.UPSTREAM_BRANCH}", api_calls)
+
+        run_prepare(False)
+        self.assertEqual(selected, [latest_upstream])
+        self.assertIn(f"repos/{release.UPSTREAM}/commits/{release.UPSTREAM_BRANCH}", api_calls)
+
+        api_calls.clear()
+        run_prepare(False, {"upstream_sha": pinned_upstream})
+        self.assertEqual(selected, [pinned_upstream])
+        self.assertNotIn(f"repos/{release.UPSTREAM}/commits/{release.UPSTREAM_BRANCH}", api_calls)
+
+    def test_prepare_shared_resumes_full_only_pair_without_recreating_full_request(self):
+        candidate, baseline_candidate, pulls, _comments = self._open_candidate_pair()
+        candidate_id = self._candidate_identity(candidate)
+        full_pull, delta_pull = pulls
+        full_sha = full_pull["head"]["sha"]
+        delta_sha = delta_pull["head"]["sha"]
+        delta_base_sha = delta_pull["base"]["sha"]
+        request_time = self.timestamp
+        retained = {
+            "candidate": candidate,
+            "full": {"request_id": 101, "review_sha": full_sha,
+                     "base_sha": UPSTREAM, "requested_at": request_time, "pull": full_pull},
+            "delta": None,
+            "delta_pull": delta_pull,
+        }
+        accepted_candidate = {
+            "schema": 1, "repository": REPO,
+            "configuration_sha": baseline_candidate["configuration_sha"],
+            "application_sha": baseline_candidate["application_sha"],
+            "upstream_sha": "7" * 40, "patchset_sha256": "e" * 64,
+            "recipe_sha256": "f" * 64, "platform": "linux/amd64",
+        }
+        accepted_baseline = {"endpoint": "fixture", "variable": {
+            "value": json.dumps({"candidate": accepted_candidate})}}
+        baseline_data = {
+            "release": {"id": 77, "published_at": PUBLISHED, "tag_name": "build-fixture"},
+            "metadata": {}, "metadata_sha256": "a" * 64,
+            "candidate": accepted_candidate, "accepted_candidate": accepted_candidate,
+            "accepted_baseline": accepted_baseline,
+        }
+        latest_path = f"repos/{release.UPSTREAM}/commits/{release.UPSTREAM_BRANCH}"
+        api_calls = []
+        selected_upstreams = []
+        review_calls = []
+        evaluation_calls = []
+
+        def identity(value):
+            return candidate_id if value == candidate else self._candidate_identity(value)
+
+        def native_api(path, **_kwargs):
+            api_calls.append(path)
+            if path == f"repos/{REPO}":
+                return {"default_branch": "downstream"}
+            if path == f"repos/{REPO}/commits/downstream":
+                return {"sha": CONFIG}
+            if path == latest_path:
+                return {"sha": "8" * 40}
+            raise AssertionError(f"Unexpected native preparation request: {path}")
+
+        def prepare_source(_app, upstream, _patch_root):
+            selected_upstreams.append(upstream)
+            return candidate["application_sha"], candidate["patchset_sha256"], "1.0.0"
+
+        def review(*args, **kwargs):
+            review_calls.append((args, kwargs))
+            return full_pull if kwargs["head_ref"] == full_pull["head"]["ref"] else delta_pull
+
+        def evaluate(*args, **kwargs):
+            evaluation_calls.append((args, kwargs))
+            scope = args[3]
+            pr = full_pull if scope == "full" else delta_pull
+            request_id = 101 if scope == "full" else 102
+            created_at = request_time if scope == "full" else "2026-10-20T06:30:00Z"
+            if scope == "delta" and retained["delta"] is None:
+                retained["delta"] = {
+                    "request_id": request_id, "review_sha": delta_sha,
+                    "base_sha": delta_base_sha, "requested_at": created_at,
+                    "pull": delta_pull,
+                }
+            result = {"findings": []}
+            evidence = {"request": {"id": request_id, "created_at": created_at},
+                        "target": {"pr": pr}}
+            return result, evidence
+
+        lifecycle = SimpleNamespace(
+            candidate_identity=identity,
+            evaluate_pair=lambda *_args, **_kwargs: {"state": "waiting", "complete": False},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repair = {"waiting": False, "state": None, "config_sha": CONFIG,
+                      "config_root": root, "patch_root": root / "patches"}
+            with (patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GITHUB_SHA": CONFIG}),
+                  patch.object(release, "shared_lifecycle", return_value=lifecycle),
+                  patch.object(release, "api", side_effect=native_api),
+                  patch.object(release, "_published_release_recovery", return_value=None),
+                  patch.object(release, "_shared_repair_candidate", return_value=repair),
+                  patch.object(release, "_adopted_workflow_candidate", return_value=None),
+                  patch.object(release, "_shared_prepare_baseline", return_value=baseline_data),
+                  patch.object(release, "_transition_review_candidates", return_value=[retained]),
+                  patch.object(release, "_prepare_source", side_effect=prepare_source),
+                  patch.object(release, "_recipe_sha256", return_value=candidate["recipe_sha256"]),
+                  patch.object(release, "_candidate_record", return_value=candidate),
+                  patch.object(release, "_create_review_context_commit", return_value=(full_sha, "")),
+                  patch.object(release, "_exact_review_pull",
+                               side_effect=[full_pull, delta_pull, full_pull, delta_pull,
+                                            full_pull, delta_pull]),
+                  patch.object(release, "_closed_policy_pair_has_verified_bundle", return_value=False),
+                  patch.object(release, "_review_pr", side_effect=review),
+                  patch.object(release, "_carried_shared_findings", return_value=(None, [], {})),
+                  patch.object(release, "evaluate_shared_review", side_effect=evaluate),
+                  patch.object(release, "pending_review") as pending_review,
+                  patch.object(release, "output") as output):
+                release.prepare_shared(root)
+                release.prepare_shared(root)
+
+        self.assertEqual(selected_upstreams, [candidate["upstream_sha"], candidate["upstream_sha"]])
+        self.assertNotIn(latest_path, api_calls)
+        self.assertEqual([kwargs["expected_request_id"] for _args, kwargs in evaluation_calls],
+                         [101, None, 101, 102])
+        self.assertEqual([kwargs["create_request"] for _args, kwargs in evaluation_calls],
+                         [False, True, False, False])
+        self.assertEqual([kwargs.get("resume_after") for _args, kwargs in evaluation_calls],
+                         [None, (request_time, 101), None, None])
+        self.assertEqual([kwargs["head_ref"] for _args, kwargs in review_calls],
+                         [full_pull["head"]["ref"], delta_pull["head"]["ref"],
+                          full_pull["head"]["ref"], delta_pull["head"]["ref"]])
+        self.assertEqual(pending_review.call_args_list,
+                         [((request_time,), {}), ((request_time,), {}),
+                          ((request_time,), {}), ((request_time,), {})])
+        self.assertEqual(output.call_count, 2)
+        self.assertEqual(output.call_args.kwargs["mode"], "waiting")
+
+    def test_retained_request_id_is_not_replaced_or_duplicated(self):
+        review_sha = "1" * 40
+        body = release.shared_review_text(
+            self.candidate, "full", review_sha, UPSTREAM, self.candidate_id)
+        comment = {"id": 101, "created_at": self.timestamp, "updated_at": self.timestamp,
+                   "user": {"login": "warelik", "type": "User"}, "body": body}
+        lifecycle = SimpleNamespace(candidate_identity=lambda _candidate: self.candidate_id)
+        request = release._native_review_request(
+            REPO, [comment], 13, self.candidate, "full", review_sha, UPSTREAM,
+            lifecycle, create=False, expected_request_id=101)
+        self.assertIs(request, comment)
+        with self.assertRaisesRegex(ValueError, "identity changed or became duplicated"):
+            release._native_review_request(
+                REPO, [comment, {**comment, "id": 102}], 13, self.candidate,
+                "full", review_sha, UPSTREAM, lifecycle,
+                create=False, expected_request_id=101)
+
+        delta_sha, delta_base = CONFIG, SEED
+        delta_candidate = {**self.candidate, "configuration_sha": CONFIG}
+        other_candidate = {**delta_candidate, "upstream_sha": "8" * 40}
+        other_id = "b" * 64
+        delta_request = {
+            **comment, "created_at": self.timestamp, "updated_at": self.timestamp,
+            "body": release.shared_review_text(
+                delta_candidate, "delta", delta_sha, delta_base, self.candidate_id),
+        }
+        newer_other = {
+            **comment, "id": 102, "created_at": "2026-10-20T07:00:00Z",
+            "updated_at": "2026-10-20T07:00:00Z",
+            "body": release.shared_review_text(
+                other_candidate, "delta", delta_sha, delta_base, other_id),
+        }
+        delta_lifecycle = SimpleNamespace(
+            candidate_identity=lambda value: (self.candidate_id if value == delta_candidate else other_id))
+        with self.assertRaisesRegex(ValueError, "superseded by a newer candidate request"):
+            release._native_review_request(
+                REPO, [delta_request, newer_other], 12, delta_candidate, "delta",
+                delta_sha, delta_base, delta_lifecycle,
+                create=False, expected_request_id=101)
+
+    def test_full_only_resume_posts_only_missing_delta_request_with_original_deadline(self):
+        delta_candidate = {**self.candidate, "configuration_sha": CONFIG}
+        delta_sha, delta_base = CONFIG, SEED
+        other_candidate = {**delta_candidate, "upstream_sha": "8" * 40}
+        other_id = "b" * 64
+        older_other = {
+            "id": 100, "created_at": "2026-10-20T05:00:00Z",
+            "updated_at": "2026-10-20T05:00:00Z",
+            "user": {"login": "warelik", "type": "User"},
+            "body": release.shared_review_text(
+                other_candidate, "delta", delta_sha, delta_base, other_id),
+        }
+        newer_other = {
+            **older_other, "id": 103, "created_at": "2026-10-20T08:00:00Z",
+            "updated_at": "2026-10-20T08:00:00Z",
+        }
+        created = {
+            "id": 102, "created_at": "2026-10-20T07:00:00Z",
+            "updated_at": "2026-10-20T07:00:00Z",
+            "user": {"login": "warelik", "type": "User"},
+            "body": release.shared_review_text(
+                delta_candidate, "delta", delta_sha, delta_base, self.candidate_id),
+        }
+        lifecycle = SimpleNamespace(
+            candidate_identity=lambda value: (self.candidate_id if value == delta_candidate else other_id))
+        with (patch.object(release, "owner_token", return_value="fixture-token"),
+              patch.object(release, "api") as blocked_api,
+              self.assertRaisesRegex(ValueError, "superseded by a newer exact delta request")):
+            release._native_review_request(
+                REPO, [newer_other], 12, delta_candidate, "delta", delta_sha, delta_base,
+                lifecycle, create=True, resume_after=(self.timestamp, 101))
+        blocked_api.assert_not_called()
+
+        with (patch.object(release, "owner_token", return_value="fixture-token"),
+              patch.object(release, "api", return_value=created) as native_api):
+            request = release._native_review_request(
+                REPO, [older_other], 12, delta_candidate, "delta", delta_sha, delta_base,
+                lifecycle, create=True, resume_after=(self.timestamp, 101))
+        self.assertIs(request, created)
+        native_api.assert_called_once()
+        self.assertEqual(native_api.call_args.args[0], f"repos/{REPO}/issues/12/comments")
+        self.assertEqual(native_api.call_args.kwargs["data"]["body"].count("fork-review:v1"), 1)
+
+        comments = [older_other, created]
+        self.assertIs(release._native_review_request(
+            REPO, comments, 12, delta_candidate, "delta", delta_sha, delta_base,
+            lifecycle, create=False, expected_request_id=102), created)
+
+        with self.assertRaisesRegex(ValueError, "superseded by a newer candidate request"):
+            release._native_review_request(
+                REPO, [older_other, created, newer_other], 12, delta_candidate,
+                "delta", delta_sha, delta_base, lifecycle,
+                create=False, expected_request_id=102)
+
+    def test_workflow_test_job_change_transitions_even_when_container_recipe_is_unchanged(self):
+        candidate = {**self.candidate, "configuration_sha": HEAD}
+        context = {"candidate": candidate, "base_config_sha": CONFIG,
+                   "reviews": {"full": {"review_sha": UPSTREAM}}}
+        parent_identity = {"parent_sha": CONFIG, "repair_pr": 2}
+        active_workflow = b"jobs:\n  test:\n    steps:\n      - run: npm test\n"
+        candidate_workflow = (
+            b"jobs:\n  test:\n    timeout-minutes: 30\n    steps:\n      - run: npm test\n")
+        native_run = {"id": 90, "run_attempt": 1, "path": ".github/workflows/release.yml"}
+        lifecycle = SimpleNamespace(candidate_identity=lambda _candidate: self.candidate_id)
+        with (patch.dict(os.environ, {"GITHUB_SHA": CONFIG, "GITHUB_RUN_ID": "90",
+                                     "GITHUB_RUN_ATTEMPT": "1"}),
+              patch.object(release, "_sanitized_repair_identity", return_value=parent_identity),
+              patch.object(release, "_shared_file", side_effect=[
+                  b"Dockerfile\n", candidate_workflow, active_workflow]),
+              patch.object(release, "_recipe_sha256", return_value=candidate["recipe_sha256"]),
+              patch.object(release, "api", return_value=native_run),
+              patch.object(release, "_native_workflow_source") as source):
+            transition = release._workflow_recipe_transition(REPO, context, lifecycle)
+        self.assertTrue(transition["transition"])
+        self.assertEqual(transition["kind"], "adopt")
+        self.assertFalse(transition["recipe_changed"])
+        source.assert_called_once_with(REPO, native_run, CONFIG)
+
+    def test_unchanged_release_workflow_does_not_start_a_transition(self):
+        candidate = {**self.candidate, "configuration_sha": CONFIG}
+        context = {"candidate": candidate, "base_config_sha": CONFIG,
+                   "reviews": {"full": {"review_sha": UPSTREAM}}}
+        identity = {"parent_sha": self.parent, "repair_pr": 2}
+        workflow = b"jobs:\n  build:\n    steps:\n      - run: docker build\n"
+        lifecycle = SimpleNamespace(candidate_identity=lambda _candidate: self.candidate_id)
+        with (patch.dict(os.environ, {"GITHUB_SHA": CONFIG}),
+              patch.object(release, "_sanitized_repair_identity", return_value=identity),
+              patch.object(release, "_shared_file", side_effect=[b"Dockerfile\n", workflow, workflow]),
+              patch.object(release, "_recipe_sha256", return_value=candidate["recipe_sha256"]),
+              patch.object(release, "api", side_effect=AssertionError("unchanged workflow must not hand off"))):
+            transition = release._workflow_recipe_transition(REPO, context, lifecycle)
+        self.assertFalse(transition["transition"])
 
     def _final_reservation_inputs(self):
         candidate = {
@@ -2452,6 +3523,31 @@ class NativeAttemptEvidenceTests(unittest.TestCase):
 
 
 class RecipeIdentityTests(unittest.TestCase):
+    def test_release_tags_bind_recipe_and_keep_legacy_tags_readable(self):
+        version = "1.2.3"
+        upstream = "a" * 40
+        patchset = "b" * 64
+        recipe = "c" * 64
+        changed_recipe = "d" * 64
+
+        tag = release._release_tag(version, upstream, patchset, recipe)
+        self.assertEqual(tag, f"build-{version}-{'a' * 12}-{'b' * 12}-r{'c' * 12}")
+        self.assertNotEqual(tag, release._release_tag(version, upstream, patchset, changed_recipe))
+
+        legacy_tag = release._legacy_release_tag(version, upstream, patchset)
+        legacy = release._parse_release_tag(legacy_tag)
+        current = release._parse_release_tag(tag)
+        self.assertIsNotNone(legacy)
+        self.assertIsNotNone(current)
+        self.assertIsNone(legacy.group("recipe"))
+        self.assertEqual(current.group("recipe"), recipe[:12])
+        release._validate_recipe_tag(legacy, {})
+        release._validate_recipe_tag(current, {"recipe_sha256": recipe})
+        with self.assertRaisesRegex(ValueError, "does not match its provenance recipe"):
+            release._validate_recipe_tag(current, {"recipe_sha256": changed_recipe})
+        with self.assertRaisesRegex(ValueError, "does not match its provenance recipe"):
+            release._validate_recipe_tag(current, {})
+
     def test_buildx_action_and_effective_configuration_are_in_recipe_identity(self):
         class Lifecycle:
             @staticmethod
@@ -2686,6 +3782,48 @@ class AdoptionTests(unittest.TestCase):
             release._validate_and_adopt_config(REPO, context, Lifecycle())
         self.assertFalse(any("ZED_TRUSTED_POLICY" in path and method == "PATCH"
                              for path, method, _data in calls))
+
+    def test_workflow_recipe_fast_forward_uses_owner_token_to_trigger_native_push(self):
+        product = {"mode": "100644", "blob_sha": HEAD}
+        tree = {"Dockerfile": product, "patches/0001-fix.patch": product,
+                "patches/source.json": {"mode": "100644", "blob_sha": UPSTREAM}}
+        policy_id, trusted_pin = "f" * 64, "9" * 40
+        calls = []
+        adopted = False
+
+        def native(path, *, method="GET", data=None, token=None):
+            nonlocal adopted
+            calls.append((path, method, data, token))
+            if path == f"repos/{REPO}/commits/downstream":
+                return {"sha": HEAD if adopted else CONFIG}
+            if path == f"repos/{REPO}/git/commits/{HEAD}":
+                return {"sha": HEAD, "parents": [{"sha": CONFIG}],
+                        "message": "Review sanitized 9router repair #2 at " + "a" * 40}
+            if path == f"repos/{REPO}/git/refs/heads/downstream":
+                adopted = True
+                return {"ref": "refs/heads/downstream", "object": {
+                    "type": "commit", "sha": HEAD}}
+            self.fail(f"Unexpected native API request: {method} {path}")
+
+        class Lifecycle:
+            def validate_adoption(self, *_args):
+                return True
+
+        context = {"candidate": {"configuration_sha": HEAD}, "base_config_sha": CONFIG,
+                   "candidate_id": policy_id,
+                   "policy_validation": {"candidate_id": policy_id, "source": "native-run",
+                                         "verified": True}}
+        with (patch.dict(os.environ, {"TRUSTED_POLICY": trusted_pin}),
+              patch.object(release, "owner_token", return_value="fixture-owner"),
+              patch.object(release, "api", side_effect=native),
+              patch.object(release, "_native_full_tree", return_value=tree),
+              patch.object(release, "_advance_trusted_policy_pin", return_value={})):
+            release._validate_and_adopt_config(
+                REPO, context, Lifecycle(), workflow_transition=True)
+        adoption = next(call for call in calls if call[0].endswith("/git/refs/heads/downstream")
+                        and call[1] == "PATCH")
+        self.assertEqual(adoption[2], {"sha": HEAD, "force": False})
+        self.assertEqual(adoption[3], "fixture-owner")
 
     def test_unverified_policy_proof_cannot_reach_config_adoption_or_pin_update(self):
         context = {"candidate": {"configuration_sha": HEAD}, "base_config_sha": CONFIG,
@@ -4007,6 +5145,8 @@ class AdoptionTests(unittest.TestCase):
                         self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
 
     def test_policy_workflow_allows_pinned_action_refresh_and_operational_parameters(self):
+        # Preserve the original O test identity. The current oracle allows only
+        # exact action-pin refresh; it separately binds runner and timeout values.
         workflow = release.ROOT / ".github/workflows/release.yml"
         with tempfile.TemporaryDirectory() as directory:
             source = workflow.read_text(encoding="utf-8")
@@ -4098,3 +5238,416 @@ class SharedReviewCheckpointCredentialTests(unittest.TestCase):
 
         owner.assert_not_called()
         native.assert_not_called()
+
+
+class RepairRefCleanupTests(unittest.TestCase):
+    def test_repair_only_scope_keeps_all_open_refs_and_default_scope_unchanged(self):
+        closed_repair = {
+            "number": 2, "state": "closed",
+            "user": {"login": "warelik", "type": "User"},
+            "head": {"ref": "repair/expired", "sha": HEAD,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": "downstream", "sha": CONFIG,
+                     "repo": {"full_name": REPO}},
+        }
+        open_repair = {
+            "number": 3, "state": "open",
+            "user": {"login": "warelik", "type": "User"},
+            "head": {"ref": "repair/current", "sha": SEED,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": "downstream", "sha": CONFIG,
+                     "repo": {"full_name": REPO}},
+        }
+        open_review = {
+            "number": 4, "state": "open",
+            "user": {"login": "warelik", "type": "User"},
+            "head": {"ref": "review/full", "sha": HEAD,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": f"review-base/{UPSTREAM}", "sha": UPSTREAM,
+                     "repo": {"full_name": REPO}},
+        }
+        open_oracle = {
+            "number": 5, "state": "open",
+            "user": {"login": "warelik", "type": "User"},
+            "head": {"ref": "oracle/current", "sha": "f" * 40,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": "downstream", "sha": CONFIG,
+                     "repo": {"full_name": REPO}},
+        }
+        pulls = [closed_repair, open_repair, open_review, open_oracle]
+        refs = [
+            {"ref": "refs/heads/repair/expired",
+             "object": {"type": "commit", "sha": HEAD}},
+            {"ref": "refs/heads/repair/current",
+             "object": {"type": "commit", "sha": SEED}},
+        ]
+        calls = []
+
+        def native(path, *, method="GET", data=None, token=None):
+            calls.append(path)
+            if path == f"repos/{REPO}/git/matching-refs/heads/review":
+                return []
+            if path == f"repos/{REPO}/git/matching-refs/heads/repair":
+                return refs
+            if path == f"repos/{REPO}/git/ref/pull/2/head":
+                return {"ref": "refs/pull/2/head", "object": {"sha": HEAD}}
+            if path == f"repos/{REPO}/git/ref/pull/3/head":
+                return {"ref": "refs/pull/3/head", "object": {"sha": SEED}}
+            self.fail(f"Unexpected native API request: {method} {path}")
+
+        class Lifecycle:
+            def __init__(self):
+                self.plans = []
+
+            def cleanup_plan(self, records, *, active_refs, protected_refs):
+                self.plans.append({
+                    "names": {record["name"] for record in records},
+                    "active_refs": active_refs,
+                    "protected_refs": protected_refs,
+                })
+                return []
+
+        repair_lifecycle = Lifecycle()
+        with (patch.object(release, "pages", return_value=pulls),
+              patch.object(release, "api", side_effect=native),
+              patch.object(release, "run", side_effect=AssertionError("An empty plan cannot mutate refs"))):
+            release._cleanup_shared_refs(REPO, repair_lifecycle, repair_only=True)
+        self.assertEqual(calls, [
+            f"repos/{REPO}/git/matching-refs/heads/repair",
+            f"repos/{REPO}/git/ref/pull/2/head",
+            f"repos/{REPO}/git/ref/pull/3/head",
+        ])
+        self.assertEqual(repair_lifecycle.plans[0]["names"],
+                         {"repair/expired", "repair/current"})
+        self.assertTrue({"repair/current", "review/full", f"review-base/{UPSTREAM}",
+                         "oracle/current", "downstream"} <= repair_lifecycle.plans[0]["active_refs"])
+        self.assertEqual(repair_lifecycle.plans[0]["protected_refs"], {"main", "downstream"})
+
+        calls.clear()
+        default_lifecycle = Lifecycle()
+        with (patch.object(release, "pages", return_value=pulls),
+              patch.object(release, "api", side_effect=native),
+              patch.object(release, "run", side_effect=AssertionError("An empty plan cannot mutate refs"))):
+            release._cleanup_shared_refs(REPO, default_lifecycle)
+        self.assertEqual(calls[:2], [
+            f"repos/{REPO}/git/matching-refs/heads/review",
+            f"repos/{REPO}/git/matching-refs/heads/repair",
+        ])
+        self.assertEqual(default_lifecycle.plans[0]["names"],
+                         {"repair/expired", "repair/current"})
+
+    def test_scheduled_prepare_cleans_before_candidate_selection(self):
+        events = []
+
+        class RepairSelectionReached(Exception):
+            pass
+
+        def native(path):
+            events.append(f"api:{path}")
+            if path == f"repos/{REPO}":
+                return {"default_branch": "downstream"}
+            if path == f"repos/{REPO}/commits/downstream":
+                return {"sha": CONFIG}
+            self.fail(f"Unexpected native API request: {path}")
+
+        def cleanup(repo, lifecycle, *, repair_only=False):
+            events.append(f"cleanup:{repo}:{repair_only}")
+
+        def select_repair(*_args):
+            events.append("repair-selection")
+            raise RepairSelectionReached
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GITHUB_SHA": CONFIG,
+                                          "GITHUB_EVENT_NAME": "schedule"}),
+                  patch.object(release, "shared_lifecycle", return_value=SimpleNamespace()),
+                  patch.object(release, "api", side_effect=native),
+                  patch.object(release, "_cleanup_shared_refs", side_effect=cleanup),
+                  patch.object(release, "_published_release_recovery", return_value=None),
+                  patch.object(release, "_shared_repair_candidate", side_effect=select_repair),
+                  self.assertRaises(RepairSelectionReached)):
+                release.prepare_shared(Path(directory))
+        self.assertLess(events.index(f"cleanup:{REPO}:True"), events.index("repair-selection"))
+
+    def test_non_scheduled_prepare_preserves_existing_candidate_selection(self):
+        class RepairSelectionReached(Exception):
+            pass
+
+        def native(path):
+            if path == f"repos/{REPO}":
+                return {"default_branch": "downstream"}
+            if path == f"repos/{REPO}/commits/downstream":
+                return {"sha": CONFIG}
+            self.fail(f"Unexpected native API request: {path}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GITHUB_SHA": CONFIG,
+                                          "GITHUB_EVENT_NAME": "workflow_dispatch"}),
+                  patch.object(release, "shared_lifecycle", return_value=SimpleNamespace()),
+                  patch.object(release, "api", side_effect=native),
+                  patch.object(release, "_cleanup_shared_refs") as cleanup,
+                  patch.object(release, "_published_release_recovery", return_value=None),
+                  patch.object(release, "_shared_repair_candidate", side_effect=RepairSelectionReached),
+                  self.assertRaises(RepairSelectionReached)):
+                release.prepare_shared(Path(directory))
+        cleanup.assert_not_called()
+
+    def test_scheduled_cleanup_failure_enters_existing_repair_path_before_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GITHUB_SHA": CONFIG,
+                                          "GITHUB_EVENT_NAME": "schedule"}),
+                  patch.object(release, "shared_lifecycle", return_value=SimpleNamespace()),
+                  patch.object(release, "api", return_value={"default_branch": "downstream"}) as native,
+                  patch.object(release, "_cleanup_shared_refs", side_effect=RuntimeError("cleanup blocked")) as cleanup,
+                  patch.object(release, "_published_release_recovery") as recovery,
+                  patch.object(release, "_shared_repair_candidate") as selection,
+                  self.assertRaisesRegex(RuntimeError, "cleanup blocked")):
+                release.prepare_shared(Path(directory))
+        cleanup.assert_called_once_with(REPO, cleanup.call_args.args[1], repair_only=True)
+        native.assert_called_once_with(f"repos/{REPO}")
+        recovery.assert_not_called()
+        selection.assert_not_called()
+
+
+class PendingReviewSourceRefTests(unittest.TestCase):
+    def source_fixture(self, patch_root):
+        candidate_config = "f" * 40
+        candidate_id = "9" * 64
+        context_sha, tree_sha = "1" * 40, "2" * 40
+        candidate = {
+            "schema": 1, "repository": REPO, "upstream_sha": UPSTREAM,
+            "application_sha": HEAD, "configuration_sha": candidate_config,
+            "patchset_sha256": release.patch_identity(patch_root)[1],
+            "recipe_sha256": "b" * 64, "platform": release.PLATFORM,
+        }
+        refs = [{
+            "ref": f"refs/heads/review/{UPSTREAM}-{candidate_id}",
+            "object": {"type": "commit", "sha": context_sha},
+        }]
+
+        def native_api(path, **_kwargs):
+            if path == f"repos/{REPO}/git/matching-refs/heads/review":
+                return refs
+            if path == f"repos/{REPO}/git/commits/{context_sha}":
+                return {"sha": context_sha,
+                        "message": f"fork-review-context:v1 {candidate_id}\n",
+                        "parents": [{"sha": HEAD}], "tree": {"sha": tree_sha}}
+            if path == f"repos/{REPO}/git/commits/{HEAD}":
+                return {"sha": HEAD, "tree": {"sha": tree_sha}}
+            if path == f"repos/{release.UPSTREAM}/commits/{release.UPSTREAM_BRANCH}":
+                return {"sha": "e" * 40}
+            self.fail(f"Unexpected native API request {path}")
+
+        lifecycle = SimpleNamespace(candidate_identity=lambda item:
+                                    candidate_id if item == candidate else "0" * 64)
+        return candidate, candidate_id, context_sha, tree_sha, native_api, lifecycle
+
+    def test_full_ref_reconstructs_the_exact_candidate_without_an_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_root = Path(temporary)
+            (patch_root / "0001-fix.patch").write_bytes(b"patch series\n")
+            candidate, candidate_id, _context, _tree, native_api, lifecycle = self.source_fixture(
+                patch_root)
+            with (patch.object(release, "api", side_effect=native_api),
+                  patch.object(release, "pages", return_value=[]),
+                  patch.object(release, "_shared_file", return_value=b"FROM node:22-alpine\n"),
+                  patch.object(release, "_recipe_sha256", return_value="b" * 64),
+                  patch.object(release, "_native_upstream_ancestor", return_value=True) as ancestor):
+                recovered = release._pending_shared_ref_candidate(
+                    REPO, lifecycle, config_sha=candidate["configuration_sha"],
+                    patch_root=patch_root, workflow_text="exact current workflow",
+                    accepted_upstream="7" * 40)
+            self.assertEqual(recovered, candidate)
+            self.assertEqual(lifecycle.candidate_identity(recovered), candidate_id)
+            self.assertEqual(ancestor.call_args_list[0].args, ("7" * 40, UPSTREAM))
+            self.assertEqual(ancestor.call_args_list[1].args, (UPSTREAM, "e" * 40))
+
+    def test_malformed_context_commit_is_not_a_candidate_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_root = Path(temporary)
+            (patch_root / "0001-fix.patch").write_bytes(b"patch series\n")
+            candidate, candidate_id, context_sha, _tree, native_api, lifecycle = self.source_fixture(
+                patch_root)
+            original = native_api
+
+            def malformed(path, **kwargs):
+                result = original(path, **kwargs)
+                if path == f"repos/{REPO}/git/commits/{context_sha}":
+                    result["message"] = "unrelated context\n"
+                return result
+
+            with (patch.object(release, "api", side_effect=malformed),
+                  patch.object(release, "pages", return_value=[]),
+                  patch.object(release, "_shared_file") as shared_file,
+                  patch.object(release, "_native_upstream_ancestor") as ancestor):
+                recovered = release._pending_shared_ref_candidate(
+                    REPO, lifecycle, config_sha=candidate["configuration_sha"],
+                    patch_root=patch_root, workflow_text="exact current workflow",
+                    accepted_upstream="7" * 40)
+            self.assertIsNone(recovered)
+            shared_file.assert_not_called()
+            ancestor.assert_not_called()
+
+    def test_pending_candidate_outside_accepted_or_current_upstream_is_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_root = Path(temporary)
+            (patch_root / "0001-fix.patch").write_bytes(b"patch series\n")
+            candidate, _candidate_id, _context, _tree, native_api, lifecycle = self.source_fixture(
+                patch_root)
+            with (patch.object(release, "api", side_effect=native_api),
+                  patch.object(release, "pages", return_value=[]),
+                  patch.object(release, "_shared_file", return_value=b"FROM node:22-alpine\n"),
+                  patch.object(release, "_recipe_sha256", return_value="b" * 64),
+                  patch.object(release, "_native_upstream_ancestor",
+                               side_effect=(True, False))):
+                with self.assertRaisesRegex(ValueError, "would downgrade or leave"):
+                    release._pending_shared_ref_candidate(
+                        REPO, lifecycle, config_sha=candidate["configuration_sha"],
+                        patch_root=patch_root, workflow_text="exact current workflow",
+                        accepted_upstream="7" * 40)
+
+    def test_context_and_application_must_have_explicit_full_tree_shas(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_root = Path(temporary)
+            (patch_root / "0001-fix.patch").write_bytes(b"patch series\n")
+            candidate, _candidate_id, context_sha, _tree, native_api, lifecycle = self.source_fixture(
+                patch_root)
+
+            def missing_trees(path, **kwargs):
+                result = native_api(path, **kwargs)
+                if path in {
+                    f"repos/{REPO}/git/commits/{context_sha}",
+                    f"repos/{REPO}/git/commits/{HEAD}",
+                }:
+                    result.pop("tree", None)
+                return result
+
+            with (patch.object(release, "api", side_effect=missing_trees),
+                  patch.object(release, "pages", return_value=[]),
+                  patch.object(release, "_shared_file") as shared_file):
+                recovered = release._pending_shared_ref_candidate(
+                    REPO, lifecycle, config_sha=candidate["configuration_sha"],
+                    patch_root=patch_root, workflow_text="exact current workflow",
+                    accepted_upstream="7" * 40)
+            self.assertIsNone(recovered)
+            shared_file.assert_not_called()
+
+    def test_foreign_fork_same_name_does_not_hide_native_open_full_pr(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_root = Path(temporary)
+            (patch_root / "0001-fix.patch").write_bytes(b"patch series\n")
+            candidate, candidate_id, context_sha, _tree, native_api, lifecycle = self.source_fixture(
+                patch_root)
+            head_ref = f"review/{UPSTREAM}-{candidate_id}"
+            base_ref = f"review-base/{UPSTREAM}"
+            foreign = {
+                "state": "open",
+                "head": {"ref": head_ref, "sha": context_sha,
+                         "repo": {"full_name": "contributor/9router"}},
+                "base": {"ref": base_ref, "sha": UPSTREAM,
+                         "repo": {"full_name": REPO}},
+            }
+            native = {
+                "state": "open",
+                "head": {"ref": head_ref, "sha": context_sha,
+                         "repo": {"full_name": REPO}},
+                "base": {"ref": base_ref, "sha": UPSTREAM,
+                         "repo": {"full_name": REPO}},
+            }
+            with (patch.object(release, "api", side_effect=native_api),
+                  patch.object(release, "pages", return_value=[foreign, native]),
+                  patch.object(release, "_shared_file", return_value=b"FROM node:22-alpine\n"),
+                  patch.object(release, "_recipe_sha256", return_value="b" * 64),
+                  patch.object(release, "_native_upstream_ancestor", return_value=True)):
+                recovered = release._pending_shared_ref_candidate(
+                    REPO, lifecycle, config_sha=candidate["configuration_sha"],
+                    patch_root=patch_root, workflow_text="exact current workflow",
+                    accepted_upstream="7" * 40)
+            self.assertEqual(recovered, candidate)
+
+
+class PendingReviewPostTests(unittest.TestCase):
+    def run_review_post(self, page_batches):
+        head_ref, base_ref = f"review/{UPSTREAM}-{'f' * 64}", f"review-base/{UPSTREAM}"
+        head_sha, base_sha = HEAD, UPSTREAM
+        pulls = iter(page_batches)
+        api_calls = []
+
+        def native_api(path, *, method="GET", data=None, token=None):
+            api_calls.append((path, method))
+            if method == "POST":
+                raise subprocess.CalledProcessError(1, ["gh", "api"])
+            self.fail(f"Unexpected native API request {method} {path}")
+
+        def native_run(*args, cwd=None, env=None):
+            if args[:3] == ("gh", "auth", "setup-git"):
+                return ""
+            if args[:2] == ("git", "rev-parse"):
+                return base_sha
+            if args[:2] == ("git", "ls-remote"):
+                return ""
+            if args[:2] == ("git", "push"):
+                return ""
+            self.fail(f"Unexpected command {args}")
+
+        with (patch.object(release, "run", side_effect=native_run),
+              patch.object(release, "api", side_effect=native_api),
+              patch.object(release, "pages", side_effect=lambda _path: next(pulls)),
+              patch.object(release.subprocess, "run",
+                           return_value=subprocess.CompletedProcess([], 0))):
+            try:
+                result = release._review_pr(
+                    REPO, Path("unused"), title="review", body="body",
+                    head_ref=head_ref, head_sha=head_sha,
+                    base_ref=base_ref, base_sha=base_sha)
+            except release.PendingReviewPost as error:
+                result = error
+        return result, api_calls
+
+    def test_uncertain_post_without_native_pull_returns_pending_after_one_post(self):
+        result, api_calls = self.run_review_post([[], []])
+        self.assertIsInstance(result, release.PendingReviewPost)
+        self.assertEqual(api_calls, [(f"repos/{REPO}/pulls", "POST")])
+
+    def test_uncertain_post_hydrates_the_exact_native_pull_without_retry(self):
+        head_ref, base_ref = f"review/{UPSTREAM}-{'f' * 64}", f"review-base/{UPSTREAM}"
+        pull = {
+            "number": 77, "state": "open",
+            "head": {"ref": head_ref, "sha": HEAD, "repo": {"full_name": REPO}},
+            "base": {"ref": base_ref, "sha": UPSTREAM, "repo": {"full_name": REPO}},
+        }
+        result, api_calls = self.run_review_post([[], [pull]])
+        self.assertEqual(result, pull)
+        self.assertEqual(api_calls, [(f"repos/{REPO}/pulls", "POST")])
+
+
+class NativeUpstreamAncestryTests(unittest.TestCase):
+    def comparison(self, base, head, *, status, ahead, behind, total, commits):
+        return {
+            "url": f"https://api.github.com/repos/{release.UPSTREAM}/compare/{base}...{head}",
+            "status": status,
+            "base_commit": {"sha": base},
+            "merge_base_commit": {"sha": base},
+            "ahead_by": ahead,
+            "behind_by": behind,
+            "total_commits": total,
+            "commits": commits,
+        }
+
+    def test_native_identical_compare_requires_no_head_commit_or_commit_rows(self):
+        response = self.comparison(
+            UPSTREAM, UPSTREAM, status="identical", ahead=0, behind=0,
+            total=0, commits=[])
+        with patch.object(release, "api", return_value=response) as native:
+            self.assertTrue(release._native_upstream_ancestor(UPSTREAM, UPSTREAM))
+        native.assert_called_once_with(
+            f"repos/{release.UPSTREAM}/compare/{UPSTREAM}...{UPSTREAM}")
+
+    def test_native_ahead_compare_over_250_uses_published_ancestry_fields(self):
+        response = self.comparison(
+            UPSTREAM, HEAD, status="ahead", ahead=301, behind=0,
+            total=301, commits=[{} for _ in range(250)])
+        with patch.object(release, "api", return_value=response) as native:
+            self.assertTrue(release._native_upstream_ancestor(UPSTREAM, HEAD))
+        native.assert_called_once_with(
+            f"repos/{release.UPSTREAM}/compare/{UPSTREAM}...{HEAD}")

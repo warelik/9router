@@ -1,0 +1,315 @@
+From f2d85e05fcdacf44c86658943005f39a60c1b23d Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Align native Gemini authentication aliases across existing
+ public routes
+
+---
+ src/app/api/v1beta/models/[...path]/route.js  | 11 +--
+ src/dashboardGuard.js                         |  6 +-
+ src/sse/services/keyAccess.js                 |  5 +-
+ .../unit/gemini-native-alpha-contract.test.js | 93 ++++++++++++++++++-
+ .../unit/native-public-gemini-rewrite.test.js | 68 +++++++++++++-
+ 5 files changed, 167 insertions(+), 16 deletions(-)
+
+diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
+index 6aa9c0a..08b4ab7 100644
+--- a/src/app/api/v1beta/models/[...path]/route.js
++++ b/src/app/api/v1beta/models/[...path]/route.js
+@@ -12,7 +12,7 @@ import { initTranslators } from "open-sse/translator/index.js";
+ import { getTargetFormat, supportsNativeGemini } from "open-sse/services/provider.js";
+ import { getModelInfo } from "@/sse/services/model.js";
+ import { proxyAwareFetch } from "open-sse/utils/proxyFetch.js";
+-import { getKeyAccessContext, enforceKeyAccessResolved } from "@/sse/services/keyAccess.js";
++import { extractClientApiKey, getKeyAccessContext, enforceKeyAccessResolved } from "@/sse/services/keyAccess.js";
+ 
+ let initialized = false;
+ const GEMINI_NATIVE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
+@@ -151,14 +151,7 @@ export async function POST(request, { params }) {
+ }
+ 
+ function extractGeminiClientApiKey(request) {
+-  const authHeader = request.headers.get("Authorization");
+-  if (authHeader?.startsWith("Bearer ")) return authHeader.slice(7);
+-
+-  const googleApiKey = request.headers.get("x-goog-api-key");
+-  if (googleApiKey) return googleApiKey;
+-
+-  const url = new URL(request.url);
+-  return url.searchParams.get("key") || url.searchParams.get("$key");
++  return extractClientApiKey(request);
+ }
+ 
+ function normalizeGeminiNativeModel(model) {
+diff --git a/src/dashboardGuard.js b/src/dashboardGuard.js
+index e592d76..a4f783d 100644
+--- a/src/dashboardGuard.js
++++ b/src/dashboardGuard.js
+@@ -35,7 +35,7 @@ const PUBLIC_API_PATHS = [
+ 
+ // Public top-level prefixes (LLM API endpoints with their own API key auth).
+ // Keep root-level rewrites here too: middleware runs before Next.js rewrites.
+-const PUBLIC_PREFIXES = ["/v1", "/v1beta", "/api/v1", "/api/v1beta", "/codex", "/responses"];
++const PUBLIC_PREFIXES = ["/v1", "/v1beta", "/v1alpha", "/api/v1", "/api/v1beta", "/api/v1alpha", "/codex", "/responses"];
+ 
+ // Always require JWT token regardless of requireLogin setting
+ const ALWAYS_PROTECTED = [
+@@ -145,7 +145,9 @@ function extractApiKey(request) {
+   if (apiKeyHeader) return apiKeyHeader;
+   const googleApiKeyHeader = request.headers.get("x-goog-api-key");
+   if (googleApiKeyHeader) return googleApiKeyHeader;
+-  return request.nextUrl.searchParams?.get("key") || null;
++  return request.nextUrl.searchParams?.get("key")
++    || request.nextUrl.searchParams?.get("$key")
++    || null;
+ }
+ 
+ async function hasValidApiKey(request) {
+diff --git a/src/sse/services/keyAccess.js b/src/sse/services/keyAccess.js
+index 4450fdc..6de0e32 100644
+--- a/src/sse/services/keyAccess.js
++++ b/src/sse/services/keyAccess.js
+@@ -41,7 +41,7 @@ const canonicalModel = (provider, model) => lower(`${provider}/${model}`);
+ /**
+  * The client key, read from the same places and in the same order as the
+  * middleware (src/dashboardGuard.js) reads the key it authorizes a remote
+- * /v1 call with: Bearer, x-api-key, x-goog-api-key, ?key=. Handlers' own
++ * /v1 call with: Bearer, x-api-key, x-goog-api-key, ?key= or ?$key=. Handlers' own
+  * extractApiKey() only reads the first two, so using it here would let a
+  * restricted key sent as x-goog-api-key look like "no key" (= unrestricted).
+  */
+@@ -55,7 +55,8 @@ export function extractClientApiKey(request) {
+   const googKey = headers.get("x-goog-api-key");
+   if (googKey) return googKey;
+   try {
+-    return new URL(request.url).searchParams.get("key") || null;
++    const params = new URL(request.url).searchParams;
++    return params.get("key") || params.get("$key") || null;
+   } catch {
+     return null;
+   }
+diff --git a/tests/unit/gemini-native-alpha-contract.test.js b/tests/unit/gemini-native-alpha-contract.test.js
+index 7a4699f..6db63a9 100644
+--- a/tests/unit/gemini-native-alpha-contract.test.js
++++ b/tests/unit/gemini-native-alpha-contract.test.js
+@@ -3,7 +3,7 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { existsSync, readdirSync } from "node:fs";
+ 
+-const mocks = vi.hoisted(() => ({ network: vi.fn(), handleChat: vi.fn() }));
++const mocks = vi.hoisted(() => ({ network: vi.fn(), handleChat: vi.fn(), validateApiKey: vi.fn(), apiKeys: {} }));
+ vi.mock("../../src/app/api/v1/models/route.js", () => ({ buildModelsList: async () => [] }));
+ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: mocks.network }));
+ vi.mock("@/sse/handlers/chat.js", () => ({ handleChat: mocks.handleChat }));
+@@ -13,9 +13,13 @@ vi.mock("@/sse/services/model.js", () => ({ getModelInfo: async value => {
+ } }));
+ vi.mock("@/sse/services/auth.js", () => ({
+   getProviderCredentials: async () => ({ apiKey: "fixture-provider-key", connectionId: "fixture", providerSpecificData: {} }),
+-  isValidApiKey: async () => true, markAccountUnavailable: async () => ({ shouldFallback: false }), clearAccountError: async () => {},
++  isValidApiKey: key => mocks.validateApiKey(key), markAccountUnavailable: async () => ({ shouldFallback: false }), clearAccountError: async () => {},
+ }));
+ vi.mock("@/lib/localDb", () => ({ getSettings: async () => ({ requireApiKey: true }) }));
++vi.mock("@/lib/db/repos/apiKeysRepo.js", () => ({
++  getApiKeyByKey: async key => mocks.apiKeys[key] || null,
++}));
++vi.mock("@/lib/db/repos/combosRepo.js", () => ({ getCombos: async () => [] }));
+ vi.mock("../../open-sse/executors/index.js", async () => {
+   const { DefaultExecutor } = await import("../../open-sse/executors/default.js");
+   return { getExecutor: provider => new DefaultExecutor(provider) };
+@@ -37,6 +41,20 @@ let credentials;
+ describe("native Gemini alpha generation contract", () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
++    mocks.apiKeys = {
++      "restricted-tts": {
++        id: "restricted-tts-id",
++        name: "restricted-tts",
++        access: { restricted: true, allow: [`gemini/${model}`] },
++      },
++      "restricted-other": {
++        id: "restricted-other-id",
++        name: "restricted-other",
++        access: { restricted: true, allow: ["gemini/gemini-2.5-pro"] },
++      },
++    };
++    mocks.validateApiKey.mockReset().mockImplementation(async key =>
++      key === "fixture-client-key" || Object.hasOwn(mocks.apiKeys, key));
+     vi.stubGlobal("fetch", vi.fn(() => { throw new Error("DIRECT_NETWORK_FORBIDDEN"); }));
+     mocks.network.mockImplementation(async (_url, options) => new Response(JSON.stringify(options.headers.Accept ? [reply] : reply), { headers: { "Content-Type": "application/json" } }));
+     mocks.handleChat.mockImplementation(async (request, raw, options) => {
+@@ -99,6 +117,77 @@ describe("native Gemini alpha generation contract", () => {
+     expect(global.fetch).not.toHaveBeenCalled();
+   });
+ 
++  it("applies restricted API-key allow-lists to $key on the direct Gemini TTS path", async () => {
++    const requestFor = key => new Request(
++      `https://router.test/v1beta/models/${model}:generateContent?$key=${key}`,
++      {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          contents: [{ role: "user", parts: [{ text: "Speak" }] }],
++          generationConfig: { responseModalities: ["AUDIO"] },
++        }),
++      },
++    );
++    const params = { params: Promise.resolve({ path: [`${model}:generateContent`] }) };
++
++    mocks.validateApiKey.mockClear();
++    const allowed = await beta.POST(requestFor("restricted-tts"), params);
++    expect(allowed.status).toBe(200);
++    expect(mocks.validateApiKey).toHaveBeenCalledWith("restricted-tts");
++    expect(mocks.network).toHaveBeenCalledOnce();
++
++    mocks.network.mockClear();
++    mocks.validateApiKey.mockClear();
++    const denied = await beta.POST(requestFor("restricted-other"), params);
++    expect(denied.status).toBe(403);
++    expect(mocks.validateApiKey).toHaveBeenCalledWith("restricted-other");
++    expect(mocks.network).not.toHaveBeenCalled();
++  });
++
++  it("uses the shared x-api-key and Bearer precedence for direct Gemini TTS authorization and access", async () => {
++    const body = JSON.stringify({
++      contents: [{ role: "user", parts: [{ text: "Speak" }] }],
++      generationConfig: { responseModalities: ["AUDIO"] },
++    });
++    const params = { params: Promise.resolve({ path: [`${model}:generateContent`] }) };
++    const xApiKey = new Request(
++      `https://router.test/v1beta/models/${model}:generateContent?key=restricted-other&$key=restricted-other`,
++      {
++        method: "POST",
++        headers: {
++          "Content-Type": "application/json",
++          "x-api-key": "restricted-tts",
++          "x-goog-api-key": "restricted-other",
++        },
++        body,
++      },
++    );
++    const allowed = await beta.POST(xApiKey, params);
++    expect(allowed.status).toBe(200);
++    expect(mocks.validateApiKey).toHaveBeenCalledWith("restricted-tts");
++    expect(mocks.network).toHaveBeenCalledOnce();
++
++    mocks.network.mockClear();
++    mocks.validateApiKey.mockClear();
++    const bearer = new Request(
++      `https://router.test/v1beta/models/${model}:generateContent?key=restricted-tts&$key=restricted-tts`,
++      {
++        method: "POST",
++        headers: {
++          "Content-Type": "application/json",
++          Authorization: "Bearer restricted-other",
++          "x-api-key": "restricted-tts",
++        },
++        body,
++      },
++    );
++    const denied = await beta.POST(bearer, params);
++    expect(denied.status).toBe(403);
++    expect(mocks.validateApiKey).toHaveBeenCalledWith("restricted-other");
++    expect(mocks.network).not.toHaveBeenCalled();
++  });
++
+   for (const provider of ["gemini", "aistudio"]) {
+     it(`${provider}: the generic executor formats an explicitly resolved alpha version`, () => {
+       const executor = new DefaultExecutor(provider);
+diff --git a/tests/unit/native-public-gemini-rewrite.test.js b/tests/unit/native-public-gemini-rewrite.test.js
+index 78978a3..faa3a3d 100644
+--- a/tests/unit/native-public-gemini-rewrite.test.js
++++ b/tests/unit/native-public-gemini-rewrite.test.js
+@@ -1,11 +1,27 @@
+ // The deployed alpha failure occurred before any API handler/provider call:
+ // importing the private route does not test Next's public rewrite front door.
+-import { describe, expect, it } from "vitest";
++import { beforeEach, describe, expect, it, vi } from "vitest";
+ import { existsSync } from "node:fs";
+ import nextConfig from "../../next.config.mjs";
+ import { getPathMatch } from "next/dist/shared/lib/router/utils/path-match.js";
+ import { prepareDestination } from "next/dist/shared/lib/router/utils/prepare-destination.js";
+ 
++const guardMocks = vi.hoisted(() => ({ validateApiKey: vi.fn() }));
++vi.mock("next/server", () => ({
++  NextResponse: {
++    next: () => ({ kind: "next" }),
++    json: (body, init) => ({ status: init?.status || 200, body }),
++  },
++}));
++vi.mock("@/lib/localDb", () => ({
++  getSettings: async () => ({ requireLogin: true }),
++  validateApiKey: guardMocks.validateApiKey,
++}));
++vi.mock("@/shared/utils/machineId", () => ({ getConsistentMachineId: async () => "fixture-cli-token" }));
++vi.mock("@/lib/auth/dashboardSession", () => ({ verifyDashboardAuthToken: async () => false }));
++
++const { proxy: dashboardGuardProxy } = await import("../../src/dashboardGuard.js");
++
+ const rules = await nextConfig.rewrites();
+ function rewrite(url, rewrites = rules) {
+   const input = new URL(url);
+@@ -22,6 +38,15 @@ function rewrite(url, rewrites = rules) {
+   return null;
+ }
+ 
++function remoteRequest(path, headers = {}) {
++  const request = new Request(`https://router.example${path}`, {
++    headers: { host: "router.example", ...headers },
++  });
++  Object.defineProperty(request, "nextUrl", { value: new URL(request.url) });
++  Object.defineProperty(request, "cookies", { value: { get: () => undefined } });
++  return request;
++}
++
+ describe("public native Gemini generation rewrites", () => {
+   for (const version of ["v1", "v1beta", "v1alpha"]) {
+     it(`${version} registers both public root and wildcard destinations`, () => {
+@@ -65,3 +90,44 @@ describe("public native Gemini generation rewrites", () => {
+     expect(rewrite("https://router.test/v1alphabet/models/gemini/gemini-3.5-flash-lite:generateContent")).toBeNull();
+   });
+ });
++
++describe("v1alpha middleware authentication before Next rewrites", () => {
++  beforeEach(() => {
++    guardMocks.validateApiKey.mockReset().mockImplementation(async key => key === "fixture-alpha-key");
++  });
++
++  for (const path of [
++    "/v1alpha/models/gemini/gemini-3.5-flash-lite:generateContent",
++    "/api/v1alpha/models/gemini/gemini-3.5-flash-lite:generateContent",
++  ]) {
++    it(`rejects an unauthenticated remote request to ${path}`, async () => {
++      const response = await dashboardGuardProxy(remoteRequest(path));
++      expect(response.status).toBe(401);
++      expect(response.body.error).toBe("API key required for remote API access");
++      expect(guardMocks.validateApiKey).not.toHaveBeenCalled();
++    });
++
++    it(`allows a valid $key on ${path}`, async () => {
++      const response = await dashboardGuardProxy(remoteRequest(`${path}?$key=fixture-alpha-key`));
++      expect(response).toEqual({ kind: "next" });
++      expect(guardMocks.validateApiKey).toHaveBeenCalledWith("fixture-alpha-key");
++    });
++  }
++
++  it("preserves Bearer, header, and key precedence before the $key alias", async () => {
++    const cases = [
++      [{ authorization: "Bearer fixture-alpha-key", "x-api-key": "other", "x-goog-api-key": "other" }, "?key=other&$key=other", "fixture-alpha-key"],
++      [{ "x-api-key": "fixture-alpha-key", "x-goog-api-key": "other" }, "?key=other&$key=other", "fixture-alpha-key"],
++      [{ "x-goog-api-key": "fixture-alpha-key" }, "?key=other&$key=other", "fixture-alpha-key"],
++      [{}, "?key=fixture-alpha-key&$key=other", "fixture-alpha-key"],
++      [{}, "?$key=fixture-alpha-key", "fixture-alpha-key"],
++    ];
++    for (const [headers, query, selected] of cases) {
++      guardMocks.validateApiKey.mockClear();
++      const response = await dashboardGuardProxy(remoteRequest(
++        `/v1alpha/models/gemini/gemini-3.5-flash-lite:generateContent${query}`, headers));
++      expect(response).toEqual({ kind: "next" });
++      expect(guardMocks.validateApiKey).toHaveBeenCalledWith(selected);
++    }
++  });
++});
+-- 
+2.55.0
+
