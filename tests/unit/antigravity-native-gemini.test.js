@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const { network, executorInstances } = vi.hoisted(() => ({
@@ -233,6 +234,8 @@ function loadRouteHarness() {
     updateProviderCredentials: services.updateProviderCredentials,
     unavailableResponse: services.unavailableResponse,
   };
+  // Production crypto is real; these remote fixtures have no trusted local/CLI principal.
+  Object.assign(context, { createHash, isLocalRequest: () => false, hasValidCliToken: async () => false });
   vm.createContext(context);
 
   const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
