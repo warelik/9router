@@ -7,6 +7,8 @@ import { isOidcConfigured } from "@/lib/auth/oidc";
 import { isSamlConfigured } from "@/lib/auth/saml.js";
 import { checkLock, recordFail, recordSuccess, getClientIp } from "@/lib/auth/loginLimiter";
 import { isLocalRequest } from "@/dashboardGuard";
+import { isDemoLock } from "@/lib/blabs/flags";
+import { assertDemoLockConfig, getDemoPassword } from "@/lib/blabs/demoPolicy";
 
 const RESET_HINT = "Forgot password? Reset to default via 9Router CLI → Settings → Reset Password to Default.";
 const NO_STORE_HEADERS = { "Cache-Control": "no-store" };
@@ -40,7 +42,25 @@ export async function POST(request) {
     // Default password is '123456' if not set
     const storedHash = settings.password;
 
-    if (settings.authMode === "sso" || settings.authMode === "saml" || settings.authMode === "oidc") {
+    if (isDemoLock()) {
+      const config = await assertDemoLockConfig();
+      if (!config.ok) {
+        return NextResponse.json(
+          { error: "Demo lock configuration invalid", code: config.error },
+          { status: 503, headers: NO_STORE_HEADERS },
+        );
+      }
+      if (password === getDemoPassword()) {
+        recordSuccess(ip);
+        const cookieStore = await cookies();
+        await setDashboardAuthCookie(cookieStore, request, { role: "demo" });
+        return NextResponse.json(
+          { success: true, role: "demo" },
+          { headers: NO_STORE_HEADERS },
+        );
+      }
+      // Demo lock still allows the admin password below. Skip the SSO-only gate.
+    } else if (settings.authMode === "sso" || settings.authMode === "saml" || settings.authMode === "oidc") {
       const ssoType = settings.ssoType || (settings.authMode === "saml" ? "saml" : "oidc");
       if (ssoType === "saml" && isSamlConfigured(settings)) {
         return NextResponse.json({ error: "Password login is disabled. Use SAML SSO sign in." }, { status: 403 });
@@ -50,15 +70,9 @@ export async function POST(request) {
       }
     }
 
-    let isValid = false;
-    if (storedHash) {
-      isValid = await bcrypt.compare(password, storedHash);
-    } else {
-      // Use env var or default
-      const initialPassword = process.env.INITIAL_PASSWORD || "123456";
-      isValid = password === initialPassword;
-    }
-
+    const isValid = storedHash
+      ? await bcrypt.compare(password, storedHash)
+      : password === (process.env.INITIAL_PASSWORD || "123456");
     if (isValid) {
       recordSuccess(ip);
 
@@ -88,9 +102,9 @@ export async function POST(request) {
       }
 
       const cookieStore = await cookies();
-      await setDashboardAuthCookie(cookieStore, request);
+      await setDashboardAuthCookie(cookieStore, request, { role: "admin" });
 
-      return NextResponse.json({ success: true, mustChangePassword: false }, { headers: NO_STORE_HEADERS });
+      return NextResponse.json({ success: true, role: "admin", mustChangePassword: false }, { headers: NO_STORE_HEADERS });
     }
 
     const { remainingBeforeLock } = recordFail(ip);

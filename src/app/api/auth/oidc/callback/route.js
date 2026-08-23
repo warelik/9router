@@ -77,6 +77,7 @@ export async function GET(request) {
       oidcSub: payload.sub || null,
       oidcEmail: pickOidcEmail(payload) || null,
       oidcName: pickOidcDisplayName(payload),
+      role: "admin", // under lock required; also set when lock off for forward-compat
     });
 
     return NextResponse.redirect(new URL("/dashboard", getPublicOrigin(request)));

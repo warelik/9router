@@ -4,12 +4,15 @@ import { getSettings } from "@/lib/localDb";
 import { isOidcConfigured } from "@/lib/auth/oidc";
 import { isSamlConfigured } from "@/lib/auth/saml.js";
 import { getDashboardAuthSession } from "@/lib/auth/dashboardSession";
+import { resolveDashboardRole } from "@/lib/blabs/demoPolicy";
 
 export async function GET() {
   try {
     const settings = await getSettings();
     const cookieStore = await cookies();
     const session = await getDashboardAuthSession(cookieStore.get("auth_token")?.value);
+    const role = resolveDashboardRole(session);
+    const authenticated = !!session && role !== null;
     const requireLogin = settings.requireLogin !== false;
     const authMode = settings.authMode || "password";
     const ssoType = settings.ssoType || "oidc";
@@ -45,6 +48,7 @@ export async function GET() {
       samlName: samlName || null,
       samlEmail: samlEmail || null,
       samlLogin: !!session?.saml,
+      role,
     });
   } catch {
     return NextResponse.json({
@@ -65,6 +69,7 @@ export async function GET() {
       samlName: null,
       samlEmail: null,
       samlLogin: false,
+      role: null,
     });
   }
 }
