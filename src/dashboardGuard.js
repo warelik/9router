@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
 import { getSettings, validateApiKey } from "@/lib/localDb";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
-import { verifyDashboardAuthToken } from "@/lib/auth/dashboardSession";
+import { getDashboardAuthSession, verifyDashboardAuthToken } from "@/lib/auth/dashboardSession";
 import { hasTrustedPeerHeaders } from "@/lib/auth/trustedPeer";
+import { isDemoLock } from "@/lib/blabs/flags";
+import { isDemoApiAllowed, isDemoPageAllowed, resolveDashboardRole } from "@/lib/blabs/demoPolicy";
 
 const CLI_TOKEN_HEADER = "x-9r-cli-token";
 const CLI_TOKEN_SALT = "9r-cli-auth";
@@ -169,6 +171,14 @@ async function hasValidToken(request) {
   return await verifyDashboardAuthToken(token);
 }
 
+async function getSessionRole(request) {
+  return resolveDashboardRole(await getDashboardAuthSession(request.cookies.get("auth_token")?.value));
+}
+
+function demoLockedJson() {
+  return NextResponse.json({ error: "Forbidden", code: "demo_locked" }, { status: 403 });
+}
+
 // Read settings directly from DB to avoid self-fetch deadlock in proxy
 async function loadSettings() {
   try {
@@ -201,35 +211,71 @@ export const __test__ = {
 export async function proxy(request) {
   const { pathname } = request.nextUrl;
 
-  // Local-only gate for spawn-capable / host-secret routes.
+  // 1. LOCAL_ONLY — stock
   if (LOCAL_ONLY_PATHS.some((p) => pathname.startsWith(p))) {
     if (!(await canAccessLocalOnlyRoute(request))) {
       return NextResponse.json({ error: "Local only: CLI token required" }, { status: 403 });
     }
   }
 
-  // Always protected - require valid JWT or local CLI token (machineId-based)
+  // 2. ALWAYS_PROTECTED — demo 403 before stock JWT success
   if (ALWAYS_PROTECTED.some((p) => pathname.startsWith(p))) {
-    if (await hasValidCliToken(request) || await hasValidToken(request))
-      return NextResponse.next();
+    if (await hasValidCliToken(request)) return NextResponse.next();
+    if (isDemoLock()) {
+      const role = await getSessionRole(request);
+      if (role === "demo") return demoLockedJson();
+      if (role === "admin") return NextResponse.next();
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+    if (await hasValidToken(request)) return NextResponse.next();
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  // 3. /v1… — stock; demo JWT grants no privilege
   if (isPublicLlmApi(pathname)) {
     if (await canAccessPublicLlmApi(request)) return NextResponse.next();
     return NextResponse.json({ error: "API key required for remote API access" }, { status: 401 });
   }
 
-  // Deny-by-default for /api/* — public allow-list bypasses, everything else requires auth.
+  // 4. /api/* under lock: oidc/test→403, public, allowlist/roles; lock off stock
   if (pathname.startsWith("/api/")) {
+    if (isDemoLock()) {
+      const role = await getSessionRole(request);
+      if (role === "demo" && pathname.startsWith("/api/auth/oidc/test")) return demoLockedJson();
+      if (isPublicApi(pathname)) return NextResponse.next();
+      if (role === "demo") {
+        if (isDemoApiAllowed(pathname, request.method || "GET")) return NextResponse.next();
+        return demoLockedJson();
+      }
+      if (role === null) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      return NextResponse.next();
+    }
     if (isPublicApi(pathname)) return NextResponse.next();
     if (await hasValidCliToken(request) || await isAuthenticated(request))
       return NextResponse.next();
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  // Protect all dashboard routes
+  // 5. /dashboard/* — lock forces requireLogin; demo 303/404
   if (pathname.startsWith("/dashboard")) {
+    if (isDemoLock()) {
+      const role = await getSessionRole(request);
+      if (role === null) return NextResponse.redirect(new URL("/login", request.url));
+      if (role === "demo") {
+        if (isDemoPageAllowed(pathname)) return NextResponse.next();
+        const accept = (request.headers.get("accept") || "").toLowerCase();
+        if (
+          request.headers.get("RSC") === "1" ||
+          request.headers.get("Next-Router-Prefetch") === "1" ||
+          accept.includes("text/x-component")
+        ) {
+          return new NextResponse(null, { status: 404 });
+        }
+        return NextResponse.redirect(new URL("/dashboard/showroom", request.url), 303);
+      }
+      return NextResponse.next();
+    }
+
     let requireLogin = true;
     let tunnelDashboardAccess = true;
 
