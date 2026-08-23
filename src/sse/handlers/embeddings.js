@@ -117,6 +117,12 @@ export async function handleEmbeddings(request) {
 
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
 
+    if (refreshedCredentials?._unrecoverableRefresh) {
+      await markAccountUnavailable(credentials.connectionId, 401, "unrecoverable credential refresh", provider, model);
+      excludeConnectionIds.add(credentials.connectionId);
+      continue;
+    }
+
     const result = await handleEmbeddingsCore({
       body: { ...body, model: `${provider}/${model}` },
       modelInfo: { provider, model },

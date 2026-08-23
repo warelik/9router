@@ -26,13 +26,13 @@ export default {
     },
     retry: {
       "429": {
-        attempts: 3,
+        attempts: 0,
       },
       "500": {
-        attempts: 3,
+        attempts: 0,
       },
       "503": {
-        attempts: 3,
+        attempts: 0,
       },
     },
     usage: {

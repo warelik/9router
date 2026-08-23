@@ -1,5 +1,6 @@
 import { PROVIDERS } from "../config/providers.js";
 import { OAUTH_ENDPOINTS, REFRESH_LEAD_MS } from "../config/appConstants.js";
+import { TOKEN_REFRESH_RETRY_CONFIG } from "../config/errorConfig.js";
 import {
   refreshXaiToken,
   refreshAccessToken,
@@ -249,16 +250,34 @@ export async function getAllAccessTokens(userInfo, log) {
   return results;
 }
 
-export async function refreshWithRetry(refreshFn, maxRetries = 3, log = null) {
+function normalizeRefreshRetryOptions(optionsOrMaxRetries) {
+  if (typeof optionsOrMaxRetries === "object" && optionsOrMaxRetries !== null) {
+    return {
+      maxRetries: optionsOrMaxRetries.maxRetries ?? TOKEN_REFRESH_RETRY_CONFIG.defaultMaxRetries,
+      retryDelayMs: optionsOrMaxRetries.retryDelayMs ?? TOKEN_REFRESH_RETRY_CONFIG.defaultRetryDelayMs,
+    };
+  }
+  return {
+    maxRetries: optionsOrMaxRetries ?? TOKEN_REFRESH_RETRY_CONFIG.defaultMaxRetries,
+    retryDelayMs: TOKEN_REFRESH_RETRY_CONFIG.defaultRetryDelayMs,
+  };
+}
+
+export async function refreshWithRetry(refreshFn, optionsOrMaxRetries = TOKEN_REFRESH_RETRY_CONFIG.defaultMaxRetries, log = null) {
+  const { maxRetries, retryDelayMs } = normalizeRefreshRetryOptions(optionsOrMaxRetries);
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     if (attempt > 0) {
-      const delay = attempt * 1000;
+      const delay = attempt * retryDelayMs;
       log?.debug?.("TOKEN_REFRESH", `Retry ${attempt}/${maxRetries} after ${delay}ms`);
-      await new Promise(r => setTimeout(r, delay));
+      if (delay > 0) await new Promise(r => setTimeout(r, delay));
     }
 
     try {
       const result = await refreshFn();
+      if (isUnrecoverableRefreshError(result)) {
+        log?.warn?.("TOKEN_REFRESH", "Permanent refresh failure; skipping retries");
+        return result;
+      }
       if (result) return result;
     } catch (error) {
       log?.warn?.("TOKEN_REFRESH", `Attempt ${attempt + 1}/${maxRetries} failed: ${error.message}`);

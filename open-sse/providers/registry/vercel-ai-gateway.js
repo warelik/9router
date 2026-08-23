@@ -22,7 +22,7 @@ export default {
     baseUrl: "https://ai-gateway.vercel.sh/v1/chat/completions",
     thinkingFormat: "openai",
     retry: {
-      "429": 2,
+      "429": 0,
     },
     usage: {
       url: "https://ai-gateway.vercel.sh/v1/credits",

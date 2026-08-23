@@ -238,6 +238,12 @@ export async function checkAndRefreshToken(provider, credentials, options = {}) 
     });
 
     const newCreds = await _refreshProviderCredentials(provider, creds, log);
+    if (newCreds?.error && /unrecoverable|reused|invalid_grant|invalid_request/.test(newCreds.error)) {
+      log.warn("TOKEN_REFRESH", "Unrecoverable refresh detected during proactive check", {
+        provider, connectionId: creds.connectionId, error: newCreds.error,
+      });
+      return { ...creds, _unrecoverableRefresh: true };
+    }
     if (newCreds?.accessToken || newCreds?.apiKey || newCreds?.copilotToken) {
       const mergedCreds = {
         ...newCreds,

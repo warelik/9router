@@ -170,6 +170,12 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
 
     const refreshedCredentials = await checkAndRefreshToken(providerId, credentials);
 
+    if (refreshedCredentials?._unrecoverableRefresh) {
+      await markAccountUnavailable(credentials.connectionId, 401, "unrecoverable credential refresh", providerId);
+      excludeConnectionIds.add(credentials.connectionId);
+      continue;
+    }
+
     const result = await handleSearchCore({
       body: coreBody,
       provider: resolvedProvider,

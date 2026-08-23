@@ -111,6 +111,8 @@ export async function refreshAccessToken(provider, refreshToken, credentials, lo
 
     if (!response.ok) {
       const errorText = await response.text();
+      const unrecoverable = buildUnrecoverableRefreshResult(provider, errorText, response.status, log);
+      if (unrecoverable) return unrecoverable;
       log?.error?.("TOKEN_REFRESH", `Failed to refresh token for ${provider}`, {
         status: response.status,
         error: errorText,
@@ -146,7 +148,6 @@ export async function refreshAccessToken(provider, refreshToken, credentials, lo
 export async function refreshKimiToken(refreshToken, credentials, log) {
   return refreshAccessToken("kimi", refreshToken, credentials, log);
 }
-
 // Claude OAuth: JSON body, client_id only. Delegate to refreshAccessToken("claude", ...).
 export async function refreshClaudeOAuthToken(refreshToken, log) {
   return refreshAccessToken("claude", refreshToken, {}, log);
@@ -172,6 +173,8 @@ export async function refreshGoogleToken(refreshToken, clientId, clientSecret, l
 
     if (!response.ok) {
       const errorText = await response.text();
+      const unrecoverable = buildUnrecoverableRefreshResult("Google", errorText, response.status, log);
+      if (unrecoverable) return unrecoverable;
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Google token", { status: response.status, error: errorText });
       return null;
     }
@@ -205,6 +208,16 @@ export function classifyOAuthRefreshError(errorText = "", status = 0) {
   ].some((marker) => combined.includes(marker));
 
   return { status, code, description, permanent };
+}
+
+function buildUnrecoverableRefreshResult(label, errorText, status, log) {
+  const failure = classifyOAuthRefreshError(errorText, status);
+  if (!failure.permanent) return null;
+  log?.error?.("TOKEN_REFRESH", `${label} refresh token is invalid. Re-auth required.`, {
+    status,
+    code: failure.code,
+  });
+  return { error: "unrecoverable_refresh_error", code: failure.code, status };
 }
 
 export async function refreshCodexToken(refreshToken, log) {
@@ -304,6 +317,8 @@ export async function refreshKiroToken(refreshToken, providerSpecificData, log, 
 
     if (!response.ok) {
       const errorText = await response.text();
+      const unrecoverable = buildUnrecoverableRefreshResult("Kiro external_idp", errorText, response.status, log);
+      if (unrecoverable) return unrecoverable;
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Kiro external_idp token", {
         status: response.status,
         error: errorText,
@@ -349,6 +364,8 @@ export async function refreshKiroToken(refreshToken, providerSpecificData, log, 
 
     if (!response.ok) {
       const errorText = await response.text();
+      const unrecoverable = buildUnrecoverableRefreshResult("Kiro AWS", errorText, response.status, log);
+      if (unrecoverable) return unrecoverable;
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Kiro AWS token", {
         status: response.status,
         error: errorText,
@@ -385,6 +402,8 @@ export async function refreshKiroToken(refreshToken, providerSpecificData, log, 
 
   if (!response.ok) {
     const errorText = await response.text();
+    const unrecoverable = buildUnrecoverableRefreshResult("Kiro social", errorText, response.status, log);
+    if (unrecoverable) return unrecoverable;
     log?.error?.("TOKEN_REFRESH", "Failed to refresh Kiro social token", {
       status: response.status,
       error: errorText,
@@ -410,13 +429,11 @@ export async function refreshKiroToken(refreshToken, providerSpecificData, log, 
 
 // iFlow: Basic Auth + client_id+client_secret in body. Delegate to refreshAccessToken("iflow", ...).
 export async function refreshIflowToken(refreshToken, log) {
-  return refreshAccessToken("iflow", refreshToken, {}, log);
-}
+  return refreshAccessToken("iflow", refreshToken, {}, log);}
 
 // GitHub: optional client_secret. Delegate to refreshAccessToken("github", ...).
 export async function refreshGitHubToken(refreshToken, log) {
-  return refreshAccessToken("github", refreshToken, {}, log);
-}
+  return refreshAccessToken("github", refreshToken, {}, log);}
 
 export async function refreshCopilotToken(githubAccessToken, log) {
   if (!githubAccessToken) return null;
@@ -435,6 +452,8 @@ export async function refreshCopilotToken(githubAccessToken, log) {
 
     if (!response.ok) {
       const errorText = await response.text();
+      const unrecoverable = buildUnrecoverableRefreshResult("Copilot", errorText, response.status, log);
+      if (unrecoverable) return unrecoverable;
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Copilot token", {
         status: response.status,
         error: errorText
@@ -486,6 +505,8 @@ export async function refreshCodebuddyToken(refreshToken, log) {
 
     if (!response.ok) {
       const errorText = await response.text();
+      const unrecoverable = buildUnrecoverableRefreshResult("CodeBuddy", errorText, response.status, log);
+      if (unrecoverable) return unrecoverable;
       log?.error?.("TOKEN_REFRESH", "Failed to refresh CodeBuddy token", {
         status: response.status,
         error: errorText,
@@ -495,6 +516,8 @@ export async function refreshCodebuddyToken(refreshToken, log) {
 
     const data = await response.json();
     if (data.code !== 0 || !data.data?.accessToken) {
+      const unrecoverable = buildUnrecoverableRefreshResult("CodeBuddy", JSON.stringify(data), response.status, log);
+      if (unrecoverable) return unrecoverable;
       log?.error?.("TOKEN_REFRESH", "CodeBuddy token refresh returned no token", {
         code: data.code,
         msg: data.msg,

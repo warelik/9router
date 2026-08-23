@@ -180,6 +180,12 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
 
     const refreshedCredentials = await checkAndRefreshToken(providerId, credentials);
 
+    if (refreshedCredentials?._unrecoverableRefresh) {
+      await markAccountUnavailable(credentials.connectionId, 401, "unrecoverable credential refresh", providerId);
+      excludeConnectionIds.add(credentials.connectionId);
+      continue;
+    }
+
     const result = await handleFetchCore({
       url: targetUrl,
       format,

@@ -30,21 +30,30 @@ export const DEFAULT_ERROR_MESSAGES = {
 
 // Exponential backoff config for rate limits
 export const BACKOFF_CONFIG = {
-  base: 2000,
-  max: 5 * 60 * 1000,
+  base: 400,
+  max: 60 * 1000,
   maxLevel: 15
 };
 
+// OAuth refresh retry policy. Chat/combo paths use the fast-switch values so
+// permanent credential failures do not block provider fallback behind sleeps.
+export const TOKEN_REFRESH_RETRY_CONFIG = {
+  defaultMaxRetries: 3,
+  defaultRetryDelayMs: 1000,
+  fastSwitchMaxRetries: 1,
+  fastSwitchRetryDelayMs: 0,
+};
+
 // Default cooldown for transient/unknown errors
-export const TRANSIENT_COOLDOWN_MS = 30 * 1000;
+export const TRANSIENT_COOLDOWN_MS = 6 * 1000;
 
 // Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h)
-export const MAX_RATE_LIMIT_COOLDOWN_MS = 30 * 60 * 1000;
+export const MAX_RATE_LIMIT_COOLDOWN_MS = 6 * 60 * 1000;
 
 // Cooldown durations (ms)
 const COOLDOWN = {
-  long: 2 * 60 * 1000,
-  short: 5 * 1000,
+  long: 24 * 1000,
+  short: 1000,
 };
 
 /**

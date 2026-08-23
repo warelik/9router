@@ -107,6 +107,12 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
 
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
 
+    if (refreshedCredentials?._unrecoverableRefresh) {
+      await markAccountUnavailable(credentials.connectionId, 401, "unrecoverable credential refresh", provider, model);
+      excludeConnectionIds.add(credentials.connectionId);
+      continue;
+    }
+
     const result = await handleImageGenerationCore({
       body,
       modelInfo: { provider, model },

@@ -245,6 +245,13 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Account selection shown in the unified "▶" line (acc:...)
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
+    if (refreshedCredentials?._unrecoverableRefresh) {
+      await markAccountUnavailable(credentials.connectionId, HTTP_STATUS.UNAUTHORIZED, "unrecoverable credential refresh", provider, model);
+      excludeConnectionIds.add(credentials.connectionId);
+      lastStatus = HTTP_STATUS.UNAUTHORIZED;
+      lastError = "unrecoverable credential refresh";
+      continue;
+    }
 
     // Ensure real project ID is available for providers that need it (P0 fix: cold miss)
     if ((provider === "antigravity" || provider === "gemini-cli") && !refreshedCredentials.projectId) {
