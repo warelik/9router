@@ -12,6 +12,10 @@ import Button from "./Button";
 import { ConfirmModal } from "./Modal";
 import NineRemotePromoModal from "./NineRemotePromoModal";
 import { useBlabsMode } from "@/lib/blabs/BlabsModeContext";
+import {
+  selectSidebarNav,
+  shouldRestrictToShowroom,
+} from "@/lib/blabs/sidebarDemoLock";
 
 // const VISIBLE_MEDIA_KINDS = ["embedding", "image", "imageToText", "tts", "stt", "webSearch", "webFetch", "video", "music"];
 const VISIBLE_MEDIA_KINDS = ["embedding", "image", "video", "tts", "stt"];
@@ -41,8 +45,10 @@ const systemItems = [
 ];
 
 export default function Sidebar({ onClose }) {
-  const { rebrand, brand } = useBlabsMode();
+  const { rebrand, brand, demoLock } = useBlabsMode();
   const pathname = usePathname();
+  const [statusPhase, setStatusPhase] = useState("loading");
+  const [role, setRole] = useState(null);
   const [mediaOpen, setMediaOpen] = useState(false);
   const [showRemoteModal, setShowRemoteModal] = useState(false);
   const [isDisconnected, setIsDisconnected] = useState(false);
@@ -56,11 +62,33 @@ export default function Sidebar({ onClose }) {
   const INSTALL_CMD = UPDATER_CONFIG.installCmdLatest;
 
   useEffect(() => {
+    const controller = new AbortController();
+    fetch("/api/auth/status", { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error("status");
+        return response.json();
+      })
+      .then((status) => {
+        setRole(status.role === "admin" || status.role === "demo" ? status.role : null);
+        setStatusPhase("ready");
+      })
+      .catch((error) => {
+        if (error.name !== "AbortError") setStatusPhase("error");
+      });
+    return () => controller.abort();
+  }, []);
+  const restrictToShowroom =
+    shouldRestrictToShowroom(demoLock, statusPhase, role);
+  const visibleNav =
+    selectSidebarNav(navItems, demoLock, statusPhase, role);
+
+  useEffect(() => {
+    if (demoLock && !(statusPhase === "ready" && role === "admin")) return;
     fetch("/api/settings")
       .then(res => res.json())
       .then(data => { if (data.enableTranslator) setEnableTranslator(true); })
       .catch(() => {});
-  }, []);
+  }, [demoLock, statusPhase, role]);
 
   // Lazy check for new npm version on mount
   useEffect(() => {
@@ -161,7 +189,7 @@ export default function Sidebar({ onClose }) {
 
         {/* Navigation */}
         <nav className="flex-1 px-4 py-2 space-y-0.5 overflow-y-auto custom-scrollbar">
-          {navItems.map((item) => (
+          {visibleNav.map((item) => (
             <Link
               key={item.href}
               href={item.href}
@@ -185,6 +213,8 @@ export default function Sidebar({ onClose }) {
             </Link>
           ))}
 
+          {!restrictToShowroom && (
+            <>
           {/* System section */}
           <div className="pt-3 mt-2 space-y-0.5">
             <p className="px-4 text-xs font-semibold text-text-muted/60 uppercase tracking-wider mb-2">
@@ -349,6 +379,8 @@ export default function Sidebar({ onClose }) {
               <span className="text-[13px] font-medium">Settings</span>
             </Link>
           </div>
+            </>
+          )}
         </nav>
 
       </aside>

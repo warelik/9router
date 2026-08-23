@@ -5,7 +5,7 @@ import { Card, Button, Input } from "@/shared/components";
 import { useBlabsMode } from "@/lib/blabs/BlabsModeContext";
 
 export default function LoginPage() {
-  const { rebrand, brand } = useBlabsMode();
+  const { rebrand, brand, demoLock } = useBlabsMode();
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [resetHint, setResetHint] = useState("");
@@ -146,6 +146,12 @@ export default function LoginPage() {
         <div className="text-center">
           <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
           <p className="text-text-muted mt-4">Loading...</p>
+          {demoLock ? (
+            <p className="text-xs text-text-muted mt-2">
+              {/* brandifyText: D003 title/CLI brand lines untouched */}
+              Demo access: use the demo password
+            </p>
+          ) : null}
         </div>
       </div>
     );
@@ -166,6 +172,13 @@ export default function LoginPage() {
               : "Enter your password to access the dashboard"}
           </p>
         </div>
+
+        {demoLock ? (
+          <p className="text-xs text-center text-text-muted mb-4">
+            {/* brandifyText: D003 title/CLI brand lines untouched */}
+            Demo access: use the demo password
+          </p>
+        ) : null}
 
         <Card>
           {mustChange ? (
