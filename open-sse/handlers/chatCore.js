@@ -1,4 +1,5 @@
 import { detectFormat, getTargetFormat, resolveTransport } from "../services/provider.js";
+import crypto from "crypto";
 import { translateRequest } from "../translator/index.js";
 import { applyThinking, extractThinking, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
 import { FORMATS } from "../translator/formats.js";
@@ -20,6 +21,12 @@ import { handleForcedSSEToJson } from "./chatCore/sseToJsonHandler.js";
 import { handleNonStreamingResponse } from "./chatCore/nonStreamingHandler.js";
 import { handleStreamingResponse, buildOnStreamComplete } from "./chatCore/streamingHandler.js";
 import { detectClientTool, isNativePassthrough } from "../utils/clientDetector.js";
+import { deriveContinuityScopeId, canonicalizeIncomingHistory, analyzeContinuityHistory, describeLastCompletedPair, describeAllEvents, describeAllPairs, describeToolLinkage } from "../utils/continuityCanonicalizer.js";
+import { resolveContinuityState, commitContinuityFromClientOutput } from "../utils/continuityStore.js";
+import { budgetThoughts, CONTINUITY_MAX_PROMPT_CHARS } from "../utils/continuityThoughtCollector.js";
+import { describeThinkingParams, logContinuityRequest, logContinuityDispatch, logContinuityInject } from "../utils/continuityLog.js";
+import { collectProviderResponseThoughts, finalizeContinuityJsonResult } from "../utils/continuityJsonResponse.js";
+import { injectContinuity } from "../rtk/continuity.js";
 import { dedupeTools } from "../utils/toolDeduper.js";
 import { injectCaveman } from "../rtk/caveman.js";
 import { injectPonytail } from "../rtk/ponytail.js";
@@ -60,7 +67,7 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, continuityEnabled, continuityCount, requestLogCtx, continuityBody }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
@@ -78,6 +85,55 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Check for bypass patterns (warmup, skip, cc naming)
   const bypassResponse = handleBypassRequest(body, model, userAgent, ccFilterNaming);
   if (bypassResponse) return bypassResponse;
+
+  // Continuity identifies a dialog only from rolling client-visible request/response
+  // pair fingerprints. Canonicalize the original client history before any mutation.
+  const continuityScopeId = continuityEnabled ? deriveContinuityScopeId(apiKey) : null;
+  let continuityCtx = null;
+  if (continuityScopeId) {
+    const effectiveRequestLogCtx = requestLogCtx ?? {
+      token: crypto.randomUUID().replaceAll("-", "").slice(0, 16),
+      requestEmitted: false
+    };
+    const incomingEvents = canonicalizeIncomingHistory(continuityBody || body, sourceFormat);
+    const continuityAnalysis = analyzeContinuityHistory(incomingEvents, continuityScopeId);
+    const completedPairHashes = continuityAnalysis.pairHashes;
+    const lastPairHash = completedPairHashes[completedPairHashes.length - 1];
+    log?.debug?.("CONTINUITY", `[LOOKUP] scope=${continuityScopeId.slice(0, 6)} format=${sourceFormat} events=${incomingEvents.length} pairs=${completedPairHashes.length} lastPair=${lastPairHash ? lastPairHash.slice(0, 10) : "none"}`);
+    log?.debug?.("CONTINUITY", `[LOOKUP-PAIR] scope=${continuityScopeId.slice(0, 6)} ${describeLastCompletedPair(incomingEvents)}`);
+    log?.debug?.("CONTINUITY", `[CANONICAL-IN] scope=${continuityScopeId.slice(0, 6)} ${describeAllEvents(incomingEvents)}`);
+    log?.debug?.("CONTINUITY", `[PAIR-CHAIN] scope=${continuityScopeId.slice(0, 6)} ${describeAllPairs(incomingEvents, continuityScopeId)}`);
+    log?.debug?.("CONTINUITY", `[TOOL-LINKAGE] scope=${continuityScopeId.slice(0, 6)} ${describeToolLinkage(incomingEvents)}`);
+
+    const resolveMeta = {};
+    let resolveReason = null;
+    if (!continuityAnalysis.canResolve) {
+      resolveReason = continuityAnalysis.hasTrailingBarrier ? "barrier" : "no-pairs";
+    }
+    const resolvedState = continuityAnalysis.canResolve
+      ? resolveContinuityState({ scopeId: continuityScopeId, completedPairHashes, completedPairRecords: continuityAnalysis.postBarrierRecords, log, resultMeta: resolveMeta })
+      : null;
+    if (continuityAnalysis.canResolve && !resolvedState) {
+      resolveReason = resolveMeta.reason || "no-match";
+    }
+    continuityCtx = { scopeId: continuityScopeId, incomingEvents, resolvedState, continuityCount, log, requestLogToken: effectiveRequestLogCtx.token };
+
+    if (!effectiveRequestLogCtx.requestEmitted) {
+      effectiveRequestLogCtx.requestEmitted = true;
+      logContinuityRequest(log, {
+        token: effectiveRequestLogCtx.token,
+        scopeId: continuityScopeId,
+        sourceFormat,
+        eventsCount: incomingEvents.length,
+        pairsCount: completedPairHashes.length,
+        lastPair: lastPairHash,
+        resolvedState,
+        resolveScore: resolveMeta.score,
+        reason: resolveReason,
+        clientThinking: describeThinkingParams(body)
+      });
+    }
+  }
 
   const alias = PROVIDER_ID_TO_ALIAS[provider] || provider;
   const modelTargetFormat = getModelTargetFormat(alias, model);
@@ -141,6 +197,15 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const reqLogger = await createRequestLogger(sourceFormat, targetFormat, model);
   if (clientRawRequest) reqLogger.logClientRawRequest(clientRawRequest.endpoint, clientRawRequest.body, clientRawRequest.headers);
   reqLogger.logRawRequest(body);
+  // Streaming capture reads request-local state from reqLogger. JSON capture uses
+  // a provider Response clone, so no internal field reaches the outbound request body.
+  if (continuityEnabled) {
+    reqLogger.continuityEnabled = true;
+    reqLogger.continuityCtx = continuityCtx;
+    if (continuityCtx) {
+      continuityCtx.responseSource = (!clientRequestedStreaming && providerRequiresStreaming) || !stream ? "json" : "stream";
+    }
+  }
   log?.debug?.("FORMAT", `${sourceFormat} → ${targetFormat} | stream=${stream}`);
 
   // Native passthrough: CLI tool and provider are the same ecosystem
@@ -294,6 +359,38 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     if (pxpipeResult.body) translatedBody = pxpipeResult.body;
     if (pxpipeSummary?.applied) xf.push(`PXPIPE:${pxpipeSummary.imageCount}img`);
     try { onPxpipeEvent?.({ provider, model, ...pxpipeSummary }); } catch { /* stats must not break requests */ }
+  }
+
+  // Inject only after all lossy/compression passes, into the final provider dialect.
+  if (continuityCtx?.resolvedState) {
+    const recentThoughts = budgetThoughts(continuityCtx.resolvedState.thoughts, continuityCount, CONTINUITY_MAX_PROMPT_CHARS);
+    if (recentThoughts.length > 0) {
+      injectContinuity(translatedBody, finalFormat, recentThoughts);
+      const injectChars = recentThoughts.reduce((sum, thought) => sum + (typeof thought === "string" ? thought.length : 0), 0);
+      log?.debug?.("CONTINUITY", `[INJECT] state=${continuityCtx.resolvedState.stateId.slice(0, 4)} thoughts=${recentThoughts.length} | ${finalFormat}`);
+      logContinuityInject(log, {
+        token: continuityCtx.requestLogToken || "",
+        sourceStateId: continuityCtx.resolvedState.stateId,
+        dialogAnchor: continuityCtx.resolvedState.dialogAnchor,
+        thoughtsCount: recentThoughts.length,
+        chars: injectChars,
+        target: finalFormat
+      });
+    }
+  }
+
+  if (continuityCtx) {
+    logContinuityDispatch(log, {
+      token: continuityCtx.requestLogToken || "",
+      scopeId: continuityCtx.scopeId,
+      dialogAnchor: continuityCtx.resolvedState?.dialogAnchor,
+      isNew: !continuityCtx.resolvedState,
+      provider,
+      model: upstreamModel,
+      stream,
+      providerThinking: describeThinkingParams(translatedBody),
+      overrideMode: providerThinking?.mode || "auto"
+    });
   }
 
   if (xf.length && log?.line) log.line(reqTag, "⚙", xf.join(" · "));
@@ -455,6 +552,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     return createErrorResult(statusCode, errMsg, resetsAtMs);
   }
 
+  const continuityJsonThoughts = continuityCtx && ((!clientRequestedStreaming && providerRequiresStreaming) || !stream)
+    ? collectProviderResponseThoughts(providerResponse.clone())
+    : null;
+
   const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };
   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
@@ -462,18 +563,35 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Provider forced streaming but client wants JSON
   if (!clientRequestedStreaming && providerRequiresStreaming) {
     const result = await handleForcedSSEToJson({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, customToolNames, trackDone, appendLog });
-    if (result) { streamController.handleComplete(); return result; }
+    if (result) {
+      streamController.handleComplete();
+      return finalizeContinuityJsonResult({ result, continuityCtx, responseThoughtsPromise: continuityJsonThoughts, sourceFormat });
+    }
   }
 
   // True non-streaming response
   if (!stream) {
+    if (continuityCtx) continuityCtx.responseSource = "json";
     const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, customToolNames, trackDone, appendLog });
     streamController.handleComplete();
-    return result;
+    return finalizeContinuityJsonResult({ result, continuityCtx, responseThoughtsPromise: continuityJsonThoughts, sourceFormat });
   }
 
   // Streaming response
-  const { onStreamComplete, streamDetailId } = buildOnStreamComplete({ ...sharedCtx });
+  if (continuityCtx) continuityCtx.responseSource = "stream";
+  const { onStreamComplete: originalOnStreamComplete, streamDetailId } = buildOnStreamComplete({ ...sharedCtx });
+  const onStreamComplete = (contentObj, usage, ttftAt) => {
+    if (continuityCtx && contentObj?.continuityTerminalSeen) {
+      commitContinuityFromClientOutput({
+        continuityCtx,
+        responseThoughts: contentObj?.thinkingSegments || [],
+        clientOutputEvents: contentObj?.clientOutputEvents || []
+      });
+    } else if (continuityCtx) {
+      log?.warn?.("CONTINUITY", `[SKIP-COMMIT] req=${continuityCtx.requestLogToken} terminal=${!!contentObj?.continuityTerminalSeen} thoughts=${contentObj?.thinkingSegments?.length || 0} output=${contentObj?.clientOutputEvents?.length || 0}`);
+    }
+    return originalOnStreamComplete(contentObj, usage, ttftAt);
+  };
   return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, userAgent, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId });
 }
 

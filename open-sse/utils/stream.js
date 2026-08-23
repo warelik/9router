@@ -9,6 +9,11 @@ import { createSseDoneTracker } from "./sseDoneTracker.js";
 
 import { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER } from "./sseConstants.js";
 
+import { createClientOutputAccumulator } from "./continuityCanonicalizer.js";
+import { createStreamingThoughtAccumulator } from "./continuityThoughtCollector.js";
+import { isContinuityProtocolTerminal } from "./continuityStreamTerminal.js";
+import { stripTaggedThinking } from "./taggedThinkingNormalizer.js";
+
 export { COLORS, formatSSE };
 export { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER };
 
@@ -54,6 +59,7 @@ export function createSSEStream(options = {}) {
   } = options;
 
   let buffer = "";
+  const continuityEnabled = reqLogger?.continuityEnabled;
   let usage = null;
 
   // Per-stream decoder with stream:true to correctly handle multi-byte chars split across chunks
@@ -67,6 +73,8 @@ export function createSSEStream(options = {}) {
   let accumulatedContent = "";
   let accumulatedThinking = "";
   let ttftAt = null;
+  const continuityClientOutput = continuityEnabled ? createClientOutputAccumulator() : null;
+  const continuityThoughts = continuityEnabled ? createStreamingThoughtAccumulator() : null;
   let sseLineCount = 0;
   let sseEmittedCount = 0;
   const eventTypeCounts = {};
@@ -76,6 +84,8 @@ export function createSSEStream(options = {}) {
   let openAIResponsesTerminalSeen = false;
   let openAIResponsesDoneSent = false;
   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
+  let sawOpenAIResponsesEventFraming = false;
+  let continuityTerminalSeen = false;
 
   const passthroughDoneTracker = createSseDoneTracker();
 
@@ -99,6 +109,16 @@ export function createSSEStream(options = {}) {
           }
         }
 
+        if (trimmed.startsWith("event:")) {
+          const evt = trimmed.slice(6).trim();
+          if (mode === STREAM_MODE.PASSTHROUGH) {
+            currentOpenAIResponsesEvent = evt;
+          }
+          if (evt.startsWith("response.") || evt === "error") {
+            sawOpenAIResponsesEventFraming = true;
+          }
+        }
+
         // Capture Responses API event name to preserve framing in same-format passthrough
         if (mode === STREAM_MODE.TRANSLATE && targetFormat === FORMATS.OPENAI_RESPONSES && trimmed.startsWith("event:")) {
           currentOpenAIResponsesEvent = trimmed.slice(6).trim();
@@ -111,8 +131,16 @@ export function createSSEStream(options = {}) {
 
           let output;
           let injectedUsage = false;
+          const passthroughData = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : null;
 
-          if (trimmed.startsWith("data:") && trimmed.slice(5).trim() !== "[DONE]") {
+          if (passthroughData === "[DONE]") {
+            streamDoneSent = true;
+            if (!sawOpenAIResponsesEventFraming) {
+              continuityTerminalSeen = true;
+            }
+          }
+
+          if (trimmed.startsWith("data:") && passthroughData !== "[DONE]") {
             try {
               const parsed = JSON.parse(trimmed.slice(5).trim());
 
@@ -158,21 +186,83 @@ export function createSSEStream(options = {}) {
                   }
                 }
               }
+              const unwrapped = parsed.response || parsed;
+              const continuityEventName = currentOpenAIResponsesEvent || parsed.type;
+              if (isContinuityProtocolTerminal(parsed, {
+                eventName: continuityEventName,
+                sawOpenAIResponsesEvent: sawOpenAIResponsesEventFraming
+              }) || isContinuityProtocolTerminal(unwrapped, {
+                eventName: continuityEventName,
+                sawOpenAIResponsesEvent: sawOpenAIResponsesEventFraming
+              })) {
+                continuityTerminalSeen = true;
+              }
+              currentOpenAIResponsesEvent = null;
 
-              if (!hasValuableContent(parsed, FORMATS.OPENAI)) {
+              // Continuity capture must run BEFORE hasValuableContent filter —
+              // thought-only chunks, usage-only chunks, or finish_reason-only
+              // chunks that the filter would skip must still be accumulated,
+              // or the committed pair hash diverges from what the client replays.
+              let tagsStripped = false;
+              if (continuityEnabled) {
+                continuityThoughts?.push(parsed);
+                tagsStripped = stripTaggedThinking(parsed);
+                continuityClientOutput?.push(parsed);
+              }
+
+              if (!hasValuableContent(parsed)) {
                 continue;
               }
 
-              const delta = parsed.choices?.[0]?.delta;
-              const content = delta?.content;
-              const reasoning = delta?.reasoning_content;
-              if (content && typeof content === "string") {
-                totalContentLength += content.length;
-                accumulatedContent += content;
+              if (unwrapped.delta?.text) {
+                totalContentLength += unwrapped.delta.text.length;
+                accumulatedContent += unwrapped.delta.text;
               }
-              if (reasoning && typeof reasoning === "string") {
-                totalContentLength += reasoning.length;
-                accumulatedThinking += reasoning;
+              if (unwrapped.delta?.thinking) {
+                totalContentLength += unwrapped.delta.thinking.length;
+                accumulatedThinking += unwrapped.delta.thinking;
+              }
+              if (typeof unwrapped.delta === "string" && unwrapped.type) {
+                totalContentLength += unwrapped.delta.length;
+                if (unwrapped.type.includes("reasoning")) accumulatedThinking += unwrapped.delta;
+                else accumulatedContent += unwrapped.delta;
+              }
+              if (unwrapped.choices?.[0]?.delta?.content) {
+                totalContentLength += unwrapped.choices[0].delta.content.length;
+                accumulatedContent += unwrapped.choices[0].delta.content;
+              }
+              if (unwrapped.choices?.[0]?.delta?.reasoning_content) {
+                totalContentLength += unwrapped.choices[0].delta.reasoning_content.length;
+                accumulatedThinking += unwrapped.choices[0].delta.reasoning_content;
+              }
+              if (unwrapped.choices?.[0]?.delta?.thinking) {
+                totalContentLength += unwrapped.choices[0].delta.thinking.length;
+                accumulatedThinking += unwrapped.choices[0].delta.thinking;
+              }
+              if (unwrapped.candidates?.[0]?.content?.parts) {
+                for (const part of unwrapped.candidates[0].content.parts) {
+                  if (part.text && typeof part.text === "string") {
+                    totalContentLength += part.text.length;
+                    if (part.thought === true) accumulatedThinking += part.text;
+                    else accumulatedContent += part.text;
+                  }
+                }
+              }
+              if (unwrapped.message?.content) {
+                totalContentLength += unwrapped.message.content.length;
+                accumulatedContent += unwrapped.message.content;
+              }
+              if (unwrapped.message?.thinking) {
+                totalContentLength += unwrapped.message.thinking.length;
+                accumulatedThinking += unwrapped.message.thinking;
+              }
+              if (unwrapped.type === "text-delta" && typeof unwrapped.text === "string") {
+                totalContentLength += unwrapped.text.length;
+                accumulatedContent += unwrapped.text;
+              }
+              if (unwrapped.type === "reasoning-delta" && typeof unwrapped.text === "string") {
+                totalContentLength += unwrapped.text.length;
+                accumulatedThinking += unwrapped.text;
               }
 
               const extracted = extractUsage(parsed);
@@ -184,16 +274,20 @@ export function createSSEStream(options = {}) {
               if (isFinishChunk && !hasValidUsage(parsed.usage)) {
                 const estimated = estimateUsage(body, totalContentLength, FORMATS.OPENAI);
                 parsed.usage = filterUsageForFormat(estimated, FORMATS.OPENAI);
-                output = `data: ${JSON.stringify(parsed)}\n`;
+                const nl = line.endsWith("\r") ? "\r\n" : "\n";
+                output = `data: ${JSON.stringify(parsed)}${nl}`;
                 usage = estimated;
                 injectedUsage = true;
               } else if (isFinishChunk && usage) {
                 const buffered = addBufferToUsage(usage);
                 parsed.usage = filterUsageForFormat(buffered, FORMATS.OPENAI);
-                output = `data: ${JSON.stringify(parsed)}\n`;
+                const nl = line.endsWith("\r") ? "\r\n" : "\n";
+                output = `data: ${JSON.stringify(parsed)}${nl}`;
+                usage = buffered;
                 injectedUsage = true;
-              } else if (idFixed || fieldsInjected) {
-                output = `data: ${JSON.stringify(parsed)}\n`;
+              } else if (idFixed || fieldsInjected || tagsStripped) {
+                const nl = line.endsWith("\r") ? "\r\n" : "\n";
+                output = `data: ${JSON.stringify(parsed)}${nl}`;
                 injectedUsage = true;
               }
               if (toolNameDecloaked && !injectedUsage) {
@@ -227,6 +321,11 @@ export function createSSEStream(options = {}) {
         const parsed = parseSSELine(trimmed, targetFormat);
         if (!parsed) continue;
 
+        if (continuityEnabled) {
+          continuityThoughts?.push(parsed);
+          stripTaggedThinking(parsed);
+        }
+
         // Responses API same-format passthrough: preserve event framing + track terminal state
         const isOpenAIResponsesStream = targetFormat === FORMATS.OPENAI_RESPONSES;
         const keepsOpenAIResponsesFormat = isOpenAIResponsesStream && sourceFormat === FORMATS.OPENAI_RESPONSES;
@@ -236,6 +335,13 @@ export function createSSEStream(options = {}) {
 
         if (isOpenAIResponsesStream && isOpenAIResponsesTerminalEvent(openAIResponsesEventName, parsed)) {
           openAIResponsesTerminalSeen = true;
+        }
+        if (isContinuityProtocolTerminal(parsed, {
+          targetFormat,
+          eventName: openAIResponsesEventName,
+          sawOpenAIResponsesEvent: sawOpenAIResponsesEventFraming
+        })) {
+          continuityTerminalSeen = true;
         }
 
         // For Ollama: done=true is the final chunk with finish_reason/usage, must translate
@@ -281,6 +387,10 @@ export function createSSEStream(options = {}) {
           totalContentLength += parsed.choices[0].delta.reasoning_content.length;
           accumulatedThinking += parsed.choices[0].delta.reasoning_content;
         }
+        if (parsed.choices?.[0]?.delta?.thinking) {
+          totalContentLength += parsed.choices[0].delta.thinking.length;
+          accumulatedThinking += parsed.choices[0].delta.thinking;
+        }
         
         // Gemini format
         if (parsed.candidates?.[0]?.content?.parts) {
@@ -303,6 +413,7 @@ export function createSSEStream(options = {}) {
 
         // Responses same-format passthrough: re-emit with original event framing
         if (keepsOpenAIResponsesFormat && openAIResponsesEventName) {
+          if (continuityEnabled) continuityClientOutput?.push(parsed);
           const output = formatSSE({ event: openAIResponsesEventName, data: parsed }, sourceFormat);
           reqLogger?.appendConvertedChunk?.(output);
           controller.enqueue(sharedEncoder.encode(output));
@@ -342,6 +453,11 @@ export function createSSEStream(options = {}) {
               // Add buffer and filter usage for client (but keep original in state.usage for logging)
               const buffered = addBufferToUsage(state.usage);
               item.usage = filterUsageForFormat(buffered, sourceFormat);
+            }
+
+            if (continuityEnabled) {
+              stripTaggedThinking(item);
+              continuityClientOutput?.push(item);
             }
 
             const output = formatSSE(item, sourceFormat);
@@ -396,7 +512,10 @@ export function createSSEStream(options = {}) {
           if (onStreamComplete) {
             onStreamComplete({
               content: accumulatedContent,
-              thinking: accumulatedThinking
+              thinking: accumulatedThinking,
+              thinkingSegments: continuityThoughts ? continuityThoughts.finalize() : [],
+              clientOutputEvents: continuityClientOutput ? continuityClientOutput.finalize() : [],
+              continuityTerminalSeen
             }, usage, ttftAt);
           }
           return;
@@ -404,7 +523,11 @@ export function createSSEStream(options = {}) {
 
         if (buffer.trim()) {
           const parsed = parseSSELine(buffer.trim());
+          if (isContinuityProtocolTerminal(parsed, { targetFormat, sawOpenAIResponsesEvent: sawOpenAIResponsesEventFraming })) {
+            continuityTerminalSeen = true;
+          }
           if (parsed && !parsed.done) {
+            if (continuityEnabled) continuityThoughts?.push(parsed);
             const translated = translateResponse(targetFormat, sourceFormat, parsed, state);
 
             if (translated?._openaiIntermediate) {
@@ -417,6 +540,10 @@ export function createSSEStream(options = {}) {
             if (translated?.length > 0) {
               for (const item of translated) {
                 if (item === null || item === undefined) continue;
+                if (continuityEnabled) {
+                  stripTaggedThinking(item);
+                  continuityClientOutput?.push(item);
+                }
                 const output = formatSSE(item, sourceFormat);
                 reqLogger?.appendConvertedChunk?.(output);
                 controller.enqueue(sharedEncoder.encode(output));
@@ -437,6 +564,10 @@ export function createSSEStream(options = {}) {
         if (flushed?.length > 0) {
           for (const item of flushed) {
             if (item === null || item === undefined) continue;
+            if (continuityEnabled) {
+              stripTaggedThinking(item);
+              continuityClientOutput?.push(item);
+            }
             const output = formatSSE(item, sourceFormat);
             reqLogger?.appendConvertedChunk?.(output);
             controller.enqueue(sharedEncoder.encode(output));
@@ -473,7 +604,10 @@ export function createSSEStream(options = {}) {
         if (onStreamComplete) {
           onStreamComplete({
             content: accumulatedContent,
-            thinking: accumulatedThinking
+            thinking: accumulatedThinking,
+            thinkingSegments: continuityThoughts ? continuityThoughts.finalize() : [],
+            clientOutputEvents: continuityClientOutput ? continuityClientOutput.finalize() : [],
+            continuityTerminalSeen
           }, state?.usage, ttftAt);
         }
       } catch (error) {

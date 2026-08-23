@@ -44,6 +44,8 @@ export default function TokenSaverClient() {
   const [cavemanLevel, setCavemanLevel] = useState("full");
   const [ponytailEnabled, setPonytailEnabled] = useState(false);
   const [ponytailLevel, setPonytailLevel] = useState("full");
+  const [continuityEnabled, setContinuityEnabled] = useState(false);
+  const [continuityCount, setContinuityCount] = useState(7);
   const [pxpipeEnabled, setPxpipeEnabled] = useState(false);
   const [pxpipeMinChars, setPxpipeMinChars] = useState(25000);
   const [pxpipeStatus, setPxpipeStatus] = useState({
@@ -353,6 +355,19 @@ export default function TokenSaverClient() {
     patchSetting({ ponytailLevel: level });
   };
 
+  const handleContinuityEnabled = (value) => {
+    setContinuityEnabled(value);
+    patchSetting({ continuityEnabled: value });
+  };
+
+  const handleContinuityCount = (event) => {
+    let value = parseInt(event.target.value, 10);
+    if (Number.isNaN(value)) value = 1;
+    value = Math.min(100, Math.max(1, value));
+    setContinuityCount(value);
+    patchSetting({ continuityCount: value });
+  };
+
   const refreshPxpipeStatus = useCallback(async () => {
     setPxpipeStatus((s) => ({ ...s, loading: true }));
     try {
@@ -421,6 +436,8 @@ export default function TokenSaverClient() {
           setCavemanLevel(data.cavemanLevel || "full");
           setPonytailEnabled(!!data.ponytailEnabled);
           setPonytailLevel(data.ponytailLevel || "full");
+          setContinuityEnabled(!!data.continuityEnabled);
+          setContinuityCount(parseInt(data.continuityCount, 10) || 7);
           setPxpipeEnabled(!!data.pxpipeEnabled);
           if (typeof data.pxpipeMinChars === "number") setPxpipeMinChars(data.pxpipeMinChars);
           refreshHeadroomStatus();
@@ -729,6 +746,42 @@ export default function TokenSaverClient() {
             <Toggle
               checked={ponytailEnabled}
               onChange={() => handlePonytailEnabled(!ponytailEnabled)}
+            />
+          </div>
+        </div>
+        {/* Continuity is experimental and opt-in. */}
+        <div className="flex items-center justify-between pt-4 mt-4 border-t border-border gap-4 flex-wrap">
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">
+              Continuity{" "}
+              <span className="text-xs font-normal text-primary">(Experimental)</span>
+            </p>
+            <p className="text-sm text-text-muted">
+              Replay recent reasoning checkpoints for cross-model continuation
+            </p>
+          </div>
+          <div className="flex items-center gap-3 shrink-0">
+            {continuityEnabled && (
+              <div className="flex flex-col items-end gap-1">
+                <div className="flex items-center gap-1 bg-surface-2 px-2 py-1 rounded border border-border">
+                  <span className="text-xs text-text-muted">Count:</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={continuityCount}
+                    onChange={handleContinuityCount}
+                    className="w-12 px-1 text-xs bg-transparent border-none focus:outline-none text-text"
+                  />
+                </div>
+                <p className="text-xs text-primary">
+                  Replaying up to {continuityCount} reasoning checkpoints.
+                </p>
+              </div>
+            )}
+            <Toggle
+              checked={continuityEnabled}
+              onChange={() => handleContinuityEnabled(!continuityEnabled)}
             />
           </div>
         </div>
