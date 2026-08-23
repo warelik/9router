@@ -11,6 +11,7 @@ import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import Button from "./Button";
 import { ConfirmModal } from "./Modal";
 import NineRemotePromoModal from "./NineRemotePromoModal";
+import { useBlabsMode } from "@/lib/blabs/BlabsModeContext";
 
 // const VISIBLE_MEDIA_KINDS = ["embedding", "image", "imageToText", "tts", "stt", "webSearch", "webFetch", "video", "music"];
 const VISIBLE_MEDIA_KINDS = ["embedding", "image", "video", "tts", "stt"];
@@ -40,6 +41,7 @@ const systemItems = [
 ];
 
 export default function Sidebar({ onClose }) {
+  const { rebrand, brand } = useBlabsMode();
   const pathname = usePathname();
   const [mediaOpen, setMediaOpen] = useState(false);
   const [showRemoteModal, setShowRemoteModal] = useState(false);
@@ -62,11 +64,12 @@ export default function Sidebar({ onClose }) {
 
   // Lazy check for new npm version on mount
   useEffect(() => {
+    if (rebrand) { setUpdateInfo(null); return; }
     fetch("/api/version")
       .then(res => res.json())
       .then(data => { if (data.hasUpdate) setUpdateInfo(data); })
       .catch(() => {});
-  }, []);
+  }, [rebrand]);
 
   const isActive = (href) => {
     if (href === "/dashboard/endpoint") {
@@ -125,12 +128,12 @@ export default function Sidebar({ onClose }) {
             </div>
             <div className="flex flex-col">
               <h1 className="text-lg font-semibold tracking-tight text-text-main">
-                {APP_CONFIG.name}
+                {brand.productName}
               </h1>
               <span className="text-xs text-text-muted">v{APP_CONFIG.version}</span>
             </div>
           </Link>
-          {updateInfo && (
+          {updateInfo && !rebrand && (
             <div className="flex flex-col gap-1.5 rounded p-1 -m-1">
               <span className="text-xs font-semibold text-green-600 dark:text-amber-500">
                 ↑ New version available: v{updateInfo.latestVersion}
@@ -292,6 +295,7 @@ export default function Sidebar({ onClose }) {
             })}
 
             {/* Remote */}
+            {!rebrand && (
             <button
               onClick={() => setShowRemoteModal(true)}
               className={cn(
@@ -304,6 +308,7 @@ export default function Sidebar({ onClose }) {
               </span>
               <span className="text-[13px] font-medium">9Remote</span>
             </button>
+            )}
 
             {/* 9English */}
             <a
@@ -349,14 +354,16 @@ export default function Sidebar({ onClose }) {
       </aside>
 
       {/* Remote Promo Modal */}
+      {!rebrand && (
       <NineRemotePromoModal isOpen={showRemoteModal} onClose={() => setShowRemoteModal(false)} />
+      )}
 
       {/* Update Confirmation Modal */}
       <ConfirmModal
         isOpen={showUpdateModal}
         onClose={() => setShowUpdateModal(false)}
         onConfirm={handleUpdate}
-        title="Update 9Router"
+        title={`Update ${brand.shortName}`}
         message={`Show install command for v${updateInfo?.latestVersion || ""}? You can copy it and shutdown to install manually.`}
         confirmText="Show Command"
         cancelText="Cancel"
@@ -399,6 +406,7 @@ Sidebar.propTypes = {
 };
 
 function ManualUpdatePanel({ latestVersion, installCmd, copied, onCopyAndShutdown, onCancel, countdown, isDisconnected }) {
+  const { brand } = useBlabsMode();
   const isCountingDown = countdown > 0;
   return (
     <div className="w-full max-w-lg rounded-xl bg-neutral-900/95 border border-white/10 p-6 text-white">
@@ -426,7 +434,7 @@ function ManualUpdatePanel({ latestVersion, installCmd, copied, onCopyAndShutdow
       <ol className="text-xs text-white/70 space-y-1 list-decimal list-inside mb-4">
         <li>Click <strong>Copy & Shutdown</strong> below.</li>
         <li>Paste the command into your terminal and press Enter.</li>
-        <li>Run <code className="px-1 rounded bg-white/10 text-green-400">9router</code> again after install.</li>
+        <li>Run <code className="px-1 rounded bg-white/10 text-green-400">{brand.shortName}</code> again after install.</li>
       </ol>
 
       {isDisconnected ? (

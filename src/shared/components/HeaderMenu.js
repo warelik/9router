@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import PropTypes from "prop-types";
 import { useTheme } from "@/shared/hooks/useTheme";
 import ChangelogModal from "./ChangelogModal";
+import { useBlabsMode } from "@/lib/blabs/BlabsModeContext";
 import { ConfirmModal } from "./Modal";
 
 function MenuItem({ icon, label, onClick, trailing, danger }) {
@@ -34,6 +35,7 @@ MenuItem.propTypes = {
 };
 
 export default function HeaderMenu({ onLogout }) {
+  const { rebrand } = useBlabsMode();
   const [isOpen, setIsOpen] = useState(false);
   const [changelogOpen, setChangelogOpen] = useState(false);
   const [shutdownOpen, setShutdownOpen] = useState(false);
@@ -79,11 +81,13 @@ export default function HeaderMenu({ onLogout }) {
 
         {isOpen && (
           <div className="absolute right-0 top-full mt-2 w-60 bg-surface border border-black/10 dark:border-white/10 rounded-xl shadow-2xl z-50 animate-in fade-in zoom-in-95 duration-150 overflow-hidden py-1">
+            {!rebrand && (
             <MenuItem
               icon="history"
               label="Change Log"
               onClick={() => { close(); setChangelogOpen(true); }}
             />
+            )}
             <MenuItem
               icon={isDark ? "light_mode" : "dark_mode"}
               label="Theme"
@@ -105,7 +109,9 @@ export default function HeaderMenu({ onLogout }) {
         )}
       </div>
 
+      {!rebrand && (
       <ChangelogModal isOpen={changelogOpen} onClose={() => setChangelogOpen(false)} />
+      )}
       <ConfirmModal
         isOpen={shutdownOpen}
         onClose={() => setShutdownOpen(false)}

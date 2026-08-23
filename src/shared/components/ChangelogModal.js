@@ -5,17 +5,19 @@ import { createPortal } from "react-dom";
 import PropTypes from "prop-types";
 import { marked } from "marked";
 import { GITHUB_CONFIG } from "@/shared/constants/config";
+import { useBlabsMode } from "@/lib/blabs/BlabsModeContext";
 
 marked.setOptions({ gfm: true, breaks: true });
 
 export default function ChangelogModal({ isOpen, onClose }) {
+  const { rebrand } = useBlabsMode();
   const [html, setHtml] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const modalRef = useRef(null);
 
   useEffect(() => {
-    if (!isOpen || html) return;
+    if (rebrand || !isOpen || html) return;
     setLoading(true);
     setError("");
     fetch(GITHUB_CONFIG.changelogUrl)
@@ -26,7 +28,7 @@ export default function ChangelogModal({ isOpen, onClose }) {
       .then((md) => setHtml(marked.parse(md)))
       .catch((err) => setError(err.message || "Failed to load"))
       .finally(() => setLoading(false));
-  }, [isOpen, html]);
+  }, [rebrand, isOpen, html]);
 
   useEffect(() => {
     const handleClickOutside = (e) => {
@@ -34,13 +36,13 @@ export default function ChangelogModal({ isOpen, onClose }) {
         onClose();
       }
     };
-    if (isOpen) {
+    if (!rebrand && isOpen) {
       document.addEventListener("mousedown", handleClickOutside);
       return () => document.removeEventListener("mousedown", handleClickOutside);
     }
-  }, [isOpen, onClose]);
+  }, [rebrand, isOpen, onClose]);
 
-  if (!isOpen || typeof document === "undefined") return null;
+  if (rebrand || !isOpen || typeof document === "undefined") return null;
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
