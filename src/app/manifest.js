@@ -1,26 +1,32 @@
-export default function manifest() {
+import { connection } from "next/server";
+import { readBlabsFlags } from "@/lib/blabs/flags";
+import { getDisplayBrand } from "@/lib/blabs/brandConfig";
+
+export default async function manifest() {
+  await connection();
+  const brand = getDisplayBrand(readBlabsFlags());
   return {
-    name: '9Router - AI Infrastructure Management',
-    short_name: '9Router',
-    description: 'One endpoint for all your AI providers. Manage keys, monitor usage, and scale effortlessly.',
+    name: brand.htmlTitle,
+    short_name: brand.shortName,
+    description: brand.description,
     start_url: '/',
     display: 'standalone',
-    background_color: '#0a0a0a',
-    theme_color: '#0a0a0a',
+    background_color: brand.manifestBackground,
+    theme_color: brand.themeColor,
     orientation: 'portrait-primary',
     icons: [
       {
-        src: '/icons/icon-192.svg',
+        src: brand.icon192Href,
         sizes: '192x192',
         type: 'image/svg+xml',
       },
       {
-        src: '/icons/icon-512.svg',
+        src: brand.icon512Href,
         sizes: '512x512',
         type: 'image/svg+xml',
       },
       {
-        src: '/icons/icon-512.svg',
+        src: brand.icon512Href,
         sizes: '512x512',
         type: 'image/svg+xml',
         purpose: 'maskable',

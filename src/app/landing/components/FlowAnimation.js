@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import ProviderIcon from "@/shared/components/ProviderIcon";
+import { useBlabsMode } from "@/lib/blabs/BlabsModeContext";
 
 const CLI_TOOLS = [
   { id: "claude", name: "Claude Code", image: "/providers/claude.png" },
@@ -37,6 +38,7 @@ const PROVIDERS = [
 ];
 
 export default function FlowAnimation() {
+  const { brand } = useBlabsMode();
   const [activeFlow, setActiveFlow] = useState(0);
 
   useEffect(() => {
@@ -54,7 +56,7 @@ export default function FlowAnimation() {
           hub
         </span>
         <span className="text-xs font-bold text-white tracking-widest uppercase">
-          9Router
+          {brand.shortName}
         </span>
         <div className="absolute inset-0 rounded-full border border-[#f97815]/30 animate-ping opacity-20"></div>
       </div>

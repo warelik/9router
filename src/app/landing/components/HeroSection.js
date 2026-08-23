@@ -1,6 +1,9 @@
 "use client";
 
+import { useBlabsMode } from "@/lib/blabs/BlabsModeContext";
+
 export default function HeroSection() {
+  const { rebrand } = useBlabsMode();
   return (
     <section className="relative pt-32 pb-20 px-6 min-h-[90vh] flex flex-col items-center justify-center overflow-hidden">
       {/* Glow effect */}
@@ -29,7 +32,8 @@ export default function HeroSection() {
           <button className="h-12 px-8 rounded-lg bg-[#f97815] hover:bg-[#e0650a] text-[#181411] text-base font-bold transition-all shadow-[0_0_15px_rgba(249,120,21,0.4)] flex items-center gap-2">
             <span className="material-symbols-outlined">rocket_launch</span>
             Get Started
-          </button>
+          </button>          {!rebrand && (
+
           <a 
             href="https://github.com/decolua/9router" 
             target="_blank" 
@@ -39,6 +43,7 @@ export default function HeroSection() {
             <span className="material-symbols-outlined">code</span>
             View on GitHub
           </a>
+          )}
         </div>
       </div>
     </section>

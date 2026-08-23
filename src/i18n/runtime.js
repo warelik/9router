@@ -1,6 +1,7 @@
 "use client";
 
 import { DEFAULT_LOCALE, LOCALE_COOKIE, normalizeLocale } from "./config";
+import { brandifyText } from "@/lib/blabs/brandifyText";
 
 let translationMap = {};
 let currentLocale = DEFAULT_LOCALE;
@@ -37,8 +38,8 @@ export function translate(text) {
   if (!text || typeof text !== "string") return text;
   const trimmed = text.trim();
   if (!trimmed) return text;
-  if (currentLocale === "en") return text;
-  return translationMap[trimmed] || text;
+  const resolved = currentLocale === "en" ? text : (translationMap[trimmed] || text);
+  return brandifyText(resolved);
 }
 
 // Get current locale - exported for use in components

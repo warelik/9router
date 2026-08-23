@@ -1,8 +1,10 @@
 "use client";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
+import { useBlabsMode } from "@/lib/blabs/BlabsModeContext";
 
 export default function GetStarted() {
   const { copied, copy } = useCopyToClipboard();
+  const { rebrand } = useBlabsMode();
 
   const handleCopy = (text) => {
     copy(text, "landing");
@@ -16,9 +18,12 @@ export default function GetStarted() {
           <div className="flex-1">
             <h2 className="text-3xl md:text-4xl font-bold mb-6">Get Started in 30 Seconds</h2>
             <p className="text-gray-400 text-lg mb-8">
-              Install 9Router, configure your providers via web dashboard, and start routing AI requests.
+              {rebrand
+                ? "Open the host dashboard to configure providers."
+                : "Install 9Router, configure your providers via web dashboard, and start routing AI requests."}
             </p>
             
+            {!rebrand && (
             <div className="flex flex-col gap-6">
               <div className="flex gap-4">
                 <div className="flex-none w-8 h-8 rounded-full bg-[#f97815]/20 text-[#f97815] flex items-center justify-center font-bold">1</div>
@@ -44,10 +49,14 @@ export default function GetStarted() {
                 </div>
               </div>
             </div>
+            )}
           </div>
 
           {/* Right: Code block */}
           <div className="flex-1 w-full">
+            {rebrand ? (
+              <p className="text-gray-400 text-lg">Open the host dashboard to configure providers.</p>
+            ) : (
             <div className="rounded-xl overflow-hidden bg-[#1e1e1e] border border-[#3a2f27] shadow-2xl">
               {/* Terminal header */}
               <div className="flex items-center gap-2 px-4 py-3 bg-[#252526] border-b border-gray-700">
@@ -88,6 +97,7 @@ export default function GetStarted() {
                 </div>
               </div>
             </div>
+            )}
           </div>
         </div>
       </div>
