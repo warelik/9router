@@ -193,6 +193,7 @@ class PatchBoundaryTests(unittest.TestCase):
 
     def test_source_records_the_fixed_cutoff_and_all_historical_test_files(self):
         source = json.loads((release.ROOT / "patches" / "source.json").read_text())
+        self.assertEqual(source["source_repository"], "warelik/9router-warelik")
         self.assertEqual(source["source_tip"], "e01983276cb2f9ce05dc167e4d56c2c040559fd6")
         self.assertEqual(source["source_upstream_base"], "ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8")
         self.assertEqual(source["cutoff_exclusive"], "2026-10-13T00:00:00Z")
@@ -355,6 +356,8 @@ class PublicationTests(unittest.TestCase):
         def request(path, *, method="GET", data=None, **kwargs):
             calls.append((path, method, data))
             path = path.split("?")[0]
+            if path.endswith("/pulls/1/comments"):
+                return []
             if path == "repos/warelik/9router":
                 return {"default_branch": "downstream"}
             if path.endswith("/commits/downstream"):
@@ -373,7 +376,8 @@ class PublicationTests(unittest.TestCase):
             if path.endswith("/git/refs") and method == "POST":
                 return data
             if path.endswith("/pulls") and method == "GET":
-                return [{"number": 1, "head": {"sha": HEAD, "repo": {"full_name": "warelik/9router"}},
+                return [{"number": 1, "head": {"sha": HEAD, "ref": "review/example",
+                                               "repo": {"full_name": "warelik/9router"}},
                          "base": {"sha": OTHER, "ref": f"review-base/{OTHER}"}}]
             if method == "PATCH":
                 return {}
