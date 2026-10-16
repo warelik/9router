@@ -62,6 +62,22 @@ it("restores namespace identity after a chained rename in event and terminal out
   expect(restoreToolNames({ type: "function_call", name: "wire_name" }, map)).toMatchObject({ name: "read", namespace: "alpha" });
 });
 
+it("restores custom response call identity from its descriptor", () => {
+  const map = new Map([["wire_patch", { name: "patch", namespace: "alpha", type: "custom" }]]);
+  const item = { type: "function_call", name: "wire_patch", call_id: "call_1", arguments: "RAW_PATCH" };
+  const direct = restoreToolNames(item, map);
+  expect(direct).toEqual({ type: "custom_tool_call", name: "patch", namespace: "alpha", call_id: "call_1", input: "RAW_PATCH" });
+
+  const event = restoreToolNames({
+    type: "response.output_item.done",
+    item,
+    response: { output: [item] },
+  }, map);
+  expect(event.item).toEqual(direct);
+  expect(event.response.output[0]).toEqual(direct);
+  expect(item).toEqual({ type: "function_call", name: "wire_patch", call_id: "call_1", arguments: "RAW_PATCH" });
+});
+
 for (const [format, provider] of [[FORMATS.GEMINI, "gemini"], [FORMATS.GEMINI, "aistudio"], [FORMATS.ANTIGRAVITY, "antigravity"]]) {
   describe(`${provider} namespace SSE roundtrip`, () => {
     for (const [name, type, args] of [["read", "function_call", { title: "record", count: 3 }], ["patch", "custom_tool_call", { input: "RAW_PATCH" }]]) {

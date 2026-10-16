@@ -455,7 +455,15 @@ export function restoreToolNames(payload, map) {
     if (typeof item.namespace === "string" && item.namespace) return item;
     const resolved = resolveToolName(item.name, map);
     if (resolved.descriptor) {
-      return { ...item, name: resolved.descriptor.name, namespace: resolved.descriptor.namespace };
+      const restored = { ...item, name: resolved.descriptor.name, namespace: resolved.descriptor.namespace };
+      if (resolved.descriptor.type === "custom") {
+        restored.type = "custom_tool_call";
+        if (Object.hasOwn(restored, "arguments")) {
+          restored.input = restored.arguments;
+          delete restored.arguments;
+        }
+      }
+      return restored;
     }
     return resolved.name === item.name ? item : { ...item, name: resolved.name };
   };
@@ -467,6 +475,14 @@ export function restoreToolNames(payload, map) {
       if (resolved.descriptor) {
         put("name", resolved.descriptor.name);
         put("namespace", resolved.descriptor.namespace);
+        if (resolved.descriptor.type === "custom") {
+          put("type", "custom_tool_call");
+          if (Object.hasOwn(payload, "arguments")) {
+            put("input", payload.arguments);
+            if (out === payload) out = { ...payload };
+            delete out.arguments;
+          }
+        }
       } else if (resolved.name !== payload.name) {
         put("name", resolved.name);
       }
