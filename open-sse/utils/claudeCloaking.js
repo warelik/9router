@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "crypto";
 import { CLAUDE_TOOL_SUFFIX, CC_DEFAULT_TOOLS } from "../config/appConstants.js";
+import { resolveToolName } from "./opencodeFingerprint.js";
 import { CLAUDE_CLI_VERSION } from "../providers/shared.js";
 
 const CC_ENTRYPOINT = "sdk-cli";
@@ -121,7 +122,7 @@ export function decloakToolNames(body, toolNameMap) {
   const content = body.content.map(block => {
     if (block?.type !== "tool_use") return block;
     if (toolNameMap?.has(block.name)) {
-      return { ...block, name: toolNameMap.get(block.name) };
+      return { ...block, name: resolveToolName(block.name, toolNameMap).name };
     }
     // toolNameMap missing/stale for this name — fall back to suffix stripping
     // rather than forwarding an unresolvable "<tool>_ide" name to the client.
@@ -155,7 +156,8 @@ export function decloakStreamChunk(chunk, toolNameMap) {
   if (chunk.type !== "content_block_start") return chunk;
   const block = chunk.content_block;
   if (block?.type !== "tool_use" || typeof block.name !== "string") return chunk;
-  const original = toolNameMap?.get(block.name) || stripCloakSuffix(block.name);
+  const mapped = toolNameMap?.has(block.name) ? resolveToolName(block.name, toolNameMap).name : null;
+  const original = mapped || stripCloakSuffix(block.name);
   if (!original) return chunk;
   return { ...chunk, content_block: { ...block, name: original } };
 }
