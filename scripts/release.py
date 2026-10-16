@@ -419,10 +419,15 @@ def minor_findings(repo, pr, sha):
             and MINOR_FINDING.search(finding.get("body") or "")]
 
 
-def close_recovered_repair(repo, config, *, state=None, has_minor=False):
+def close_recovered_repair(repo, config, *, state=None, has_minor=False, expected_head=None):
     if has_minor or api(f"repos/{repo}/commits/downstream")["sha"] != config:
         return
-    state = state or repair_pull(repo, config)
+    if state is None:
+        if not expected_head:
+            return
+        state = repair_pull(repo, config)
+        if state is None or state["head"] != expected_head:
+            return
     if state is None or state.get("nonblocking"):
         return
     pull = api(f"repos/{repo}/pulls/{state['number']}")
@@ -1060,7 +1065,8 @@ def publish(directory):
                             f"review/{os.environ['UPSTREAM_SHA']}-{os.environ['PATCHSET_SHA256']}")
     print(f"Published {tag}; VPS untouched")
     close_recovered_repair(repo, os.environ["GITHUB_SHA"],
-                           has_minor=bool(minor_findings(repo, pr, sha)))
+                           has_minor=bool(minor_findings(repo, pr, sha)),
+                           expected_head=os.environ.get("REPAIR_HEAD"))
 
 
 def main():

@@ -402,6 +402,25 @@ class PublicationTests(unittest.TestCase):
                 ("repos/warelik/9router/pulls/1", {"state": "closed"}),
             ])
 
+    def test_publish_passes_the_captured_repair_head_to_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = self.artifacts(root)
+            env["REPAIR_HEAD"] = OTHER
+            calls = []
+            with (patch.dict(os.environ, env),
+                  patch.object(release, "check_review", return_value=(True, "reviewed")),
+                  patch.object(release, "api", side_effect=self.fake_api(root, env, calls)),
+                  patch.object(release, "close_recovered_repair") as close):
+                release.publish(root)
+            close.assert_called_once_with(
+                "warelik/9router", env["GITHUB_SHA"], has_minor=False, expected_head=OTHER)
+
+    def test_publish_step_wires_the_prepared_repair_head(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/release.yml").read_text()
+        publish_step = workflow.split("- name: Publish Only This Verified Candidate", 1)[1].split("run:", 1)[0]
+        self.assertIn("REPAIR_HEAD: ${{ needs.prepare.outputs.repair_head }}", publish_step)
+
     def test_wrong_uploaded_digest_source_or_tag_never_publishes(self):
         for scenario in ({"bad_digest": True}, {"draft_sha": OTHER}, {"tag_sha": OTHER}):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:

@@ -132,6 +132,25 @@ class RepairBoundaryTests(unittest.TestCase):
             release.close_recovered_repair(REPO, CONFIG, state=STATE)
         self.assertEqual(api.call_args.kwargs, {"method": "PATCH", "data": {"state": "closed"}})
 
+    def test_late_lookup_closes_the_captured_unchanged_blocking_repair(self):
+        with (patch.object(release, "repair_pull", return_value=STATE),
+              patch.object(release, "api", side_effect=[
+                  {"sha": CONFIG}, {"state": "open", "head": {"sha": HEAD}}, {}, {}]) as api):
+            release.close_recovered_repair(REPO, CONFIG, expected_head=HEAD)
+        self.assertEqual(api.call_args.kwargs, {"method": "PATCH", "data": {"state": "closed"}})
+
+    def test_late_lookup_does_not_close_a_repair_advanced_after_preparation(self):
+        with (patch.object(release, "repair_pull", return_value={**STATE, "head": SEED}),
+              patch.object(release, "api", return_value={"sha": CONFIG}) as api):
+            release.close_recovered_repair(REPO, CONFIG, expected_head=HEAD)
+        self.assertFalse(any(c.kwargs.get("method") in {"POST", "PATCH"} for c in api.call_args_list))
+
+    def test_late_lookup_without_a_captured_head_does_not_discover_a_new_repair(self):
+        with (patch.object(release, "repair_pull", side_effect=AssertionError("must not look up repair")),
+              patch.object(release, "api", return_value={"sha": CONFIG}) as api):
+            release.close_recovered_repair(REPO, CONFIG)
+        self.assertFalse(any(c.kwargs.get("method") in {"POST", "PATCH"} for c in api.call_args_list))
+
     def test_minor_or_changed_repair_is_not_closed_by_default_candidate_recovery(self):
         for state, minor, head in (
             ({**STATE, "nonblocking": True}, False, HEAD),
