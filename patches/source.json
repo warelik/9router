@@ -70,5 +70,6 @@
     "tests/unit/translated-chat-stream-done.test.js",
     "tests/unit/undeclared-responses-sse.test.js",
     "tests/unit/zed-completions-wire.test.js"
-  ]
+  ],
+  "regression_files": []
 }

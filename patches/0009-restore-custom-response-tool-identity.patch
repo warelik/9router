@@ -1,0 +1,76 @@
+From 922b47238769ba8c91ad46e4ccc03b6c577a933f Mon Sep 17 00:00:00 2001
+From: Repair <repair@example.invalid>
+Date: Fri, 16 Oct 2026 18:00:11 +0000
+Subject: [PATCH] Restore custom response tool identity
+
+---
+ open-sse/utils/opencodeFingerprint.js          | 18 +++++++++++++++++-
+ tests/unit/openai-responses-namespaces.test.js | 16 ++++++++++++++++
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
+index 3fcdc1c..b7e7066 100644
+--- a/open-sse/utils/opencodeFingerprint.js
++++ b/open-sse/utils/opencodeFingerprint.js
+@@ -302,7 +302,15 @@ export function restoreToolNames(payload, map) {
+     if (typeof item.namespace === "string" && item.namespace) return item;
+     const resolved = resolveToolName(item.name, map);
+     if (resolved.descriptor) {
+-      return { ...item, name: resolved.descriptor.name, namespace: resolved.descriptor.namespace };
++      const restored = { ...item, name: resolved.descriptor.name, namespace: resolved.descriptor.namespace };
++      if (resolved.descriptor.type === "custom") {
++        restored.type = "custom_tool_call";
++        if (Object.hasOwn(restored, "arguments")) {
++          restored.input = restored.arguments;
++          delete restored.arguments;
++        }
++      }
++      return restored;
+     }
+     return resolved.name === item.name ? item : { ...item, name: resolved.name };
+   };
+@@ -314,6 +322,14 @@ export function restoreToolNames(payload, map) {
+       if (resolved.descriptor) {
+         put("name", resolved.descriptor.name);
+         put("namespace", resolved.descriptor.namespace);
++        if (resolved.descriptor.type === "custom") {
++          put("type", "custom_tool_call");
++          if (Object.hasOwn(payload, "arguments")) {
++            put("input", payload.arguments);
++            if (out === payload) out = { ...payload };
++            delete out.arguments;
++          }
++        }
+       } else if (resolved.name !== payload.name) {
+         put("name", resolved.name);
+       }
+diff --git a/tests/unit/openai-responses-namespaces.test.js b/tests/unit/openai-responses-namespaces.test.js
+index 98995a2..7efe3e8 100644
+--- a/tests/unit/openai-responses-namespaces.test.js
++++ b/tests/unit/openai-responses-namespaces.test.js
+@@ -62,6 +62,22 @@ it("restores namespace identity after a chained rename in event and terminal out
+   expect(restoreToolNames({ type: "function_call", name: "wire_name" }, map)).toMatchObject({ name: "read", namespace: "alpha" });
+ });
+ 
++it("restores custom response call identity from its descriptor", () => {
++  const map = new Map([["wire_patch", { name: "patch", namespace: "alpha", type: "custom" }]]);
++  const item = { type: "function_call", name: "wire_patch", call_id: "call_1", arguments: "RAW_PATCH" };
++  const direct = restoreToolNames(item, map);
++  expect(direct).toEqual({ type: "custom_tool_call", name: "patch", namespace: "alpha", call_id: "call_1", input: "RAW_PATCH" });
++
++  const event = restoreToolNames({
++    type: "response.output_item.done",
++    item,
++    response: { output: [item] },
++  }, map);
++  expect(event.item).toEqual(direct);
++  expect(event.response.output[0]).toEqual(direct);
++  expect(item).toEqual({ type: "function_call", name: "wire_patch", call_id: "call_1", arguments: "RAW_PATCH" });
++});
++
+ for (const [format, provider] of [[FORMATS.GEMINI, "gemini"], [FORMATS.GEMINI, "aistudio"], [FORMATS.ANTIGRAVITY, "antigravity"]]) {
+   describe(`${provider} namespace SSE roundtrip`, () => {
+     for (const [name, type, args] of [["read", "function_call", { title: "record", count: 3 }], ["patch", "custom_tool_call", { input: "RAW_PATCH" }]]) {
+-- 
+2.43.0
+
