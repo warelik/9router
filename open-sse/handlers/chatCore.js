@@ -160,7 +160,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const preTranslateRtkLine = formatRtkLog(preTranslateRtk);
   if (preTranslateRtkLine) console.log(preTranslateRtkLine);
 
-  const clientRequestedStreaming = body.stream === true || sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI;
+  const clientRequestedStreaming = body.stream === true || (body.stream !== false && (sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI));
   const providerRequiresStreaming = PROVIDERS[provider]?.forceStream === true;
   let stream = providerRequiresStreaming ? true : (body.stream !== false);
 
@@ -189,15 +189,33 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const reqLogger = await createRequestLogger(sourceFormat, targetFormat, model);
   if (clientRawRequest) reqLogger.logClientRawRequest(clientRawRequest.endpoint, clientRawRequest.body, clientRawRequest.headers);
   reqLogger.logRawRequest(body);
+  // Reject opaque-only tasks before a translator or strict Responses transport drops their payload; readable mixed histories keep the provider's existing contract.
+  if (sourceFormat === FORMATS.OPENAI_RESPONSES
+    && (targetFormat !== FORMATS.OPENAI_RESPONSES || effectiveTransport?.quirks?.portableResponsesInput)
+    && hasUndeliverableAgentMessage(body.input)) {
+    return createErrorResult(HTTP_STATUS.BAD_REQUEST,
+      "This history contains an encrypted Codex agent_message that this provider cannot read. Enable portable collaboration on the parent and start a new child with a plaintext task; existing encrypted task history cannot be recovered by this route.");
+  }
   log?.debug?.("FORMAT", `${sourceFormat} → ${targetFormat} | stream=${stream}`);
 
   // Native passthrough: CLI tool and provider are the same ecosystem
   // Skip all translation/normalization — only model and Bearer are swapped
   const clientTool = detectClientTool(clientRawRequest?.headers || {}, body);
-  const passthrough = isNativePassthrough(clientTool, provider);
+  const passthrough = nativeGemini || isNativePassthrough(clientTool, provider);
 
   // Expose raw client headers to translators/executors for session-id resolution
   if (credentials) credentials.rawHeaders = clientRawRequest?.headers || {};
+  if (provider === "antigravity" && credentials) credentials.nativeGeminiPassthrough = nativeAntigravity;
+  if (nativeGemini && credentials) {
+    credentials.nativeGeminiPassthrough = true;
+    credentials.nativeGeminiRequest = {
+      query: clientRawRequest?.queryParams,
+      headers: clientRawRequest?.headers || {},
+      // Client and provider versions are separate routing decisions. The
+      // browser-authenticated AIStudio generation API uses its beta wire.
+      apiVersion: provider === "aistudio" ? "v1beta" : clientRawRequest?.apiVersion,
+    };
+  }
 
   // Auto-strip media blocks the model can't read (vision/audio/pdf) before translation.
   if (!passthrough) {
@@ -240,10 +258,25 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     }
     toolNameMap = translatedBody._toolNameMap;
     delete translatedBody._toolNameMap;
-    customToolNames = translatedBody._customToolNames;
+    customToolNames = translatedBody._customToolNames ? new Set(translatedBody._customToolNames) : null;
     delete translatedBody._customToolNames;
     translatedBody.model = stripThinkingSuffix(upstreamModel);
     stripContinuityFields(translatedBody);
+    // Strict Responses upstreams (quirks.portableResponsesInput) reject Codex
+    // multi-agent/delegation history items — rewrite them to portable shapes.
+    if (effectiveTransport?.quirks?.portableResponsesInput
+      && targetFormat === FORMATS.OPENAI_RESPONSES
+      && Array.isArray(translatedBody.input)) {
+      translatedBody.input = toPortableResponsesInput(translatedBody.input);
+    }
+  }
+
+  const portableCollaboration = Object.entries(clientRawRequest?.headers || {}).some(
+    ([name, value]) => name.toLowerCase() === PORTABLE_COLLABORATION.header && String(value).toLowerCase() === "true");
+  if (portableCollaboration && sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES) {
+    const prepared = preparePortableCollaboration(translatedBody);
+    translatedBody = prepared.body;
+    if (prepared.toolNameMap.size) toolNameMap = new Map([...(toolNameMap || []), ...prepared.toolNameMap]);
   }
 
   // Tool normalization: MCP-equivalent built-in dedup (Claude clients) + same-name
@@ -356,6 +389,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${model} | ${msgCount} msgs`);
 
   const streamController = createStreamController({
+    clientSignal,
     onDisconnect: (reason) => {
       trackPendingRequest(model, provider, connectionId, false);
       if (onDisconnect) onDisconnect(reason);
@@ -368,6 +402,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     connectionProxyEnabled: credentials?.providerSpecificData?.connectionProxyEnabled === true,
     connectionProxyUrl: credentials?.providerSpecificData?.connectionProxyUrl || "",
     connectionNoProxy: credentials?.providerSpecificData?.connectionNoProxy || "",
+    strictProxy: credentials?.providerSpecificData?.strictProxy === true,
     vercelRelayUrl: credentials?.providerSpecificData?.vercelRelayUrl || "",
     // Strict pools must never silently fall back to a direct connection —
     // honored on the Cursor AgentService h2 path and in proxyFetch (#4333).
@@ -408,7 +443,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   let providerResponseFormat = targetFormat;
   try {
     const result = await executor.execute({
-      model,
+      model: nativeGemini ? stripThinkingSuffix(upstreamModel) : model,
       body: translatedBody,
       stream,
       credentials,
@@ -477,7 +512,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         }
         try {
           const retryResult = await executor.execute({
-            model,
+            model: nativeGemini ? stripThinkingSuffix(upstreamModel) : model,
             body: translatedBody,
             stream,
             credentials,
@@ -504,6 +539,17 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   // Provider returned error
   if (!providerResponse.ok) {
+    let nativeErrorResponse = null;
+    if (nativeGemini) {
+      const headers = new Headers(providerResponse.headers);
+      // fetch exposes decoded bytes; forwarding compressed-length headers makes
+      // native clients decompress them twice or wait for bytes that cannot arrive.
+      for (const name of ["content-encoding", "content-length", "transfer-encoding"]) headers.delete(name);
+      headers.set("Access-Control-Allow-Origin", "*");
+      nativeErrorResponse = new Response(providerResponse.clone().body, {
+        status: providerResponse.status, statusText: providerResponse.statusText, headers,
+      });
+    }
     trackPendingRequest(model, provider, connectionId, false, true);
     const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
     appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
@@ -524,10 +570,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       log.errorLine(reqTag, "✗", `ERROR ${statusCode} · ${provider}/${model} · ${Date.now() - requestStartTime}ms${urlStr}\n    ${errMsg}`);
     }
     reqLogger.logError(new Error(message), finalBody || translatedBody);
-    return createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
+    const result = createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
+    return nativeErrorResponse ? { ...result, response: nativeErrorResponse, nativeResponse: true } : result;
   }
 
-  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };
+  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log, nativeResponseProjection };
   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
 

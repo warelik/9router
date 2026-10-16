@@ -1,12 +1,13 @@
 import { FORMATS } from "./formats.js";
-import { ensureToolCallIds, fixMissingToolResponses } from "./concerns/toolCall.js";
+import { ensureToolCallIds, fixMissingToolResponses, isGeminiFamilyTarget } from "./concerns/toolCall.js";
 import { prepareClaudeRequest, ensureTrailingUserTurn } from "./formats/claude.js";
 import { cloakClaudeTools, decloakStreamChunk } from "../utils/claudeCloaking.js";
 import { restoreToolNames } from "../utils/opencodeFingerprint.js";
 import { filterToOpenAIFormat } from "./formats/openai.js";
+import { adaptAIStudioStructuredOutput } from "./formats/gemini.js";
 import { normalizeThinkingConfig } from "../services/provider.js";
-import { applyThinking, captureThinking } from "./concerns/thinkingUnified.js";
-import { captureSessionId } from "../utils/sessionManager.js";
+import { applyThinking, captureThinking, stripThinkingSuffix } from "./concerns/thinkingUnified.js";
+import { captureSessionId, captureConversationId } from "../utils/sessionManager.js";
 import { AntigravityExecutor } from "../executors/antigravity.js";
 import { PROVIDERS } from "../providers/index.js";
 import { ROLE, GEMINI_ROLE } from "./schema/roles.js";
@@ -134,7 +135,46 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     targetFormat === FORMATS.KIRO &&
     (sourceFormat === FORMATS.OPENAI || sourceFormat === FORMATS.CLAUDE);
   if (!kiroThinkingMappedByTranslator) {
-    applyThinking(targetFormat, model, result, provider, thinkingIntent);
+    applyThinking(targetFormat, model, result, provider, thinkingIntent, { preserveResponsesOptions: targetFormat === FORMATS.OPENAI_RESPONSES });
+  }
+
+  if (sourceFormat !== targetFormat && targetFormat === FORMATS.GEMINI && provider === "aistudio") {
+    result = adaptAIStudioStructuredOutput(result);
+  }
+
+  // Hosted web_search (Codex Responses tools): only Gemini-3 models on the
+  // generateContent API can serve it — as a googleSearch tool entry plus
+  // toolConfig.includeServerSideToolInvocations. Antigravity/Gemini-CLI share the
+  // Cloud Code internal API which rejects that combination, and Vertex is
+  // unverified, so the flag is consumed without effect for them. The internal
+  // marker must never reach a provider body.
+  if (sourceFormat !== targetFormat && result && typeof result === "object") {
+    const wantsWebSearch = result._webSearch === true;
+    delete result._webSearch;
+    const webSearchEnabled = wantsWebSearch && targetFormat === FORMATS.GEMINI && (provider === "gemini" || provider === "aistudio")
+      && /^gemini-3/.test(stripThinkingSuffix(String(model ?? "").split("/").pop() || "") || "");
+    if (webSearchEnabled) {
+      result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
+      result.toolConfig = {
+        ...(result.toolConfig && typeof result.toolConfig === "object" && !Array.isArray(result.toolConfig) ? result.toolConfig : {}),
+        includeServerSideToolInvocations: true,
+      };
+    } else if (isGeminiFamilyTarget(targetFormat, model)) {
+      // The replay helper inserts stored server-side parts for any Gemini-family
+      // history, but only a web-search-enabled upstream can accept them. A fallback
+      // target (or a request without the web_search tool) must not receive them.
+      for (const contents of [result.contents, result.request?.contents]) {
+        if (!Array.isArray(contents)) continue;
+        for (const entry of contents) {
+          if (Array.isArray(entry?.parts)) {
+            entry.parts = entry.parts.filter(part => !(part && (part.toolCall || part.toolResponse)));
+          }
+        }
+        for (let i = contents.length - 1; i >= 0; i--) {
+          if (Array.isArray(contents[i]?.parts) && contents[i].parts.length === 0) contents.splice(i, 1);
+        }
+      }
+    }
   }
 
   // Always normalize to clean OpenAI format when target is OpenAI

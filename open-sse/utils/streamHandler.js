@@ -15,11 +15,21 @@ function getTimeString() {
  * @param {string} options.provider - Provider name
  * @param {string} options.model - Model name
  */
-export function createStreamController({ onDisconnect, onError, log, provider, model, reqTag = "" } = {}) {
+export function createStreamController({ onDisconnect, onError, log, provider, model, clientSignal, reqTag = "" } = {}) {
   const abortController = new AbortController();
   const startTime = Date.now();
   let disconnected = false;
   let abortTimeout = null;
+  const detachClientAbort = () => clientSignal?.removeEventListener("abort", onClientAbort);
+  const onClientAbort = () => {
+    if (disconnected) return;
+    disconnected = true;
+    detachClientAbort();
+    abortController.abort(clientSignal.reason);
+    onDisconnect?.({ reason: "client_closed", duration: Date.now() - startTime });
+  };
+  if (clientSignal?.aborted) onClientAbort();
+  else clientSignal?.addEventListener("abort", onClientAbort, { once: true });
 
   // Only abnormal terminations are logged; normal completion is covered by "📊 done".
   // isError uses errorLine (always shown, ignores LOG_LEVEL) so failures survive quiet levels.
@@ -40,6 +50,7 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
     handleDisconnect: (reason = "client_closed") => {
       if (disconnected) return;
       disconnected = true;
+      detachClientAbort();
 
       // Debug-only: Responses API has no [DONE] sentinel, so codex/droid close the
       // socket on every completed request. "📊 done" is the authoritative outcome line.
@@ -57,6 +68,7 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
     handleComplete: () => {
       if (disconnected) return;
       disconnected = true;
+      detachClientAbort();
 
       if (abortTimeout) {
         clearTimeout(abortTimeout);
@@ -68,6 +80,7 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
     handleError: (error) => {
       if (disconnected) return;
       disconnected = true;
+      detachClientAbort();
 
       if (abortTimeout) {
         clearTimeout(abortTimeout);
@@ -98,8 +111,10 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
  *
  * @param {function} [onAbortTerminal] - Receives a human-readable abort
  * message and returns terminal SSE bytes to emit downstream.
+ * @param {boolean} [propagateAbortErrors] - Reject interrupted JSON streams
+ * instead of treating transport closure as successful EOF.
  */
-export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null) {
+export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, propagateAbortErrors = false) {
   const reader = transformStream.readable.getReader();
   const writer = transformStream.writable.getWriter();
   let terminalEmitted = false;
@@ -117,6 +132,14 @@ export function createDisconnectAwareStream(transformStream, streamController, o
   return new ReadableStream({
     async pull(controller) {
       if (!streamController.isConnected()) {
+        if (propagateAbortErrors) {
+          const error = new Error("Upstream stream interrupted");
+          streamController.handleError(error);
+          reader.cancel().catch(() => {});
+          writer.abort().catch(() => {});
+          controller.error(error);
+          return;
+        }
         emitTerminal(controller);
         controller.close();
         return;
@@ -158,7 +181,12 @@ export function createDisconnectAwareStream(transformStream, streamController, o
         // Graceful close on network/abort, or when a structured terminal is available
         // (Responses passthrough prefers response.failed + [DONE] over a raw transport error)
         try {
-          if (!wasConnected || isNetworkClose || onAbortTerminal) {
+          if (propagateAbortErrors) {
+            // A native JSON stream cannot receive an SSE error trailer. Keep
+            // a transport failure observable instead of closing partial JSON
+            // as though the upstream completed it.
+            controller.error(error);
+          } else if (!wasConnected || isNetworkClose || onAbortTerminal) {
             emitTerminal(controller);
             controller.close();
           } else {
@@ -191,8 +219,10 @@ export function createDisconnectAwareStream(transformStream, streamController, o
  * @param {Response} providerResponse - Response from provider
  * @param {TransformStream} transformStream - Transform stream for SSE
  * @param {object} streamController - Stream controller from createStreamController
+ * @param {boolean} [propagateAbortErrors] - Preserve transport failures for
+ * native JSON framing, which cannot accept an SSE error trailer.
  */
-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS) {
+export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, propagateAbortErrors = false) {
   let stallTimer = null;
   let chunkCount = 0;
   let totalBytes = 0;
@@ -254,7 +284,7 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   return createDisconnectAwareStream(
     { readable: transformedBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
     wrappedController,
-    onAbortTerminal ? () => onAbortTerminal(abortMessage) : null
+    onAbortTerminal ? () => onAbortTerminal(abortMessage) : null,
+    propagateAbortErrors
   );
 }
-

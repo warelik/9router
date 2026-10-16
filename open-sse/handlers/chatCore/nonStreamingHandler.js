@@ -14,6 +14,28 @@ import { decloakToolNames } from "../../utils/claudeCloaking.js";
 import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
 import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
 
+function parseToolArguments(value) {
+  if (!value) return {};
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
+}
+
+function nativeGeminiErrorResult(providerResponse, status, message, responseBody = null) {
+  const headers = new Headers(providerResponse.headers);
+  for (const name of ["content-encoding", "content-length", "transfer-encoding"]) headers.delete(name);
+  headers.set("Content-Type", "application/json");
+  headers.set("Access-Control-Allow-Origin", "*");
+  const result = createErrorResult(status, message);
+  return {
+    ...result,
+    nativeResponse: true,
+    response: Response.json(responseBody || { error: { code: status, status: "INTERNAL", message } }, { status, headers }),
+  };
+}
 /**
  * Convert an OpenAI Chat Completions non-streaming response body into the
  * OpenAI Responses API shape. Used when a Responses-format client (e.g. Codex)
@@ -234,12 +256,19 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
 /**
  * Handle non-streaming response from provider.
  */
-export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log }) {
+export async function handleNonStreamingResponse({ credentials, providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log, nativeResponseProjection }) {
   trackDone();
+  const isNativeGeminiResponse = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
   const contentType = providerResponse.headers.get("content-type") || "";
   let responseBody;
 
   if (contentType.includes("text/event-stream")) {
+    if (isNativeGeminiResponse) {
+      const message = "Unexpected streaming response for non-streaming Gemini request";
+      try { await providerResponse.body?.cancel(message); } catch { /* Keep the framing error even if upstream cancellation fails. */ }
+      appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
+      return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, message);
+    }
     const sseText = await providerResponse.text();
     const parsed = parseSSEToOpenAIResponse(sseText, model);
     if (!parsed) {
@@ -253,6 +282,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     } catch (err) {
       appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
       console.error(`[ChatCore] Failed to parse JSON from ${provider}:`, err.message);
+      if (isNativeGeminiResponse) return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
     }
   }
@@ -263,6 +293,25 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   responseBody = unwrapClineEnvelope(responseBody, provider);
 
   reqLogger.logProviderResponse(providerResponse.status, providerResponse.statusText, providerResponse.headers, responseBody);
+  if (isNativeGeminiResponse) {
+    const projected = nativeResponseProjection?.masks?.some(value => String(value ?? "").trim() && String(value).trim() !== "*");
+    const validObject = responseBody !== null && typeof responseBody === "object" && !Array.isArray(responseBody);
+    if (!validObject || (!projected && Object.keys(responseBody).length === 0)) {
+      const message = `Invalid native Gemini response from ${provider}`;
+      appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
+      return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, message);
+    }
+    if (responseBody.error) {
+      const reportedCode = Number(responseBody.error.code);
+      const status = Number.isInteger(reportedCode) && reportedCode >= 400 && reportedCode <= 599
+        ? reportedCode : HTTP_STATUS.BAD_GATEWAY;
+      const message = typeof responseBody.error.message === "string"
+        ? responseBody.error.message : `Native Gemini error from ${provider}`;
+      appendLog({ status: `FAILED ${status}` });
+      const validError = typeof responseBody.error === "object" && !Array.isArray(responseBody.error);
+      return nativeGeminiErrorResult(providerResponse, status, message, validError ? responseBody : null);
+    }
+  }
   if (onRequestSuccess) {
     Promise.resolve()
       .then(onRequestSuccess)
@@ -288,7 +337,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   const isResponsesResponse = sourceFormat === FORMATS.OPENAI_RESPONSES && translatedResponse?.object === "response";
 
   // Fix finish_reason for tool_calls: some providers return non-standard values (e.g. "other")
-  if (translatedResponse?.choices?.[0]) {
+  if (!isNativeGeminiResponse && translatedResponse?.choices?.[0]) {
     const choice = translatedResponse.choices[0];
     const msg = choice.message;
     const hasToolCalls = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
@@ -298,27 +347,27 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   }
 
   // Ensure OpenAI-required fields
-  if (!isClaudeMessageResponse && !isResponsesResponse) {
+  if (!isClaudeMessageResponse && !isResponsesResponse && !isNativeGeminiResponse) {
     if (!translatedResponse.object) translatedResponse.object = "chat.completion";
     if (!translatedResponse.created) translatedResponse.created = Math.floor(Date.now() / 1000);
   }
 
   // Strip Azure-specific fields
-  if (!isClaudeMessageResponse && !isResponsesResponse) {
+  if (!isClaudeMessageResponse && !isResponsesResponse && !isNativeGeminiResponse) {
     delete translatedResponse.prompt_filter_results;
     if (translatedResponse?.choices) {
       for (const choice of translatedResponse.choices) delete choice.content_filter_results;
     }
   }
 
-  if (translatedResponse?.usage) {
+  if (!isNativeGeminiResponse && translatedResponse?.usage) {
     translatedResponse.usage = filterUsageForFormat(addBufferToUsage(translatedResponse.usage), sourceFormat);
   }
 
   // Strip reasoning_content only when content is non-empty.
   // When content is empty (e.g. thinking models that used all tokens for reasoning),
   // reasoning_content is the only useful output and must be preserved.
-  if (!isClaudeMessageResponse && !isResponsesResponse && translatedResponse?.choices) {
+  if (!isClaudeMessageResponse && !isResponsesResponse && !isNativeGeminiResponse && translatedResponse?.choices) {
     for (const choice of translatedResponse.choices) {
       if (choice?.message?.reasoning_content && choice.message.content) {
         delete choice.message.reasoning_content;

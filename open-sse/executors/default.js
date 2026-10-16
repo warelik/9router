@@ -8,6 +8,7 @@ import { buildClineHeaders } from "../shared/clineAuth.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
+import { adaptAIStudioStructuredOutput } from "../translator/formats/gemini.js";
 import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
 
 // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
@@ -115,7 +116,10 @@ export class DefaultExecutor extends BaseExecutor {
       stripUnsupportedParams(this.provider, model, transformed);
     }
 
-    return injectReasoningContent({ provider: this.provider, model, body: transformed });
+    const injected = injectReasoningContent({ provider: this.provider, model, body: transformed });
+    return isResponsesWire(this.provider, this.config, credentials)
+      ? normalizeResponsesReasoning(injected)
+      : injected;
   }
 
   applyNousAttribution(model, body, stream, credentials) {
@@ -180,7 +184,21 @@ export class DefaultExecutor extends BaseExecutor {
     }
     // gemini-format: build :streamGenerateContent / :generateContent path
     if (this.config.format === "gemini") {
-      return `${this.config.baseUrl}/${model}:${stream ? "streamGenerateContent?alt=sse" : "generateContent"}`;
+      // The caller has resolved the provider wire version. Format it without
+      // overriding that routing decision for any Gemini-format provider.
+      const nativeVersion = credentials?.nativeGeminiPassthrough
+        && ["v1", "v1alpha"].includes(credentials.nativeGeminiRequest?.apiVersion)
+        ? credentials.nativeGeminiRequest.apiVersion : null;
+      const baseUrl = nativeVersion
+        ? this.config.baseUrl.replace("/v1beta/", `/${nativeVersion}/`) : this.config.baseUrl;
+      const url = new URL(`${baseUrl}/${model}:${stream ? "streamGenerateContent" : "generateContent"}`);
+      const nativeQuery = credentials?.nativeGeminiRequest?.query;
+      if (credentials?.nativeGeminiPassthrough && Array.isArray(nativeQuery)) {
+        for (const [key, value] of nativeQuery) {
+          if (key !== "key" && key !== "$key") url.searchParams.append(key, value);
+        }
+      } else if (stream) url.searchParams.set("alt", "sse");
+      return url.toString();
     }
     // urlSuffix (e.g. ?beta=true) declared per-provider in registry
     if (this.config.urlSuffix) {
@@ -213,6 +231,19 @@ export class DefaultExecutor extends BaseExecutor {
     // Hooks run BEFORE auth so dynamic overlays can't clobber the token.
     for (const hook of desc.hooks || []) HEADER_HOOKS[hook]?.(headers, credentials);
     applyAuth(headers, desc, credentials);
+    if (credentials?.nativeGeminiPassthrough) {
+      const reserved = new Set(Object.keys(headers).map(key => key.toLowerCase()));
+      const privateHeaders = new Set([
+        "authorization", "proxy-authorization", "x-goog-api-key", "x-api-key", "cookie", "set-cookie",
+        "host", "content-length", "connection", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer",
+      ]);
+      for (const [name, value] of Object.entries(credentials.nativeGeminiRequest?.headers || {})) {
+        const lower = name.toLowerCase();
+        if (!privateHeaders.has(lower) && !reserved.has(lower) && !lower.startsWith("x-forwarded-") && !lower.startsWith("x-9router-")) {
+          headers[name] = value;
+        }
+      }
+    }
 
     // anthropic-compatible-* nodes serving a real Claude model sit in front of
     // Anthropic itself (a rotating multi-account proxy, a corporate gateway),

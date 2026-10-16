@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   handleChat: vi.fn(),
@@ -7,6 +7,8 @@ const mocks = vi.hoisted(() => ({
   getProviderCredentials: vi.fn(),
   markAccountUnavailable: vi.fn(),
   clearAccountError: vi.fn(),
+  getModelInfo: vi.fn(),
+  proxyAwareFetch: vi.fn(),
 }));
 
 vi.mock("@/sse/handlers/chat.js", () => ({
@@ -22,6 +24,19 @@ vi.mock("@/sse/services/auth.js", () => ({
 
 vi.mock("@/lib/localDb", () => ({
   getSettings: mocks.getSettings,
+}));
+
+vi.mock("@/sse/services/model.js", () => ({
+  getModelInfo: mocks.getModelInfo,
+}));
+
+// proxyFetch captures the native fetch at module import; explicitly replace the
+// transport boundary so these tests can never call Google with fixture keys.
+vi.mock("open-sse/utils/proxyFetch.js", () => ({
+  proxyAwareFetch: (...args) => {
+    if (!vi.isMockFunction(global.fetch)) throw new Error("Offline Gemini test requires mocked fetch");
+    return mocks.proxyAwareFetch(...args);
+  },
 }));
 
 const { GET } = await import("../../src/app/api/v1beta/models/route.js");
@@ -68,16 +83,25 @@ describe("Gemini native v1beta endpoint", () => {
       providerSpecificData: {},
     });
     mocks.markAccountUnavailable.mockResolvedValue({ shouldFallback: false });
-    global.fetch = vi.fn().mockResolvedValue(
+    mocks.getModelInfo.mockImplementation(async model => {
+      const separator = model.indexOf("/");
+      return separator < 0
+        ? { provider: "gemini", model }
+        : { provider: model.slice(0, separator), model: model.slice(separator + 1) };
+    });
+    mocks.proxyAwareFetch.mockImplementation((...args) => global.fetch(...args));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       })
-    );
+    ));
     mocks.handleChat.mockResolvedValue(
       Response.json({ candidates: [{ content: { parts: [{ text: "chat" }] } }] })
     );
   });
+
+  afterEach(() => vi.unstubAllGlobals());
 
   it("lists Gemini TTS models using standard Google model names", async () => {
     const response = await GET();
@@ -246,7 +270,35 @@ describe("Gemini native v1beta endpoint", () => {
     });
 
     expect(mocks.handleChat).toHaveBeenCalledTimes(1);
+    const [request, clientRawRequest, options] = mocks.handleChat.mock.calls[0];
+    expect(await request.json()).toEqual({ ...body, model: "gemini-2.5-flash", stream: false });
+    expect(clientRawRequest.body).toEqual(body);
+    expect(options).toMatchObject({ sourceFormatOverride: "gemini", stream: false });
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("passes strict proxy requirements to the native AUDIO transport", async () => {
+    mocks.getProviderCredentials.mockResolvedValueOnce({
+      apiKey: "real-gemini-key",
+      connectionId: "gemini-conn",
+      providerSpecificData: {
+        connectionProxyEnabled: true,
+        connectionProxyUrl: "http://127.0.0.1:18080",
+        connectionNoProxy: "localhost",
+        strictProxy: true,
+      },
+    });
+    const response = await POST(makeGeminiRequest("gemini-3.1-flash-tts-preview:generateContent", audioBody()), {
+      params: Promise.resolve({ path: ["gemini-3.1-flash-tts-preview:generateContent"] }),
+    });
+    expect(response.status).toBe(200);
+    expect(mocks.proxyAwareFetch).toHaveBeenCalledTimes(1);
+    expect(mocks.proxyAwareFetch.mock.calls[0][2]).toEqual({
+      connectionProxyEnabled: true,
+      connectionProxyUrl: "http://127.0.0.1:18080",
+      connectionNoProxy: "localhost",
+      strictProxy: true,
+    });
   });
 
   it("does not hijack provider-prefixed non-Gemini audio requests", async () => {
