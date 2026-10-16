@@ -1,0 +1,557 @@
+From 9c54d19d6e587f0602c016114b3a2c6aa7a5a8b6 Mon Sep 17 00:00:00 2001
+From: Overlay Migration <overlay-migration@example.invalid>
+Date: Fri, 16 Oct 2026 08:36:03 +0000
+Subject: [PATCH 6/8] 0006 claude-thinking-streams
+
+Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
+Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
+Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
+---
+ .../translator/concerns/thinkingUnified.js    |  15 +-
+ open-sse/utils/claudeCloaking.js              |   6 +-
+ open-sse/utils/claudeSignature.js             |  32 ++-
+ open-sse/utils/streamHelpers.js               |   3 +-
+ .../claude-adaptive-display.test.js           |  70 ++++++
+ tests/unit/claude-same-format-stream.test.js  | 218 ++++++++++++++++++
+ .../claude-signature-versioned-form.test.js   |  87 +++++++
+ 7 files changed, 413 insertions(+), 18 deletions(-)
+ create mode 100644 tests/translator/claude-adaptive-display.test.js
+ create mode 100644 tests/unit/claude-same-format-stream.test.js
+ create mode 100644 tests/unit/claude-signature-versioned-form.test.js
+
+diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
+index 8deab900..2a7958fd 100644
+--- a/open-sse/translator/concerns/thinkingUnified.js
++++ b/open-sse/translator/concerns/thinkingUnified.js
+@@ -255,8 +255,15 @@ function stripAll(body) {
+   }
+ }
+ 
++// Anthropic accepts {type:"adaptive",display} for its always-adaptive Claude models;
++// other claude-adaptive providers (MiniMax Code) require effort-only bodies there.
++function servesAnthropicClaude(provider, model) {
++  if (provider === "claude" || provider === "anthropic") return true;
++  return typeof provider === "string" && provider.startsWith("anthropic-compatible") && /^claude-/.test(model || "");
++}
++
+ // Apply unified thinking config to body in the resolved provider-native format.
+-function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
++function applyFormat(fmt, body, cfg, caps, supportedLevels, display, forwardDisplay = false) {
+   const none = cfg.mode === "none";
+   const canDisable = caps.thinkingCanDisable !== false;
+   // Model cannot disable thinking → clamp "none" to minimal effort instead.
+@@ -288,8 +295,10 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
+     case "claude-adaptive": {
+       if (none && canDisable) { body.thinking = { type: "disabled" }; break; }
+       // Models that can disable thinking need the explicit adaptive switch.
+-      // Permanently adaptive models such as Fable 5.1 accept effort directly.
++      // Permanently adaptive models such as Fable 5.1 accept effort directly; on
++      // Anthropic they still take the client's display ({type:"adaptive",display}).
+       if (canDisable) body.thinking = { type: "adaptive", ...(display ? { display } : {}) };
++      else if (display && forwardDisplay) body.thinking = { type: "adaptive", display };
+       else delete body.thinking;
+       const level = toLevel(eff);
+       // xhigh is model-gated (Opus/Sonnet 4.6 reject it) — clamp when not advertised.
+@@ -424,7 +433,7 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
+ // Mutates and returns body. No-op when model has no reasoning capability.
+ // `intent` is a pre-captured config (from captureThinking on the original body);
+ // falls back to extracting from the current body when omitted.
+-export function applyThinking(targetFormat, model, body, provider = null, intent = undefined) {
++export function applyThinking(targetFormat, model, body, provider = null, intent = undefined, { preserveResponsesOptions = false } = {}) {
+   if (!body || typeof body !== "object") return body;
+ 
+   const { cleanModel, override } = parseSuffix(model);
+diff --git a/open-sse/utils/claudeCloaking.js b/open-sse/utils/claudeCloaking.js
+index 60e40b79..de5b523d 100644
+--- a/open-sse/utils/claudeCloaking.js
++++ b/open-sse/utils/claudeCloaking.js
+@@ -1,5 +1,6 @@
+ import { createHash, randomBytes, randomUUID } from "crypto";
+ import { CLAUDE_TOOL_SUFFIX, CC_DEFAULT_TOOLS } from "../config/appConstants.js";
++import { resolveToolName } from "./opencodeFingerprint.js";
+ import { CLAUDE_CLI_VERSION } from "../providers/shared.js";
+ 
+ const CC_ENTRYPOINT = "sdk-cli";
+@@ -121,7 +122,7 @@ export function decloakToolNames(body, toolNameMap) {
+   const content = body.content.map(block => {
+     if (block?.type !== "tool_use") return block;
+     if (toolNameMap?.has(block.name)) {
+-      return { ...block, name: toolNameMap.get(block.name) };
++      return { ...block, name: resolveToolName(block.name, toolNameMap).name };
+     }
+     // toolNameMap missing/stale for this name — fall back to suffix stripping
+     // rather than forwarding an unresolvable "<tool>_ide" name to the client.
+@@ -155,7 +156,8 @@ export function decloakStreamChunk(chunk, toolNameMap) {
+   if (chunk.type !== "content_block_start") return chunk;
+   const block = chunk.content_block;
+   if (block?.type !== "tool_use" || typeof block.name !== "string") return chunk;
+-  const original = toolNameMap?.get(block.name) || stripCloakSuffix(block.name);
++  const mapped = toolNameMap?.has(block.name) ? resolveToolName(block.name, toolNameMap).name : null;
++  const original = mapped || stripCloakSuffix(block.name);
+   if (!original) return chunk;
+   return { ...chunk, content_block: { ...block, name: original } };
+ }
+diff --git a/open-sse/utils/claudeSignature.js b/open-sse/utils/claudeSignature.js
+index 1a186967..1f541825 100644
+--- a/open-sse/utils/claudeSignature.js
++++ b/open-sse/utils/claudeSignature.js
+@@ -1,6 +1,7 @@
+ // Claude thinking signature validation (ported from CLIProxyAPI internal/signature).
+ // E-form: single-layer base64, decoded[0] == 0x12 (Claude marker).
+-// R-form: double-layer base64, outer decoded[0] == 'E', inner decoded[0] == 0x12.
++// C-form: single-layer base64, the same marker preceded by a protobuf field-1 varint (08 <version>), as in Claude 5.5.
++// Double-layer (R…/Q…): base64 of the E-/C-form text; outer decodes to base64 text, inner carries the marker.
+ // Cache prefix "...#sig" stripped before validation.
+ 
+ const MAX_CLAUDE_SIGNATURE_LEN = 32 * 1024 * 1024;
+@@ -13,6 +14,17 @@ function stripCachePrefix(rawSignature) {
+   return idx >= 0 ? sig.slice(idx + 1).trim() : sig;
+ }
+ 
++// Marker may be preceded by a protobuf field-1 varint (08 <version>), as in Claude 5.5 "C…" signatures.
++function hasClaudeMarker(buf) {
++  let i = 0;
++  if (buf[0] === 0x08) {
++    i = 1;
++    while (i < buf.length && (buf[i] & 0x80)) i++;
++    i++;
++  }
++  return i < buf.length && buf[i] === CLAUDE_SIGNATURE_MARKER;
++}
++
+ export function hasClaudeSignaturePrefix(rawSignature) {
+   const sig = stripCachePrefix(rawSignature);
+   return sig.length > 0 && (sig[0] === "E" || sig[0] === "R");
+@@ -24,17 +36,13 @@ export function isValidClaudeSignature(rawSignature) {
+   if (!sig || sig.length > MAX_CLAUDE_SIGNATURE_LEN) return false;
+ 
+   try {
+-    if (sig[0] === "E") {
+-      const decoded = Buffer.from(sig, "base64");
+-      return decoded.length > 0 && decoded[0] === CLAUDE_SIGNATURE_MARKER;
+-    }
+-    if (sig[0] === "R") {
+-      const outer = Buffer.from(sig, "base64");
+-      if (!outer.length || outer[0] !== 0x45) return false; // 'E'
+-      const inner = Buffer.from(outer.toString(), "base64");
+-      return inner.length > 0 && inner[0] === CLAUDE_SIGNATURE_MARKER;
+-    }
+-    return false;
++    const decoded = Buffer.from(sig, "base64");
++    if (!decoded.length) return false;
++    if (hasClaudeMarker(decoded)) return true;
++    const outerText = decoded.toString("latin1");
++    if (!/^[A-Za-z0-9+/]+=*$/.test(outerText)) return false;
++    const inner = Buffer.from(outerText, "base64");
++    return inner.length > 0 && hasClaudeMarker(inner);
+   } catch {
+     return false;
+   }
+diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
+index 00dae23f..3742ae58 100644
+--- a/open-sse/utils/streamHelpers.js
++++ b/open-sse/utils/streamHelpers.js
+@@ -55,8 +55,9 @@ export function hasValuableContent(chunk, format) {
+     const hasText = chunk.delta?.text && chunk.delta.text !== "";
+     const hasThinking = chunk.delta?.thinking && chunk.delta.thinking !== "";
+     const hasInputJson = chunk.delta?.partial_json && chunk.delta.partial_json !== "";
++    const hasSignature = chunk.delta?.signature && chunk.delta.signature !== "";
+     
+-    if (isContentBlockDelta && !hasText && !hasThinking && !hasInputJson) {
++    if (isContentBlockDelta && !hasText && !hasThinking && !hasInputJson && !hasSignature) {
+       return false;
+     }
+     return true;
+diff --git a/tests/translator/claude-adaptive-display.test.js b/tests/translator/claude-adaptive-display.test.js
+new file mode 100644
+index 00000000..390c3f9a
+--- /dev/null
++++ b/tests/translator/claude-adaptive-display.test.js
+@@ -0,0 +1,70 @@
++// Always-adaptive Claude models (thinkingCanDisable: false) keep the client's
++// thinking.display. Dropping it sent the redact-thinking beta, so Anthropic
++// returned signature-only thinking blocks even when the client asked for summaries.
++import { describe, it, expect } from "vitest";
++import "./registerAll.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { selectAnthropicBeta } from "../../open-sse/providers/shared.js";
++import { applyThinking } from "../../open-sse/translator/concerns/thinkingUnified.js";
++
++const REDACT = "redact-thinking-2026-02-12";
++const ALWAYS_ADAPTIVE = "claude-opus-5-5";
++const CAN_DISABLE = "claude-sonnet-5-5";
++const FABLE = "claude-fable-5-1";
++
++function toClaude(model, sourceFormat, body) {
++  return translateRequest(sourceFormat, FORMATS.CLAUDE, model, body, true, null, "claude", null, [], "x", "claude");
++}
++
++const claudeBody = thinking => ({
++  model: ALWAYS_ADAPTIVE,
++  max_tokens: 4096,
++  messages: [{ role: "user", content: "hi" }],
++  ...(thinking ? { thinking } : {})
++});
++
++describe("always-adaptive Claude models keep the client's thinking display", () => {
++  it("forwards display summarized with effort and drops the redact beta", () => {
++    const out = toClaude(ALWAYS_ADAPTIVE, FORMATS.CLAUDE, {
++      ...claudeBody({ type: "adaptive", display: "summarized" }),
++      output_config: { effort: "high" }
++    });
++    expect(out.thinking).toEqual({ type: "adaptive", display: "summarized" });
++    expect(out.output_config.effort).toBe("high");
++    expect(selectAnthropicBeta(ALWAYS_ADAPTIVE, out)).not.toContain(REDACT);
++  });
++
++  it("sends no thinking field and keeps the redact beta when no display was requested", () => {
++    const out = toClaude(ALWAYS_ADAPTIVE, FORMATS.CLAUDE, claudeBody({ type: "adaptive" }));
++    expect(out.thinking).toBeUndefined();
++    expect(selectAnthropicBeta(ALWAYS_ADAPTIVE, out)).toContain(REDACT);
++  });
++
++  it("OpenAI reasoning_effort intent yields summarized thinking for always-adaptive models", () => {
++    const out = toClaude(ALWAYS_ADAPTIVE, FORMATS.OPENAI, {
++      model: ALWAYS_ADAPTIVE,
++      messages: [{ role: "user", content: "hi" }],
++      reasoning_effort: "high"
++    });
++    expect(out.thinking).toEqual({ type: "adaptive", display: "summarized" });
++    expect(selectAnthropicBeta(ALWAYS_ADAPTIVE, out)).not.toContain(REDACT);
++  });
++
++  it("keeps display summarized on a model that can disable thinking", () => {
++    const out = toClaude(CAN_DISABLE, FORMATS.CLAUDE, claudeBody({ type: "adaptive", display: "summarized" }));
++    expect(out.thinking).toEqual({ type: "adaptive", display: "summarized" });
++  });
++
++  it("sends no thinking field for Fable when no display was requested", () => {
++    const out = toClaude(FABLE, FORMATS.CLAUDE, claudeBody({ type: "adaptive" }));
++    expect(out.thinking).toBeUndefined();
++  });
++
++  it("leaves MiniMax Code's permanent-adaptive wire shape effort-only despite a display intent", () => {
++    const body = { model: "MiniMax-M3.1-Flash-Preview", messages: [], thinking: { type: "adaptive", display: "summarized" } };
++    applyThinking("claude", "MiniMax-M3.1-Flash-Preview(xhigh)", body, "minimax-code");
++    expect(body.thinking).toBeUndefined();
++    expect(body.output_config.effort).toBe("xhigh");
++  });
++});
+diff --git a/tests/unit/claude-same-format-stream.test.js b/tests/unit/claude-same-format-stream.test.js
+new file mode 100644
+index 00000000..aa6502d0
+--- /dev/null
++++ b/tests/unit/claude-same-format-stream.test.js
+@@ -0,0 +1,218 @@
++import { describe, it, expect, vi } from "vitest";
++
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => { }),
++  saveRequestDetail: vi.fn(async () => { }),
++  saveUsageStats: vi.fn()
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => { }, remove: async () => { }, getAll: async () => ({}) })
++}));
++vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", async importOriginal => ({
++  ...await importOriginal(),
++  buildRequestDetail: () => ({}),
++  saveUsageStats: () => { },
++  formatDoneLine: () => ""
++}));
++
++import { handleStreamingResponse } from "../../open-sse/handlers/chatCore/streamingHandler.js";
++import { handleNonStreamingResponse } from "../../open-sse/handlers/chatCore/nonStreamingHandler.js";
++import { cloakClaudeTools } from "../../open-sse/utils/claudeCloaking.js";
++import { createStreamController } from "../../open-sse/utils/streamHandler.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++
++const clientRequest = {
++  tools: [{ name: "read", input_schema: { type: "object" } }, { name: "write", input_schema: { type: "object" } }],
++  messages: [{ role: "user", content: "read files" }],
++  tool_choice: { type: "tool", name: "read" }
++};
++
++const derive = () => cloakClaudeTools(clientRequest);
++const upstreamName = (toolNameMap, original) => [...toolNameMap].find(([, name]) => name === original)[0];
++const frame = event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
++const parseEvents = wire => wire.split("\n")
++  .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
++  .map(line => JSON.parse(line.slice(6)));
++const isToolStart = event => event.type === "content_block_start" && event.content_block?.type === "tool_use";
++
++const messageStart = { type: "message_start", message: { id: "msg_stream_1", type: "message", role: "assistant", model: "claude-opus-5-5", content: [], stop_reason: null, usage: { input_tokens: 5, output_tokens: 1 } } };
++const messageDelta = { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 9 } };
++const toolStart = (index, id, name) => ({ type: "content_block_start", index, content_block: { type: "tool_use", id, name, input: {}, caller: { type: "direct" } } });
++const toolCall = (index, id, name, chunks) => [
++  toolStart(index, id, name),
++  ...chunks.map(partial_json => ({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json } })),
++  { type: "content_block_stop", index }
++];
++
++const multiCallEvents = nameOf => [
++  messageStart,
++  ...toolCall(0, "toolu_read_1", nameOf("read"), ['{"path":"文', '件.txt"}']),
++  ...toolCall(1, "toolu_read_2", nameOf("read"), ['{"path":"café.md"}']),
++  ...toolCall(2, "toolu_write_1", nameOf("write"), ['{"path":"日本.txt"}']),
++  messageDelta,
++  { type: "message_stop" }
++];
++
++const richEvents = nameOf => [
++  { ...messageStart, future_field: { enabled: true } },
++  { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
++  { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Plan 思考" } },
++  { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig_opaque" } },
++  { type: "content_block_stop", index: 0 },
++  { type: "content_block_start", index: 1, content_block: { type: "redacted_thinking", data: "opaque_blob" } },
++  { type: "content_block_stop", index: 1 },
++  { type: "ping" },
++  ...toolCall(2, "toolu_read_1", nameOf("read"), ['{"path":"文', '件.txt"}']),
++  { ...messageDelta, future_usage: 1 },
++  { type: "message_stop" }
++];
++
++async function runStream(wire, { toolNameMap, fragmented = false, sourceFormat = FORMATS.CLAUDE, targetFormat = FORMATS.CLAUDE, provider = "claude", body = clientRequest } = {}) {
++  const bytes = new TextEncoder().encode(wire);
++  const chunks = fragmented ? [...bytes].map(byte => Uint8Array.of(byte)) : [bytes];
++  const providerResponse = new Response(new ReadableStream({
++    start(controller) {
++      for (const chunk of chunks) controller.enqueue(chunk);
++      controller.close();
++    }
++  }), { headers: { "content-type": "text/event-stream" } });
++  const result = await handleStreamingResponse({
++    providerResponse,
++    provider,
++    model: "claude-opus-5-5",
++    sourceFormat,
++    targetFormat,
++    body,
++    stream: true,
++    requestStartTime: Date.now(),
++    toolNameMap,
++    streamController: createStreamController({ provider: "claude", model: "claude-opus-5-5" })
++  });
++  return result.response.text();
++}
++
++describe("claude same-format stream keeps tool names and thinking signatures", () => {
++  it.each([false, true])("restores each mapped tool call exactly once and rebuilds the next turn (fragmented=%s)", async fragmented => {
++    const { body: upstreamRequest, toolNameMap } = derive();
++    const mapBefore = new Map(toolNameMap);
++    const wireEvents = multiCallEvents(name => upstreamName(toolNameMap, name));
++    const expectedEvents = multiCallEvents(name => name);
++    const snapshot = structuredClone(wireEvents);
++
++    const out = parseEvents(await runStream(wireEvents.map(frame).join(""), { toolNameMap, fragmented }));
++
++    expect(out).toEqual(expectedEvents);
++    expect(out.filter(isToolStart).map(event => event.content_block.name)).toEqual(["read", "read", "write"]);
++    expect(wireEvents).toEqual(snapshot);
++    expect(toolNameMap).toEqual(mapBefore);
++
++    const upstreamNames = wireEvents.filter(isToolStart).map(event => event.content_block.name);
++    const advertised = new Set(upstreamRequest.tools.map(tool => tool.name));
++    expect(upstreamNames.every(name => advertised.has(name))).toBe(true);
++
++    const starts = out.filter(isToolStart);
++    const inputs = {};
++    for (const event of out) {
++      if (event.type === "content_block_delta") inputs[event.index] = (inputs[event.index] || "") + event.delta.partial_json;
++    }
++    const calls = starts.map(event => ({ type: "tool_use", id: event.content_block.id, name: event.content_block.name, input: JSON.parse(inputs[event.index]) }));
++    expect(calls.map(call => call.input)).toEqual([{ path: "文件.txt" }, { path: "café.md" }, { path: "日本.txt" }]);
++    expect(calls.map(call => call.id)).toEqual(wireEvents.filter(isToolStart).map(event => event.content_block.id));
++
++    const history = [
++      { role: "user", content: "read files" },
++      { role: "assistant", content: calls },
++      { role: "user", content: calls.map(call => ({ type: "tool_result", tool_use_id: call.id, content: "ok" })) }
++    ];
++    const second = cloakClaudeTools({ ...clientRequest, messages: history });
++    expect(second.body.messages[1].content.map(block => block.name)).toEqual(upstreamNames);
++    expect(second.body.messages[2].content.map(block => block.tool_use_id)).toEqual(calls.map(call => call.id));
++    expect(second.body.tool_choice).toEqual({ type: "tool", name: upstreamName(toolNameMap, "read") });
++  });
++
++  it("leaves unmapped, decoy and non-tool events unchanged under an active map and without a map", async () => {
++    const { toolNameMap } = derive();
++    const events = [
++      toolStart(1, "toolu_bash", "Bash"),
++      { type: "content_block_start", index: 2, content_block: { type: "text", text: "", name: upstreamName(toolNameMap, "read") } }
++    ];
++    expect(parseEvents(await runStream(events.map(frame).join(""), { toolNameMap }))).toEqual(events);
++
++    const mappedLooking = [toolStart(0, "toolu_map", "write_ide"), toolStart(1, "toolu_plain", "read_ide")];
++    expect(parseEvents(await runStream(mappedLooking.map(frame).join(""), { toolNameMap: null }))).toEqual(mappedLooking);
++  });
++
++  it.each([false, true])("keeps thinking, redacted, ping, caller, future fields and terminal events (fragmented=%s)", async fragmented => {
++    const { toolNameMap } = derive();
++    const wireEvents = richEvents(name => upstreamName(toolNameMap, name));
++    const raw = await runStream(wireEvents.map(frame).join(""), { toolNameMap, fragmented });
++
++    expect(parseEvents(raw)).toEqual(richEvents(name => name));
++    for (const event of wireEvents.filter(event => !isToolStart(event))) expect(raw).toContain(frame(event));
++  });
++
++  it("passes an overloaded error event through without fabricating a terminal", async () => {
++    const { toolNameMap } = derive();
++    const events = [messageStart, { type: "error", error: { type: "overloaded_error", message: "Overloaded", retry_after: 3 }, request_id: "req_overloaded_1" }];
++    const out = parseEvents(await runStream(events.map(frame).join(""), { toolNameMap }));
++    expect(out).toEqual(events);
++    expect(out.map(event => event.type)).toEqual(["message_start", "error"]);
++  });
++
++  it.each([
++    ["mapped", "read_ide", "read"],
++    ["unmapped", "Bash", "Bash"]
++  ])("frames a final %s tool data line without trailing newline before [DONE]", async (_, upstream, expected) => {
++    const { toolNameMap } = derive();
++    const name = upstream === "read_ide" ? upstreamName(toolNameMap, "read") : upstream;
++    const start = toolStart(0, "toolu_eof_1", name);
++    const wire = frame(messageStart) + `event: content_block_start\ndata: ${JSON.stringify(start)}`;
++
++    const raw = await runStream(wire, { toolNameMap });
++    expect(parseEvents(raw)).toEqual([messageStart, toolStart(0, "toolu_eof_1", expected)]);
++  });
++
++  it("restores a single non-streaming tool name while keeping signed thinking and extra fields", async () => {
++    const request = { tools: [{ name: "view_file", input_schema: { type: "object" } }], messages: [{ role: "user", content: "open" }] };
++    const { toolNameMap } = cloakClaudeTools(request);
++    const [providerName] = toolNameMap.keys();
++    const providerBody = {
++      id: "msg_nonstream_1",
++      type: "message",
++      role: "assistant",
++      model: "claude-opus-5-5",
++      content: [
++        { type: "thinking", thinking: "Need file", signature: "sig_opaque" },
++        { type: "tool_use", id: "toolu_view_1", name: providerName, input: { path: "a.txt" }, caller: { type: "direct" } }
++      ],
++      stop_reason: "tool_use",
++      stop_sequence: null,
++      usage: { input_tokens: 4, output_tokens: 2 },
++      future_field: { kept: true }
++    };
++
++    const result = await handleNonStreamingResponse({
++      providerResponse: new Response(JSON.stringify(providerBody), { status: 200, headers: { "content-type": "application/json" } }),
++      provider: "claude",
++      model: "claude-opus-5-5",
++      sourceFormat: FORMATS.CLAUDE,
++      targetFormat: FORMATS.CLAUDE,
++      body: request,
++      stream: false,
++      requestStartTime: Date.now(),
++      toolNameMap,
++      reqLogger: { logProviderResponse() { }, logConvertedResponse() { } },
++      trackDone() { },
++      appendLog() { }
++    });
++
++    const body = await result.response.json();
++    expect({ ...body, usage: null }).toEqual({
++      ...providerBody,
++      content: [providerBody.content[0], { ...providerBody.content[1], name: "view_file" }],
++      usage: null
++    });
++  });
++});
++
+diff --git a/tests/unit/claude-signature-versioned-form.test.js b/tests/unit/claude-signature-versioned-form.test.js
+new file mode 100644
+index 00000000..ad682605
+--- /dev/null
++++ b/tests/unit/claude-signature-versioned-form.test.js
+@@ -0,0 +1,87 @@
++import { describe, it, expect } from "vitest";
++import { isValidClaudeSignature } from "../../open-sse/utils/claudeSignature.js";
++import { normalizeClaudePassthrough, prepareClaudeRequest } from "../../open-sse/translator/formats/claude.js";
++
++const b64 = bytes => Buffer.from(bytes).toString("base64");
++
++const cForm = b64([0x08, 0x04, 0x12, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05]);
++const cFormMultiByteVarint = b64([0x08, 0x80, 0x01, 0x12, 0x01, 0x00]);
++const eForm = b64([0x12, 0x03, 0x01, 0x02, 0x03]);
++const rForm = Buffer.from(eForm).toString("base64");
++const qForm = Buffer.from(cForm).toString("base64");
++const foreignMarker = b64([0x0a, 0x10, 0x01, 0x02]);
++const foreignVarint = b64([0x08, 0x04, 0x0a, 0x01]);
++const foreignWrapped = Buffer.from(foreignMarker).toString("base64");
++
++describe("isValidClaudeSignature accepts every Claude signature form", () => {
++  it.each([
++    ["C-form with a version varint", cForm],
++    ["C-form with a multi-byte version varint", cFormMultiByteVarint],
++    ["E-form", eForm],
++    ["R-form wrapping an E-form", rForm],
++    ["Q-form wrapping a C-form", qForm]
++  ])("accepts %s", (_, signature) => {
++    expect(isValidClaudeSignature(signature)).toBe(true);
++  });
++
++  it.each([
++    ["marker byte absent", foreignMarker],
++    ["marker byte absent after a version varint", foreignVarint],
++    ["double-wrapped foreign payload", foreignWrapped],
++    ["empty string", ""]
++  ])("rejects %s", (_, signature) => {
++    expect(isValidClaudeSignature(signature)).toBe(false);
++  });
++
++  it("returns a boolean for non-base64 garbage without throwing", () => {
++    expect(typeof isValidClaudeSignature("CAQS!!@@$$%%")).toBe("boolean");
++  });
++});
++
++const historyWith = signature => ({
++  model: "claude-opus-5-5",
++  thinking: { type: "enabled", budget_tokens: 1024 },
++  messages: [
++    { role: "user", content: "read the file" },
++    {
++      role: "assistant",
++      content: [
++        { type: "thinking", thinking: "t", signature },
++        { type: "tool_use", id: "toolu_1", name: "read", input: {} }
++      ]
++    },
++    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] }
++  ]
++});
++
++const assistantContent = body => body.messages[1].content;
++const isPlaceholder = block => block.type === "thinking" && block.thinking === ".";
++
++describe("claude passthrough keeps versioned signatures in history", () => {
++  it("keeps a C-form thinking block and adds no placeholder (normalizeClaudePassthrough)", () => {
++    const body = historyWith(cForm);
++    normalizeClaudePassthrough(body, "claude-opus-5-5");
++
++    const content = assistantContent(body);
++    expect(content[0]).toEqual({ type: "thinking", thinking: "t", signature: cForm });
++    expect(content.some(isPlaceholder)).toBe(false);
++  });
++
++  it("keeps a C-form thinking block for provider claude (prepareClaudeRequest)", () => {
++    const body = prepareClaudeRequest(historyWith(cForm), "claude", "sk-ant-api-test");
++
++    const content = assistantContent(body);
++    expect(content.find(block => block.type === "thinking")).toMatchObject({ thinking: "t", signature: cForm });
++    expect(content.some(isPlaceholder)).toBe(false);
++  });
++
++  it("still drops a foreign-signed thinking block and inserts the placeholder", () => {
++    const body = historyWith(foreignMarker);
++    normalizeClaudePassthrough(body, "claude-opus-5-5");
++
++    const content = assistantContent(body);
++    expect(content.some(block => block.signature === foreignMarker)).toBe(false);
++    expect(content[0]).toMatchObject({ type: "thinking", thinking: "." });
++    expect(content.at(-1)).toMatchObject({ type: "tool_use", id: "toolu_1" });
++  });
++});

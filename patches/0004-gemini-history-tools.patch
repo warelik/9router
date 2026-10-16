@@ -1,0 +1,3125 @@
+From 0fa0f75329ea4368ffc920bf176076da68ce7805 Mon Sep 17 00:00:00 2001
+From: Overlay Migration <overlay-migration@example.invalid>
+Date: Fri, 16 Oct 2026 08:36:02 +0000
+Subject: [PATCH 4/8] 0004 gemini-history-tools
+
+Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
+Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
+Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
+---
+ open-sse/executors/zed.js                     |  14 +-
+ open-sse/handlers/chatCore.js                 |   2 +-
+ .../handlers/chatCore/nonStreamingHandler.js  |  57 +-
+ open-sse/services/thoughtSignatureStore.js    | 113 +++
+ open-sse/translator/concerns/toolCall.js      |  40 +-
+ open-sse/translator/formats/gemini.js         | 205 +++--
+ open-sse/translator/index.js                  |  13 +-
+ .../translator/request/openai-to-gemini.js    | 334 +++----
+ .../translator/request/openai-to-vertex.js    |   9 +-
+ .../translator/response/gemini-to-openai.js   |  50 +-
+ open-sse/utils/sessionManager.js              |  16 +
+ open-sse/utils/stream.js                      |  29 +-
+ open-sse/utils/usageTracking.js               |   2 +-
+ .../__snapshots__/golden-request.test.js.snap |   4 +-
+ .../bugs-gemini-cursor-commandcode.test.js    |   7 +-
+ tests/translator/golden-request.test.js       |  18 +
+ tests/unit/chat-to-gemini-contract.test.js    | 817 ++++++++++++++++++
+ .../gemini-contents-normalization.test.js     |   4 +-
+ .../gemini-nonstream-source-format.test.js    |  65 ++
+ .../gemini-server-parts-isolation.test.js     | 130 +++
+ tests/unit/gemini-tool-call-id-fifo.test.js   | 118 +++
+ tests/unit/gemini-turn-signature.test.js      | 168 ++++
+ .../unit/translated-chat-stream-done.test.js  |  57 ++
+ tests/unit/zed-completions-wire.test.js       | 110 +++
+ 24 files changed, 2087 insertions(+), 295 deletions(-)
+ create mode 100644 tests/unit/chat-to-gemini-contract.test.js
+ create mode 100644 tests/unit/gemini-nonstream-source-format.test.js
+ create mode 100644 tests/unit/gemini-server-parts-isolation.test.js
+ create mode 100644 tests/unit/gemini-tool-call-id-fifo.test.js
+ create mode 100644 tests/unit/gemini-turn-signature.test.js
+ create mode 100644 tests/unit/translated-chat-stream-done.test.js
+
+diff --git a/open-sse/executors/zed.js b/open-sse/executors/zed.js
+index b88d2762..5d3a7e79 100644
+--- a/open-sse/executors/zed.js
++++ b/open-sse/executors/zed.js
+@@ -17,6 +17,8 @@
+ import { BaseExecutor } from "./base.js";
+ import { FORMATS } from "../translator/formats.js";
+ import { initState } from "../translator/index.js";
++import { ensureToolCallIds, fixMissingToolResponses } from "../translator/concerns/toolCall.js";
++import { applyThinking, captureThinking } from "../translator/concerns/thinkingUnified.js";
+ import { openaiToClaudeRequest } from "../translator/request/openai-to-claude.js";
+ import { openaiToGeminiRequest } from "../translator/request/openai-to-gemini.js";
+ import { openaiToOpenAIResponsesRequest } from "../translator/request/openai-responses.js";
+@@ -59,22 +61,32 @@ function normalizeZedProvider(value, model) {
+ 
+ function buildProviderRequest(provider, model, body, stream, credentials) {
+   if (provider === ZED_PROVIDER.anthropic) {
++    ensureToolCallIds(body);
++    fixMissingToolResponses(body);
+     return openaiToClaudeRequest(model, body, true);
+   }
+   if (provider === ZED_PROVIDER.google) {
+-    const geminiRequest = openaiToGeminiRequest(model, body, true);
++    ensureToolCallIds(body, { preserveIds: true });
++    const geminiRequest = openaiToGeminiRequest(model, body, true, credentials);
++    applyThinking("gemini", model, geminiRequest, "gemini", captureThinking(body));
+     // Zed's hosted Gemini backend speaks the Vertex safety vocabulary, not the
+     // public Gemini API enum the shared translator emits (`OFF`, `CIVIC_INTEGRITY`,
+     // `DANGEROUS_CONTENT`). Drop client-side safetySettings for the Zed Google
+     // path so Zed applies its own defaults — scoped here so native Gemini/
+     // Antigravity is untouched.
+     delete geminiRequest.safetySettings;
++    delete geminiRequest._customToolNames;
++    delete geminiRequest._toolNameMap;
+     return geminiRequest;
+   }
+   if (provider === ZED_PROVIDER.openai) {
++    ensureToolCallIds(body);
++    fixMissingToolResponses(body);
+     return openaiToOpenAIResponsesRequest(model, body, true, credentials);
+   }
+   // xAI is OpenAI-shaped — forward as-is.
++  ensureToolCallIds(body);
++  fixMissingToolResponses(body);
+   return { ...(body || {}), model, stream: stream !== false };
+ }
+ 
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index 827ce9b7..aa275eb3 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -589,7 +589,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+ 
+   // True non-streaming response
+   if (!stream) {
+-    const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, customToolNames, trackDone, appendLog });
++    const result = await handleNonStreamingResponse({ ...sharedCtx, credentials, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, customToolNames, trackDone, appendLog });
+     streamController.handleComplete();
+     return result;
+   }
+diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
+index ac79c218..70420821 100644
+--- a/open-sse/handlers/chatCore/nonStreamingHandler.js
++++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
+@@ -1,6 +1,7 @@
+ import { FORMATS } from "../../translator/formats.js";
+ import { needsTranslation } from "../../translator/index.js";
+ import { openAICompletionToClaudeMessage } from "../../translator/concerns/claudeMessage.js";
++import { toOpenAIUsage } from "../../translator/concerns/usage.js";
+ import { ollamaBodyToOpenAI } from "../../translator/response/ollama-to-openai.js";
+ import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTracking.js";
+ import { createErrorResult } from "../../utils/error.js";
+@@ -13,6 +14,8 @@ import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+ import { decloakToolNames } from "../../utils/claudeCloaking.js";
+ import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
+ import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
++import { storeGeminiTurnSignature, storeGeminiThoughtSignature, storeGeminiServerParts, storeGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
++import { toOpenAIFinish } from "../../translator/concerns/finishReason.js";
+ 
+ function parseToolArguments(value) {
+   if (!value) return {};
+@@ -138,14 +141,34 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
+     const usage = response.usageMetadata || responseBody.usageMetadata;
+     let textContent = "", reasoningContent = "";
+     const toolCalls = [];
++    const serverParts = [];
++    let turnSignature = null;
+ 
+     if (content?.parts) {
+       for (const part of content.parts) {
++        // Server-executed tool parts (googleSearch on Gemini 3) are captured verbatim
++        // for replay; they must not surface as text or set the pending signature.
++        if (part.toolCall || part.toolResponse) {
++          serverParts.push(part);
++          continue;
++        }
++        const partSig = part.thoughtSignature || part.thought_signature;
++        if (typeof partSig === "string" && partSig) turnSignature = partSig;
+         if (part.thought === true && part.text) reasoningContent += part.text;
+         else if (part.text !== undefined) textContent += part.text;
+         if (part.functionCall) {
++          const callId = part.functionCall.id || `call_${part.functionCall.name}_${Date.now()}_${toolCalls.length}`;
++          // The call's own signature (or the one just before it) must come back with the call.
++          if (turnSignature) {
++            storeGeminiThoughtSignature(callId, turnSignature, sessionId, response.modelVersion);
++            turnSignature = null;
++          }
++          if (serverParts.length) {
++            storeGeminiServerParts(callId, serverParts, serverPartsSessionId, response.modelVersion, turnScope);
++            serverParts.length = 0;
++          }
+           toolCalls.push({
+-            id: `call_${part.functionCall.name}_${Date.now()}_${toolCalls.length}`,
++            id: callId,
+             type: "function",
+             function: { name: part.functionCall.name, arguments: JSON.stringify(part.functionCall.args || {}) }
+           });
+@@ -162,10 +185,25 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
+     const message = { role: "assistant" };
+     if (textContent) message.content = textContent;
+     if (reasoningContent) message.reasoning_content = reasoningContent;
++    if (turnSignature && toolCalls.length === 0) {
++      storeGeminiTurnSignature({
++        reasoning: reasoningContent,
++        content: textContent,
++        scope: turnScope,
++      }, turnSignature, response.modelVersion);
++    }
++    if (serverParts.length) {
++      storeGeminiServerPartsForTurn({
++        reasoning: reasoningContent,
++        content: textContent,
++        scope: turnScope,
++        sessionId: serverPartsSessionId,
++      }, serverParts, response.modelVersion);
++    }
+     if (toolCalls.length > 0) message.tool_calls = toolCalls;
+     if (!message.content && !message.tool_calls) message.content = "";
+ 
+-    let finishReason = (candidate.finishReason || "stop").toLowerCase();
++    let finishReason = toOpenAIFinish(candidate.finishReason || "STOP", "gemini");
+     if (finishReason === "stop" && toolCalls.length > 0) finishReason = "tool_calls";
+ 
+     const result = {
+@@ -177,15 +215,12 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
+     };
+ 
+     if (usage) {
+-      result.usage = {
+-        prompt_tokens: (usage.promptTokenCount || 0) + (usage.thoughtsTokenCount || 0),
+-        completion_tokens: usage.candidatesTokenCount || 0,
+-        total_tokens: usage.totalTokenCount || 0
+-      };
+-      if (usage.thoughtsTokenCount > 0) {
+-        result.usage.completion_tokens_details = { reasoning_tokens: usage.thoughtsTokenCount };
+-      }
++      result.usage = toOpenAIUsage(usage, "gemini");
+     }
++    // Same hand-off as the OpenAI-shaped branches above: Claude and Responses clients must not
++    // receive a bare chat.completion body.
++    if (sourceFormat === FORMATS.OPENAI_RESPONSES) return openAICompletionToResponses(result, customToolNames);
++    if (sourceFormat === FORMATS.CLAUDE) return openAICompletionToClaudeMessage(result);
+     return result;
+   }
+ 
+@@ -329,7 +364,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
+   if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: Date.now() - requestStartTime } }));
+ 
+   const translatedResponse = needsTranslation(targetFormat, sourceFormat)
+-    ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames)
++    ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames, credentials?._geminiTurnScope, credentials?._clientSessionId, credentials?._geminiServerPartsSessionId)
+     : responseBody;
+   const isClaudeMessageResponse = sourceFormat === FORMATS.CLAUDE && translatedResponse?.type === "message";
+   // Responses-format translation produces a `object:"response"` body with no
+diff --git a/open-sse/services/thoughtSignatureStore.js b/open-sse/services/thoughtSignatureStore.js
+index 71fb94b8..906cffc4 100644
+--- a/open-sse/services/thoughtSignatureStore.js
++++ b/open-sse/services/thoughtSignatureStore.js
+@@ -1,3 +1,4 @@
++import { createHash } from "node:crypto";
+ import { makeKv } from "../../src/lib/db/helpers/kvStore.js";
+ 
+ const MAX_SIGNATURES = 2000;
+@@ -197,3 +198,115 @@ export function getGeminiThoughtSignatureSync(toolCallId, sessionId = null, mode
+   }
+   return null;
+ }
++
++/**
++ * Conversation identity for turn signatures: everything stable that gives a turn its context -
++ * the system instruction and, per part, roles, texts, tool call ids, tool names, call arguments, tool results
++ * and inline data. Only what differs between a turn and its echo is left out: thought parts and
++ * signatures. It is computed from the request that produced a turn and, later, from the history
++ * preceding that turn in the next request, so both sides agree even though normalisation merges
++ * messages.
++ */
++export function geminiTurnScope(contents, systemInstruction = null) {
++  if (!Array.isArray(contents)) return null;
++  const h = createHash("sha256");
++  const put = (...items) => h.update(`${items.join("\u0001")}\u0000`);
++  for (const p of systemInstruction?.parts || []) {
++    if (typeof p?.text === "string" && p.text.trim()) put("sys", p.text.trim());
++  }
++  for (const c of contents) {
++    for (const p of c?.parts || []) {
++      if (p?.functionCall) put(c.role, "fc", p.functionCall.id ?? "", p.functionCall.name, JSON.stringify(p.functionCall.args ?? {}));
++      else if (p?.functionResponse) put(c.role, "fr", p.functionResponse.id ?? "", p.functionResponse.name, JSON.stringify(p.functionResponse.response ?? {}));
++      else if (p?.inlineData || p?.inline_data) put(c.role, "inline", JSON.stringify(p.inlineData || p.inline_data));
++      else if (p?.fileData || p?.file_data) put(c.role, "file", JSON.stringify(p.fileData || p.file_data));
++      else if (!p?.thought && typeof p?.text === "string" && p.text.trim()) put(c.role, "t", p.text.trim());
++    }
++  }
++  return h.digest("hex");
++}
++
++/**
++ * Signatures of assistant turns without a tool call. Clients echo the turn back as plain
++ * reasoning/content text and never see the signature, so the turn is keyed by its text within
++ * its conversation scope: `r` = reasoning (thought summary) text, `c` = visible answer text.
++ * Both are stored when present so the lookup works for clients that drop either of them.
++ * The same text in a different conversation prefix never matches.
++ */
++function turnKey(kind, text, scope) {
++  const normalized = typeof text === "string" ? text.trim() : "";
++  if (!normalized || !scope) return null;
++  const digest = createHash("sha256").update(`${scope}\0${kind}\0${normalized}`).digest("hex");
++  return `turn:${digest}`;
++}
++
++export function storeGeminiTurnSignature({ reasoning, content, scope }, signature, model = null) {
++  for (const key of [turnKey("r", reasoning, scope), turnKey("c", content, scope)]) {
++    if (key) storeGeminiThoughtSignature(key, signature, null, model);
++  }
++}
++
++export function findGeminiTurnSignature({ reasoning, content, scope }, model = null) {
++  for (const key of [turnKey("r", reasoning, scope), turnKey("c", content, scope)]) {
++    const sig = key ? getGeminiThoughtSignatureSync(key, null, model) : null;
++    if (sig) return sig;
++  }
++  return null;
++}
++
++const SERVER_PARTS_PREFIX = "serverparts:";
++
++const isNonEmptyString = (value) => typeof value === "string" && value.length > 0;
++
++// Server-side tool parts are plaintext conversation data: they are only ever addressed
++// by session AND conversation scope AND anchor, never by the anchor alone.
++function serverPartsKey(anchorId, sessionId, scope) {
++  if (!isNonEmptyString(anchorId) || !isNonEmptyString(sessionId) || !isNonEmptyString(scope)) return null;
++  return `${SERVER_PARTS_PREFIX}${createHash("sha256").update(JSON.stringify([sessionId, scope, anchorId])).digest("hex")}`;
++}
++
++function decodeServerParts(raw) {
++  if (typeof raw !== "string") return null;
++  try {
++    const parsed = JSON.parse(raw);
++    return Array.isArray(parsed) ? parsed : null;
++  } catch {
++    return null;
++  }
++}
++
++/**
++ * Server-side tool parts (toolCall/toolResponse, e.g. googleSearch on Gemini 3) anchored to the
++ * functionCall they precede. Stored as a JSON string so the shared KV prune keeps working.
++ */
++export function storeGeminiServerParts(anchorId, parts, sessionId = null, model = null, scope = null) {
++  const key = serverPartsKey(anchorId, sessionId, scope);
++  if (!key || !Array.isArray(parts) || parts.length === 0) return;
++  storeGeminiThoughtSignature(key, JSON.stringify(parts), null, model);
++}
++
++export function getGeminiServerPartsSync(anchorId, sessionId = null, model = null, scope = null) {
++  const key = serverPartsKey(anchorId, sessionId, scope);
++  return key ? decodeServerParts(getGeminiThoughtSignatureSync(key, null, model)) : null;
++}
++
++/**
++ * Same anchoring as storeGeminiTurnSignature: a turn that ends in text has no call id, so the
++ * parts are keyed by the turn's reasoning/content text inside its conversation scope.
++ */
++export function storeGeminiServerPartsForTurn({ reasoning, content, scope, sessionId = null }, parts, model = null) {
++  if (!Array.isArray(parts) || parts.length === 0) return;
++  for (const anchor of [turnKey("r", reasoning, scope), turnKey("c", content, scope)]) {
++    const key = serverPartsKey(anchor, sessionId, scope);
++    if (key) storeGeminiThoughtSignature(key, JSON.stringify(parts), null, model);
++  }
++}
++
++export function findGeminiServerPartsForTurn({ reasoning, content, scope, sessionId = null }, model = null) {
++  for (const anchor of [turnKey("r", reasoning, scope), turnKey("c", content, scope)]) {
++    const key = serverPartsKey(anchor, sessionId, scope);
++    const parts = key ? decodeServerParts(getGeminiThoughtSignatureSync(key, null, model)) : null;
++    if (parts) return parts;
++  }
++  return null;
++}
+diff --git a/open-sse/translator/concerns/toolCall.js b/open-sse/translator/concerns/toolCall.js
+index 251850c1..95cca8b6 100644
+--- a/open-sse/translator/concerns/toolCall.js
++++ b/open-sse/translator/concerns/toolCall.js
+@@ -23,8 +23,18 @@ function sanitizeToolId(id) {
+   return sanitized.length > 0 ? sanitized : null;
+ }
+ 
++export function isGeminiFamilyTarget(targetFormat, model) {
++  if (targetFormat === FORMATS.GEMINI || targetFormat === FORMATS.GEMINI_CLI || targetFormat === FORMATS.VERTEX) {
++    return true;
++  }
++  if (targetFormat === FORMATS.ANTIGRAVITY) {
++    return !String(model || "").toLowerCase().includes("claude");
++  }
++  return false;
++}
++
+ // Ensure all tool_calls have valid id field and arguments is string (some providers require it)
+-export function ensureToolCallIds(body) {
++export function ensureToolCallIds(body, { preserveIds = false } = {}) {
+   if (!body.messages || !Array.isArray(body.messages)) return body;
+ 
+   for (let i = 0; i < body.messages.length; i++) {
+@@ -33,8 +43,8 @@ export function ensureToolCallIds(body) {
+       for (let j = 0; j < msg.tool_calls.length; j++) {
+         const tc = msg.tool_calls[j];
+         // Validate or regenerate ID for Anthropic compatibility
+-        if (!tc.id || !TOOL_ID_PATTERN.test(tc.id)) {
+-          const sanitized = sanitizeToolId(tc.id);
++        if (preserveIds ? !tc.id : (!tc.id || !TOOL_ID_PATTERN.test(tc.id))) {
++          const sanitized = preserveIds ? null : sanitizeToolId(tc.id);
+           tc.id = sanitized || generateToolCallId(i, j, tc.function?.name);
+         }
+         if (!tc.type) {
+@@ -48,23 +58,29 @@ export function ensureToolCallIds(body) {
+     }
+ 
+     // Validate tool_call_id in tool messages (role: "tool")
+-    if (msg.role === "tool" && msg.tool_call_id && !TOOL_ID_PATTERN.test(msg.tool_call_id)) {
+-      const sanitized = sanitizeToolId(msg.tool_call_id);
+-      msg.tool_call_id = sanitized || generateToolCallId(i, 0);
++    if (msg.role === "tool") {
++      if (preserveIds ? !msg.tool_call_id : (msg.tool_call_id && !TOOL_ID_PATTERN.test(msg.tool_call_id))) {
++        const sanitized = preserveIds ? null : sanitizeToolId(msg.tool_call_id);
++        msg.tool_call_id = sanitized || generateToolCallId(i, 0);
++      }
+     }
+ 
+     // Also validate tool_use blocks in content (Claude format)
+     if (Array.isArray(msg.content)) {
+       for (let k = 0; k < msg.content.length; k++) {
+         const block = msg.content[k];
+-        if (block.type === "tool_use" && block.id && !TOOL_ID_PATTERN.test(block.id)) {
+-          const sanitized = sanitizeToolId(block.id);
+-          block.id = sanitized || generateToolCallId(i, k, block.name);
++        if (block.type === "tool_use") {
++          if (preserveIds ? !block.id : (block.id && !TOOL_ID_PATTERN.test(block.id))) {
++            const sanitized = preserveIds ? null : sanitizeToolId(block.id);
++            block.id = sanitized || generateToolCallId(i, k, block.name);
++          }
+         }
+         // Validate tool_use_id in tool_result blocks
+-        if (block.type === "tool_result" && block.tool_use_id && !TOOL_ID_PATTERN.test(block.tool_use_id)) {
+-          const sanitized = sanitizeToolId(block.tool_use_id);
+-          block.tool_use_id = sanitized || generateToolCallId(i, k);
++        if (block.type === "tool_result") {
++          if (preserveIds ? !block.tool_use_id : (block.tool_use_id && !TOOL_ID_PATTERN.test(block.tool_use_id))) {
++            const sanitized = preserveIds ? null : sanitizeToolId(block.tool_use_id);
++            block.tool_use_id = sanitized || generateToolCallId(i, k);
++          }
+         }
+       }
+     }
+diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
+index ba24aade..1f42b117 100644
+--- a/open-sse/translator/formats/gemini.js
++++ b/open-sse/translator/formats/gemini.js
+@@ -1,7 +1,7 @@
+ // Gemini helper functions for translator
+ 
+ import { safeParseJSON } from "../concerns/json.js";
+-import { OPENAI_BLOCK } from "../schema/index.js";
++import { OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
+ import { isGemini4Model } from "../../providers/capabilities.js";
+ 
+ // Unsupported JSON Schema constraints that should be removed for Antigravity
+@@ -52,6 +52,43 @@ export const DEFAULT_SAFETY_SETTINGS = [
+   { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "OFF" }
+ ];
+ 
++const FILE_EXTENSION_MIME = {
++  pdf: "application/pdf", json: "application/json",
++  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
++  mp3: "audio/mpeg", wav: "audio/wav", mp4: "video/mp4",
++  txt: "text/plain", md: "text/markdown", csv: "text/csv",
++};
++
++function fileMimeType(filename, explicit) {
++  if (typeof explicit === "string" && explicit.includes("/")) return explicit;
++  const ext = typeof filename === "string" ? filename.split(".").pop().toLowerCase() : "";
++  const mime = FILE_EXTENSION_MIME[ext];
++  return typeof mime === "string" ? mime : undefined;
++}
++
++function dataUrlToInlinePart(url) {
++  const commaIndex = url.indexOf(",");
++  if (commaIndex === -1) return null;
++  const mimeType = url.substring(5, commaIndex).split(";")[0];
++  return { inlineData: { mime_type: mimeType, data: url.substring(commaIndex + 1) } };
++}
++
++function appendFilePart(parts, file) {
++  if (!file || typeof file !== "object") return;
++  const mime = fileMimeType(file.filename, file.mime_type || file.mimeType);
++  const data = file.file_data;
++  if (typeof data === "string" && data.startsWith("data:")) {
++    const part = dataUrlToInlinePart(data);
++    if (part) parts.push(part);
++  } else if (typeof data === "string" && /^https?:\/\//.test(data)) {
++    parts.push({ fileData: { fileUri: data, ...(mime ? { mimeType: mime } : {}) } });
++  } else if (typeof data === "string" && data) {
++    parts.push({ inlineData: { mime_type: mime || "application/octet-stream", data } });
++  } else if (typeof file.file_url === "string" && /^https?:\/\//.test(file.file_url)) {
++    parts.push({ fileData: { fileUri: file.file_url, ...(mime ? { mimeType: mime } : {}) } });
++  }
++}
++
+ // Convert OpenAI content to Gemini parts
+ export function convertOpenAIContentToParts(content) {
+   const parts = [];
+@@ -95,14 +132,10 @@ export function convertOpenAIContentToParts(content) {
+             inlineData: { mime_type: mimeType, data: data }
+           });
+         }
+-      } else if (item.type === OPENAI_BLOCK.FILE && item.file?.file_data?.startsWith("data:")) {
+-        const url = item.file.file_data;
+-        const commaIndex = url.indexOf(",");
+-        if (commaIndex !== -1) {
+-          const mimeType = url.substring(5, commaIndex).split(";")[0];
+-          const data = url.substring(commaIndex + 1);
+-          parts.push({ inlineData: { mime_type: mimeType, data: data } });
+-        }
++      } else if (item.type === OPENAI_BLOCK.FILE) {
++        appendFilePart(parts, item.file);
++      } else if (item.type === RESPONSES_ITEM.INPUT_FILE) {
++        appendFilePart(parts, item);
+       }
+     }
+   }
+@@ -143,50 +176,61 @@ export function generateProjectId() {
+   return `${adj}-${noun}-${crypto.randomUUID().slice(0, 5)}`;
+ }
+ 
++const SCHEMA_MAP_KEYS = new Set(["properties", "$defs", "definitions", "patternProperties", "dependentSchemas"]);
++const SCHEMA_ARRAY_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
++const SCHEMA_SINGLE_KEYS = new Set(["items", "additionalProperties", "contains", "not", "if", "then", "else"]);
++
++function eachChildSchema(node, fn) {
++  for (const key of Object.keys(node)) {
++    if (SCHEMA_MAP_KEYS.has(key)) {
++      const map = node[key];
++      if (map && typeof map === "object" && !Array.isArray(map)) {
++        for (const child of Object.values(map)) {
++          if (child && typeof child === "object") fn(child);
++        }
++      }
++    } else if (SCHEMA_ARRAY_KEYS.has(key)) {
++      if (Array.isArray(node[key])) {
++        for (const child of node[key]) {
++          if (child && typeof child === "object") fn(child);
++        }
++      }
++    } else if (SCHEMA_SINGLE_KEYS.has(key)) {
++      const child = node[key];
++      if (child && typeof child === "object" && !Array.isArray(child)) fn(child);
++    }
++  }
++}
++
+ // Helper: Remove unsupported keywords recursively from object/array
+ // Also strips all vendor extension fields (x- prefixed) not supported by Gemini
+ function removeUnsupportedKeywords(obj, keywords) {
+-  if (!obj || typeof obj !== "object") return;
+-
+-  if (Array.isArray(obj)) {
+-    for (const item of obj) {
+-      removeUnsupportedKeywords(item, keywords);
+-    }
+-    return;
+-  }
++  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+ 
+   for (const key of Object.keys(obj)) {
+     if (keywords.includes(key) || key.startsWith("x-")) {
+       delete obj[key];
+-      continue;
+-    }
+-
+-    const value = obj[key];
+-    if (value && typeof value === "object") {
+-      removeUnsupportedKeywords(value, keywords);
+     }
+   }
++
++  eachChildSchema(obj, (child) => removeUnsupportedKeywords(child, keywords));
+ }
+ 
+ // Convert const to enum
+ function convertConstToEnum(obj) {
+-  if (!obj || typeof obj !== "object") return;
++  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+ 
+   if (obj.const !== undefined && !obj.enum) {
+     obj.enum = [obj.const];
+     delete obj.const;
+   }
+ 
+-  for (const value of Object.values(obj)) {
+-    if (value && typeof value === "object") {
+-      convertConstToEnum(value);
+-    }
+-  }
++  eachChildSchema(obj, convertConstToEnum);
+ }
+ 
+ // Convert enum values to strings (Gemini requires string enum values + explicit type:"string")
+ function convertEnumValuesToStrings(obj) {
+-  if (!obj || typeof obj !== "object") return;
++  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+ 
+   if (obj.enum && Array.isArray(obj.enum)) {
+     obj.enum = obj.enum.map(v => String(v));
+@@ -196,16 +240,12 @@ function convertEnumValuesToStrings(obj) {
+     }
+   }
+ 
+-  for (const value of Object.values(obj)) {
+-    if (value && typeof value === "object") {
+-      convertEnumValuesToStrings(value);
+-    }
+-  }
++  eachChildSchema(obj, convertEnumValuesToStrings);
+ }
+ 
+ // Merge allOf schemas
+ function mergeAllOf(obj) {
+-  if (!obj || typeof obj !== "object") return;
++  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+ 
+   if (obj.allOf && Array.isArray(obj.allOf)) {
+     const merged = {};
+@@ -230,11 +270,7 @@ function mergeAllOf(obj) {
+     if (merged.required) obj.required = [...(obj.required || []), ...merged.required];
+   }
+ 
+-  for (const value of Object.values(obj)) {
+-    if (value && typeof value === "object") {
+-      mergeAllOf(value);
+-    }
+-  }
++  eachChildSchema(obj, mergeAllOf);
+ }
+ 
+ // Select best schema from anyOf/oneOf
+@@ -266,7 +302,7 @@ function selectBest(items) {
+ 
+ // Flatten anyOf/oneOf
+ function flattenAnyOfOneOf(obj) {
+-  if (!obj || typeof obj !== "object") return;
++  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+ 
+   if (obj.anyOf && Array.isArray(obj.anyOf) && obj.anyOf.length > 0) {
+     const nonNullSchemas = obj.anyOf.filter(s => s && s.type !== "null");
+@@ -288,47 +324,32 @@ function flattenAnyOfOneOf(obj) {
+     }
+   }
+ 
+-  for (const value of Object.values(obj)) {
+-    if (value && typeof value === "object") {
+-      flattenAnyOfOneOf(value);
+-    }
+-  }
++  eachChildSchema(obj, flattenAnyOfOneOf);
+ }
+ 
+ // Flatten type arrays
+ function flattenTypeArrays(obj) {
+-  if (!obj || typeof obj !== "object") return;
++  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+ 
+   if (obj.type && Array.isArray(obj.type)) {
+     const nonNullTypes = obj.type.filter(t => t !== "null");
+     obj.type = nonNullTypes.length > 0 ? nonNullTypes[0] : "string";
+   }
+ 
+-  for (const value of Object.values(obj)) {
+-    if (value && typeof value === "object") {
+-      flattenTypeArrays(value);
+-    }
+-  }
++  eachChildSchema(obj, flattenTypeArrays);
+ }
+ 
+ // Infer missing type=object when properties exist (Gemini requires explicit type)
+ function ensureObjectType(obj) {
+-  if (!obj || typeof obj !== "object") return;
++  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+   if (obj.properties && !obj.type) obj.type = "object";
+-  for (const [key, v] of Object.entries(obj)) {
+-    if (!v || typeof v !== "object") continue;
+-    if (key === "properties" && !Array.isArray(v)) {
+-      for (const sub of Object.values(v)) ensureObjectType(sub);
+-    } else {
+-      ensureObjectType(v);
+-    }
+-  }
++  eachChildSchema(obj, ensureObjectType);
+ }
+ 
+ // Convert prefixItems (tuple validation) to items — Gemini cannot express tuples,
+ // and a type:"array" schema without items is rejected with "missing field"
+ function convertPrefixItems(obj) {
+-  if (!obj || typeof obj !== "object") return;
++  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+ 
+   if (Array.isArray(obj.prefixItems) && obj.prefixItems.length > 0) {
+     const variants = obj.prefixItems.filter(s => s && s.type !== "null");
+@@ -340,20 +361,16 @@ function convertPrefixItems(obj) {
+     delete obj.prefixItems;
+   }
+ 
+-  for (const value of Object.values(obj)) {
+-    if (value && typeof value === "object") {
+-      convertPrefixItems(value);
+-    }
+-  }
++  eachChildSchema(obj, convertPrefixItems);
+ }
+ 
+ // Gemini requires items on every type:"array" schema — fill a permissive placeholder
+ function ensureArrayItems(obj) {
+-  if (!obj || typeof obj !== "object") return;
++  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+   if (obj.type === "array" && !obj.items) {
+     obj.items = { type: "string" };
+   }
+-  for (const v of Object.values(obj)) if (v && typeof v === "object") ensureArrayItems(v);
++  eachChildSchema(obj, ensureArrayItems);
+ }
+ 
+ // Clean JSON Schema for Antigravity API compatibility - removes unsupported keywords recursively
+@@ -382,7 +399,7 @@ export function cleanJSONSchemaForAntigravity(schema) {
+ 
+   // Phase 4: Cleanup required fields recursively
+   function cleanupRequired(obj) {
+-    if (!obj || typeof obj !== "object") return;
++    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+ 
+     if (obj.required && Array.isArray(obj.required) && obj.properties) {
+       const validRequired = obj.required.filter(field =>
+@@ -395,12 +412,8 @@ export function cleanJSONSchemaForAntigravity(schema) {
+       }
+     }
+ 
+-    // Recurse into nested objects
+-    for (const value of Object.values(obj)) {
+-      if (value && typeof value === "object") {
+-        cleanupRequired(value);
+-      }
+-    }
++    // Recurse into nested schemas
++    eachChildSchema(obj, cleanupRequired);
+   }
+ 
+   cleanupRequired(cleaned);
+@@ -434,12 +447,8 @@ export function cleanJSONSchemaForAntigravity(schema) {
+       }
+     }
+ 
+-    // Recurse into nested objects
+-    for (const value of Object.values(obj)) {
+-      if (value && typeof value === "object") {
+-        addPlaceholders(value);
+-      }
+-    }
++    // Recurse into nested schemas
++    eachChildSchema(obj, addPlaceholders);
+   }
+ 
+   addPlaceholders(cleaned);
+@@ -536,7 +545,12 @@ function moveFunctionResponsesLast(parts) {
+ }
+ 
+ // Merge adjacent same-role messages, strip empty parts, ensure initial and terminal user turns
+-export function normalizeGeminiContents(contents, model = null) {
++export function normalizeGeminiContents(contents, modelOrOptions = null, extraOptions = {}) {
++  const optionsObject = modelOrOptions && typeof modelOrOptions === "object"
++    && Object.hasOwn(modelOrOptions, "synthesizeTerminalToolResponse");
++  const model = optionsObject ? null : modelOrOptions;
++  const options = optionsObject ? modelOrOptions : extraOptions;
++  const synthesizeTerminalToolResponse = options?.synthesizeTerminalToolResponse ?? true;
+   const frLast = isGemini4Model(model);
+   const out = [];
+   for (const c of contents || []) {
+@@ -555,16 +569,18 @@ export function normalizeGeminiContents(contents, model = null) {
+   if (out.length > 0 && out.at(-1).role === "model") {
+     const fnCalls = (out.at(-1).parts || []).filter(p => p && p.functionCall);
+     if (fnCalls.length > 0) {
+-      const responses = fnCalls.map(p => {
+-        const call = p.functionCall || {};
+-        const fr = {
+-          name: call.name || "tool",
+-          response: { result: "Continue." }
+-        };
+-        if (call.id) fr.id = call.id;
+-        return { functionResponse: fr };
+-      });
+-      out.push({ role: "user", parts: responses });
++      if (synthesizeTerminalToolResponse) {
++        const responses = fnCalls.map(p => {
++          const call = p.functionCall || {};
++          const fr = {
++            name: call.name || "tool",
++            response: { result: "Continue." }
++          };
++          if (call.id) fr.id = call.id;
++          return { functionResponse: fr };
++        });
++        out.push({ role: "user", parts: responses });
++      }
+     } else {
+       out.push({ role: "user", parts: [{ text: "Continue." }] });
+     }
+@@ -572,4 +588,3 @@ export function normalizeGeminiContents(contents, model = null) {
+   return out;
+ }
+ 
+-
+diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
+index 972ddeb4..59d90319 100644
+--- a/open-sse/translator/index.js
++++ b/open-sse/translator/index.js
+@@ -79,13 +79,15 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+   normalizeThinkingConfig(result);
+ 
+   // Always ensure tool_calls have id (some providers require it)
+-  ensureToolCallIds(result);
+-  
++  const zedDeferred = provider === "zed";
++  const geminiFamily = isGeminiFamilyTarget(targetFormat, model);
++  if (!zedDeferred) ensureToolCallIds(result, { preserveIds: geminiFamily });
++
+   // Kiro performs stricter source-aware reconciliation after session replay.
+   // The generic helper inserts OpenAI `role: tool` messages, which a direct
+   // Claude→Kiro translator cannot consume and which cannot repair partial
+   // parallel tool results.
+-  if (targetFormat !== FORMATS.KIRO) {
++  if (targetFormat !== FORMATS.KIRO && !geminiFamily && !zedDeferred) {
+     fixMissingToolResponses(result);
+   }
+ 
+@@ -97,6 +99,9 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+   const clientSessionId = captureSessionId(result, credentials, connectionId, targetFormat);
+   // Expose to downstream translators (gemini-cli/antigravity envelopes) that run after envelope is stripped
+   if (credentials) credentials._clientSessionId = clientSessionId;
++  if (credentials) credentials._geminiServerPartsSessionId = captureConversationId(result, credentials);
++
++  let sourceToolNameMap = null;
+ 
+   // If same format, skip translation steps
+   if (sourceFormat !== targetFormat) {
+@@ -106,6 +111,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+     const directFn = requestRegistry.get(`${sourceFormat}:${targetFormat}`);
+     if (directFn) {
+       result = directFn(model, result, stream, credentials);
++      if (result._toolNameMap instanceof Map) sourceToolNameMap = result._toolNameMap;
+     } else {
+       // Step 1: source -> openai (if source is not openai)
+       if (sourceFormat !== FORMATS.OPENAI) {
+@@ -116,6 +122,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+           reqLogger?.logOpenAIRequest?.(result);
+         }
+       }
++      if (result._toolNameMap instanceof Map) sourceToolNameMap = result._toolNameMap;
+ 
+       // Step 2: openai -> target (if target is not openai)
+       if (targetFormat !== FORMATS.OPENAI) {
+diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
+index 7b36bbfc..5ca519ce 100644
+--- a/open-sse/translator/request/openai-to-gemini.js
++++ b/open-sse/translator/request/openai-to-gemini.js
+@@ -2,7 +2,8 @@ import { register } from "../index.js";
+ import { FORMATS } from "../formats.js";
+ import { DEFAULT_THINKING_AG_SIGNATURE, DEFAULT_THINKING_GEMINI_CLI_SIGNATURE } from "../../config/defaultThinkingSignature.js";
+ import { openaiToClaudeRequestForAntigravity } from "./openai-to-claude.js";
+-import { getGeminiThoughtSignatureSync } from "../../services/thoughtSignatureStore.js";
++import { safeParseJSON } from "../concerns/json.js";
++import { getGeminiThoughtSignatureSync, findGeminiTurnSignature, geminiTurnScope, getGeminiServerPartsSync, findGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
+ function generateUUID() {
+   return crypto.randomUUID();
+ }
+@@ -16,7 +17,10 @@ import {
+   generateSessionId,
+   generateProjectId,
+   cleanJSONSchemaForAntigravity,
+-  normalizeGeminiContents
++  lowerProtoSchemaTypes,
++  isLegacyGeminiSchema,
++  normalizeGeminiContents,
++  GEMINI_RESERVED_RESPONSE_KEYS
+ } from "../formats/gemini.js";
+ import { deriveSessionId, toNumericSessionId } from "../../utils/sessionManager.js";
+ import { ROLE, GEMINI_ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
+@@ -37,6 +41,22 @@ function sanitizeGeminiFunctionName(name) {
+   return sanitized.substring(0, 64);
+ }
+ 
++function buildFunctionDeclaration(name, description, schema) {
++  const decl = { name: sanitizeGeminiFunctionName(name), description: description || "" };
++  if (schema === undefined || schema === null) return decl;
++  if (typeof schema !== "object") {
++    decl.parametersJsonSchema = schema;
++    return decl;
++  }
++  const cleaned = isLegacyGeminiSchema(schema) ? cleanJSONSchemaForAntigravity(structuredClone(schema)) : null;
++  if (cleaned !== null && JSON.stringify(cleaned) === JSON.stringify(schema)) {
++    decl.parameters = cleaned;
++  } else {
++    decl.parametersJsonSchema = lowerProtoSchemaTypes(structuredClone(schema));
++  }
++  return decl;
++}
++
+ /**
+  * Rewrites duplicate tool_call_ids so every emitted functionCall id is unique.
+  *
+@@ -74,7 +94,7 @@ function createToolCallIdUniquifier() {
+ }
+ 
+ // Core: Convert OpenAI request to Gemini format (base for all variants)
+-function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG_SIGNATURE, sessionId = null) {
++function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG_SIGNATURE, sessionId = null, serverPartsSessionId = null) {
+   const result = {
+     model: model,
+     contents: [],
+@@ -93,49 +113,73 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+   if (allowSampling && body.top_k !== undefined) {
+     result.generationConfig.topK = body.top_k;
+   }
+-  if (body.max_tokens !== undefined) {
+-    result.generationConfig.maxOutputTokens = body.max_tokens;
++  const maxOutput = body.max_completion_tokens !== undefined ? body.max_completion_tokens : body.max_tokens;
++  if (maxOutput !== undefined) {
++    result.generationConfig.maxOutputTokens = maxOutput;
++  }
++  if (typeof body.stop === "string") {
++    result.generationConfig.stopSequences = [body.stop];
++  } else if (Array.isArray(body.stop)) {
++    result.generationConfig.stopSequences = [...body.stop];
++  }
++  if (body.seed !== undefined) {
++    result.generationConfig.seed = body.seed;
++  }
++  if (body.presence_penalty !== undefined) {
++    result.generationConfig.presencePenalty = body.presence_penalty;
++  }
++  if (body.frequency_penalty !== undefined) {
++    result.generationConfig.frequencyPenalty = body.frequency_penalty;
+   }
+ 
+-  // Build tool_call_id -> name map
+-  const tcID2Name = {};
+-  if (body.messages && Array.isArray(body.messages)) {
+-    for (const msg of body.messages) {
+-      if (msg.role === ROLE.ASSISTANT && msg.tool_calls) {
+-        for (const tc of msg.tool_calls) {
+-          if (tc.type === OPENAI_BLOCK.FUNCTION && tc.id && tc.function?.name) {
+-            tcID2Name[tc.id] = tc.function.name;
++  const applyJsonOutput = (schema) => {
++    result.generationConfig.responseMimeType = "application/json";
++    if (schema !== undefined) result.generationConfig.responseJsonSchema = schema;
++  };
++  const textFormat = body.text?.format;
++  if (textFormat?.type === "json_object") {
++    applyJsonOutput();
++  } else if (textFormat?.type === "json_schema") {
++    applyJsonOutput(textFormat.schema);
++  }
++  const responseFormat = body.response_format;
++  if (responseFormat?.type === "json_object") {
++    applyJsonOutput();
++  } else if (responseFormat?.type === "json_schema") {
++    applyJsonOutput(responseFormat.json_schema?.schema ?? responseFormat.json_schema);
++  }
++
++  const instructionParts = [];
++  if (Array.isArray(body.messages)) {
++    for (const m of body.messages) {
++      if (m.role !== ROLE.SYSTEM && m.role !== ROLE.DEVELOPER) continue;
++      if (typeof m.content === "string") {
++        if (m.content) instructionParts.push({ text: m.content });
++      } else if (Array.isArray(m.content)) {
++        for (const block of m.content) {
++          if (block?.type === OPENAI_BLOCK.TEXT && typeof block.text === "string") {
++            instructionParts.push({ text: block.text });
+           }
+         }
+       }
+     }
+   }
++  // The system instruction the finished request will carry (all system/developer blocks aggregate in order); the
++  // turn scope of every earlier assistant message must see the same value as the request that
++  // produced that turn did.
++  const finalSystem = instructionParts.length > 0
++    ? { role: GEMINI_ROLE.USER, parts: instructionParts }
++    : null;
++  if (finalSystem) result.systemInstruction = finalSystem;
+ 
+-  // Build tool responses cache.
+-  //
+-  // Queued per id rather than a single value: an OpenAI tool_call_id is only
+-  // unique within its own assistant turn, so a long agent session can reuse one
+-  // id for two different tool results. A plain id->content map keeps only the
+-  // LAST one, and the earlier turn would then be answered with the later
+-  // turn's output. Each functionCall consumes the oldest unconsumed result for
+-  // its id instead. #4273
+-  const toolResponses = {};
+-  if (body.messages && Array.isArray(body.messages)) {
+-    for (const msg of body.messages) {
+-      if (msg.role === ROLE.TOOL && msg.tool_call_id) {
+-        (toolResponses[msg.tool_call_id] ||= []).push(msg.content);
+-      }
+-    }
+-  }
+-  const toolResponseCursor = {};
+-
+-  // Gemini validates that functionCall ids are unique across the WHOLE history,
+-  // and rejects the entire request with 400 INVALID_ARGUMENT when one repeats.
+-  // tool_call_id is only unique within a single assistant turn, so a long agent
+-  // session can legitimately emit call_51859 at turn 14 and again at turn 22.
+-  //
+-  // Each functionCall takes the next free id here and passes it down to its
+-  // matching functionResponse, so the pair always agrees. #4532
++  // Build tool_call_id -> name map
++  const tcID2Name = new Map();
++
++  // Calls awaiting their results, keyed by ORIGINAL tool_call_id. The same id may
++  // be reused by several calls (a later turn, or sibling calls in one turn), so each
++  // id has a FIFO queue and every real tool message consumes the oldest queued call.
++  const pendingToolCalls = new Map();
++  // Emitted functionCall ids must be unique across the whole history.
+   const toolCallIdUniquifier = createToolCallIdUniquifier();
+ 
+   // Convert messages
+@@ -145,12 +189,9 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+       const role = msg.role;
+       const content = msg.content;
+ 
+-      if (role === ROLE.SYSTEM && body.messages.length > 1) {
+-        result.systemInstruction = {
+-          role: GEMINI_ROLE.USER,
+-          parts: [{ text: typeof content === "string" ? content : extractTextContent(content) }]
+-        };
+-      } else if (role === ROLE.USER || (role === ROLE.SYSTEM && body.messages.length === 1)) {
++      if (role === ROLE.SYSTEM || role === ROLE.DEVELOPER) {
++        continue;
++      } else if (role === ROLE.USER) {
+         const parts = convertOpenAIContentToParts(content);
+         if (parts.length > 0) {
+           result.contents.push({ role: GEMINI_ROLE.USER, parts });
+@@ -158,30 +199,47 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+       } else if (role === ROLE.ASSISTANT) {
+         const parts = [];
+ 
++        const text = content ? (typeof content === "string" ? content : extractTextContent(content)) : "";
++        const turnScope = geminiTurnScope(result.contents, finalSystem);
++        // Signature the provider issued for this tool-free turn (Gemini only accepts its own).
++        const turnSig = msg.tool_calls?.length
++          ? null
++          : findGeminiTurnSignature({ reasoning: msg.reasoning_content, content: text, scope: turnScope }, model);
++        // Server-side tool parts (googleSearch toolCall/toolResponse) that preceded the
++        // text of this turn must go back verbatim or Gemini 3 rejects the request.
++        const serverTurnParts = findGeminiServerPartsForTurn({ reasoning: msg.reasoning_content, content: text, scope: turnScope, sessionId: serverPartsSessionId }, model);
++
+         // Thinking/reasoning → thought part with signature
+         if (msg.reasoning_content) {
+           parts.push({
+             thought: true,
+             text: msg.reasoning_content
+           });
+-          parts.push({
+-            thoughtSignature: signature,
+-            text: ""
+-          });
++          if (!turnSig) {
++            parts.push({
++              thoughtSignature: signature,
++              text: ""
++            });
++          }
+         }
+ 
+-        if (content) {
+-          const text = typeof content === "string" ? content : extractTextContent(content);
+-          if (text) {
+-            parts.push({ text });
+-          }
++        const contentParts = typeof content === "string"
++          ? (content ? [{ text: content }] : [])
++          : convertOpenAIContentToParts(content);
++        if (serverTurnParts) parts.push(...serverTurnParts);
++        if (contentParts.length > 0) {
++          const [first, ...rest] = contentParts;
++          parts.push(turnSig ? { ...first, thoughtSignature: turnSig } : first);
++          parts.push(...rest);
++        } else if (turnSig) {
++          parts.push({ thoughtSignature: turnSig, text: "" });
+         }
+ 
+         if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+-          const toolCallIds = [];
+           let firstFunctionCallSeen = false;
+           for (const tc of msg.tool_calls) {
+             if (tc.type !== OPENAI_BLOCK.FUNCTION) continue;
++            if (tc.id && tc.function?.name) tcID2Name.set(tc.id, tc.function.name);
+ 
+             const args = tryParseJSON(tc.function?.arguments || "{}");
+             const cachedSig = tc.id ? getGeminiThoughtSignatureSync(tc.id, sessionId, model) : null;
+@@ -189,8 +247,10 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+             const callSig = cachedSig || (!firstFunctionCallSeen ? signature : undefined);
+             firstFunctionCallSeen = true;
+ 
+-            // Emitted id is uniquified; the thought-signature lookup above stays
+-            // on the ORIGINAL id so a cached signature is still found. #4532
++            const serverParts = tc.id ? getGeminiServerPartsSync(tc.id, serverPartsSessionId, model, turnScope) : null;
++            if (serverParts) parts.push(...serverParts);
++            // Emitted id is uniquified; signature and server-part lookups stay on
++            // the ORIGINAL id so cached entries are still found.
+             const emitId = toolCallIdUniquifier.next(tc.id);
+ 
+             const part = {
+@@ -204,137 +264,119 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+               part.thoughtSignature = callSig;
+             }
+             parts.push(part);
+-            // The NAME travels with the pair for the same reason the id does:
+-            // tcID2Name is a conversation-wide id->name map, so a later call
+-            // reusing the id would otherwise rename this turn's response.
+-            // #4273
+-            toolCallIds.push({ origId: tc.id, emitId, name: tc.function?.name });
++            if (tc.id) {
++              if (!pendingToolCalls.has(tc.id)) pendingToolCalls.set(tc.id, []);
++              pendingToolCalls.get(tc.id).push({ name: tc.function?.name, emitId });
++            }
+           }
+ 
+           if (parts.length > 0) {
+             result.contents.push({ role: GEMINI_ROLE.MODEL, parts });
+           }
+-
+-          // Check if there are actual tool responses in the next messages
+-          const isIntermediate = i < body.messages.length - 1;
+-          const hasActualResponses = toolCallIds.some(
+-            ({ origId }) => (toolResponseCursor[origId] || 0) < (toolResponses[origId]?.length ?? 0)
+-          );
+-
+-          if (hasActualResponses || isIntermediate) {
+-            const toolParts = [];
+-            for (const { origId, emitId, name: callName } of toolCallIds) {
+-              // Content resolves on the ORIGINAL id, consuming the oldest
+-              // unconsumed result; only the emitted id is uniquified. #4273 #4532
+-              const queue = toolResponses[origId];
+-              const cursor = toolResponseCursor[origId] || 0;
+-              let resp;
+-              if (queue && cursor < queue.length) {
+-                resp = queue[cursor];
+-                toolResponseCursor[origId] = cursor + 1;
+-              } else {
+-                resp = "";
+-              }
+-
+-              // Name comes from THIS call, not from the conversation-wide id->name map,
+-              // which a later duplicate of the same id would have overwritten.
+-              let name = callName || tcID2Name[origId];
+-              if (!name) {
+-                const idParts = String(origId).split("-");
+-                if (idParts.length > 2) {
+-                  name = idParts.slice(0, -2).join("-");
+-                } else {
+-                  name = origId;
+-                }
+-              }
+-
+-              let parsedResp = tryParseJSON(resp);
+-              if (parsedResp === null) {
+-                parsedResp = { result: resp };
+-              } else if (typeof parsedResp !== "object") {
+-                parsedResp = { result: parsedResp };
+-              }
+-
+-              toolParts.push({
+-                functionResponse: {
+-                  // Matches the functionCall id emitted above, so a response
+-                  // never points at an id the call does not carry. #4532
+-                  id: emitId,
+-                  name: sanitizeGeminiFunctionName(name),
+-                  response: { result: parsedResp }
+-                }
+-              });
+-            }
+-            if (toolParts.length > 0) {
+-              result.contents.push({ role: GEMINI_ROLE.USER, parts: toolParts });
+-            }
+-          }
+         } else if (parts.length > 0) {
+           result.contents.push({ role: GEMINI_ROLE.MODEL, parts });
+         }
++      } else if (role === ROLE.TOOL) {
++        // Tool results come from their own role:tool messages
++        const fid = msg.tool_call_id;
++        // The oldest preceding call that used this id answers this result.
++        const pendingCall = fid ? pendingToolCalls.get(fid)?.shift() : undefined;
++        // Resolve the function name from preceding calls
++        let name = pendingCall?.name || (fid ? tcID2Name.get(fid) : undefined);
++        if (!name && fid) {
++          const idParts = fid.split("-");
++          name = idParts.length > 2 ? idParts.slice(0, -2).join("-") : fid;
++        }
++
++        const parsed = safeParseJSON(msg.content, msg.content);
++        let response = (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed))
++          ? parsed
++          : { result: parsed ?? null };
++        const serialized = JSON.stringify(response);
++        if (Object.keys(GEMINI_RESERVED_RESPONSE_KEYS).some(key => serialized.includes(`${JSON.stringify(key)}:`))) {
++          response = { result: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content) };
++        }
++
++        const functionResponse = { name: sanitizeGeminiFunctionName(name || "tool"), response };
++        const responseId = pendingCall ? pendingCall.emitId : fid;
++        if (responseId) functionResponse.id = responseId;
++        result.contents.push({ role: GEMINI_ROLE.USER, parts: [{ functionResponse }] });
+       }
+     }
+   }
+ 
++  if (result.contents.length === 0 && result.systemInstruction) {
++    result.contents.push({ role: GEMINI_ROLE.USER, parts: [{ text: "..." }] });
++  }
++
+   // Convert tools
+   if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
+     const functionDeclarations = [];
+     for (const t of body.tools) {
+       // Check if already in Anthropic/Claude format (no type field, direct name/description/input_schema)
+       if (t.name && t.input_schema) {
+-        const cleanedSchema = cleanJSONSchemaForAntigravity(structuredClone(t.input_schema || { type: "object", properties: {} }));
+-        functionDeclarations.push({
+-          name: sanitizeGeminiFunctionName(t.name),
+-          description: t.description || "",
+-          parameters: cleanedSchema
+-        });
++        functionDeclarations.push(buildFunctionDeclaration(t.name, t.description, t.input_schema));
+       }
+       // OpenAI format
+       else if (t.type === OPENAI_BLOCK.FUNCTION && t.function) {
+         const fn = t.function;
+-        const cleanedSchema = cleanJSONSchemaForAntigravity(structuredClone(fn.parameters || { type: "object", properties: {} }));
+-        functionDeclarations.push({
+-          name: sanitizeGeminiFunctionName(fn.name),
+-          description: fn.description || "",
+-          parameters: cleanedSchema
+-        });
++        functionDeclarations.push(buildFunctionDeclaration(fn.name, fn.description, fn.parameters));
+       }
+     }
+ 
+     if (functionDeclarations.length > 0) {
+       result.tools = [{ functionDeclarations }];
++
++      const choice = body.tool_choice;
++      if (choice === "auto") {
++        result.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
++      } else if (choice === "none") {
++        result.toolConfig = { functionCallingConfig: { mode: "NONE" } };
++      } else if (choice === "required") {
++        result.toolConfig = { functionCallingConfig: { mode: "ANY" } };
++      } else if (choice && typeof choice === "object") {
++        const named = choice.function?.name ?? choice.name;
++        if (typeof named === "string" && named) {
++          result.toolConfig = {
++            functionCallingConfig: {
++              mode: "ANY",
++              allowedFunctionNames: [sanitizeGeminiFunctionName(named)]
++            }
++          };
++        }
++      }
+     }
+   }
+ 
+-  result.contents = normalizeGeminiContents(result.contents, model);
++  if (body._customToolNames) result._customToolNames = body._customToolNames;
++  if (body._toolNameMap) result._toolNameMap = body._toolNameMap;
++  if (body._webSearch) result._webSearch = body._webSearch;
++
++  result.contents = normalizeGeminiContents(result.contents, model, { synthesizeTerminalToolResponse: false });
+   return result;
+ }
+ 
+ // OpenAI -> Gemini (standard API)
+ export function openaiToGeminiRequest(model, body, stream, credentials = null) {
+-  return openaiToGeminiBase(model, body, stream, DEFAULT_THINKING_AG_SIGNATURE, credentials?._clientSessionId);
++  const result = openaiToGeminiBase(model, body, stream, DEFAULT_THINKING_AG_SIGNATURE, credentials?._clientSessionId, credentials?._geminiServerPartsSessionId || null);
++  // The response of this request is a new turn of this exact history (see geminiTurnScope).
++  if (credentials) credentials._geminiTurnScope = geminiTurnScope(result.contents, result.systemInstruction);
++  return result;
+ }
+ 
+ // OpenAI -> Gemini CLI (Cloud Code Assist)
+ export function openaiToGeminiCLIRequest(model, body, stream, credentials = null) {
+-  const gemini = openaiToGeminiBase(model, body, stream, DEFAULT_THINKING_GEMINI_CLI_SIGNATURE, credentials?._clientSessionId);
++  const gemini = openaiToGeminiBase(model, body, stream, DEFAULT_THINKING_GEMINI_CLI_SIGNATURE, credentials?._clientSessionId, credentials?._geminiServerPartsSessionId || null);
++  if (credentials) credentials._geminiTurnScope = geminiTurnScope(gemini.contents, gemini.systemInstruction);
+   // Thinking is normalized centrally by applyThinking (thinkingUnified.js) after translation.
+ 
+-  // Clean schema for tools
+-  if (gemini.tools?.[0]?.functionDeclarations) {
+-    for (const fn of gemini.tools[0].functionDeclarations) {
+-      if (fn.parameters) {
+-        const cleanedSchema = cleanJSONSchemaForAntigravity(fn.parameters);
+-        fn.parameters = cleanedSchema;
+-        // if (isClaude) {
+-        //   fn.parameters = cleanedSchema;
+-        // } else {
+-        //   fn.parametersJsonSchema = cleanedSchema;
+-        //   delete fn.parameters;
+-        // }
+-      }
+-    }
+-  }
++  // Schema compatibility is handled once in the base converter
++  // if (isClaude) {
++  //   fn.parameters = cleanedSchema;
++  // } else {
++  //   fn.parametersJsonSchema = cleanedSchema;
++  //   delete fn.parameters;
++  // }
+ 
+   return gemini;
+ }
+diff --git a/open-sse/translator/request/openai-to-vertex.js b/open-sse/translator/request/openai-to-vertex.js
+index 8fe8e637..4572497a 100644
+--- a/open-sse/translator/request/openai-to-vertex.js
++++ b/open-sse/translator/request/openai-to-vertex.js
+@@ -1,7 +1,12 @@
+ import { register } from "../index.js";
+ import { FORMATS } from "../formats.js";
+ import { openaiToGeminiRequest } from "./openai-to-gemini.js";
+-import { DEFAULT_THINKING_VERTEX_SIGNATURE } from "../../config/defaultThinkingSignature.js";
++import { DEFAULT_THINKING_VERTEX_SIGNATURE, DEFAULT_THINKING_AG_SIGNATURE, DEFAULT_THINKING_GEMINI_CLI_SIGNATURE } from "../../config/defaultThinkingSignature.js";
++
++const SYNTHETIC_THINKING_SIGNATURES = new Set([
++  DEFAULT_THINKING_AG_SIGNATURE,
++  DEFAULT_THINKING_GEMINI_CLI_SIGNATURE,
++]);
+ 
+ /**
+  * Post-process a Gemini-format body for Vertex AI compatibility:
+@@ -17,7 +22,7 @@ function postProcessForVertex(body) {
+ 
+     for (const part of turn.parts) {
+       // Replace any synthetic signature with Vertex-native one
+-      if (part.thoughtSignature !== undefined) {
++      if (part.thoughtSignature !== undefined && SYNTHETIC_THINKING_SIGNATURES.has(part.thoughtSignature)) {
+         part.thoughtSignature = DEFAULT_THINKING_VERTEX_SIGNATURE;
+       }
+       // Strip id from functionCall
+diff --git a/open-sse/translator/response/gemini-to-openai.js b/open-sse/translator/response/gemini-to-openai.js
+index 14c47939..e7e5267d 100644
+--- a/open-sse/translator/response/gemini-to-openai.js
++++ b/open-sse/translator/response/gemini-to-openai.js
+@@ -37,6 +37,17 @@ function emitFunctionCall(functionCall, state, signature = null) {
+   return buildChunk(chunkMeta(state), { tool_calls: [toolCall] }, null);
+ }
+ 
++// Emit a text part as reasoning/content and remember it for the turn signature (see finish).
++function emitText(part, isThought, state) {
++  if (isThought) state.turnReasoning = (state.turnReasoning || "") + part.text;
++  else state.turnContent = (state.turnContent || "") + part.text;
++  return buildChunk(
++    chunkMeta(state),
++    isThought ? reasoningDelta(part.text) : { content: part.text },
++    null
++  );
++}
++
+ // Convert Gemini response chunk to OpenAI format
+ export function geminiToOpenAIResponse(chunk, state) {
+   if (!chunk) return null;
+@@ -61,6 +72,13 @@ export function geminiToOpenAIResponse(chunk, state) {
+   // Process parts
+   if (content?.parts) {
+     for (const part of content.parts) {
++      // Server-executed tool parts (googleSearch on Gemini 3) never reach the client;
++      // capture them verbatim, in order, without letting their signatures become the
++      // pending signature of the following functionCall.
++      if (part.toolCall || part.toolResponse) {
++        (state.geminiServerParts ??= []).push(part);
++        continue;
++      }
+       const hasThoughtSig = part.thoughtSignature || part.thought_signature;
+       if (hasThoughtSig && typeof hasThoughtSig === "string") {
+         state.pendingThoughtSignature = hasThoughtSig;
+@@ -78,11 +96,7 @@ export function geminiToOpenAIResponse(chunk, state) {
+         }
+ 
+         if (hasTextContent) {
+-          results.push(buildChunk(
+-            chunkMeta(state),
+-            isThought ? reasoningDelta(part.text) : { content: part.text },
+-            null
+-          ));
++          results.push(emitText(part, isThought, state));
+         }
+ 
+         if (hasFunctionCall) {
+@@ -97,11 +111,7 @@ export function geminiToOpenAIResponse(chunk, state) {
+       // can also stream thought parts without a signature; those must not be
+       // surfaced as normal assistant content in OpenAI-compatible clients.
+       if (part.text !== undefined && part.text !== "") {
+-        results.push(buildChunk(
+-          chunkMeta(state),
+-          isThought ? reasoningDelta(part.text) : { content: part.text },
+-          null
+-        ));
++        results.push(emitText(part, isThought, state));
+       }
+ 
+       // Function call
+@@ -136,6 +146,26 @@ export function geminiToOpenAIResponse(chunk, state) {
+ 
+   // Finish reason - include usage in final chunk
+   if (candidate.finishReason) {
++    // Server parts that never preceded a functionCall belong to a turn that ended on
++    // text; anchor them to the turn key so the next request can replay them.
++    if (state.geminiServerParts?.length) {
++      storeGeminiServerPartsForTurn(
++        { reasoning: state.turnReasoning, content: state.turnContent, scope: state.turnScope, sessionId: state.serverPartsSessionId },
++        state.geminiServerParts,
++        state.model
++      );
++      state.geminiServerParts = [];
++    }
++    // A signature still pending at the end of a turn without tool calls belongs to the
++    // thinking that produced this text; keep it so the next request can replay it.
++    if (state.pendingThoughtSignature && state.geminiToolCallCount === 0) {
++      storeGeminiTurnSignature(
++        { reasoning: state.turnReasoning, content: state.turnContent, scope: state.turnScope },
++        state.pendingThoughtSignature,
++        state.model
++      );
++      state.pendingThoughtSignature = null;
++    }
+     let finishReason = toOpenAIFinish(candidate.finishReason, "gemini");
+     if (finishReason === OPENAI_FINISH.STOP && state.geminiToolCallCount > 0) {
+       finishReason = OPENAI_FINISH.TOOL_CALLS;
+diff --git a/open-sse/utils/sessionManager.js b/open-sse/utils/sessionManager.js
+index 4f701b88..8fb60815 100644
+--- a/open-sse/utils/sessionManager.js
++++ b/open-sse/utils/sessionManager.js
+@@ -220,6 +220,22 @@ export function resolveSessionIdentity({ headers, body, connectionId, workspaceI
+     return { sessionId: deriveSessionId(connectionId), ephemeral: false };
+ }
+ 
++// Client-declared conversation identity for plaintext caches. Unlike a transport session
++// it is never generated and never derived from the provider connection, workspace,
++// prompt_cache_key or assistant text. Account-wide fallbacks remain transport-only.
++export function captureConversationId(body, credentials) {
++    const headers = credentials?.rawHeaders;
++    const thread = headerValue(headers, "thread-id") || headerValue(headers, "x-amp-thread-id");
++    if (thread) return thread;
++    const claude = extractClaudeCodeSession(body?.metadata?.user_id) || headerValue(headers, CLAUDE_CODE_SESSION_HEADER);
++    if (claude) return `claude:${claude}`;
++    for (const key of SESSION_HEADER_KEYS) {
++        const v = headerValue(headers, key);
++        if (v) return v;
++    }
++    return normalizeSessionId(body?.conversation_id) || normalizeSessionId(body?.session_id) || null;
++}
++
+ export function resolveSessionId(opts = {}) {
+     return resolveSessionIdentity(opts).sessionId;
+ }
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index cf73241a..52720a31 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -89,17 +89,26 @@ export function createSSEStream(options = {}) {
+     body = null,
+     onStreamComplete = null,
+     apiKey = null,
+-    credentials = null
++    credentials = null,
++    nativeJson = false,
++    nativeResponseProjection = null
+   } = options;
+ 
+   let buffer = "";
+   let usage = null;
++  // The client's wire protocol determines termination, regardless of which
++  // provider serves it. Native Gemini SSE ends at EOF and carries arbitrary
++  // Parts/metadata that must not pass through Chat normalization.
++  const nativeGeminiPassthrough = mode === STREAM_MODE.PASSTHROUGH &&
++    [FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY].includes(sourceFormat);
++  const observeNativeFinishReason = nativeCandidateFieldIsVisible(nativeResponseProjection, "finishReason");
++  const observeNativeCandidateIndex = nativeCandidateFieldIsVisible(nativeResponseProjection, "index");
+ 
+   // Per-stream decoder with stream:true to correctly handle multi-byte chars split across chunks
+   const decoder = new TextDecoder("utf-8", { fatal: false });
+ 
+   const state = mode === STREAM_MODE.TRANSLATE
+-    ? { ...initState(sourceFormat), provider, toolNameMap, customToolNames: new Set(customToolNames || []), model, sessionId: credentials?._clientSessionId || null,
++    ? { ...initState(sourceFormat), provider, toolNameMap, customToolNames: new Set(customToolNames || []), model, sessionId: credentials?._clientSessionId || null, serverPartsSessionId: credentials?._geminiServerPartsSessionId || null, turnScope: credentials?._geminiTurnScope || null,
+         // Which upstream format this stream came from. A response translator can be
+         // reached either directly (target === its registered source) or as the second
+         // hop of a pivot, and on the terminal null chunk the pivot drops it — so a
+@@ -574,9 +583,7 @@ export function createSSEStream(options = {}) {
+           // Some clients (e.g. OpenClaw) expect the OpenAI-style sentinel:
+           //   data: [DONE]\n\n
+           // Without it they can hang until timeout and trigger failover.
+-          // Gemini-family clients (Antigravity, Vertex, Gemini) reject this sentinel with 400 syntax errors.
+-          const isGeminiFamily = provider === "antigravity" || provider === "gemini" || provider === "vertex";
+-          if (!streamDoneSent && !isGeminiFamily) {
++          if (!streamDoneSent) {
+             const doneOutput = "data: [DONE]\n\n";
+             reqLogger?.appendConvertedChunk?.(doneOutput);
+             controller.enqueue(sharedEncoder.encode(doneOutput));
+@@ -617,6 +624,7 @@ export function createSSEStream(options = {}) {
+                 const output = formatSSE(item, sourceFormat);
+                 reqLogger?.appendConvertedChunk?.(output);
+                 controller.enqueue(sharedEncoder.encode(output));
++                sseEmittedCount++;
+               }
+             }
+           }
+@@ -637,6 +645,7 @@ export function createSSEStream(options = {}) {
+             const output = formatSSE(item, sourceFormat);
+             reqLogger?.appendConvertedChunk?.(output);
+             controller.enqueue(sharedEncoder.encode(output));
++            sseEmittedCount++;
+           }
+         }
+ 
+@@ -657,6 +666,16 @@ export function createSSEStream(options = {}) {
+           streamDoneSent = true;
+         }
+ 
++        // A translated stream for an OpenAI Chat client must end with the OpenAI sentinel: the
++        // upstream's own [DONE] is consumed above and Gemini/Claude streams have none. Nothing
++        // else in this mode emits it, so one is written here.
++        if (sourceFormat === FORMATS.OPENAI && sseEmittedCount > 0) {
++          const doneOutput = "data: [DONE]\n\n";
++          reqLogger?.appendConvertedChunk?.(doneOutput);
++          controller.enqueue(sharedEncoder.encode(doneOutput));
++          streamDoneSent = true;
++        }
++
+         finalizeStream();
+       } catch (error) {
+         console.log("Error in flush:", error);
+diff --git a/open-sse/utils/usageTracking.js b/open-sse/utils/usageTracking.js
+index 62a5cc76..09643fa5 100644
+--- a/open-sse/utils/usageTracking.js
++++ b/open-sse/utils/usageTracking.js
+@@ -83,7 +83,7 @@ export function filterUsageForFormat(usage, targetFormat) {
+       'estimated'
+     ],
+     [FORMATS.OPENAI_RESPONSES]: [
+-      'input_tokens', 'output_tokens',
++      'input_tokens', 'output_tokens', 'total_tokens',
+       'input_tokens_details', 'output_tokens_details',
+       'estimated'
+     ],
+diff --git a/tests/translator/__snapshots__/golden-request.test.js.snap b/tests/translator/__snapshots__/golden-request.test.js.snap
+index 8bcab641..bf1d55df 100644
+--- a/tests/translator/__snapshots__/golden-request.test.js.snap
++++ b/tests/translator/__snapshots__/golden-request.test.js.snap
+@@ -167,9 +167,7 @@ exports[`GOLDEN request: OpenAI → Gemini > full body (system/image/tool/tool_r
+             "id": "call_1",
+             "name": "get_weather",
+             "response": {
+-              "result": {
+-                "result": "sunny",
+-              },
++              "result": "sunny",
+             },
+           },
+         },
+diff --git a/tests/translator/bugs-gemini-cursor-commandcode.test.js b/tests/translator/bugs-gemini-cursor-commandcode.test.js
+index 8483bfc1..58e39274 100644
+--- a/tests/translator/bugs-gemini-cursor-commandcode.test.js
++++ b/tests/translator/bugs-gemini-cursor-commandcode.test.js
+@@ -9,9 +9,9 @@ const O2C = (body) => translateRequest(FORMATS.OPENAI, FORMATS.CURSOR, "m", body
+ const O2CC = (body) => translateRequest(FORMATS.OPENAI, FORMATS.COMMANDCODE, "m", body, true, null, "commandcode");
+ 
+ describe("OpenAI → Gemini", () => {
+-  // openai-to-gemini.js:92-96 — each system message overwrites systemInstruction → only last kept
+-  // KNOWN BUG
+-  it.fails("multiple system messages are all kept", () => {
++  // Was: each system message overwrote systemInstruction → only last kept.
++  // Fixed: all system/developer text blocks land in systemInstruction.parts in order.
++  it("multiple system messages are all kept", () => {
+     const out = O2G({
+       messages: [
+         { role: "system", content: "RULE_ONE" },
+@@ -20,6 +20,7 @@ describe("OpenAI → Gemini", () => {
+       ],
+     });
+     expect(JSON.stringify(out.systemInstruction), "earlier system lost").toContain("RULE_ONE");
++    expect(JSON.stringify(out.systemInstruction), "later system lost").toContain("RULE_TWO");
+   });
+ });
+ 
+diff --git a/tests/translator/golden-request.test.js b/tests/translator/golden-request.test.js
+index 21cf49f7..5a12ae26 100644
+--- a/tests/translator/golden-request.test.js
++++ b/tests/translator/golden-request.test.js
+@@ -93,6 +93,24 @@ describe("GOLDEN request: OpenAI → Gemini", () => {
+     expect(out.request.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "high", includeThoughts: true });
+     expect(out.request.generationConfig.maxOutputTokens).toBe(65535);
+   });
++
++  it("Gemini CLI retains the thinking output floor when the client set no cap", () => {
++    const body = {
++      messages: [{ role: "user", content: "hi" }],
++      reasoning_effort: "high",
++    };
++    const out = translateRequest(
++      FORMATS.OPENAI,
++      FORMATS.GEMINI_CLI,
++      "gemini-3.1-pro-preview",
++      body,
++      true,
++      { accessToken: "t", projectId: "p" },
++      "gemini-cli"
++    );
++    expect(out.request.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "high", includeThoughts: true });
++    expect(out.request.generationConfig.maxOutputTokens).toBe(65535);
++  });
+ });
+ 
+ describe("GOLDEN request: OpenAI → Kiro", () => {
+diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
+new file mode 100644
+index 00000000..6efffa53
+--- /dev/null
++++ b/tests/unit/chat-to-gemini-contract.test.js
+@@ -0,0 +1,817 @@
++import { describe, it, expect, vi, beforeEach } from "vitest";
++
++const { network } = vi.hoisted(() => ({ network: vi.fn() }));
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: network }));
++vi.mock("../../open-sse/executors/index.js", async () => {
++  const { DefaultExecutor } = await import("../../open-sse/executors/default.js");
++  const executors = new Map();
++  return { getExecutor(provider) {
++    if (!executors.has(provider)) executors.set(provider, new DefaultExecutor(provider));
++    return executors.get(provider);
++  } };
++});
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: async () => new Proxy({}, { get: (_t, name) => name === "then" ? undefined : vi.fn() }),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(), appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}), saveRequestUsage: vi.fn(async () => {}),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++
++import "../translator/registerAll.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import {
++  openaiToGeminiRequest,
++  openaiToGeminiCLIRequest,
++  openaiToAntigravityRequest,
++} from "../../open-sse/translator/request/openai-to-gemini.js";
++import { openaiToVertexRequest } from "../../open-sse/translator/request/openai-to-vertex.js";
++import { openaiResponsesToOpenAIRequest } from "../../open-sse/translator/request/openai-responses.js";
++import {
++  normalizeGeminiContents,
++  convertOpenAIContentToParts,
++  cleanJSONSchemaForAntigravity,
++  isLegacyGeminiSchema,
++} from "../../open-sse/translator/formats/gemini.js";
++import { AntigravityExecutor } from "../../open-sse/executors/antigravity.js";
++import { handleChatCore } from "../../open-sse/handlers/chatCore.js";
++import { storeGeminiThoughtSignature } from "../../open-sse/services/thoughtSignatureStore.js";
++import {
++  DEFAULT_THINKING_VERTEX_SIGNATURE,
++  DEFAULT_THINKING_AG_SIGNATURE,
++} from "../../open-sse/config/defaultThinkingSignature.js";
++
++const MODEL = "gemini-3.5-flash-lite";
++const user = (content) => ({ role: "user", content });
++const AG_CREDENTIALS = { projectId: "p", connectionId: "conn-contract" };
++
++const o2g = (body, credentials = null) =>
++  translateRequest(FORMATS.OPENAI, FORMATS.GEMINI, MODEL, body, true, credentials, "gemini");
++const o2cli = (body, credentials = { accessToken: "t", projectId: "p" }) =>
++  translateRequest(FORMATS.OPENAI, FORMATS.GEMINI_CLI, MODEL, body, true, credentials, "gemini-cli");
++const o2vx = (body, credentials = null) =>
++  translateRequest(FORMATS.OPENAI, FORMATS.VERTEX, MODEL, body, true, credentials, "vertex");
++const o2ag = (body, credentials = AG_CREDENTIALS) =>
++  translateRequest(FORMATS.OPENAI, FORMATS.ANTIGRAVITY, MODEL, body, true, credentials, "antigravity");
++
++const inner = {
++  plain: (out) => out,
++  cli: (out) => out.request,
++  vertex: (out) => out,
++  ag: (out) => out.request,
++};
++const WRAPPERS = { plain: o2g, cli: o2cli, vertex: o2vx, ag: o2ag };
++
++describe("instructions: every system/developer text block lands once, in order", () => {
++  it.each(Object.keys(WRAPPERS))("aggregates interleaved roles and multi-block content (%s)", (w) => {
++    const out = inner[w](WRAPPERS[w]({
++      messages: [
++        { role: "system", content: "S1" },
++        user("u1"),
++        { role: "developer", content: "D1" },
++        { role: "system", content: [
++          { type: "text", text: "S2a" },
++          { type: "image_url", image_url: { url: "data:image/png;base64,AA" } },
++          { type: "text", text: "S2b" },
++        ] },
++        user("u2"),
++      ],
++    }));
++    expect(out.systemInstruction.parts).toEqual([
++      { text: "S1" }, { text: "D1" }, { text: "S2a" }, { text: "S2b" },
++    ]);
++    const texts = out.contents.flatMap((c) => c.parts.filter((p) => p.text).map((p) => p.text));
++    expect(texts).toEqual(["u1", "u2"]);
++  });
++
++  it("instruction-only request gets the stable ... user trigger, not instruction copies", () => {
++    const out = o2g({ messages: [{ role: "system", content: "ONLY_SYS" }] });
++    expect(out.systemInstruction.parts).toEqual([{ text: "ONLY_SYS" }]);
++    expect(out.contents).toEqual([{ role: "user", parts: [{ text: "..." }] }]);
++    expect(JSON.stringify(out.contents)).not.toContain("ONLY_SYS");
++  });
++
++  it("developer-only history behaves the same", () => {
++    const out = o2g({ messages: [{ role: "developer", content: [{ type: "text", text: "DEV_ONLY" }] }] });
++    expect(out.systemInstruction.parts).toEqual([{ text: "DEV_ONLY" }]);
++    expect(out.contents).toEqual([{ role: "user", parts: [{ text: "..." }] }]);
++  });
++
++  it("developer instructions arriving through the Responses first hop are retained", () => {
++    const out = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, {
++      input: [
++        { type: "message", role: "developer", content: [{ type: "input_text", text: "DEV_RULE" }] },
++        { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
++      ],
++      instructions: "TOP_INSTRUCTIONS",
++    }, true, null, "gemini");
++    expect(JSON.stringify(out.systemInstruction)).toContain("TOP_INSTRUCTIONS");
++    expect(JSON.stringify(out.systemInstruction)).toContain("DEV_RULE");
++  });
++
++  it("same instructions replay to a stable turn scope; different contexts differ", () => {
++    const mk = (sys) => ({
++      messages: [
++        { role: "system", content: sys },
++        { role: "developer", content: "shared dev" },
++        user("q"),
++        { role: "assistant", content: "a" },
++        user("again"),
++      ],
++    });
++    const c1 = {}, c2 = {}, c3 = {};
++    openaiToGeminiRequest(MODEL, mk("rules A"), true, c1);
++    openaiToGeminiRequest(MODEL, mk("rules A"), true, c2);
++    openaiToGeminiRequest(MODEL, mk("rules B"), true, c3);
++    expect(c1._geminiTurnScope).toBe(c2._geminiTurnScope);
++    expect(c1._geminiTurnScope).not.toBe(c3._geminiTurnScope);
++    expect(c1._geminiTurnScope).toMatch(/^[0-9a-f]{64}$/);
++  });
++});
++
++describe("schema carrier: legacy parameters vs lossless parametersJsonSchema", () => {
++  const toolWith = (parameters) => ({
++    type: "function",
++    function: { name: "do_thing", description: "d", ...(parameters !== undefined ? { parameters } : {}) },
++  });
++  const declOf = (out) => innerOfTools(out).functionDeclarations[0];
++  const innerOfTools = (out) => out.tools?.[0] || out.request?.tools?.[0];
++
++  it("basic JSON Schema keeps the legacy parameters wire", () => {
++    const schema = { type: "object", properties: { q: { type: "string" } }, required: ["q"] };
++    for (const w of Object.keys(WRAPPERS)) {
++      const decl = declOf(WRAPPERS[w]({ messages: [user("x")], tools: [toolWith(schema)] }));
++      expect(decl.parameters).toEqual(schema);
++      expect(decl).not.toHaveProperty("parametersJsonSchema");
++    }
++  });
++
++  it("a cleaning-unsafe schema rides parametersJsonSchema untouched", () => {
++    const schema = {
++      $defs: { n: { type: "integer", minimum: 0 } },
++      type: "object",
++      properties: {
++        title: { type: "string", minLength: 1, maxLength: 40 },
++        count: { $ref: "#/$defs/n" },
++        choice: { anyOf: [{ type: "string" }, { type: "integer" }] },
++        level: { enum: [1, 2, 3] },
++        meta: { type: "object", default: { type: "customer" } },
++      },
++      required: ["title"],
++      additionalProperties: false,
++    };
++    for (const w of Object.keys(WRAPPERS)) {
++      const decl = declOf(WRAPPERS[w]({ messages: [user("x")], tools: [toolWith(schema)] }));
++      expect(decl).not.toHaveProperty("parameters");
++      expect(decl.parametersJsonSchema).toEqual(schema);
++    }
++  });
++
++  it("property names that collide with keyword names survive cleaning", () => {
++    const schema = {
++      type: "object",
++      properties: {
++        title: { type: "string" }, default: { type: "string" }, const: { type: "string" },
++        enum: { type: "integer" }, type: { type: "string" }, required: { type: "string" },
++        items: { type: "string" }, "x-customer": { type: "boolean" },
++      },
++      required: ["title"],
++    };
++    const out = o2g({ messages: [user("x")], tools: [toolWith(schema)] });
++    expect(declOf(out).parameters).toEqual(schema);
++  });
++
++  it("cleaning does not mutate the caller's schema object", () => {
++    const schema = {
++      type: "object",
++      properties: { deep: { type: "object", properties: { n: { type: "integer" } } } },
++      "x-extra": { nested: { type: "no" } },
++    };
++    const snapshot = structuredClone(schema);
++    o2g({ messages: [user("x")], tools: [toolWith(schema)] });
++    expect(schema).toEqual(snapshot);
++  });
++
++  it("no declared schema and an explicitly empty schema both stay reason-free", () => {
++    for (const parameters of [undefined, {}, { type: "object", properties: {} }]) {
++      const out = o2g({ messages: [user("x")], tools: [toolWith(parameters)] });
++      const decl = declOf(out);
++      expect(JSON.stringify(decl)).not.toContain("reason");
++      if (parameters === undefined) {
++        expect(decl).not.toHaveProperty("parameters");
++        expect(decl).not.toHaveProperty("parametersJsonSchema");
++      } else {
++        expect(decl).not.toHaveProperty("parameters");
++        expect(decl.parametersJsonSchema).toEqual(parameters);
++      }
++    }
++  });
++
++  it("cleaning-invariant schemas that proto Schema cannot hold still use the JSON carrier", () => {
++    const cases = [
++      { type: "array", items: [{ type: "string" }, { type: "integer" }] },
++      { type: "array", items: true },
++      { type: "object", properties: { flag: false } },
++    ];
++    for (const schema of cases) {
++      const decl = declOf(o2g({ messages: [user("x")], tools: [toolWith(schema)] }));
++      expect(decl.parametersJsonSchema, JSON.stringify(schema)).toEqual(schema);
++      expect(decl).not.toHaveProperty("parameters");
++    }
++  });
++
++  it("schemas the cleaner would alter also use the JSON carrier", () => {
++    const cases = [
++      { type: "object", properties: { q: { type: "string" } }, not: { type: "object" } },
++      { type: "object", properties: { q: { type: "string" } }, if: { type: "string" }, then: { type: "string" } },
++      { type: "object", properties: { q: { type: "string" } }, additionalProperties: { type: "string" } },
++    ];
++    for (const schema of cases) {
++      const decl = declOf(o2g({ messages: [user("x")], tools: [toolWith(schema)] }));
++      expect(decl.parametersJsonSchema, JSON.stringify(schema)).toEqual(schema);
++      expect(decl).not.toHaveProperty("parameters");
++    }
++  });
++
++  it("proto-compatible keyword sets keep the parameters wire", () => {
++    const schema = {
++      type: "object", description: "d", nullable: false,
++      properties: { a: { type: "string" }, n: { type: "integer" } },
++      required: ["a"], propertyOrdering: ["a", "n"],
++    };
++    expect(declOf(o2g({ messages: [user("x")], tools: [toolWith(schema)] })).parameters).toEqual(schema);
++    const enumSchema = { type: "string", enum: ["x", "y"] };
++    expect(declOf(o2g({ messages: [user("x")], tools: [toolWith(enumSchema)] })).parameters).toEqual(enumSchema);
++  });
++
++  it("a proto-style schema stays in parameters when cleaning is a no-op; if it must move to the JSON carrier its types are lowercased", () => {
++    const clean = { type: "OBJECT", properties: { n: { type: "INTEGER" }, z: { type: "NULL" } } };
++    const kept = declOf(o2g({ messages: [user("x")], tools: [toolWith(clean)] }));
++    expect(kept.parameters).toEqual(clean);
++
++    const rich = { type: "OBJECT", properties: { n: { type: "INTEGER", title: "n" }, z: { type: "NULL" } } };
++    const decl = declOf(o2g({ messages: [user("x")], tools: [toolWith(rich)] }));
++    expect(decl).not.toHaveProperty("parameters");
++    expect(decl.parametersJsonSchema).toEqual({ type: "object", properties: { n: { type: "integer", title: "n" }, z: { type: "null" } } });
++  });
++
++  it("instance-valued enum/const objects bypass the legacy cleaner entirely across all wrappers", () => {
++    const cases = [
++      { type: "object", properties: { payload: { type: "object", enum: [{ toString: "literal", type: "INTEGER", "x-meta": 1 }] } } },
++      { type: "object", properties: { payload: { type: "object", const: { toString: "literal", type: "INTEGER" } } } },
++    ];
++    for (const schema of cases) {
++      for (const w of Object.keys(WRAPPERS)) {
++        const decl = declOf(WRAPPERS[w]({ messages: [user("x")], tools: [toolWith(schema)] }));
++        expect(decl, `${w} ${JSON.stringify(schema)}`).not.toHaveProperty("parameters");
++        expect(decl.parametersJsonSchema, w).toEqual(schema);
++      }
++    }
++  });
++});
++
++describe("cleanJSONSchemaForAntigravity traversal is schema-position aware", () => {
++  it("property names that equal keyword names are data, never stripped", () => {
++    const schema = {
++      type: "object",
++      properties: {
++        definitions: { type: "string" },
++        $defs: { type: "integer" },
++        patternProperties: { type: "string" },
++        dependentSchemas: { type: "boolean" },
++        not: { type: "string" },
++        "x-meta": { type: "string" },
++      },
++      required: ["definitions", "patternProperties", "not"],
++    };
++    const cleaned = cleanJSONSchemaForAntigravity(structuredClone(schema));
++    expect(cleaned.properties).toEqual(schema.properties);
++    expect(cleaned.required).toEqual(schema.required);
++  });
++
++  it("isLegacyGeminiSchema accepts proto shapes and rejects non-proto ones", () => {
++    expect(isLegacyGeminiSchema({ type: "object", properties: { a: { type: "string" } }, required: ["a"], propertyOrdering: ["a"], enum: undefined })).toBe(true);
++    expect(isLegacyGeminiSchema({ type: "array", items: { type: "string" } })).toBe(true);
++    expect(isLegacyGeminiSchema({ type: "string", enum: ["a"] })).toBe(true);
++    expect(isLegacyGeminiSchema({ type: "string", enum: [] })).toBe(true);
++    expect(isLegacyGeminiSchema(null)).toBe(false);
++    expect(isLegacyGeminiSchema("string")).toBe(false);
++    expect(isLegacyGeminiSchema([])).toBe(false);
++    expect(isLegacyGeminiSchema({ type: "object", not: {} })).toBe(false);
++    expect(isLegacyGeminiSchema({ anyOf: [{ type: "string" }] })).toBe(false);
++    expect(isLegacyGeminiSchema({ type: "array", items: [{ type: "string" }] })).toBe(false);
++    expect(isLegacyGeminiSchema({ type: "object", properties: { flag: false } })).toBe(false);
++    expect(isLegacyGeminiSchema({ type: "object", properties: [] })).toBe(false);
++    expect(isLegacyGeminiSchema({ type: "object", $defs: { x: {} } })).toBe(false);
++    for (const bad of [[1, 2], [true], [null], [{}], "x"]) {
++      expect(isLegacyGeminiSchema({ type: "object", enum: bad }), JSON.stringify(bad)).toBe(false);
++    }
++  });
++});
++
++describe("tool choice mapping", () => {
++  const tools = [{ type: "function", function: { name: "pick_me", parameters: { type: "object", properties: {} } } }];
++  const modeOf = (out) => (out.toolConfig || out.request?.toolConfig)?.functionCallingConfig?.mode;
++  const namesOf = (out) => (out.toolConfig || out.request?.toolConfig)?.functionCallingConfig?.allowedFunctionNames;
++
++  it.each(Object.keys(WRAPPERS))("maps auto/none/required (%s)", (w) => {
++    for (const [choice, mode] of [["auto", "AUTO"], ["none", "NONE"], ["required", "ANY"]]) {
++      const out = WRAPPERS[w]({ messages: [user("x")], tools, tool_choice: choice });
++      expect(modeOf(out), `${w} ${choice}`).toBe(mode);
++    }
++  });
++
++  it.each(Object.keys(WRAPPERS))("named function maps to ANY + sanitized allowedFunctionNames (%s)", (w) => {
++    const nested = WRAPPERS[w]({ messages: [user("x")], tools, tool_choice: { type: "function", function: { name: "pick me!" } } });
++    expect(modeOf(nested)).toBe("ANY");
++    expect(namesOf(nested)).toEqual(["pick_me_"]);
++
++    const flat = WRAPPERS[w]({ messages: [user("x")], tools, tool_choice: { type: "function", name: "pick_me" } });
++    expect(modeOf(flat)).toBe("ANY");
++    expect(namesOf(flat)).toEqual(["pick_me"]);
++  });
++
++  it("absent tool_choice keeps provider defaults: nothing for plain/vertex, VALIDATED for cli/ag", () => {
++    expect(o2g({ messages: [user("x")], tools })).not.toHaveProperty("toolConfig");
++    expect(o2vx({ messages: [user("x")], tools })).not.toHaveProperty("toolConfig");
++    expect(o2cli({ messages: [user("x")], tools }).request.toolConfig)
++      .toEqual({ functionCallingConfig: { mode: "VALIDATED" } });
++    expect(o2ag({ messages: [user("x")], tools }).request.toolConfig)
++      .toEqual({ functionCallingConfig: { mode: "VALIDATED" } });
++  });
++
++  it("Antigravity executor preserves a translated toolConfig instead of overwriting with VALIDATED", () => {
++    const envelope = o2ag({ messages: [user("x")], tools, tool_choice: "auto" });
++    const out = new AntigravityExecutor().transformRequest(MODEL, envelope, true, AG_CREDENTIALS);
++    expect(out.request.toolConfig).toEqual({ functionCallingConfig: { mode: "AUTO" } });
++  });
++
++  it("Antigravity executor keeps VALIDATED default when no tool_choice was provided", () => {
++    const envelope = o2ag({ messages: [user("x")], tools });
++    const out = new AntigravityExecutor().transformRequest(MODEL, envelope, true, AG_CREDENTIALS);
++    expect(out.request.toolConfig).toEqual({ functionCallingConfig: { mode: "VALIDATED" } });
++  });
++});
++
++describe("tool history is chronological, lossless, and unfabricated", () => {
++  const call = (id, name, args = "{}") => ({ id, type: "function", function: { name, arguments: args } });
++  const toolMsg = (id, content) => ({ role: "tool", tool_call_id: id, content });
++  const functionResponsesOf = (out) => out.contents.flatMap((c) => c.parts.filter((p) => p.functionResponse).map((p) => p.functionResponse));
++  const functionCallsOf = (out) => out.contents.flatMap((c) => c.parts.filter((p) => p.functionCall).map((p) => p.functionCall));
++
++  it("parallel calls keep original ids (call.1 vs call1) and results follow message order", () => {
++    const out = o2g({
++      messages: [
++        user("go"),
++        { role: "assistant", content: null, tool_calls: [call("call.1", "alpha"), call("call1", "beta")] },
++        toolMsg("call1", "B-RESULT"),
++        toolMsg("call.1", '{"nested":1}'),
++        user("next"),
++      ],
++    });
++    const calls = functionCallsOf(out);
++    expect(calls.map((c) => c.id)).toEqual(["call.1", "call1"]);
++    expect(calls.map((c) => c.name)).toEqual(["alpha", "beta"]);
++    const resps = functionResponsesOf(out);
++    expect(resps.map((r) => r.id)).toEqual(["call1", "call.1"]);
++    expect(resps.map((r) => r.name)).toEqual(["beta", "alpha"]);
++    expect(resps[0].response).toEqual({ result: "B-RESULT" });
++    expect(resps[1].response).toEqual({ nested: 1 });
++  });
++
++  it("result contract: Struct objects pass unchanged, everything else wraps under result", () => {
++    const cases = [
++      ["sunny", { result: "sunny" }],
++      ["false", { result: false }],
++      ["0", { result: 0 }],
++      ["null", { result: null }],
++      [null, { result: null }],
++      [undefined, { result: null }],
++      ['{"error":"denied"}', { error: "denied" }],
++      [{ already: "object" }, { already: "object" }],
++      ["[1,2]", { result: [1, 2] }],
++      ["not json {", { result: "not json {" }],
++    ];
++    for (const [content, expected] of cases) {
++      const out = o2g({
++        messages: [user("go"), { role: "assistant", content: null, tool_calls: [call("c1", "f")] }, toolMsg("c1", content), user("n")],
++      });
++      expect(functionResponsesOf(out)[0].response, JSON.stringify(content)).toEqual(expected);
++    }
++  });
++
++  it("opaque ids that collide with Object.prototype keys still resolve their declared name", () => {
++    const out = o2g({
++      messages: [
++        user("go"),
++        { role: "assistant", content: null, tool_calls: [call("__proto__", "proto_fn")] },
++        toolMsg("__proto__", "ok"),
++        user("n"),
++      ],
++    });
++    const fr = functionResponsesOf(out)[0];
++    expect(fr.name).toBe("proto_fn");
++    expect(fr.id).toBe("__proto__");
++  });
++
++  it("never fabricates a success response for a call with no result", () => {
++    const out = o2g({
++      messages: [user("go"), { role: "assistant", content: null, tool_calls: [call("c1", "f")] }],
++    });
++    expect(functionResponsesOf(out)).toEqual([]);
++    expect(out.contents.at(-1).role).toBe("model");
++    const midHistory = o2g({
++      messages: [user("go"), { role: "assistant", content: null, tool_calls: [call("c1", "f")] }, user("anyway")],
++    });
++    expect(functionResponsesOf(midHistory)).toEqual([]);
++  });
++
++  it("default normalizeGeminiContents still fabricates for other consumers; the option does not", () => {
++    const contents = [user("x") && { role: "user", parts: [{ text: "x" }] }, { role: "model", parts: [{ functionCall: { id: "c1", name: "f" } }] }];
++    const withDefault = normalizeGeminiContents(contents);
++    expect(withDefault.at(-1).parts[0].functionResponse.response).toEqual({ result: "Continue." });
++    const off = normalizeGeminiContents(contents, { synthesizeTerminalToolResponse: false });
++    expect(off.at(-1).role).toBe("model");
++  });
++});
++
++describe("translator metadata stays off the provider body", () => {
++  it("_customToolNames/_toolNameMap ride the envelope top level only", () => {
++    const intermediate = openaiResponsesToOpenAIRequest(MODEL, {
++      input: [
++        { type: "additional_tools", role: "developer", tools: [{ type: "custom", name: "exec", format: { syntax: "lark" } }] },
++        { type: "message", role: "user", content: [{ type: "input_text", text: "go" }] },
++      ],
++    }, true, null);
++    expect(intermediate._customToolNames).toEqual(["exec"]);
++
++    for (const w of Object.keys(WRAPPERS)) {
++      const out = WRAPPERS[w]({ ...intermediate, _toolNameMap: new Map([["a", "b"]]) });
++      expect(out._customToolNames).toEqual(["exec"]);
++      expect(out._toolNameMap instanceof Map ? [...out._toolNameMap] : out._toolNameMap).toEqual([["a", "b"]]);
++      const payload = inner[w](out);
++      for (const section of [payload.contents, payload.tools, payload.systemInstruction]) {
++        if (section !== undefined) {
++          expect(JSON.stringify(section)).not.toContain("_customToolNames");
++          expect(JSON.stringify(section)).not.toContain("_toolNameMap");
++        }
++      }
++      const decls = payload.tools?.[0]?.functionDeclarations || [];
++      expect(decls.map((d) => d.name)).toContain("exec");
++    }
++  });
++});
++
++describe("media content", () => {
++  it("retained input_file inline data and file URLs become inlineData/fileData", () => {
++    const parts = convertOpenAIContentToParts([
++      { type: "input_file", filename: "d.pdf", file_data: "data:application/pdf;base64,JVBER" },
++      { type: "input_file", filename: "a.txt", file_url: "https://files.example/a.txt" },
++      { type: "input_file", file_id: "file-abc", filename: "x.pdf" },
++      { type: "file", file: { filename: "b.pdf", file_data: "UkFXUkFXX1JBVw==" } },
++      { type: "file", file: { filename: "c.pdf", file_data: "https://files.example/c.pdf" } },
++    ]);
++    expect(parts[0]).toEqual({ inlineData: { mime_type: "application/pdf", data: "JVBER" } });
++    expect(parts[1]).toEqual({ fileData: { fileUri: "https://files.example/a.txt", mimeType: "text/plain" } });
++    expect(parts.filter((p) => p.fileData || p.inlineData)).toHaveLength(4);
++    expect(parts[2]).toEqual({ inlineData: { mime_type: "application/pdf", data: "UkFXUkFXX1JBVw==" } });
++    expect(parts[3]).toEqual({ fileData: { fileUri: "https://files.example/c.pdf", mimeType: "application/pdf" } });
++  });
++
++  it("assistant multimodal content keeps its media parts instead of flattening to text", () => {
++    const out = o2g({
++      messages: [
++        user("look"),
++        { role: "assistant", content: [
++          { type: "text", text: "see this" },
++          { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
++        ] },
++        user("more"),
++      ],
++    });
++    const modelTurn = out.contents.find((c) => c.role === "model");
++    expect(modelTurn.parts).toContainEqual({ text: "see this" });
++    expect(modelTurn.parts.some((p) => p.inlineData?.data === "AAAA")).toBe(true);
++  });
++});
++
++describe("generation settings and structured output", () => {
++  it("maps scalar controls, preferring max_completion_tokens over max_tokens", () => {
++    const out = o2g({
++      messages: [user("x")],
++      temperature: 0.5, top_p: 0.9, top_k: 40,
++      max_tokens: 100, max_completion_tokens: 77,
++      stop: ["END", "STOP"], seed: 42,
++      presence_penalty: 0.3, frequency_penalty: -0.1,
++    });
++    expect(out.generationConfig).toMatchObject({
++      temperature: 0.5, topP: 0.9, topK: 40,
++      maxOutputTokens: 77, stopSequences: ["END", "STOP"], seed: 42,
++      presencePenalty: 0.3, frequencyPenalty: -0.1,
++    });
++  });
++
++  it("n/logprobs/top_logprobs stay unmapped — unconsumed candidates and probabilities are not activated", () => {
++    const out = o2g({ messages: [user("x")], n: 2, logprobs: true, top_logprobs: 5 });
++    expect(out.generationConfig).not.toHaveProperty("candidateCount");
++    expect(out.generationConfig).not.toHaveProperty("responseLogprobs");
++    expect(out.generationConfig).not.toHaveProperty("logprobs");
++  });
++
++  it.each([
++    ["gemini-3.1-pro-preview", 128, 65535, { thinkingLevel: "high", includeThoughts: true }],
++    ["gemini-2.5-pro", 1024, 32768, { thinkingBudget: 24576, includeThoughts: true }],
++  ])("retains upstream thinking answer headroom on %s", (model, cap, expectedFloor, thinking) => {
++    const out = translateRequest(FORMATS.OPENAI, FORMATS.GEMINI_CLI, model, {
++      messages: [user("x")],
++      max_completion_tokens: cap,
++      reasoning_effort: "high",
++    }, true, { accessToken: "t", projectId: "p" }, "gemini-cli");
++    expect(out.request.generationConfig.maxOutputTokens).toBe(expectedFloor);
++    expect(out.request.generationConfig.thinkingConfig).toMatchObject(thinking);
++  });
++
++  it("stop string becomes a one-element stopSequences", () => {
++    const out = o2g({ messages: [user("x")], stop: "END" });
++    expect(out.generationConfig.stopSequences).toEqual(["END"]);
++  });
++
++  it("response_format json_object/json_schema map to responseMimeType/responseJsonSchema", () => {
++    const schema = { type: "object", properties: { n: { type: "integer" } }, $defs: { a: { type: "string" } }, additionalProperties: false };
++    const obj = o2g({ messages: [user("x")], response_format: { type: "json_object" } });
++    expect(obj.generationConfig.responseMimeType).toBe("application/json");
++    expect(obj.generationConfig).not.toHaveProperty("responseJsonSchema");
++
++    const js = o2g({ messages: [user("x")], response_format: { type: "json_schema", json_schema: { name: "s", schema } } });
++    expect(js.generationConfig.responseMimeType).toBe("application/json");
++    expect(js.generationConfig.responseJsonSchema).toEqual(schema);
++  });
++
++  it("first-hop Responses text.format lands the same way", () => {
++    const schema = { type: "object", properties: { ok: { type: "boolean" } } };
++    const out = o2g({ messages: [user("x")], text: { format: { type: "json_schema", name: "s", schema } } });
++    expect(out.generationConfig.responseMimeType).toBe("application/json");
++    expect(out.generationConfig.responseJsonSchema).toEqual(schema);
++    const jo = o2g({ messages: [user("x")], text: { format: { type: "json_object" } } });
++    expect(jo.generationConfig.responseMimeType).toBe("application/json");
++  });
++});
++
++describe("Vertex post-processing", () => {
++  it("replaces only the known synthetic signatures, preserving a cached real one", () => {
++    storeGeminiThoughtSignature("call-real", "REAL_PROVIDER_SIG", "sess-vertex", MODEL);
++    const body = (id) => ({
++      messages: [
++        user("q"),
++        { role: "assistant", content: null, tool_calls: [{ id, type: "function", function: { name: "f", arguments: "{}" } }] },
++        { role: "tool", tool_call_id: id, content: "r" },
++        user("n"),
++      ],
++    });
++    const withReal = openaiToVertexRequest(MODEL, body("call-real"), true, { _clientSessionId: "sess-vertex" });
++    const realCall = withReal.contents.flatMap((c) => c.parts).find((p) => p.functionCall);
++    expect(realCall.thoughtSignature).toBe("REAL_PROVIDER_SIG");
++    expect(realCall.thoughtSignature).not.toBe(DEFAULT_THINKING_VERTEX_SIGNATURE);
++
++    const withDefault = openaiToVertexRequest(MODEL, body("call-uncached"), true, null);
++    const defaultCall = withDefault.contents.flatMap((c) => c.parts).find((p) => p.functionCall);
++    expect(defaultCall.thoughtSignature).toBe(DEFAULT_THINKING_VERTEX_SIGNATURE);
++    expect(defaultCall.thoughtSignature).not.toBe(DEFAULT_THINKING_AG_SIGNATURE);
++    expect(defaultCall.functionCall.id).toBeUndefined();
++  });
++});
++
++describe("Antigravity executor contract on translated Gemini bodies", () => {
++  const executor = () => new AntigravityExecutor();
++  const tools = [
++    { type: "function", function: { name: "rich", parameters: { type: "object", properties: { s: { type: "string", minLength: 2 } } } } },
++    { type: "function", function: { name: "plain", parameters: { type: "object", properties: { q: { type: "string" } } } } },
++    { type: "function", function: { name: "noargs" } },
++  ];
++
++  it("keeps parametersJsonSchema carriers verbatim, cleans legacy parameters, injects no placeholder", () => {
++    const envelope = o2ag({ messages: [user("x")], tools });
++    const out = executor().transformRequest(MODEL, envelope, true, AG_CREDENTIALS);
++    const decls = out.request.tools[0].functionDeclarations;
++    const rich = decls.find((d) => d.name === "rich");
++    expect(rich.parametersJsonSchema).toEqual({ type: "object", properties: { s: { type: "string", minLength: 2 } } });
++    expect(rich).not.toHaveProperty("parameters");
++    const plain = decls.find((d) => d.name === "plain");
++    expect(plain.parameters).toEqual({ type: "object", properties: { q: { type: "string" } } });
++    const noargs = decls.find((d) => d.name === "noargs");
++    expect(JSON.stringify(noargs)).not.toContain("reason");
++  });
++
++  it("does not re-add a fabricated terminal functionResponse after executor normalization", () => {
++    const envelope = o2ag({
++      messages: [user("go"), { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] }],
++      tools,
++    });
++    const out = executor().transformRequest(MODEL, envelope, true, AG_CREDENTIALS);
++    expect(out.request.contents.at(-1).role).toBe("model");
++    expect(JSON.stringify(out.request.contents)).not.toContain("Continue.");
++  });
++
++  it("Claude-backed envelopes keep the legacy placeholder and VALIDATED toolConfig", () => {
++    const envelope = {
++      model: "claude-sonnet-4.5",
++      request: {
++        contents: [{ role: "user", parts: [{ text: "hi" }] }],
++        tools: [{ functionDeclarations: [
++          { name: "naked" },
++          { name: "typed", parameters: { type: "object", properties: { q: { type: "string" } } } },
++          { name: "nulled", parameters: null },
++          { name: "falsed", parameters: false },
++        ] }],
++        toolConfig: { functionCallingConfig: { mode: "ANY" } },
++      },
++    };
++    const out = executor().transformRequest("claude-sonnet-4.5", envelope, true, AG_CREDENTIALS);
++    const decls = out.request.tools[0].functionDeclarations;
++    expect(decls.find((d) => d.name === "naked").parameters.properties.reason).toBeDefined();
++    expect(decls.find((d) => d.name === "nulled").parameters.properties.reason).toBeDefined();
++    expect(decls.find((d) => d.name === "falsed").parameters.properties.reason).toBeDefined();
++    expect(decls.find((d) => d.name === "typed").parameters).toEqual({ type: "object", properties: { q: { type: "string" } } });
++    expect(out.request.toolConfig).toEqual({ functionCallingConfig: { mode: "VALIDATED" } });
++  });
++});
++
++describe.each([["gemini"], ["aistudio"]])("translated Chat → %s through the real chat core", (provider) => {
++  const quiet = Object.fromEntries(["debug", "info", "warn", "error", "line", "errorLine"].map((n) => [n, vi.fn()]));
++  const reply = { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }] };
++
++  const wireBody = () => JSON.parse(network.mock.calls.at(-1)[1].body);
++  const wireUrl = () => network.mock.calls.at(-1)[0];
++
++  beforeEach(() => {
++    network.mockReset();
++  });
++
++  async function runChat(stream, extra = {}) {
++    return handleChatCore({
++      body: {
++        model: `${provider}/${MODEL}`,
++        stream,
++        messages: [
++          { role: "system", content: "S1" },
++          { role: "developer", content: "D1" },
++          user("q1"),
++          { role: "assistant", content: null, tool_calls: [
++            { id: "call.1", type: "function", function: { name: "alpha", arguments: '{"a":1}' } },
++            { id: "call1", type: "function", function: { name: "beta", arguments: "{}" } },
++            { id: "c-miss", type: "function", function: { name: "ghost", arguments: "{}" } },
++          ] },
++          { role: "tool", tool_call_id: "call1", content: '["x","y"]' },
++          { role: "tool", tool_call_id: "call.1", content: '{"err":"nope"}' },
++          user("next"),
++        ],
++        tools: [
++          { type: "function", function: { name: "rich", description: "d", parameters: { type: "object", properties: { s: { type: "string", minLength: 2 } } } } },
++          { type: "function", function: { name: "plain", description: "d", parameters: { type: "object", properties: { q: { type: "string" } } } } },
++        ],
++        tool_choice: { type: "function", function: { name: "plain" } },
++        reasoning_effort: "high",
++        max_completion_tokens: 128,
++        ...extra,
++      },
++      modelInfo: { provider, model: MODEL },
++      credentials: { apiKey: "offline-key", connectionId: "offline-contract" },
++      log: quiet,
++      clientRawRequest: { endpoint: "/v1/chat/completions", body: {}, headers: {} },
++      connectionId: "offline-contract",
++      rtkEnabled: false, headroomEnabled: false, cavemanEnabled: false, ponytailEnabled: false, pxpipeEnabled: false,
++    });
++  }
++
++  it.each([["JSON", false], ["SSE", true]])("carries instructions, schema carrier, toolConfig, chronological results, cap+thinking (%s)", async (_label, stream) => {
++    network.mockImplementation(async () => stream
++      ? new Response(`data: ${JSON.stringify(reply)}\n\n`, { headers: { "Content-Type": "text/event-stream" } })
++      : Response.json(structuredClone(reply)));
++    const result = await runChat(stream);
++    expect(result.success).toBe(true);
++
++    const wb = wireBody();
++    expect(wb.systemInstruction.parts).toEqual([{ text: "S1" }, { text: "D1" }]);
++
++    const decls = wb.tools[0].functionDeclarations;
++    expect(decls.find((d) => d.name === "rich").parametersJsonSchema)
++      .toEqual({ type: "object", properties: { s: { type: "string", minLength: 2 } } });
++    expect(decls.find((d) => d.name === "plain").parameters)
++      .toEqual({ type: "object", properties: { q: { type: "string" } } });
++
++    expect(wb.toolConfig).toEqual({ functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["plain"] } });
++    expect(wb.generationConfig.maxOutputTokens).toBe(65535);
++    expect(wb.generationConfig.thinkingConfig).toMatchObject({ thinkingLevel: "high" });
++
++    const calls = wb.contents.flatMap((c) => c.parts.filter((p) => p.functionCall).map((p) => p.functionCall));
++    expect(calls.map((c) => c.id)).toEqual(["call.1", "call1", "c-miss"]);
++    const resps = wb.contents.flatMap((c) => c.parts.filter((p) => p.functionResponse).map((p) => p.functionResponse));
++    expect(resps.map((r) => [r.id, r.name])).toEqual([["call1", "beta"], ["call.1", "alpha"]]);
++    expect(resps[0].response).toEqual({ result: ["x", "y"] });
++    expect(resps[1].response).toEqual({ err: "nope" });
++
++    expect(JSON.stringify(wb)).not.toContain("_customToolNames");
++    await result.response.text();
++  });
++
++  it.each([["JSON", false], ["SSE", true]])("adapts responseJsonSchema to the aistudio responseFormat wire (%s)", async (_label, stream) => {
++    const schema = { type: "object", properties: { n: { type: "integer" } }, additionalProperties: false };
++    network.mockImplementation(async () => stream
++      ? new Response(`data: ${JSON.stringify(reply)}\n\n`, { headers: { "Content-Type": "text/event-stream" } })
++      : Response.json(structuredClone(reply)));
++    const result = await runChat(stream, { response_format: { type: "json_schema", json_schema: { name: "s", schema } } });
++    expect(result.success).toBe(true);
++    const gc = wireBody().generationConfig;
++    if (provider === "aistudio") {
++      expect(gc.responseFormat).toEqual({ text: { mimeType: "APPLICATION_JSON", schema } });
++      expect(gc.responseJsonSchema).toBeUndefined();
++      expect(gc.responseMimeType).toBeUndefined();
++    } else {
++      expect(gc.responseJsonSchema).toEqual(schema);
++      expect(gc.responseMimeType).toBe("application/json");
++    }
++    await result.response.text();
++  });
++
++  it("surfaces the provider's native error shape instead of fabricating success", async () => {
++    network.mockImplementation(async () => new Response(
++      JSON.stringify({ error: { code: 400, status: "INVALID_ARGUMENT", message: "fixture native invalid argument" } }),
++      { status: 400, headers: { "Content-Type": "application/json" } }));
++    const result = await runChat(false);
++    expect(result.success).toBe(false);
++    expect(result.response.status).toBe(400);
++    expect(await result.response.text()).toContain("fixture native invalid argument");
++    expect(network.mock.calls).toHaveLength(1);
++  });
++});
++
++describe("Responses custom tools through the chat core to a Gemini wire", () => {
++  const quiet = Object.fromEntries(["debug", "info", "warn", "error", "line", "errorLine"].map((n) => [n, vi.fn()]));
++  const replyWithCalls = {
++    candidates: [{ index: 0, content: { role: "model", parts: [
++      { functionCall: { name: "exec", args: { input: "opaque" } } },
++      { functionCall: { name: "plain", args: { x: 1 } } },
++    ] }, finishReason: "STOP" }],
++  };
++
++  beforeEach(() => {
++    network.mockReset();
++  });
++
++  function coreArgs(stream = true) {
++    return {
++      body: {
++        model: `gemini/${MODEL}`,
++        stream,
++        input: [
++          { type: "additional_tools", role: "developer", tools: [{ type: "custom", name: "exec", format: { syntax: "lark" } }] },
++          { type: "message", role: "user", content: [{ type: "input_text", text: "go" }] },
++        ],
++        tools: [{ type: "function", name: "plain", description: "d", parameters: { type: "object", properties: { x: { type: "number" } } } }],
++      },
++      modelInfo: { provider: "gemini", model: MODEL },
++      credentials: { apiKey: "offline-key", connectionId: "offline-contract" },
++      log: quiet,
++      clientRawRequest: { endpoint: "/v1/responses", body: {}, headers: {} },
++      connectionId: "offline-contract",
++      rtkEnabled: false, headroomEnabled: false, cavemanEnabled: false, ponytailEnabled: false, pxpipeEnabled: false,
++    };
++  }
++
++  it("JSON: exec lands as custom_tool_call with input, plain as function_call with identity", async () => {
++    network.mockImplementation(async () => Response.json(structuredClone(replyWithCalls)));
++    const result = await handleChatCore(coreArgs(false));
++    expect(result.success).toBe(true);
++
++    const wire = JSON.parse(network.mock.calls.at(-1)[1].body);
++    const names = wire.tools[0].functionDeclarations.map((d) => d.name);
++    expect(names).toContain("exec");
++    expect(names).toContain("plain");
++    expect(JSON.stringify(wire)).not.toContain("_customToolNames");
++
++    const data = await result.response.json();
++    const custom = data.output.find((i) => i.type === "custom_tool_call");
++    expect(custom).toMatchObject({ name: "exec", input: "opaque" });
++    const fn = data.output.find((i) => i.type === "function_call");
++    expect(fn).toMatchObject({ name: "plain" });
++    expect(fn.call_id).toBeTruthy();
++    expect(JSON.parse(fn.arguments)).toEqual({ x: 1 });
++  });
++
++  it("SSE: custom_tool_call and function_call items stream back", async () => {
++    const sse = `data: ${JSON.stringify(replyWithCalls)}\n\ndata: [DONE]\n\n`;
++    network.mockImplementation(async () => new Response(sse, { headers: { "Content-Type": "text/event-stream" } }));
++    const result = await handleChatCore(coreArgs());
++    expect(result.success).toBe(true);
++    const text = await result.response.text();
++    expect(text).toContain("custom_tool_call");
++    expect(text).toContain("exec");
++    expect(text).toContain("opaque");
++    expect(text).toContain("function_call");
++    expect(text).toContain("plain");
++  });
++});
+diff --git a/tests/unit/gemini-contents-normalization.test.js b/tests/unit/gemini-contents-normalization.test.js
+index 6b8a94c8..e446e522 100644
+--- a/tests/unit/gemini-contents-normalization.test.js
++++ b/tests/unit/gemini-contents-normalization.test.js
+@@ -190,7 +190,7 @@ describe("functionResponse `$ref` sanitization", () => {
+     const frs = out.contents.flatMap(c => c.parts).filter(p => p.functionResponse);
+     expect(frs).toHaveLength(1);
+     expect(JSON.stringify(frs[0].functionResponse.response)).not.toContain('"$ref"');
+-    expect(frs[0].functionResponse.response.result._ref).toBe("#/$defs/Config");
++    expect(frs[0].functionResponse.response.result).toBe(JSON.stringify(schemaResult));
++    expect(JSON.parse(frs[0].functionResponse.response.result)).toEqual(schemaResult);
+   });
+ });
+-
+diff --git a/tests/unit/gemini-nonstream-source-format.test.js b/tests/unit/gemini-nonstream-source-format.test.js
+new file mode 100644
+index 00000000..225c30b1
+--- /dev/null
++++ b/tests/unit/gemini-nonstream-source-format.test.js
+@@ -0,0 +1,65 @@
++import { describe, it, expect, vi } from "vitest";
++
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++
++const { translateNonStreamingResponse } = await import("../../open-sse/handlers/chatCore/nonStreamingHandler.js");
++const { FORMATS } = await import("../../open-sse/translator/formats.js");
++const { getGeminiThoughtSignatureSync } = await import("../../open-sse/services/thoughtSignatureStore.js");
++
++const geminiBody = () => ({
++  responseId: "r1",
++  modelVersion: "model-x",
++  candidates: [{
++    finishReason: "STOP",
++    content: { role: "model", parts: [{ text: "thinking summary", thought: true }, { text: "final answer" }] },
++  }],
++  usageMetadata: { promptTokenCount: 3, candidatesTokenCount: 2, totalTokenCount: 5 },
++});
++
++describe("non-streaming Gemini upstream answers in the client's own format", () => {
++  it("OpenAI client keeps the chat.completion shape", () => {
++    const r = translateNonStreamingResponse(geminiBody(), FORMATS.GEMINI, FORMATS.OPENAI);
++    expect(r.object).toBe("chat.completion");
++    expect(r.choices[0].message.content).toBe("final answer");
++    expect(r.choices[0].message.reasoning_content).toBe("thinking summary");
++  });
++
++  it("Claude client gets a message with thinking and text blocks", () => {
++    const r = translateNonStreamingResponse(geminiBody(), FORMATS.GEMINI, FORMATS.CLAUDE);
++    expect(r.type).toBe("message");
++    expect(r.content.map((b) => b.type)).toEqual(expect.arrayContaining(["text"]));
++    expect(r.content.find((b) => b.type === "text").text).toBe("final answer");
++  });
++
++  it("Responses client gets a response object with message output", () => {
++    const r = translateNonStreamingResponse(geminiBody(), FORMATS.GEMINI, FORMATS.OPENAI_RESPONSES);
++    expect(r.object).toBe("response");
++    const msg = r.output.find((o) => o.type === "message");
++    expect(msg.content[0].text).toBe("final answer");
++  });
++
++  it("reports a MAX_TOKENS cut-off as a valid terminal state for every client format", () => {
++    const cut = () => ({ ...geminiBody(), candidates: [{ ...geminiBody().candidates[0], finishReason: "MAX_TOKENS" }] });
++    expect(translateNonStreamingResponse(cut(), FORMATS.GEMINI, FORMATS.OPENAI).choices[0].finish_reason).toBe("length");
++    const resp = translateNonStreamingResponse(cut(), FORMATS.GEMINI, FORMATS.OPENAI_RESPONSES);
++    expect(resp.status).toBe("incomplete");
++    expect(resp.incomplete_details).toEqual({ reason: "max_output_tokens" });
++    expect(translateNonStreamingResponse(cut(), FORMATS.GEMINI, FORMATS.CLAUDE).stop_reason).toBe("max_tokens");
++  });
++
++  it("caches the signature of a returned tool call under the id the client will send back", () => {
++    const body = {
++      responseId: "r2",
++      candidates: [{
++        finishReason: "STOP",
++        content: { role: "model", parts: [{ text: "plan", thought: true }, { functionCall: { name: "lookup", args: { q: 1 } }, thoughtSignature: "call-sig-1" }] },
++      }],
++    };
++    const r = translateNonStreamingResponse(body, FORMATS.GEMINI, FORMATS.CLAUDE, null, null, null);
++    const toolUse = r.content.find((b) => b.type === "tool_use");
++    expect(toolUse.id).toBeTruthy();
++    expect(getGeminiThoughtSignatureSync(toolUse.id, null, "gemini-model")).toBe("call-sig-1");
++  });
++});
+diff --git a/tests/unit/gemini-server-parts-isolation.test.js b/tests/unit/gemini-server-parts-isolation.test.js
+new file mode 100644
+index 00000000..e2949f2e
+--- /dev/null
++++ b/tests/unit/gemini-server-parts-isolation.test.js
+@@ -0,0 +1,130 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { captureConversationId, captureSessionId } from "../../open-sse/utils/sessionManager.js";
++
++const rows = new Map();
++vi.mock("../../src/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({
++    get: async (key) => rows.get(key) ?? null,
++    set: async (key, value) => { rows.set(key, value); },
++    remove: async (key) => { rows.delete(key); },
++    getAll: async () => Object.fromEntries(rows),
++  }),
++}));
++
++let store;
++
++const MODEL = "gemini-3.8-flash";
++const partsFor = (label) => [{ thoughtSignature: `sig-${label}`, toolCall: { id: "call_1", toolType: "GOOGLE_SEARCH_WEB", args: { queries: [label] } } }];
++
++beforeEach(async () => {
++  rows.clear();
++  vi.resetModules();
++  store = await import("../../open-sse/services/thoughtSignatureStore.js");
++});
++
++describe("server-side tool parts are bound to session and scope", () => {
++  it("returns the stored parts verbatim for the same session, scope and id", () => {
++    store.storeGeminiServerParts("call_1", partsFor("A"), "session-a", MODEL, "scope-1");
++    expect(store.getGeminiServerPartsSync("call_1", "session-a", MODEL, "scope-1")).toEqual(partsFor("A"));
++  });
++
++  it("does not leak across sessions or scopes for the same call id", () => {
++    store.storeGeminiServerParts("call_1", partsFor("A"), "session-a", MODEL, "scope-1");
++    expect(store.getGeminiServerPartsSync("call_1", "session-b", MODEL, "scope-1")).toBeNull();
++    expect(store.getGeminiServerPartsSync("call_1", "session-a", MODEL, "scope-2")).toBeNull();
++    expect(store.getGeminiServerPartsSync("call_1", null, MODEL, "scope-1")).toBeNull();
++  });
++
++  it("keeps two scopes with the same id apart", () => {
++    store.storeGeminiServerParts("call_1", partsFor("one"), "session-a", MODEL, "scope-1");
++    store.storeGeminiServerParts("call_1", partsFor("two"), "session-a", MODEL, "scope-2");
++    expect(store.getGeminiServerPartsSync("call_1", "session-a", MODEL, "scope-1")).toEqual(partsFor("one"));
++    expect(store.getGeminiServerPartsSync("call_1", "session-a", MODEL, "scope-2")).toEqual(partsFor("two"));
++  });
++
++  it.each([
++    ["missing session", [undefined, "scope-1"]],
++    ["empty session", ["", "scope-1"]],
++    ["numeric session", [7, "scope-1"]],
++    ["missing scope", ["session-a", undefined]],
++    ["empty scope", ["session-a", ""]],
++    ["numeric scope", ["session-a", 7]],
++  ])("neither caches nor falls back with a %s", (_label, [sessionId, scope]) => {
++    store.storeGeminiServerParts("call_1", partsFor("A"), sessionId, MODEL, scope);
++    expect(rows.size).toBe(0);
++    store.storeGeminiServerParts("call_1", partsFor("B"), "session-a", MODEL, "scope-1");
++    expect(store.getGeminiServerPartsSync("call_1", sessionId, MODEL, scope)).toBeNull();
++  });
++
++  it("cannot collide through colon delimiters", () => {
++    store.storeGeminiServerParts("c:d", partsFor("first"), "a", MODEL, "b");
++    store.storeGeminiServerParts("d", partsFor("second"), "a:c", MODEL, "b");
++    expect(store.getGeminiServerPartsSync("c:d", "a", MODEL, "b")).toEqual(partsFor("first"));
++    expect(store.getGeminiServerPartsSync("d", "a:c", MODEL, "b")).toEqual(partsFor("second"));
++    expect(store.getGeminiServerPartsSync("d", "a", MODEL, "c:b")).toBeNull();
++  });
++
++  it("ignores a legacy unscoped entry written through the opaque store", () => {
++    store.storeGeminiThoughtSignature("serverparts:call_1", JSON.stringify(partsFor("legacy")), "session-a", MODEL);
++    store.storeGeminiThoughtSignature("serverparts:call_1", JSON.stringify(partsFor("legacy")), null, MODEL);
++    expect(store.getGeminiServerPartsSync("call_1", "session-a", MODEL, "scope-1")).toBeNull();
++    expect(store.getGeminiServerPartsSync("call_1", "session-b", MODEL, "scope-1")).toBeNull();
++  });
++
++  it("isolates turn-anchored parts with identical reasoning, content and scope", () => {
++    const turn = { reasoning: "thinking", content: "answer", scope: "scope-1" };
++    store.storeGeminiServerPartsForTurn({ ...turn, sessionId: "session-a" }, partsFor("A"), MODEL);
++    expect(store.findGeminiServerPartsForTurn({ ...turn, sessionId: "session-a" }, MODEL)).toEqual(partsFor("A"));
++    expect(store.findGeminiServerPartsForTurn({ ...turn, sessionId: "session-b" }, MODEL)).toBeNull();
++    expect(store.findGeminiServerPartsForTurn({ ...turn, sessionId: null }, MODEL)).toBeNull();
++    expect(store.findGeminiServerPartsForTurn({ ...turn, scope: "scope-2", sessionId: "session-a" }, MODEL)).toBeNull();
++  });
++
++  it("leaves the opaque thought-signature cache compatible", () => {
++    store.storeGeminiThoughtSignature("call_x", "opaque-sig", "session-a", MODEL);
++    expect(store.getGeminiThoughtSignatureSync("call_x", "session-a", MODEL)).toBe("opaque-sig");
++    expect(store.getGeminiThoughtSignatureSync("call_x", null, MODEL)).toBe("opaque-sig");
++  });
++});
++
++describe("captureConversationId", () => {
++  const capture = (rawHeaders, body = {}) => captureConversationId(body, { rawHeaders });
++
++  it.each([
++    ["no headers or body", {}, {}],
++    ["a plain metadata.user_id", {}, { metadata: { user_id: "user-123" } }],
++    ["a shared prompt_cache_key", {}, { prompt_cache_key: "shared-cache-key" }],
++    ["a client request id", { "x-client-request-id": "req-1" }, {}],
++    ["a workspace or account value", { "x-workspace-id": "ws-1", "x-account-id": "acct-1" }, { workspace_id: "ws-1" }],
++  ])("is never genuine for %s", (_label, headers, body) => {
++    expect(capture(headers, body)).toBeNull();
++  });
++
++  it("takes declared body and header identities", () => {
++    expect(capture({}, { session_id: "body-session" })).toBe("body-session");
++    expect(capture({}, { conversation_id: "conv-1", session_id: "body-session" })).toBe("conv-1");
++    expect(capture({ "session-id": "session-1" })).toBe("session-1");
++    expect(capture({ "x-session-id": "x-1", "session-id": "session-1" })).toBe("x-1");
++    expect(capture({ "x-amp-thread-id": "amp-1" })).toBe("amp-1");
++  });
++
++  it("prefers the Codex thread-id over the session-id and is stable across calls", () => {
++    const headers = { "session-id": "session-1", "thread-id": "thread-1" };
++    expect(capture(headers)).toBe("thread-1");
++    expect(capture(headers, { prompt_cache_key: "ignored" })).toBe("thread-1");
++    expect(capture({ "thread-id": "thread-1" })).toBe("thread-1");
++  });
++
++  it("recognizes Claude Code sessions", () => {
++    expect(capture({}, { metadata: { user_id: "user_abc_account__session_0123abcd-ef01" } })).toBe("claude:0123abcd-ef01");
++    expect(capture({ "x-claude-code-session-id": "cc-1" })).toBe("claude:cc-1");
++  });
++
++  it("does not change the provider transport session", () => {
++    const transport = captureSessionId({}, { rawHeaders: {} }, "selected-provider-credential");
++    expect(typeof transport).toBe("string");
++    expect(transport.length).toBeGreaterThan(0);
++    expect(capture({})).toBeNull();
++    expect(captureSessionId({}, { rawHeaders: {} }, "selected-provider-credential")).toBe(transport);
++  });
++});
+diff --git a/tests/unit/gemini-tool-call-id-fifo.test.js b/tests/unit/gemini-tool-call-id-fifo.test.js
+new file mode 100644
+index 00000000..c1930f9f
+--- /dev/null
++++ b/tests/unit/gemini-tool-call-id-fifo.test.js
+@@ -0,0 +1,118 @@
++import { describe, expect, it } from "vitest";
++
++import { openaiToGeminiRequest } from "../../open-sse/translator/request/openai-to-gemini.js";
++
++const MODEL = "gemini-3.8-flash";
++const call = (id, name, args = {}) => ({ id, type: "function", function: { name, arguments: JSON.stringify(args) } });
++const assistant = (...calls) => ({ role: "assistant", tool_calls: calls });
++const result = (id, content) => ({ role: "tool", tool_call_id: id, content });
++
++function convert(messages) {
++  const body = { model: MODEL, messages };
++  const before = JSON.stringify(body);
++  const out = openaiToGeminiRequest(MODEL, body, false);
++  expect(JSON.stringify(body)).toBe(before);
++  const parts = out.contents.flatMap((c) => c.parts);
++  return {
++    out,
++    calls: parts.filter((p) => p.functionCall).map((p) => p.functionCall),
++    responses: parts.filter((p) => p.functionResponse).map((p) => p.functionResponse),
++  };
++}
++
++describe("Gemini tool-call identity with repeated ids", () => {
++  it("answers each repeated id with its own call id, name and result", () => {
++    const { calls, responses } = convert([
++      { role: "user", content: "go" },
++      assistant(call("call_1", "read", { path: "a" })),
++      result("call_1", '{"text":"first"}'),
++      { role: "user", content: "again" },
++      assistant(call("call_1", "write", { path: "b" })),
++      result("call_1", '{"text":"second"}'),
++    ]);
++    expect(calls[0].id).toBe("call_1");
++    expect(new Set(calls.map((c) => c.id)).size).toBe(2);
++    expect(responses.map((r) => r.id)).toEqual(calls.map((c) => c.id));
++    expect(responses.map((r) => r.name)).toEqual(["read", "write"]);
++    expect(responses.map((r) => r.response)).toEqual([{ text: "first" }, { text: "second" }]);
++  });
++
++  it("matches results of duplicate sibling calls first-in first-out", () => {
++    const { calls, responses } = convert([
++      { role: "user", content: "go" },
++      assistant(call("call_dup", "alpha"), call("call_dup", "beta")),
++      result("call_dup", '{"v":1}'),
++      result("call_dup", '{"v":2}'),
++    ]);
++    expect(new Set(calls.map((c) => c.id)).size).toBe(2);
++    expect(responses.map((r) => [r.id, r.name, r.response])).toEqual([
++      [calls[0].id, "alpha", { v: 1 }],
++      [calls[1].id, "beta", { v: 2 }],
++    ]);
++  });
++
++  it("does not invent a functionResponse when the result is missing", () => {
++    const { calls, responses, out } = convert([
++      { role: "user", content: "go" },
++      assistant(call("call_missing", "read")),
++      { role: "user", content: "never mind" },
++    ]);
++    expect(calls).toHaveLength(1);
++    expect(responses).toHaveLength(0);
++    expect(JSON.stringify(out.contents)).not.toContain("functionResponse");
++  });
++
++  it("leaves already unique ids unchanged", () => {
++    const { calls, responses } = convert([
++      { role: "user", content: "go" },
++      assistant(call("call_a", "read"), call("call_b", "write")),
++      result("call_a", '{"ok":true}'),
++      result("call_b", '{"ok":false}'),
++    ]);
++    expect(calls.map((c) => c.id)).toEqual(["call_a", "call_b"]);
++    expect(responses.map((r) => [r.id, r.name])).toEqual([["call_a", "read"], ["call_b", "write"]]);
++  });
++
++  it("keeps the private representation of array and JSON null results", () => {
++    const { responses } = convert([
++      { role: "user", content: "go" },
++      assistant(call("call_arr", "list"), call("call_null", "nothing")),
++      result("call_arr", "[1,2]"),
++      result("call_null", "null"),
++    ]);
++    expect(responses[0].response).toEqual({ result: [1, 2] });
++    expect(responses[1].response).toEqual({ result: null });
++  });
++
++  describe("reserved response keys", () => {
++    const single = (content) => convert([
++      { role: "user", content: "go" },
++      assistant(call("call_ref", "fetch")),
++      result("call_ref", content),
++    ]);
++
++    it("forwards a payload carrying both reserved and renamed keys without losing either", () => {
++      const original = { $ref: "#/$defs/A", _ref: "separate", other: 1 };
++      const { responses } = single(JSON.stringify(original));
++      expect(responses).toHaveLength(1);
++      expect(responses[0]).toMatchObject({ id: "call_ref", name: "fetch" });
++      expect(JSON.parse(responses[0].response.result)).toEqual(original);
++    });
++
++    it("keeps reserved keys nested in objects and arrays", () => {
++      const original = { items: [{ $ref: "#/$defs/B", _ref: "kept" }], nested: { deeper: { $ref: "x", _ref: "y" } } };
++      const { responses } = single(JSON.stringify(original));
++      expect(JSON.parse(responses[0].response.result)).toEqual(original);
++    });
++
++    it("does not rewrite plain text that only mentions the key", () => {
++      const { responses } = single("see $ref in the schema");
++      expect(responses[0].response).toEqual({ result: "see $ref in the schema" });
++    });
++
++    it("leaves ordinary payloads unchanged", () => {
++      const { responses } = single('{"text":"fine","count":2}');
++      expect(responses[0].response).toEqual({ text: "fine", count: 2 });
++    });
++  });
++});
+diff --git a/tests/unit/gemini-turn-signature.test.js b/tests/unit/gemini-turn-signature.test.js
+new file mode 100644
+index 00000000..455c36f7
+--- /dev/null
++++ b/tests/unit/gemini-turn-signature.test.js
+@@ -0,0 +1,168 @@
++import { describe, it, expect, vi } from "vitest";
++
++// Keep the signature store in RAM only; the SQLite kv layer is not under test here.
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({
++    get: async () => null,
++    set: async () => {},
++    remove: async () => {},
++    getAll: async () => ({}),
++  }),
++}));
++
++const { geminiToOpenAIResponse } = await import("../../open-sse/translator/response/gemini-to-openai.js");
++const { openaiToGeminiRequest, openaiToGeminiCLIRequest, openaiToAntigravityRequest } = await import("../../open-sse/translator/request/openai-to-gemini.js");
++const { DEFAULT_THINKING_AG_SIGNATURE } = await import("../../open-sse/config/defaultThinkingSignature.js");
++
++// A model id is just a string here; only its family ("gemini") matters to the signature store.
++const MODEL = "gemini-turn-signature-test";
++
++const chunk = (parts, finishReason) => ({
++  responseId: "r1",
++  candidates: [{ content: { role: "model", parts }, ...(finishReason ? { finishReason } : {}) }],
++});
++
++// Translate the request that starts a turn, then stream the provider's answer to it, exactly as
++// the router does: the request translator leaves the history identity on `credentials`.
++function turn(history, chunks) {
++  const credentials = {};
++  openaiToGeminiRequest(MODEL, { messages: history }, true, credentials);
++  const state = { model: MODEL, turnScope: credentials._geminiTurnScope };
++  const out = [];
++  for (const c of chunks) out.push(...(geminiToOpenAIResponse(c, state) || []));
++  const delta = (k) => out.map((o) => o.choices?.[0]?.delta?.[k]).filter(Boolean).join("");
++  return { reasoning: delta("reasoning_content"), content: delta("content") };
++}
++
++function modelParts(body) {
++  const req = openaiToGeminiRequest(MODEL, body, false, null);
++  return req.contents.filter((c) => c.role === "model").flatMap((c) => c.parts);
++}
++
++const ask = (text) => ({ role: "user", content: text });
++
++describe("signature of a tool-free thinking turn survives the round trip", () => {
++  it("replays the provider's signature (on the answer part) when the client echoes reasoning + answer", () => {
++    const sig = "real-signature-1";
++    const { reasoning, content } = turn([ask("q1")], [
++      chunk([{ thought: true, text: "unique thought one " }]),
++      chunk([{ text: "unique answer one", thoughtSignature: sig }], "STOP"),
++    ]);
++    const parts = modelParts({
++      messages: [ask("q1"), { role: "assistant", reasoning_content: reasoning, content }, ask("again")],
++    });
++    expect(parts).toContainEqual({ text: "unique answer one", thoughtSignature: sig });
++    expect(parts.some((p) => p.thoughtSignature === DEFAULT_THINKING_AG_SIGNATURE)).toBe(false);
++  });
++
++  it("finds the signature from the answer alone when the client drops the reasoning", () => {
++    const sig = "real-signature-2";
++    const { content } = turn([ask("q2")], [
++      chunk([{ thought: true, text: "unique thought two" }, { text: "unique answer two", thoughtSignature: sig }], "STOP"),
++    ]);
++    const parts = modelParts({
++      messages: [ask("q2"), { role: "assistant", content }, ask("again")],
++    });
++    expect(parts).toContainEqual({ text: "unique answer two", thoughtSignature: sig });
++  });
++
++  it("keeps the default signature for reasoning this router never produced", () => {
++    const parts = modelParts({
++      messages: [
++        { role: "user", content: "q" },
++        { role: "assistant", reasoning_content: "foreign thought", content: "foreign answer" },
++        { role: "user", content: "again" },
++      ],
++    });
++    expect(parts).toContainEqual({ thought: true, text: "foreign thought" });
++    expect(parts).toContainEqual({ thoughtSignature: DEFAULT_THINKING_AG_SIGNATURE, text: "" });
++    expect(parts).toContainEqual({ text: "foreign answer" });
++  });
++
++  it("does not store a signature that belongs to a tool call as a turn signature", () => {
++    turn([ask("q4")], [
++      chunk([{ thought: true, text: "tool thought" }, { functionCall: { name: "f", args: {} }, thoughtSignature: "tool-sig" }], "STOP"),
++    ]);
++    const parts = modelParts({
++      messages: [ask("q4"), { role: "assistant", reasoning_content: "tool thought", content: "" }, ask("again")],
++    });
++    expect(parts.some((p) => p.thoughtSignature === "tool-sig")).toBe(false);
++  });
++
++  it("never replays a signature across conversations that give the same answer", () => {
++    // Same visible answer, different histories and different hidden state.
++    turn([ask("conversation A")], [chunk([{ text: "same short answer", thoughtSignature: "sig-A" }], "STOP")]);
++    turn([ask("conversation B")], [chunk([{ text: "same short answer", thoughtSignature: "sig-B" }], "STOP")]);
++    const replay = (q) => modelParts({
++      messages: [ask(q), { role: "assistant", content: "same short answer" }, ask("again")],
++    });
++    expect(replay("conversation A")).toContainEqual({ text: "same short answer", thoughtSignature: "sig-A" });
++    expect(replay("conversation B")).toContainEqual({ text: "same short answer", thoughtSignature: "sig-B" });
++    expect(replay("conversation C")).toEqual([{ text: "same short answer" }]);
++  });
++
++  it("keeps working after the history grows by earlier tool-free turns", () => {
++    const first = turn([ask("g1")], [chunk([{ text: "first answer g", thoughtSignature: "sig-g1" }], "STOP")]);
++    const history = [ask("g1"), { role: "assistant", content: first.content }, ask("g2")];
++    const second = turn(history, [chunk([{ text: "second answer g", thoughtSignature: "sig-g2" }], "STOP")]);
++    const parts = modelParts({
++      messages: [...history, { role: "assistant", content: second.content }, ask("g3")],
++    });
++    expect(parts).toContainEqual({ text: "first answer g", thoughtSignature: "sig-g1" });
++    expect(parts).toContainEqual({ text: "second answer g", thoughtSignature: "sig-g2" });
++  });
++
++  it("separates conversations that differ only by system prompt", () => {
++    const sys = (t) => ({ role: "system", content: t });
++    turn([sys("rules one"), ask("s1")], [chunk([{ text: "shared reply s", thoughtSignature: "sig-sys1" }], "STOP")]);
++    turn([sys("rules two"), ask("s1")], [chunk([{ text: "shared reply s", thoughtSignature: "sig-sys2" }], "STOP")]);
++    const replay = (t) => modelParts({
++      messages: [sys(t), ask("s1"), { role: "assistant", content: "shared reply s" }, ask("again")],
++    });
++    expect(replay("rules one")).toContainEqual({ text: "shared reply s", thoughtSignature: "sig-sys1" });
++    expect(replay("rules two")).toContainEqual({ text: "shared reply s", thoughtSignature: "sig-sys2" });
++    expect(replay("rules three")).toEqual([{ text: "shared reply s" }]);
++  });
++
++  it("separates conversations that differ only by tool arguments or tool results", () => {
++    const call = (args) => ({ role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "lookup", arguments: JSON.stringify(args) } }] });
++    const result = (text) => ({ role: "tool", tool_call_id: "c1", content: text });
++    const history = (args, res) => [ask("t1"), call(args), result(res)];
++    turn(history({ k: 1 }, "result one"), [chunk([{ text: "shared reply t", thoughtSignature: "sig-t1" }], "STOP")]);
++    turn(history({ k: 2 }, "result two"), [chunk([{ text: "shared reply t", thoughtSignature: "sig-t2" }], "STOP")]);
++    const replay = (args, res) => modelParts({
++      messages: [...history(args, res), { role: "assistant", content: "shared reply t" }, ask("again")],
++    }).filter((p) => p.text === "shared reply t");
++    expect(replay({ k: 1 }, "result one")).toEqual([{ text: "shared reply t", thoughtSignature: "sig-t1" }]);
++    expect(replay({ k: 2 }, "result two")).toEqual([{ text: "shared reply t", thoughtSignature: "sig-t2" }]);
++    expect(replay({ k: 1 }, "result two")).toEqual([{ text: "shared reply t" }]);
++  });
++
++  it("separates otherwise identical tool exchanges that carry different call ids", () => {
++    const history = (id) => [
++      ask("ids"),
++      { role: "assistant", content: null, tool_calls: [{ id, type: "function", function: { name: "lookup", arguments: "{}" } }] },
++      { role: "tool", tool_call_id: id, content: "same result" },
++    ];
++    turn(history("call-A"), [chunk([{ text: "shared reply i", thoughtSignature: "sig-idA" }], "STOP")]);
++    turn(history("call-B"), [chunk([{ text: "shared reply i", thoughtSignature: "sig-idB" }], "STOP")]);
++    const replay = (id) => modelParts({
++      messages: [...history(id), { role: "assistant", content: "shared reply i" }, ask("again")],
++    }).filter((p) => p.text === "shared reply i");
++    expect(replay("call-A")).toEqual([{ text: "shared reply i", thoughtSignature: "sig-idA" }]);
++    expect(replay("call-B")).toEqual([{ text: "shared reply i", thoughtSignature: "sig-idB" }]);
++  });
++
++  it("leaves the history identity on credentials for the Gemini CLI and Antigravity wrappers too", () => {
++    const body = { messages: [ask("wrapped")] };
++    const cli = {};
++    openaiToGeminiCLIRequest(MODEL, body, true, cli);
++    const ag = {};
++    openaiToAntigravityRequest(MODEL, body, true, ag);
++    const plain = {};
++    openaiToGeminiRequest(MODEL, body, true, plain);
++    expect(plain._geminiTurnScope).toMatch(/^[0-9a-f]{64}$/);
++    expect(cli._geminiTurnScope).toBe(plain._geminiTurnScope);
++    expect(ag._geminiTurnScope).toBe(plain._geminiTurnScope);
++  });
++});
+diff --git a/tests/unit/translated-chat-stream-done.test.js b/tests/unit/translated-chat-stream-done.test.js
+new file mode 100644
+index 00000000..63b74532
+--- /dev/null
++++ b/tests/unit/translated-chat-stream-done.test.js
+@@ -0,0 +1,57 @@
++import { describe, it, expect, vi } from "vitest";
++
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++
++const { createSSETransformStreamWithLogger } = await import("../../open-sse/utils/stream.js");
++const { FORMATS } = await import("../../open-sse/translator/formats.js");
++
++const GEMINI_CHUNKS = [
++  { responseId: "r", candidates: [{ content: { role: "model", parts: [{ text: "hello" }] } }] },
++  { responseId: "r", candidates: [{ content: { role: "model", parts: [{ text: " world" }] }, finishReason: "STOP" }],
++    usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 2, totalTokenCount: 3 } },
++];
++
++async function run(sourceFormat, { withDone = false, tailOnly = false } = {}) {
++  const chunks = tailOnly ? [GEMINI_CHUNKS[1]] : GEMINI_CHUNKS;
++  // tailOnly: a single EOF-terminated chunk without a trailing newline is parsed and emitted in flush().
++  const body = tailOnly
++    ? `data: ${JSON.stringify(chunks[0])}`
++    : chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") + (withDone ? "data: [DONE]\n\n" : "");
++  const input = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(body)); c.close(); } });
++  const out = input.pipeThrough(createSSETransformStreamWithLogger(FORMATS.GEMINI, sourceFormat, "gemini-wire-test", null, null, "model-x"));
++  const reader = out.getReader();
++  const dec = new TextDecoder();
++  let text = "";
++  for (;;) {
++    const { value, done } = await reader.read();
++    if (done) break;
++    text += typeof value === "string" ? value : dec.decode(value, { stream: true });
++  }
++  return text;
++}
++const doneCount = (t) => t.split("\n").filter((l) => l.trim() === "data: [DONE]").length;
++
++describe("translated stream for an OpenAI Chat client", () => {
++  it("ends with exactly one [DONE] although the Gemini upstream sends none", async () => {
++    const text = await run(FORMATS.OPENAI);
++    expect(text).toContain("hello");
++    expect(doneCount(text)).toBe(1);
++    expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
++  });
++
++  it("does not duplicate [DONE] when the upstream already sent one", async () => {
++    expect(doneCount(await run(FORMATS.OPENAI, { withDone: true }))).toBe(1);
++  });
++
++  it("does not add the OpenAI sentinel to a Claude client stream", async () => {
++    expect(doneCount(await run(FORMATS.CLAUDE))).toBe(0);
++  });
++
++  it("also terminates a stream whose only chunk is emitted while flushing", async () => {
++    const text = await run(FORMATS.OPENAI, { tailOnly: true });
++    expect(text).toContain("world");
++    expect(doneCount(text)).toBe(1);
++  });
++});
+diff --git a/tests/unit/zed-completions-wire.test.js b/tests/unit/zed-completions-wire.test.js
+index 5be982ae..f8c9b53f 100644
+--- a/tests/unit/zed-completions-wire.test.js
++++ b/tests/unit/zed-completions-wire.test.js
+@@ -19,6 +19,9 @@ import {
+   zedLlmFetch,
+ } from "open-sse/shared/zedAuth.js";
+ import ZedExecutor from "open-sse/executors/zed.js";
++import "../translator/registerAll.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
+ 
+ function catalogFor(entries) {
+   const rawById = new Map(entries);
+@@ -118,4 +121,111 @@ describe("completion payload shaping", () => {
+       "safetySettings",
+     );
+   });
++
++  it("keeps all instruction text in systemInstruction and never leaks translator metadata into provider_request", async () => {
++    resolveZedModels.mockImplementation(async () => catalogFor([
++      ["gemini-x", { provider: "google" }],
++    ]));
++    const captured = {};
++    mockCatalogFetch(captured);
++    const executor = makeExecutor();
++
++    await executor.execute({
++      model: "gemini-x",
++      body: {
++        messages: [
++          { role: "system", content: "SYS_ONE" },
++          { role: "developer", content: "DEV_ONE" },
++          { role: "user", content: "hi" },
++        ],
++        tools: [{
++          type: "function",
++          function: {
++            name: "rich_tool",
++            parameters: {
++              type: "object",
++              properties: { count: { type: "integer", minimum: 1, maximum: 5 } },
++            },
++          },
++        }],
++        _customToolNames: ["custom_one"],
++        _toolNameMap: new Map([["cloaked", "orig"]]),
++      },
++      stream: false,
++      credentials: {},
++    });
++
++    const req = captured.body.provider_request;
++    const sysText = JSON.stringify(req.systemInstruction);
++    expect(sysText).toContain("SYS_ONE");
++    expect(sysText).toContain("DEV_ONE");
++    expect(JSON.stringify(req)).not.toContain("_customToolNames");
++    expect(JSON.stringify(req)).not.toContain("_toolNameMap");
++    expect(req).not.toHaveProperty("_customToolNames");
++    expect(req).not.toHaveProperty("_toolNameMap");
++  });
++
++  const ZED_TOOL_HISTORY = {
++    input: [
++      { type: "message", role: "user", content: [{ type: "input_text", text: "go" }] },
++      { type: "function_call", name: "alpha", call_id: "call.1", arguments: "{}" },
++      { type: "function_call", name: "beta", call_id: "call1", arguments: "{}" },
++      { type: "function_call", name: "ghost", call_id: "c-miss", arguments: "{}" },
++      { type: "function_call_output", call_id: "call1", output: "B" },
++      { type: "function_call_output", call_id: "call.1", output: "A" },
++      { type: "function_call", name: "zeta", call_id: "c-tail", arguments: "{}" },
++      { type: "message", role: "user", content: [{ type: "input_text", text: "done" }] },
++    ],
++    reasoning: { effort: "high" },
++    max_output_tokens: 128,
++  };
++
++  it("google backend keeps client ids, chronological results, high thinking and upstream answer headroom", async () => {
++    resolveZedModels.mockImplementation(async () => catalogFor([
++      ["gemini-3.5-flash-lite", { provider: "google" }],
++    ]));
++    const captured = {};
++    mockCatalogFetch(captured);
++    const executor = makeExecutor();
++
++    const deferred = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, "gemini-3.5-flash-lite", structuredClone(ZED_TOOL_HISTORY), false, {}, "zed");
++    const assistant = deferred.messages.find((m) => m.role === "assistant" && m.tool_calls?.length);
++    expect(assistant.tool_calls.map((t) => t.id)).toEqual(["call.1", "call1", "c-miss"]);
++    expect(deferred.messages.filter((m) => m.role === "tool")).toHaveLength(2);
++    expect(deferred.reasoning_effort).toBe("high");
++
++    await executor.execute({ model: "gemini-3.5-flash-lite", body: deferred, stream: false, credentials: {} });
++
++    const req = captured.body.provider_request;
++    const calls = req.contents.flatMap((c) => c.parts.filter((p) => p.functionCall).map((p) => p.functionCall));
++    expect(calls.map((c) => c.id)).toEqual(["call.1", "call1", "c-miss", "c-tail"]);
++    const resps = req.contents.flatMap((c) => c.parts.filter((p) => p.functionResponse).map((p) => p.functionResponse));
++    expect(resps.map((r) => r.id)).toEqual(["call1", "call.1"]);
++    expect(resps.map((r) => r.name)).toEqual(["beta", "alpha"]);
++    expect(req.generationConfig.thinkingConfig).toMatchObject({ thinkingLevel: "high" });
++    expect(req.generationConfig.maxOutputTokens).toBe(65535);
++  });
++
++  it("anthropic backend retains Anthropic id sanitation and placeholder results", async () => {
++    resolveZedModels.mockImplementation(async () => catalogFor([
++      ["claude-sonnet-4.5", { provider: "anthropic" }],
++    ]));
++    const captured = {};
++    mockCatalogFetch(captured);
++    const executor = makeExecutor();
++
++    const deferred = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, "claude-sonnet-4.5", structuredClone(ZED_TOOL_HISTORY), false, {}, "zed");
++
++    await executor.execute({ model: "claude-sonnet-4.5", body: deferred, stream: false, credentials: {} });
++
++    const req = captured.body.provider_request;
++    const toolUses = req.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : []).filter((b) => b.type === "tool_use"));
++    for (const tu of toolUses) {
++      expect(tu.id).toMatch(/^[a-zA-Z0-9_-]+$/);
++    }
++    const toolResults = req.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : []).filter((b) => b.type === "tool_result"));
++    expect(toolResults.length).toBeGreaterThanOrEqual(3);
++    const uncoveredId = toolUses.at(-1).id;
++    expect(toolResults.some((tr) => tr.tool_use_id === uncoveredId)).toBe(true);
++  });
+ });

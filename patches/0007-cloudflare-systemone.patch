@@ -1,0 +1,153 @@
+From d739d9c55cd80497d2da9cd338e15fb0f7502f54 Mon Sep 17 00:00:00 2001
+From: Overlay Migration <overlay-migration@example.invalid>
+Date: Fri, 16 Oct 2026 08:36:03 +0000
+Subject: [PATCH 7/8] 0007 cloudflare-systemone
+
+Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
+Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
+Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
+---
+ open-sse/handlers/systemoneCore.js           | 19 +++++
+ open-sse/providers/registry/cloudflare-ai.js |  1 +
+ tests/unit/systemone-core.test.js            | 83 ++++++++++++++++++++
+ 3 files changed, 103 insertions(+)
+ create mode 100644 tests/unit/systemone-core.test.js
+
+diff --git a/open-sse/handlers/systemoneCore.js b/open-sse/handlers/systemoneCore.js
+index d61241bf..7e7c7d1c 100644
+--- a/open-sse/handlers/systemoneCore.js
++++ b/open-sse/handlers/systemoneCore.js
+@@ -8,6 +8,9 @@ import { generateSessionId } from "../executors/opencode-zen.js";
+  * Core System One (Jev) handler — native decision payload pass-through.
+  * URL/headers come from the registry's systemoneConfig; body and JSON response
+  * are forwarded untouched (decision models have no chat translation layer).
++ * Providers whose REST API wraps the native result in an envelope (Cloudflare
++ * /ai/run: { success, result, errors }) declare systemoneConfig.responseRoot;
++ * only that envelope is removed, the native payload itself is not changed.
+  *
+  * @returns {Promise<{ success: boolean, response: Response, usage?: object, status?: number, error?: string }>}
+  */
+@@ -94,6 +97,22 @@ export async function handleSystemoneCore({
+     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
+   }
+ 
++  const responseRoot = cfg.responseRoot;
++  if (responseRoot) {
++    if (responseBody?.success === false) {
++      const detail = Array.isArray(responseBody.errors) ? responseBody.errors.find((e) => e?.message)?.message : null;
++      return createErrorResult(
++        HTTP_STATUS.BAD_GATEWAY,
++        formatProviderError(new Error(detail || `${provider} reported an unsuccessful System One response`), provider, model, HTTP_STATUS.BAD_GATEWAY)
++      );
++    }
++    const native = responseBody?.[responseRoot];
++    if (!native || typeof native !== "object" || Array.isArray(native)) {
++      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid System One response from ${provider}: missing ${responseRoot}`);
++    }
++    responseBody = native;
++  }
++
+   if (onRequestSuccess) await onRequestSuccess();
+ 
+   const usage = responseBody?.usage;
+diff --git a/open-sse/providers/registry/cloudflare-ai.js b/open-sse/providers/registry/cloudflare-ai.js
+index d998c924..d1ab31a4 100644
+--- a/open-sse/providers/registry/cloudflare-ai.js
++++ b/open-sse/providers/registry/cloudflare-ai.js
+@@ -58,6 +58,7 @@ export default {
+     baseUrl: "https://api.cloudflare.com/client/v4/accounts/{accountId}/ai/run/{model}",
+     authType: "apikey",
+     authHeader: "bearer",
++    responseRoot: "result",
+   },
+   imageConfig: { baseUrl: "https://api.cloudflare.com/client/v4/accounts" },
+ };
+diff --git a/tests/unit/systemone-core.test.js b/tests/unit/systemone-core.test.js
+new file mode 100644
+index 00000000..80299c61
+--- /dev/null
++++ b/tests/unit/systemone-core.test.js
+@@ -0,0 +1,83 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { handleSystemoneCore } from "../../open-sse/handlers/systemoneCore.js";
++
++const originalFetch = globalThis.fetch;
++const body = () => ({ state: { turn: 1 }, questions: { q1: { text: "Which?" } }, model: "caller-supplied" });
++const cloudflare = { provider: "cloudflare-ai", model: "@cf/cloudflare/clef-flash" };
++const cloudflareCredentials = () => ({ apiKey: "cf-token", providerSpecificData: { accountId: "acct123" } });
++const json = (payload, status = 200) => new Response(typeof payload === "string" ? payload : JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
++
++let fetchMock;
++beforeEach(() => { fetchMock = vi.fn(); globalThis.fetch = fetchMock; });
++afterEach(() => { globalThis.fetch = originalFetch; });
++
++async function run(modelInfo, credentials, requestBody = body()) {
++  const onRequestSuccess = vi.fn();
++  const out = await handleSystemoneCore({ body: requestBody, modelInfo, credentials, onRequestSuccess });
++  return { out, onRequestSuccess };
++}
++
++describe("System One Cloudflare response envelope", () => {
++  it("unwraps result, counts usage once and leaves the request unchanged", async () => {
++    const native = { model: "clef-flash", answers: { q1: "A" }, usage: { input_tokens: 11, output_tokens: 4 } };
++    fetchMock.mockResolvedValue(json({ success: true, errors: [], messages: [], result: native }));
++    const { out, onRequestSuccess } = await run(cloudflare, cloudflareCredentials());
++    expect(out.success).toBe(true);
++    expect(await out.response.json()).toEqual(native);
++    expect(out.usage).toEqual({ prompt_tokens: 11, completion_tokens: 4 });
++    expect(onRequestSuccess).toHaveBeenCalledTimes(1);
++    const [url, init] = fetchMock.mock.calls[0];
++    expect(url).toBe("https://api.cloudflare.com/client/v4/accounts/acct123/ai/run/@cf/cloudflare/clef-flash");
++    expect(init.headers.Authorization).toBe("Bearer cf-token");
++    expect(JSON.parse(init.body)).toEqual({ ...body(), model: "clef-flash" });
++  });
++
++  it("returns 502 and skips the success callback for an unsuccessful envelope", async () => {
++    fetchMock.mockResolvedValue(json({ success: false, errors: [{ code: 1000, message: "model unavailable" }], result: null }));
++    const { out, onRequestSuccess } = await run(cloudflare, cloudflareCredentials());
++    expect(out.success).toBe(false);
++    expect(out.status).toBe(502);
++    expect(out.error).toContain("model unavailable");
++    expect(onRequestSuccess).not.toHaveBeenCalled();
++  });
++
++  it.each([
++    ["missing", { success: true }],
++    ["null", { success: true, result: null }],
++    ["scalar", { success: true, result: "text" }],
++    ["array", { success: true, result: [1] }],
++  ])("returns 502 for a %s result", async (_label, payload) => {
++    fetchMock.mockResolvedValue(json(payload));
++    const { out, onRequestSuccess } = await run(cloudflare, cloudflareCredentials());
++    expect(out.success).toBe(false);
++    expect(out.status).toBe(502);
++    expect(onRequestSuccess).not.toHaveBeenCalled();
++  });
++
++  it("keeps non-2xx provider errors and invalid JSON handling", async () => {
++    fetchMock.mockResolvedValueOnce(json({ errors: [{ message: "bad token" }] }, 401));
++    const unauthorized = await run(cloudflare, cloudflareCredentials());
++    expect(unauthorized.out.success).toBe(false);
++    expect(unauthorized.out.status).toBe(401);
++    expect(unauthorized.onRequestSuccess).not.toHaveBeenCalled();
++
++    fetchMock.mockResolvedValueOnce(json("not json"));
++    const invalid = await run(cloudflare, cloudflareCredentials());
++    expect(invalid.out.status).toBe(502);
++    expect(invalid.out.error).toContain("Invalid JSON response from cloudflare-ai");
++    expect(invalid.onRequestSuccess).not.toHaveBeenCalled();
++  });
++});
++
++describe("System One providers without an envelope", () => {
++  it("passes a v1m JSON response through exactly", async () => {
++    const native = { success: false, result: "kept", answers: { q1: "A" }, usage: { input_tokens: 3, output_tokens: 2 } };
++    fetchMock.mockResolvedValue(json(native));
++    const { out, onRequestSuccess } = await run({ provider: "v1m", model: "rev-latest" }, { apiKey: "v1m-token" });
++    expect(out.success).toBe(true);
++    expect(await out.response.json()).toEqual(native);
++    expect(out.usage).toEqual({ prompt_tokens: 3, completion_tokens: 2 });
++    expect(onRequestSuccess).toHaveBeenCalledTimes(1);
++    expect(fetchMock.mock.calls[0][0]).toBe("https://v1m.ir/v1/systemone");
++  });
++});

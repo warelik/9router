@@ -1,0 +1,1343 @@
+From 9532a9b58ddb35a591be45c125185e2fbb8dabc3 Mon Sep 17 00:00:00 2001
+From: Overlay Migration <overlay-migration@example.invalid>
+Date: Fri, 16 Oct 2026 08:36:01 +0000
+Subject: [PATCH 1/8] 0001 transport-responses-wire
+
+Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
+Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
+Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
+---
+ open-sse/executors/default.js                 |  26 +-
+ open-sse/handlers/chatCore.js                 |  27 +-
+ .../handlers/chatCore/sseToJsonHandler.js     |   7 +-
+ open-sse/providers/registry/kimi.js           |   3 +
+ .../translator/request/openai-responses.js    |  12 +-
+ open-sse/utils/responsesStreamHelpers.js      |   3 +-
+ tests/unit/kimi-responses-transport.test.js   |  15 +-
+ .../opencode-go-transport-routing.test.js     |  50 ++-
+ tests/unit/responses-reasoning-wire.test.js   | 414 ++++++++++++++++++
+ ...onses-thinking-option-preservation.test.js |  71 +++
+ tests/unit/target-format-transport.test.js    | 287 ++++++++++++
+ tests/unit/undeclared-responses-sse.test.js   | 206 +++++++++
+ 12 files changed, 1092 insertions(+), 29 deletions(-)
+ create mode 100644 tests/unit/responses-reasoning-wire.test.js
+ create mode 100644 tests/unit/responses-thinking-option-preservation.test.js
+ create mode 100644 tests/unit/target-format-transport.test.js
+ create mode 100644 tests/unit/undeclared-responses-sse.test.js
+
+diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
+index cd9fd089..a2961460 100644
+--- a/open-sse/executors/default.js
++++ b/open-sse/executors/default.js
+@@ -75,13 +75,37 @@ const REFRESH_GRANTS = Object.fromEntries(
+     })
+ );
+ 
++function isResponsesWire(provider, config, credentials) {
++  const runtimeFormat = credentials?.runtimeTransport?.format;
++  if (runtimeFormat) return runtimeFormat === "openai-responses";
++  if (provider?.startsWith?.("openai-compatible-")) {
++    return resolveOpenAICompatibleApiType(provider, credentials) === "responses";
++  }
++  return config?.format === "openai-responses";
++}
++
++function normalizeResponsesReasoning(body) {
++  if (!body || typeof body !== "object" || body.reasoning_effort === undefined) return body;
++
++  const reasoning = body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning)
++    ? { ...body.reasoning }
++    : {};
++  reasoning.effort = body.reasoning_effort;
++  body.reasoning = reasoning;
++  delete body.reasoning_effort;
++  return body;
++}
++
+ export class DefaultExecutor extends BaseExecutor {
+   constructor(provider) {
+     super(provider, PROVIDERS[provider] || PROVIDERS.openai);
+   }
+ 
+   transformRequest(model, body, stream, credentials) {
+-    const transformed = this.applyJsonSchemaFallback(this.applyNousAttribution(model, body, stream, credentials));
++    let transformed = this.applyJsonSchemaFallback(this.applyNousAttribution(model, body, stream, credentials));
++    if (this.provider === "aistudio" && credentials?.nativeGeminiPassthrough) {
++      transformed = adaptAIStudioStructuredOutput(transformed);
++    }
+ 
+     if (transformed && typeof transformed === "object") {
+       // quirk: some openai-compatible providers reject Anthropic's client_metadata field
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index e014effa..ef5b0698 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -107,14 +107,35 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   // whose wire format has no supported transport (for example MiniMax-M3:
+   // OpenAI clients should stay on /chat/completions; other clients can fall
+   // back to its declared Claude target).
+-  const targetFormat = useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
+-  if (useTransport && credentials) credentials.runtimeTransport = useTransport;
++  const nativeAntigravity = sourceFormat === FORMATS.GEMINI && provider === "antigravity"
++    && supportsNativeGemini(provider, model);
++  // The executor unwraps Cloud Code responses into Gemini for this source only.
++  // Its global Antigravity format remains in use for OpenAI/Claude/IDE clients.
++  const targetFormat = nativeAntigravity ? FORMATS.GEMINI
++    : useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
++  const nativeGemini = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
++  // A response projection can intentionally hide the native completion field.
++  // Keep this metadata out of the provider body and cache prefix.
++  const nativeResponseProjection = nativeGemini ? {
++    masks: [
++      ...(clientRawRequest?.queryParams || [])
++        .filter(([name]) => name === "fields" || name === "$fields")
++        .map(([, value]) => value),
++      ...Object.entries(clientRawRequest?.headers || {})
++        .filter(([name]) => name.toLowerCase() === "x-goog-fieldmask")
++        .map(([, value]) => value),
++    ],
++  } : null;
++  // When the model guard rejects the source-matched transport, translation
++  // must dispatch to the transport matching its target wire format.
++  const effectiveTransport = useTransport || resolveTransport(provider, targetFormat);
++  if (effectiveTransport && credentials) credentials.runtimeTransport = effectiveTransport;
+   const stripList = getModelStrip(alias, model);
+   const upstreamModel = getModelUpstreamId(alias, model);
+ 
+   // Inject provider-level thinking config override (only if client hasn't set)
+   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
+-  if (providerThinking?.mode && providerThinking.mode !== "auto") {
++  if (!nativeGemini && providerThinking?.mode && providerThinking.mode !== "auto") {
+     const mode = providerThinking.mode;
+     if (mode === "on" && !body.thinking) {
+       console.log("Injecting provider-level thinking config override: on");
+diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
+index fa37c24b..cd953f7e 100644
+--- a/open-sse/handlers/chatCore/sseToJsonHandler.js
++++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
+@@ -7,6 +7,7 @@ import { openAICompletionToClaudeMessage } from "../../translator/concerns/claud
+ import { PROVIDERS } from "../../config/providers.js";
+ import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
+ import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
++import { upstreamResponseHeaders } from "../../utils/upstreamHeaders.js";
+ 
+ // Responses-API providers (e.g. codex) may emit SSE without content-type + use Responses output shape
+ const isResponsesProvider = (p) => PROVIDERS[p]?.format === FORMATS.OPENAI_RESPONSES;
+@@ -227,7 +228,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
+ 
+       // Client is Responses API → return as-is
+       if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
+-        return { success: true, response: new Response(JSON.stringify(restoreToolNames(jsonResponse, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
++        return { success: true, response: new Response(JSON.stringify(restoreToolNames(jsonResponse, toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+       }
+ 
+       // Build client-format response.
+@@ -287,7 +288,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
+         finalResp = openAICompletionToClaudeMessage(finalResp);
+       }
+ 
+-      return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalResp, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
++      return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalResp, toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+     } catch (err) {
+       console.error("[ChatCore] Responses API SSE→JSON failed:", err);
+       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Failed to convert streaming response to JSON");
+@@ -367,7 +368,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
+         ? openAICompletionToClaudeMessage(parsed)
+         : parsed;
+ 
+-    return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalBody, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
++    return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalBody, toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+   } catch (err) {
+     console.error("[ChatCore] Chat Completions SSE→JSON failed:", err);
+     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Failed to convert streaming response to JSON");
+diff --git a/open-sse/providers/registry/kimi.js b/open-sse/providers/registry/kimi.js
+index 88f6e386..e90fe5a5 100644
+--- a/open-sse/providers/registry/kimi.js
++++ b/open-sse/providers/registry/kimi.js
+@@ -56,6 +56,9 @@ export default {
+     {
+       format: "openai-responses",
+       baseUrl: "https://api.kimi.com/coding/v1/responses",
++      // Strict input: Codex multi-agent/delegation history items must be rewritten
++      // to portable user messages before dispatch.
++      quirks: { portableResponsesInput: true },
+       auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["kimiHeaders"] },
+     },
+   ],
+diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
+index 5c719fd2..e5c62aec 100644
+--- a/open-sse/translator/request/openai-responses.js
++++ b/open-sse/translator/request/openai-responses.js
+@@ -455,7 +455,13 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
+   }
+   if (body.top_p !== undefined) result.top_p = body.top_p;
+   if (body.reasoning !== undefined) result.reasoning = body.reasoning;
+-  if (body.reasoning_effort !== undefined) result.reasoning = { effort: body.reasoning_effort, summary: "auto" };
++  if (body.reasoning_effort !== undefined) {
++    const current = body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning)
++      ? body.reasoning
++      : {};
++    result.reasoning = { ...current, effort: body.reasoning_effort };
++    if (inferReasoningSummary && !Object.hasOwn(current, "summary")) result.reasoning.summary = "auto";
++  }
+   if (body.service_tier !== undefined) result.service_tier = body.service_tier;
+   if (body.prompt_cache_key !== undefined) result.prompt_cache_key = body.prompt_cache_key;
+ 
+@@ -464,4 +470,6 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
+ 
+ // Register both directions
+ register(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, openaiResponsesToOpenAIRequest, null);
+-register(FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, openaiToOpenAIResponsesRequest, null);
++// Executor construction keeps its summary default; translation preserves client options.
++register(FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, (model, body, stream, credentials) =>
++  openaiToOpenAIResponsesRequest(model, body, stream, credentials, { inferReasoningSummary: false }), null);
+diff --git a/open-sse/utils/responsesStreamHelpers.js b/open-sse/utils/responsesStreamHelpers.js
+index eaacdcd0..6a1e94c2 100644
+--- a/open-sse/utils/responsesStreamHelpers.js
++++ b/open-sse/utils/responsesStreamHelpers.js
+@@ -7,6 +7,7 @@ const OPENAI_RESPONSES_TERMINAL_EVENTS = new Set([
+   "response.completed",
+   "response.done",
+   "response.failed",
++  "response.incomplete",
+   "error"
+ ]);
+ 
+@@ -20,7 +21,7 @@ export function isOpenAIResponsesTerminalEvent(eventName, chunk) {
+   const type = getOpenAIResponsesEventName(eventName, chunk);
+   if (OPENAI_RESPONSES_TERMINAL_EVENTS.has(type)) return true;
+   const status = chunk?.response?.status;
+-  return status === "completed" || status === "failed";
++  return status === "completed" || status === "failed" || status === "incomplete";
+ }
+ 
+ const sharedEncoder = new TextEncoder();
+diff --git a/tests/unit/kimi-responses-transport.test.js b/tests/unit/kimi-responses-transport.test.js
+index faffc086..4d80dd8f 100644
+--- a/tests/unit/kimi-responses-transport.test.js
++++ b/tests/unit/kimi-responses-transport.test.js
+@@ -3,8 +3,8 @@
+ // Drives the REAL handleChatCore guard + targetFormat resolution; only the executor's HTTP
+ // response is mocked. The assertion target is credentials.runtimeTransport — the field
+ // DefaultExecutor.buildUrl/buildHeaders read — so a wrong routing decision shows up as the
+-// wrong baseUrl here, same as on the wire. Executor-level cells check URL and auth
+-// without any network.
++// wrong baseUrl here, same as on the wire. Executor-level cells check URL, auth and the
++// Responses reasoning shape without any network.
+ import { describe, it, expect, vi, beforeEach } from "vitest";
+ 
+ const { executeMock } = vi.hoisted(() => ({
+@@ -193,4 +193,15 @@ describe("DefaultExecutor('kimi') on the responses transport", () => {
+     const oauthHeaders = ex.buildHeaders({ accessToken: "tok-test", runtimeTransport: rt(), providerSpecificData: {} }, true, url, MODELS[0]);
+     expect(oauthHeaders.Authorization).toBe("Bearer tok-test");
+   });
++
++  it("emits reasoning.effort (Responses shape) incl. max, never reasoning_effort", () => {
++    const ex = new DefaultExecutor("kimi");
++    const out = ex.transformRequest(MODELS[0], {
++      model: MODELS[0],
++      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
++      reasoning_effort: "max",
++    }, true, { runtimeTransport: rt() });
++    expect(out.reasoning?.effort).toBe("max");
++    expect(out.reasoning_effort).toBeUndefined();
++  });
+ });
+diff --git a/tests/unit/opencode-go-transport-routing.test.js b/tests/unit/opencode-go-transport-routing.test.js
+index 7d65a406..b2fd58c0 100644
+--- a/tests/unit/opencode-go-transport-routing.test.js
++++ b/tests/unit/opencode-go-transport-routing.test.js
+@@ -10,8 +10,8 @@
+ //   - deepseek × {openai, claude, openai-responses} × {bare, (max)} — the endpoint matrix
+ //     under dispute in #3278/#3332. Bare and suffixed cells must resolve identically.
+ //   - glm/kimi (chat-only) + (max) — regression cells: with the thinking suffix, the guard
+-//     is bypassed on master (suffix isn't stripped before the registry lookup) and these get
+-//     routed to /messages, which the upstream does not serve for them.
++//     must reject unsupported source endpoints, then use the translated target's supported
++//     transport rather than falling through to the provider's chat default implicitly.
+ //   - minimax + (max) + claude — suffix must NOT block a genuinely declared format.
+ import { describe, it, expect, vi, beforeEach } from "vitest";
+ 
+@@ -96,14 +96,18 @@ const RESPONSE_BY_FORMAT = {
+ };
+ 
+ async function route(model, sourceFormat) {
+-  executeMock.mockResolvedValueOnce({
+-    response: new Response(JSON.stringify(RESPONSE_BY_FORMAT[sourceFormat === "openai" ? "openai" : sourceFormat] || RESPONSE_BY_FORMAT.openai), {
+-      status: 200,
+-      headers: { "content-type": "application/json" },
+-    }),
+-    url: ENDPOINTS[sourceFormat] || ENDPOINTS.openai,
+-    headers: {},
+-    transformedBody: null,
++  executeMock.mockImplementationOnce(async ({ credentials }) => {
++    const format = credentials.runtimeTransport?.format || "openai";
++    const url = credentials.runtimeTransport?.baseUrl || ENDPOINTS.openai;
++    return {
++      response: new Response(JSON.stringify(RESPONSE_BY_FORMAT[format] || RESPONSE_BY_FORMAT.openai), {
++        status: 200,
++        headers: { "content-type": "application/json" },
++      }),
++      url,
++      headers: {},
++      transformedBody: null,
++    };
+   });
+ 
+   const credentials = { apiKey: "test-key", providerSpecificData: {} };
+@@ -122,7 +126,12 @@ async function route(model, sourceFormat) {
+   });
+ 
+   const { credentials: creds } = executeMock.mock.calls.at(-1)[0];
+-  return { result, runtimeTransport: creds.runtimeTransport ?? null };
++  const executorResult = await executeMock.mock.results.at(-1).value;
++  return {
++    result,
++    runtimeTransport: creds.runtimeTransport ?? null,
++    effectiveUrl: executorResult.url,
++  };
+ }
+ 
+ describe("opencode-go DeepSeek endpoint matrix (via real handleChatCore)", () => {
+@@ -149,16 +158,21 @@ describe("opencode-go thinking-suffix guard (regression)", () => {
+     vi.clearAllMocks();
+   });
+ 
++  // Keep these original full titles stable: the differential regression gate keys cases by path and full_name.
+   it("does NOT route chat-only glm-5.2(max) to /messages on a claude-format request", async () => {
+-    const { result, runtimeTransport } = await route("glm-5.2(max)", "claude");
++    const { result, runtimeTransport, effectiveUrl } = await route("glm-5.2(max)", "claude");
+     expect(result.success).toBe(true);
+-    expect(runtimeTransport).toBeNull(); // guard must block; falls back to chat/completions
++    expect(runtimeTransport?.format).toBe("openai");
++    expect(effectiveUrl).toBe(ENDPOINTS.openai);
++    expect(effectiveUrl).not.toBe(ENDPOINTS.claude);
+   });
+ 
+   it("does NOT route chat-only kimi-k2.6(max) to /responses on a responses-format request", async () => {
+-    const { result, runtimeTransport } = await route("kimi-k2.6(max)", "openai-responses");
++    const { result, runtimeTransport, effectiveUrl } = await route("kimi-k2.6(max)", "openai-responses");
+     expect(result.success).toBe(true);
+-    expect(runtimeTransport).toBeNull();
++    expect(runtimeTransport?.format).toBe("openai");
++    expect(effectiveUrl).toBe(ENDPOINTS.openai);
++    expect(effectiveUrl).not.toBe(ENDPOINTS["openai-responses"]);
+   });
+ 
+   it("still routes minimax-m3(max) + claude-format client to /messages", async () => {
+@@ -168,9 +182,11 @@ describe("opencode-go thinking-suffix guard (regression)", () => {
+   });
+ 
+   it("does NOT route minimax-m3(max) (no responses support) to /responses", async () => {
+-    const { result, runtimeTransport } = await route("minimax-m3(max)", "openai-responses");
++    const { result, runtimeTransport, effectiveUrl } = await route("minimax-m3(max)", "openai-responses");
+     expect(result.success).toBe(true);
+-    expect(runtimeTransport).toBeNull();
++    expect(runtimeTransport?.format).toBe("openai");
++    expect(effectiveUrl).toBe(ENDPOINTS.openai);
++    expect(effectiveUrl).not.toBe(ENDPOINTS["openai-responses"]);
+   });
+ });
+ 
+diff --git a/tests/unit/responses-reasoning-wire.test.js b/tests/unit/responses-reasoning-wire.test.js
+new file mode 100644
+index 00000000..40cd5125
+--- /dev/null
++++ b/tests/unit/responses-reasoning-wire.test.js
+@@ -0,0 +1,414 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import "../translator/registerAll.js";
++import { DefaultExecutor } from "../../open-sse/executors/default.js";
++import { handleChatCore } from "../../open-sse/handlers/chatCore.js";
++
++const {
++  proxyAwareFetchMock,
++  createRequestLoggerMock,
++  handleNonStreamingResponseMock,
++  buildOnStreamCompleteMock,
++  handleStreamingResponseMock,
++} = vi.hoisted(() => ({
++  proxyAwareFetchMock: vi.fn(),
++  createRequestLoggerMock: vi.fn(async () => ({
++    logClientRawRequest: vi.fn(),
++    logRawRequest: vi.fn(),
++    logTargetRequest: vi.fn(),
++    logError: vi.fn(),
++  })),
++  handleNonStreamingResponseMock: vi.fn(),
++  buildOnStreamCompleteMock: vi.fn(),
++  handleStreamingResponseMock: vi.fn(),
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
++  default: proxyAwareFetchMock,
++  proxyAwareFetch: proxyAwareFetchMock,
++}));
++
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: createRequestLoggerMock,
++}));
++
++vi.mock("../../open-sse/handlers/chatCore/nonStreamingHandler.js", () => ({
++  handleNonStreamingResponse: handleNonStreamingResponseMock,
++}));
++
++vi.mock("../../open-sse/handlers/chatCore/streamingHandler.js", () => ({
++  buildOnStreamComplete: buildOnStreamCompleteMock,
++  handleStreamingResponse: handleStreamingResponseMock,
++}));
++
++vi.mock("../../open-sse/services/tokenRefresh.js", () => ({
++  refreshWithRetry: vi.fn(),
++}));
++
++vi.mock("../../open-sse/rtk/caveman.js", () => ({ injectCaveman: vi.fn() }));
++vi.mock("../../open-sse/rtk/ponytail.js", () => ({ injectPonytail: vi.fn() }));
++vi.mock("../../open-sse/rtk/index.js", () => ({
++  compressMessages: vi.fn(() => null),
++  formatRtkLog: vi.fn(() => ""),
++}));
++vi.mock("../../open-sse/rtk/headroom.js", () => ({
++  compressWithHeadroom: vi.fn(async () => null),
++  formatHeadroomLog: vi.fn(() => ""),
++  formatHeadroomSizeLog: vi.fn(() => ""),
++  isHeadroomPhantomSavings: vi.fn(() => false),
++}));
++vi.mock("../../open-sse/rtk/pxpipe.js", () => ({
++  compressWithPxpipe: vi.fn(async () => ({ body: null, summary: null })),
++}));
++vi.mock("../../open-sse/translator/concerns/prefetch.js", () => ({
++  prefetchRemoteImages: vi.fn(async () => 0),
++}));
++vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", () => ({
++  buildRequestDetail: vi.fn((detail) => detail),
++  extractRequestConfig: vi.fn((body, stream) => ({ body, stream })),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(() => Promise.resolve()),
++  saveRequestDetail: vi.fn(() => Promise.resolve()),
++}));
++
++const MUSE = "muse";
++const MUSE_SPARK = "muse-spark-1.3-contributor";
++const RESPONSE_SUCCESS = { id: "resp_test", object: "response", status: "completed", output: [] };
++
++function chatMessages(stream, extra = {}) {
++  return {
++    model: `${MUSE}/${MUSE_SPARK}`,
++    stream,
++    messages: [
++      { role: "system", content: "Use the existing lookup tool." },
++      { role: "user", content: "Find item 7." },
++      {
++        role: "assistant",
++        content: null,
++        reasoning_content: "The item should be looked up.",
++        encrypted_content: "encrypted-prior-reasoning",
++        tool_calls: [{
++          id: "call_lookup_7",
++          type: "function",
++          function: { name: "lookup", arguments: "{\"item\":7}" },
++        }],
++      },
++      { role: "tool", tool_call_id: "call_lookup_7", content: "{\"value\":\"seven\"}" },
++      { role: "user", content: "Summarize it." },
++    ],
++    tools: [{
++      type: "function",
++      function: {
++        name: "lookup",
++        description: "Look up an item.",
++        parameters: { type: "object", properties: { item: { type: "integer" } } },
++      },
++    }],
++    ...extra,
++  };
++}
++
++function museCredentials() {
++  return {
++    apiKey: "test-only-muse-api-key",
++    connectionId: "test-muse-connection",
++    connectionName: "test Muse",
++    providerSpecificData: {},
++  };
++}
++
++function chatCoreOptions(body, providerThinking = null) {
++  const streaming = body.stream === true;
++  return {
++    body,
++    modelInfo: { provider: MUSE, model: MUSE_SPARK },
++    credentials: museCredentials(),
++    clientRawRequest: {
++      endpoint: "/v1/chat/completions",
++      body,
++      headers: { accept: streaming ? "text/event-stream" : "application/json" },
++    },
++    connectionId: "test-muse-connection",
++    providerThinking,
++    log: {
++      debug: vi.fn(),
++      info: vi.fn(),
++      warn: vi.fn(),
++      error: vi.fn(),
++      errorLine: vi.fn(),
++    },
++  };
++}
++
++function transformMuseResponse(body, credentials = { runtimeTransport: { format: "openai-responses" } }) {
++  return new DefaultExecutor(MUSE).transformRequest(MUSE_SPARK, structuredClone(body), true, credentials);
++}
++
++describe("Responses reasoning wire format", () => {
++  beforeEach(() => {
++    proxyAwareFetchMock.mockReset().mockImplementation(async () => new Response(
++      JSON.stringify(RESPONSE_SUCCESS),
++      { status: 200, headers: { "content-type": "application/json" } },
++    ));
++    handleNonStreamingResponseMock.mockReset().mockResolvedValue({
++      success: true,
++      responseMode: "json",
++    });
++    buildOnStreamCompleteMock.mockReset().mockReturnValue({
++      onStreamComplete: vi.fn(),
++      streamDetailId: "test-stream-detail",
++    });
++    handleStreamingResponseMock.mockReset().mockResolvedValue({
++      success: true,
++      responseMode: "sse",
++    });
++  });
++
++  it.each([true, false])(
++    "sends Muse xhigh as Responses reasoning.effort and returns HTTP 200 (stream=%s)",
++    async (stream) => {
++      const result = await handleChatCore(
++        chatCoreOptions(chatMessages(stream), { mode: "xhigh" }),
++      );
++
++      expect(proxyAwareFetchMock).toHaveBeenCalledTimes(1);
++      const [url, init] = proxyAwareFetchMock.mock.calls[0];
++      expect(url).toBe("https://api.meta.ai/v1/responses");
++      expect(init.headers.Authorization).toBe("Bearer test-only-muse-api-key");
++
++      const sent = JSON.parse(init.body);
++      expect(sent.reasoning).toEqual({ effort: "xhigh" });
++      expect(sent).not.toHaveProperty("reasoning_effort");
++      expect(sent.input).toEqual(expect.arrayContaining([
++        expect.objectContaining({
++          type: "reasoning",
++          encrypted_content: "encrypted-prior-reasoning",
++        }),
++        expect.objectContaining({
++          type: "function_call",
++          call_id: "call_lookup_7",
++          name: "lookup",
++        }),
++        expect.objectContaining({
++          type: "function_call_output",
++          call_id: "call_lookup_7",
++        }),
++      ]));
++      expect(result).toEqual({
++        success: true,
++        responseMode: stream ? "sse" : "json",
++      });
++    },
++  );
++
++  it("preserves an explicit medium effort over provider-level xhigh", async () => {
++    const result = await handleChatCore(
++      chatCoreOptions(chatMessages(false, { reasoning_effort: "medium" }), { mode: "xhigh" }),
++    );
++    const sent = JSON.parse(proxyAwareFetchMock.mock.calls[0][1].body);
++
++    expect(sent.reasoning).toEqual({ effort: "medium" });
++    expect(sent).not.toHaveProperty("reasoning_effort");
++    expect(result.success).toBe(true);
++  });
++
++  it("preserves native Responses reasoning keys, input continuity, include, and other fields", () => {
++    const input = [
++      {
++        type: "reasoning",
++        encrypted_content: "native-encrypted-reasoning",
++        summary: [{ type: "summary_text", text: "prior thought" }],
++      },
++      {
++        type: "function_call",
++        call_id: "call_native_1",
++        name: "lookup",
++        arguments: "{\"item\":1}",
++      },
++      { type: "function_call_output", call_id: "call_native_1", output: "one" },
++    ];
++    const body = {
++      model: MUSE_SPARK,
++      input,
++      include: ["reasoning.encrypted_content"],
++      reasoning: { summary: "detailed", context: "all_turns", vendor_extension: "preserve" },
++      reasoning_effort: "medium",
++      metadata: { trace: "keep" },
++      store: false,
++    };
++
++    const out = transformMuseResponse(body);
++
++    expect(out.reasoning).toEqual({
++      summary: "detailed",
++      context: "all_turns",
++      vendor_extension: "preserve",
++      effort: "medium",
++    });
++    expect(out).not.toHaveProperty("reasoning_effort");
++    expect(out.input).toEqual(input);
++    expect(out.include).toEqual(["reasoning.encrypted_content"]);
++    expect(out.metadata).toEqual({ trace: "keep" });
++    expect(out.store).toBe(false);
++  });
++
++  it.each([
++    "minimal",
++    "low",
++    "medium",
++    "high",
++    "xhigh",
++    "max",
++    "ultra",
++    "none",
++    "off",
++    "auto",
++    "future-level",
++  ])("moves Muse effort %s to Responses without changing its value", (effort) => {
++    const out = transformMuseResponse({ model: MUSE_SPARK, input: [], reasoning_effort: effort });
++    expect(out.reasoning.effort).toBe(effort);
++    expect(out).not.toHaveProperty("reasoning_effort");
++  });
++
++  it("does not inject reasoning when no intent is present", () => {
++    const out = transformMuseResponse({
++      model: MUSE_SPARK,
++      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
++      include: ["reasoning.encrypted_content"],
++    });
++
++    expect(out).not.toHaveProperty("reasoning");
++    expect(out).not.toHaveProperty("reasoning_effort");
++  });
++
++  it("preserves max for the standard Muse Spark model that advertises it", () => {
++    const out = new DefaultExecutor(MUSE).transformRequest("muse-spark-1.3", {
++      model: "muse-spark-1.3",
++      input: [],
++      reasoning_effort: "max",
++    }, true, { runtimeTransport: { format: "openai-responses" } });
++
++    expect(out.reasoning).toEqual({ effort: "max" });
++    expect(out).not.toHaveProperty("reasoning_effort");
++  });
++
++  it("forwards explicit none unchanged and returns the upstream 400", async () => {
++    proxyAwareFetchMock.mockResolvedValueOnce(new Response(
++      JSON.stringify({
++        error: {
++          message: "Unsupported reasoning effort: none",
++          type: "invalid_request_error",
++          code: "bad_request",
++        },
++      }),
++      { status: 400, headers: { "content-type": "application/json" } },
++    ));
++
++    const result = await handleChatCore(
++      chatCoreOptions(chatMessages(false, { reasoning_effort: "none" })),
++    );
++
++    expect(proxyAwareFetchMock.mock.calls[0][0]).toBe("https://api.meta.ai/v1/responses");
++    const sent = JSON.parse(proxyAwareFetchMock.mock.calls[0][1].body);
++    expect(sent.reasoning).toEqual({ effort: "none" });
++    expect(sent).not.toHaveProperty("reasoning_effort");
++    expect(result).toMatchObject({ success: false, status: 400 });
++    expect(result.error).toContain("Unsupported reasoning effort: none");
++  });
++
++  it("keeps contributor max intact at the executor boundary and propagates its upstream 400", async () => {
++    proxyAwareFetchMock.mockResolvedValueOnce(new Response(
++      JSON.stringify({
++        error: {
++          message: "Unsupported reasoning effort: max",
++          type: "invalid_request_error",
++          code: "bad_request",
++        },
++      }),
++      { status: 400, headers: { "content-type": "application/json" } },
++    ));
++
++    const result = await new DefaultExecutor(MUSE).execute({
++      model: MUSE_SPARK,
++      body: { model: MUSE_SPARK, input: [], reasoning_effort: "max" },
++      stream: false,
++      credentials: {
++        apiKey: "test-only-muse-api-key",
++        runtimeTransport: {
++          format: "openai-responses",
++          baseUrl: "https://api.meta.ai/v1/responses",
++        },
++      },
++      log: { debug: vi.fn() },
++    });
++
++    expect(proxyAwareFetchMock.mock.calls[0][0]).toBe("https://api.meta.ai/v1/responses");
++    const sent = JSON.parse(proxyAwareFetchMock.mock.calls[0][1].body);
++    expect(sent.reasoning).toEqual({ effort: "max" });
++    expect(sent).not.toHaveProperty("reasoning_effort");
++    expect(result.response.status).toBe(400);
++    expect(await result.response.text()).toContain("Unsupported reasoning effort: max");
++  });
++
++  it("uses provider config Responses format when there is no runtime transport", () => {
++    const executor = new DefaultExecutor("codex");
++    const out = executor.transformRequest("gpt-5.6-sol", {
++      model: "gpt-5.6-sol",
++      input: [],
++      reasoning_effort: "xhigh",
++    }, true, { accessToken: "test-only-codex-token" });
++
++    expect(out.reasoning).toEqual({ effort: "xhigh" });
++    expect(out).not.toHaveProperty("reasoning_effort");
++  });
++
++  it("lets runtime transport format override provider config format", () => {
++    const executor = new DefaultExecutor("codex");
++    const out = executor.transformRequest("gpt-5.6-sol", {
++      model: "gpt-5.6-sol",
++      messages: [{ role: "user", content: "hi" }],
++      reasoning_effort: "xhigh",
++    }, true, { runtimeTransport: { format: "openai" } });
++
++    expect(out.reasoning_effort).toBe("xhigh");
++    expect(out.reasoning).toBeUndefined();
++  });
++
++  it.each([
++    ["chat", "xhigh"],
++    ["chat", "none"],
++    ["responses", "xhigh"],
++    ["responses", "none"],
++  ])("uses the configured OpenAI-compatible %s wire for effort %s", (apiType, effort) => {
++    const provider = "openai-compatible-chat-test";
++    const executor = new DefaultExecutor(provider);
++    const credentials = {
++      apiKey: "test-only-compatible-key",
++      providerSpecificData: {
++        apiType,
++        baseUrl: "https://compatible.example/v1",
++      },
++    };
++    const body = {
++      model: "reasoning-model",
++      messages: [{ role: "user", content: "hi" }],
++      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
++      reasoning_effort: effort,
++    };
++
++    const out = executor.transformRequest("reasoning-model", structuredClone(body), true, credentials);
++
++    if (apiType === "chat") {
++      expect(out.reasoning_effort).toBe(effort);
++      expect(out.reasoning).toBeUndefined();
++      expect(executor.buildUrl("reasoning-model", true, 0, credentials))
++        .toBe("https://compatible.example/v1/chat/completions");
++    } else {
++      expect(out.reasoning).toEqual({ effort });
++      expect(out.reasoning_effort).toBeUndefined();
++      expect(executor.buildUrl("reasoning-model", true, 0, credentials))
++        .toBe("https://compatible.example/v1/responses");
++    }
++  });
++});
+diff --git a/tests/unit/responses-thinking-option-preservation.test.js b/tests/unit/responses-thinking-option-preservation.test.js
+new file mode 100644
+index 00000000..19b385e7
+--- /dev/null
++++ b/tests/unit/responses-thinking-option-preservation.test.js
+@@ -0,0 +1,71 @@
++import { describe, expect, it } from "vitest";
++import "../translator/registerAll.js";
++import { applyThinking } from "../../open-sse/translator/concerns/thinkingUnified.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++
++const FORMAT = "openai-responses";
++const MODEL = "muse-spark-1.3-contributor";
++const preserve = { preserveResponsesOptions: true };
++
++describe("applyThinking preserveResponsesOptions", () => {
++  it("keeps native summary and opaque reasoning, include and metadata fields", () => {
++    const body = {
++      reasoning: { effort: "xhigh", summary: "none", vendor: { tier: 2 }, context: "keep" },
++      include: ["reasoning.encrypted_content"],
++      metadata: { run: "r1" },
++    };
++    applyThinking(FORMAT, MODEL, body, "muse", undefined, preserve);
++    expect(body.reasoning).toEqual({ effort: "xhigh", summary: "none", vendor: { tier: 2 }, context: "keep" });
++    expect(body.include).toEqual(["reasoning.encrypted_content"]);
++    expect(body.metadata).toEqual({ run: "r1" });
++    expect(body).not.toHaveProperty("reasoning_effort");
++  });
++
++  it.each(["none", "off", "max", "future-level"])("migrates top-level %s unchanged without a summary", (effort) => {
++    const body = { reasoning_effort: effort };
++    applyThinking(FORMAT, MODEL, body, "muse", undefined, preserve);
++    expect(body.reasoning).toEqual({ effort });
++    expect(body).not.toHaveProperty("reasoning_effort");
++  });
++
++  it("does not invent a summary for a provider-level intent", () => {
++    const body = {};
++    applyThinking(FORMAT, MODEL, body, "muse", { mode: "level", level: "xhigh" }, preserve);
++    expect(body.reasoning).toEqual({ effort: "xhigh" });
++  });
++
++  it("lets a model suffix override an explicit effort", () => {
++    const body = { reasoning: { effort: "low", summary: "none" } };
++    applyThinking(FORMAT, `${MODEL}(high)`, body, "muse", undefined, preserve);
++    expect(body.reasoning).toEqual({ effort: "high", summary: "none" });
++  });
++
++  it("keeps the upstream standalone behavior when the option is off", () => {
++    const body = { reasoning_effort: "xhigh" };
++    applyThinking(FORMAT, MODEL, body, "muse");
++    expect(body.reasoning).toEqual({ effort: "xhigh", summary: "auto" });
++    expect(body).not.toHaveProperty("reasoning_effort");
++  });
++});
++
++describe("translateRequest OpenAI to Responses keeps client reasoning options", () => {
++  const translate = (extra) => {
++    const body = { model: MODEL, messages: [{ role: "user", content: "hi" }], ...extra };
++    const before = JSON.stringify(body);
++    const out = translateRequest(FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, MODEL, body, true, {}, "muse");
++    expect(JSON.stringify(body)).toBe(before);
++    return out;
++  };
++
++  it("retains the client's summary and opaque reasoning keys next to the effort", () => {
++    const out = translate({ reasoning_effort: "medium", reasoning: { summary: "detailed", vendor: "keep" } });
++    expect(out.reasoning).toEqual({ summary: "detailed", vendor: "keep", effort: "medium" });
++    expect(out).not.toHaveProperty("reasoning_effort");
++  });
++
++  it("sends a plain effort without an invented summary", () => {
++    const out = translate({ reasoning_effort: "xhigh" });
++    expect(out.reasoning).toEqual({ effort: "xhigh" });
++  });
++});
+diff --git a/tests/unit/target-format-transport.test.js b/tests/unit/target-format-transport.test.js
+new file mode 100644
+index 00000000..489a4f28
+--- /dev/null
++++ b/tests/unit/target-format-transport.test.js
+@@ -0,0 +1,287 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import "../translator/registerAll.js";
++import { handleChatCore } from "../../open-sse/handlers/chatCore.js";
++
++const {
++  proxyAwareFetchMock,
++  createRequestLoggerMock,
++  handleNonStreamingResponseMock,
++  buildOnStreamCompleteMock,
++  handleStreamingResponseMock,
++} = vi.hoisted(() => ({
++  proxyAwareFetchMock: vi.fn(),
++  createRequestLoggerMock: vi.fn(async () => ({
++    logClientRawRequest: vi.fn(),
++    logRawRequest: vi.fn(),
++    logTargetRequest: vi.fn(),
++    logError: vi.fn(),
++  })),
++  handleNonStreamingResponseMock: vi.fn(),
++  buildOnStreamCompleteMock: vi.fn(),
++  handleStreamingResponseMock: vi.fn(),
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
++  default: proxyAwareFetchMock,
++  proxyAwareFetch: proxyAwareFetchMock,
++}));
++
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: createRequestLoggerMock,
++}));
++
++vi.mock("../../open-sse/handlers/chatCore/nonStreamingHandler.js", () => ({
++  handleNonStreamingResponse: handleNonStreamingResponseMock,
++}));
++
++vi.mock("../../open-sse/handlers/chatCore/streamingHandler.js", () => ({
++  buildOnStreamComplete: buildOnStreamCompleteMock,
++  handleStreamingResponse: handleStreamingResponseMock,
++}));
++
++vi.mock("../../open-sse/services/tokenRefresh.js", () => ({
++  refreshWithRetry: vi.fn(),
++}));
++
++vi.mock("../../open-sse/rtk/caveman.js", () => ({ injectCaveman: vi.fn() }));
++vi.mock("../../open-sse/rtk/ponytail.js", () => ({ injectPonytail: vi.fn() }));
++vi.mock("../../open-sse/rtk/index.js", () => ({
++  compressMessages: vi.fn(() => null),
++  formatRtkLog: vi.fn(() => ""),
++}));
++vi.mock("../../open-sse/rtk/headroom.js", () => ({
++  compressWithHeadroom: vi.fn(async () => null),
++  formatHeadroomLog: vi.fn(() => ""),
++  formatHeadroomSizeLog: vi.fn(() => ""),
++  isHeadroomPhantomSavings: vi.fn(() => false),
++}));
++vi.mock("../../open-sse/rtk/pxpipe.js", () => ({
++  compressWithPxpipe: vi.fn(async () => ({ body: null, summary: null })),
++}));
++vi.mock("../../open-sse/translator/concerns/prefetch.js", () => ({
++  prefetchRemoteImages: vi.fn(async () => 0),
++}));
++vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", () => ({
++  buildRequestDetail: vi.fn((detail) => detail),
++  extractRequestConfig: vi.fn((body, stream) => ({ body, stream })),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(() => Promise.resolve()),
++  saveRequestDetail: vi.fn(() => Promise.resolve()),
++}));
++
++const PROVIDER = "muse";
++const MODEL = "muse-spark-1.3-contributor";
++const RESPONSE_ERROR = {
++  error: {
++    message: "[400]: {\"error\":{\"code\":null,\"message\":\"unknown parameter `input`\",\"param\":\"input\",\"type\":\"invalid_request_error\"}}",
++    type: "invalid_request_error",
++    code: "bad_request",
++  },
++};
++
++function makeOptions(body, endpoint) {
++  const streaming = body.stream === true;
++  return {
++    body,
++    modelInfo: { provider: PROVIDER, model: MODEL },
++    credentials: {
++      accessToken: "test-only-muse-oauth-token",
++      connectionId: "test-muse-connection",
++      connectionName: "test Muse",
++      providerSpecificData: {},
++    },
++    clientRawRequest: {
++      endpoint,
++      body,
++      headers: { accept: streaming ? "text/event-stream" : "application/json" },
++    },
++    connectionId: "test-muse-connection",
++    log: {
++      debug: vi.fn(),
++      info: vi.fn(),
++      warn: vi.fn(),
++      error: vi.fn(),
++      errorLine: vi.fn(),
++    },
++  };
++}
++
++function chatBody(stream) {
++  return {
++    model: `${PROVIDER}/${MODEL}`,
++    stream,
++    messages: [
++      { role: "system", content: "Keep the lookup result intact." },
++      { role: "user", content: "Look up item 7." },
++      {
++        role: "assistant",
++        content: null,
++        tool_calls: [{
++          id: "call_preserve_7",
++          type: "function",
++          function: { name: "lookup", arguments: "{\"item\":7}" },
++        }],
++      },
++      { role: "tool", tool_call_id: "call_preserve_7", content: "{\"value\":\"seven\"}" },
++      { role: "user", content: "Summarize the result." },
++    ],
++    tools: [{
++      type: "function",
++      function: {
++        name: "lookup",
++        description: "Look up an item.",
++        parameters: { type: "object", properties: { item: { type: "integer" } } },
++      },
++    }],
++  };
++}
++
++function responsesBody(stream) {
++  return {
++    model: `${PROVIDER}/${MODEL}`,
++    stream,
++    instructions: "Preserve the native Responses request.",
++    input: [{
++      type: "message",
++      role: "user",
++      content: [{ type: "input_text", text: "Say hello." }],
++    }],
++    include: ["reasoning.encrypted_content"],
++    store: false,
++  };
++}
++
++describe("model target-format transport selection", () => {
++  beforeEach(() => {
++    proxyAwareFetchMock.mockReset();
++    proxyAwareFetchMock.mockImplementation(async () => new Response(
++      JSON.stringify(RESPONSE_ERROR),
++      { status: 400, headers: { "content-type": "application/json" } },
++    ));
++    handleNonStreamingResponseMock.mockReset().mockResolvedValue({
++      success: true,
++      responseMode: "json",
++    });
++    buildOnStreamCompleteMock.mockReset().mockReturnValue({
++      onStreamComplete: vi.fn(),
++      streamDetailId: "test-stream-detail",
++    });
++    handleStreamingResponseMock.mockReset().mockResolvedValue({
++      success: true,
++      responseMode: "sse",
++    });
++  });
++
++  it.each([true, false])(
++    "sends chat messages translated to Muse Responses through /responses (stream=%s)",
++    async (stream) => {
++      const body = chatBody(stream);
++      const result = await handleChatCore(makeOptions(body, "/v1/chat/completions"));
++
++      expect(proxyAwareFetchMock).toHaveBeenCalledTimes(1);
++      const [url, init] = proxyAwareFetchMock.mock.calls[0];
++      expect(url).toBe("https://api.meta.ai/v1/responses");
++      expect(init.headers.Authorization).toBe("Bearer test-only-muse-oauth-token");
++      expect(init.headers["x-api-version"]).toBe("1.0.0");
++
++      const sent = JSON.parse(init.body);
++      expect(sent.model).toBe(MODEL);
++      expect(sent.instructions).toBe("Keep the lookup result intact.");
++      expect(sent.input).toEqual(expect.arrayContaining([
++        expect.objectContaining({ type: "function_call", call_id: "call_preserve_7", name: "lookup" }),
++        expect.objectContaining({ type: "function_call_output", call_id: "call_preserve_7" }),
++      ]));
++      expect(result).toMatchObject({ success: false, status: 400 });
++      expect(result.error).toContain("unknown parameter `input`");
++    },
++  );
++
++  it.each([true, false])(
++    "keeps native Responses input and provider fields on /responses (stream=%s)",
++    async (stream) => {
++      const body = responsesBody(stream);
++      const result = await handleChatCore(makeOptions(body, "/v1/responses"));
++
++      expect(proxyAwareFetchMock).toHaveBeenCalledTimes(1);
++      const [url, init] = proxyAwareFetchMock.mock.calls[0];
++      expect(url).toBe("https://api.meta.ai/v1/responses");
++      const sent = JSON.parse(init.body);
++      expect(sent.input).toEqual(body.input);
++      expect(sent.instructions).toBe(body.instructions);
++      expect(sent.include).toEqual(body.include);
++      expect(sent.store).toBe(false);
++      expect(result).toMatchObject({ success: false, status: 400 });
++      expect(result.error).toContain("unknown parameter `input`");
++    },
++  );
++
++  it.each([
++    {
++      label: "chat messages",
++      body: chatBody,
++      endpoint: "/v1/chat/completions",
++      sourceFormat: "openai",
++    },
++    {
++      label: "native Responses input",
++      body: responsesBody,
++      endpoint: "/v1/responses",
++      sourceFormat: "openai-responses",
++    },
++  ])("$label receives a valid upstream response (stream=true)", async ({
++    body: makeBody,
++    endpoint,
++    sourceFormat,
++  }) => {
++    proxyAwareFetchMock.mockResolvedValueOnce(new Response(
++      JSON.stringify({ id: "resp_synthetic_success" }),
++      { status: 200, headers: { "content-type": "application/json" } },
++    ));
++
++    const result = await handleChatCore(makeOptions(makeBody(true), endpoint));
++
++    expect(proxyAwareFetchMock.mock.calls[0][0]).toBe("https://api.meta.ai/v1/responses");
++    expect(handleStreamingResponseMock).toHaveBeenCalledWith(expect.objectContaining({
++      sourceFormat,
++      targetFormat: "openai-responses",
++      stream: true,
++    }));
++    expect(result).toEqual({ success: true, responseMode: "sse" });
++  });
++
++  it.each([
++    {
++      label: "chat messages",
++      body: chatBody,
++      endpoint: "/v1/chat/completions",
++      sourceFormat: "openai",
++    },
++    {
++      label: "native Responses input",
++      body: responsesBody,
++      endpoint: "/v1/responses",
++      sourceFormat: "openai-responses",
++    },
++  ])("$label receives a valid upstream response (stream=false)", async ({
++    body: makeBody,
++    endpoint,
++    sourceFormat,
++  }) => {
++    proxyAwareFetchMock.mockResolvedValueOnce(new Response(
++      JSON.stringify({ id: "resp_synthetic_success" }),
++      { status: 200, headers: { "content-type": "application/json" } },
++    ));
++
++    const result = await handleChatCore(makeOptions(makeBody(false), endpoint));
++
++    expect(proxyAwareFetchMock.mock.calls[0][0]).toBe("https://api.meta.ai/v1/responses");
++    expect(handleNonStreamingResponseMock).toHaveBeenCalledWith(expect.objectContaining({
++      sourceFormat,
++      targetFormat: "openai-responses",
++      stream: false,
++    }));
++    expect(result).toEqual({ success: true, responseMode: "json" });
++  });
++});
+diff --git a/tests/unit/undeclared-responses-sse.test.js b/tests/unit/undeclared-responses-sse.test.js
+new file mode 100644
+index 00000000..8a0e19b6
+--- /dev/null
++++ b/tests/unit/undeclared-responses-sse.test.js
+@@ -0,0 +1,206 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import "../translator/registerAll.js";
++
++const {
++  proxyAwareFetchMock,
++  handleNonStreamingResponseMock,
++  handleStreamingResponseMock,
++} = vi.hoisted(() => ({
++  proxyAwareFetchMock: vi.fn(),
++  handleNonStreamingResponseMock: vi.fn(),
++  handleStreamingResponseMock: vi.fn(),
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
++  default: proxyAwareFetchMock,
++  proxyAwareFetch: proxyAwareFetchMock,
++}));
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: vi.fn(async () => ({
++    logClientRawRequest: vi.fn(),
++    logRawRequest: vi.fn(),
++    logTargetRequest: vi.fn(),
++    logError: vi.fn(),
++  })),
++}));
++vi.mock("../../open-sse/handlers/chatCore/nonStreamingHandler.js", () => ({
++  handleNonStreamingResponse: handleNonStreamingResponseMock,
++}));
++vi.mock("../../open-sse/handlers/chatCore/streamingHandler.js", () => ({
++  buildOnStreamComplete: vi.fn(() => ({ onStreamComplete: vi.fn(), streamDetailId: "test-stream" })),
++  handleStreamingResponse: handleStreamingResponseMock,
++}));
++vi.mock("../../open-sse/services/tokenRefresh.js", () => ({ refreshWithRetry: vi.fn() }));
++vi.mock("../../open-sse/rtk/caveman.js", () => ({ injectCaveman: vi.fn() }));
++vi.mock("../../open-sse/rtk/ponytail.js", () => ({ injectPonytail: vi.fn() }));
++vi.mock("../../open-sse/rtk/index.js", () => ({
++  compressMessages: vi.fn(() => null),
++  formatRtkLog: vi.fn(() => ""),
++}));
++vi.mock("../../open-sse/rtk/headroom.js", () => ({
++  compressWithHeadroom: vi.fn(async () => null),
++  formatHeadroomLog: vi.fn(() => ""),
++  formatHeadroomSizeLog: vi.fn(() => ""),
++  isHeadroomPhantomSavings: vi.fn(() => false),
++}));
++vi.mock("../../open-sse/rtk/pxpipe.js", () => ({
++  compressWithPxpipe: vi.fn(async () => ({ body: null, summary: null })),
++}));
++vi.mock("../../open-sse/translator/concerns/prefetch.js", () => ({
++  prefetchRemoteImages: vi.fn(async () => 0),
++}));
++vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", () => ({
++  buildRequestDetail: vi.fn((detail) => detail),
++  extractRequestConfig: vi.fn((body, stream) => ({ body, stream })),
++  saveUsageStats: vi.fn(),
++  formatDoneLine: vi.fn(() => ""),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(() => Promise.resolve()),
++  saveRequestDetail: vi.fn(() => Promise.resolve()),
++  saveRequestUsage: vi.fn(),
++}));
++
++const { FORMATS } = await import("../../open-sse/translator/formats.js");
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++
++const PROVIDER = "muse";
++const MODEL = "muse-spark-1.3-contributor";
++
++function sseResponse(events, headers = {}) {
++  return new Response(events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join(""), {
++    headers: { "content-type": "text/event-stream", ...headers },
++  });
++}
++
++function chatOptions({ stream = false, sourceFormat = FORMATS.OPENAI, endpoint = "/v1/chat/completions" } = {}) {
++  const body = sourceFormat === FORMATS.OPENAI_RESPONSES
++    ? { model: MODEL, stream, input: "hello", store: false, include: ["reasoning.encrypted_content"] }
++    : { model: MODEL, stream, messages: [{ role: "user", content: "hello" }] };
++  return {
++    body,
++    modelInfo: { provider: PROVIDER, model: MODEL },
++    credentials: { accessToken: "test-token", connectionId: "test-connection", providerSpecificData: {} },
++    clientRawRequest: {
++      endpoint,
++      body,
++      headers: { accept: stream ? "text/event-stream" : "application/json" },
++    },
++    sourceFormatOverride: sourceFormat,
++    connectionId: "test-connection",
++    log: {},
++  };
++}
++
++function completedResponsesEvents(output) {
++  return [
++    ["response.created", { response: { id: "resp_test", created_at: 1700000000 } }],
++    ...output.map((item, output_index) => ["response.output_item.done", { output_index, item }]),
++    ["response.completed", { response: { usage: { input_tokens: 11, output_tokens: 5, total_tokens: 16 } } }],
++  ];
++}
++
++describe("Responses upstream SSE for clients that requested JSON", () => {
++  beforeEach(() => {
++    proxyAwareFetchMock.mockReset();
++    handleNonStreamingResponseMock.mockReset().mockResolvedValue({
++      success: true,
++      response: new Response('{"handled":"nonstream"}', { headers: { "content-type": "application/json" } }),
++    });
++    handleStreamingResponseMock.mockReset().mockResolvedValue({ success: true, responseMode: "sse" });
++  });
++
++  it("collects Responses SSE into a chat completion with tools, usage, and safe headers", async () => {
++    proxyAwareFetchMock.mockResolvedValue(sseResponse(completedResponsesEvents([
++      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Found it." }] },
++      { type: "function_call", call_id: "call_lookup_7", name: "lookup", arguments: "{\"item\":7}" },
++    ]), { "retry-after": "3" }));
++
++    const result = await handleChatCore(chatOptions());
++    const body = await result.response.json();
++
++    expect(result.success).toBe(true);
++    expect(body.object).toBe("chat.completion");
++    expect(body.choices[0]).toMatchObject({
++      message: {
++        content: "Found it.",
++        tool_calls: [{
++          id: "call_lookup_7",
++          function: { name: "lookup", arguments: "{\"item\":7}" },
++        }],
++      },
++      finish_reason: "tool_calls",
++    });
++    expect(body.usage).toMatchObject({ prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 });
++    expect(result.response.headers.get("content-type")).toBe("application/json");
++    expect(result.response.headers.get("retry-after")).toBe("3");
++    expect(result.response.headers.get("access-control-allow-origin")).toBe("*");
++    expect(result.response.headers.get("content-length")).toBeNull();
++    expect(handleNonStreamingResponseMock).not.toHaveBeenCalled();
++  });
++
++  it("returns native Responses JSON, including encrypted reasoning output", async () => {
++    proxyAwareFetchMock.mockResolvedValue(sseResponse(completedResponsesEvents([
++      {
++        type: "reasoning",
++        encrypted_content: "opaque-reasoning",
++        summary: [{ type: "summary_text", text: "private" }],
++      },
++      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Done." }] },
++    ])));
++
++    const result = await handleChatCore(chatOptions({
++      sourceFormat: FORMATS.OPENAI_RESPONSES,
++      endpoint: "/v1/responses",
++    }));
++    const body = await result.response.json();
++
++    expect(result.success).toBe(true);
++    expect(body.object).toBe("response");
++    expect(body.status).toBe("completed");
++    expect(body.output[0]).toMatchObject({
++      type: "reasoning",
++      encrypted_content: "opaque-reasoning",
++    });
++    expect(body.usage).toMatchObject({ input_tokens: 11, output_tokens: 5, total_tokens: 16 });
++    expect(handleNonStreamingResponseMock).not.toHaveBeenCalled();
++  });
++
++  it("leaves streaming requests on the streaming path", async () => {
++    proxyAwareFetchMock.mockResolvedValue(sseResponse([]));
++    const result = await handleChatCore(chatOptions({ stream: true }));
++
++    expect(result).toMatchObject({ success: true, responseMode: "sse" });
++    expect(handleStreamingResponseMock).toHaveBeenCalledTimes(1);
++    expect(handleNonStreamingResponseMock).not.toHaveBeenCalled();
++  });
++
++  it("lets an actual JSON upstream body fall through untouched", async () => {
++    const upstream = new Response('{"id":"resp_json","object":"response","status":"completed","output":[]}', {
++      headers: { "content-type": "application/json" },
++    });
++    proxyAwareFetchMock.mockResolvedValue(upstream);
++
++    await handleChatCore(chatOptions());
++
++    expect(handleNonStreamingResponseMock).toHaveBeenCalledTimes(1);
++    const call = handleNonStreamingResponseMock.mock.calls[0][0];
++    expect(call.providerResponse).toBe(upstream);
++    expect(call.providerResponse.bodyUsed).toBe(false);
++  });
++
++  it("propagates an upstream HTTP 400 without trying SSE conversion", async () => {
++    proxyAwareFetchMock.mockResolvedValue(new Response(
++      JSON.stringify({ error: { message: "unknown parameter `input`" } }),
++      { status: 400, headers: { "content-type": "application/json" } },
++    ));
++
++    const result = await handleChatCore(chatOptions());
++
++    expect(result.success).toBe(false);
++    expect(result.status).toBe(400);
++    expect(result.error).toContain("unknown parameter `input`");
++    expect(handleNonStreamingResponseMock).not.toHaveBeenCalled();
++  });
++});

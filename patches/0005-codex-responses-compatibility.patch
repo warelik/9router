@@ -1,0 +1,2865 @@
+From ae2a1391f301bb965d861d7ef5697d80f17f3178 Mon Sep 17 00:00:00 2001
+From: Overlay Migration <overlay-migration@example.invalid>
+Date: Fri, 16 Oct 2026 08:36:03 +0000
+Subject: [PATCH 5/8] 0005 codex-responses-compatibility
+
+Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
+Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
+Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
+---
+ open-sse/config/runtimeConfig.js              |   7 +
+ open-sse/executors/codex.js                   |  67 +++-
+ open-sse/handlers/chatCore.js                 |  17 +-
+ .../handlers/chatCore/nonStreamingHandler.js  |  10 +-
+ .../handlers/chatCore/streamingHandler.js     |   2 +-
+ .../concerns/portableCollaboration.js         |  86 +++++
+ open-sse/translator/formats/responsesApi.js   |  84 ++++-
+ open-sse/translator/index.js                  |  15 +-
+ .../translator/request/openai-responses.js    | 106 +++++-
+ .../translator/response/claude-to-openai.js   |   3 +-
+ .../translator/response/gemini-to-openai.js   |  11 +-
+ .../translator/response/kiro-to-claude.js     |   3 +-
+ .../translator/response/kiro-to-openai.js     |   3 +-
+ .../translator/response/openai-responses.js   |  66 ++--
+ .../response/openai-to-antigravity.js         |   3 +-
+ open-sse/translator/schema/blocks.js          |   1 +
+ open-sse/utils/opencodeFingerprint.js         |  62 ++-
+ open-sse/utils/stream.js                      |   2 +-
+ .../unit/codex-hosted-search-history.test.js  |  95 +++++
+ .../codex-sse-error-before-output.test.js     | 148 ++++++++
+ .../kimi-portable-responses-input.test.js     | 318 ++++++++++++++++
+ tests/unit/kiro-namespace-descriptors.test.js |  40 ++
+ .../openai-responses-agent-messages.test.js   | 232 ++++++++++++
+ .../unit/openai-responses-incomplete.test.js  |  67 ++++
+ .../unit/openai-responses-namespaces.test.js  | 353 ++++++++++++++++++
+ .../unit/openai-responses-web-search.test.js  | 310 +++++++++++++++
+ tests/unit/responses-output-index.test.js     |  78 ++++
+ 27 files changed, 2123 insertions(+), 66 deletions(-)
+ create mode 100644 open-sse/translator/concerns/portableCollaboration.js
+ create mode 100644 tests/unit/codex-hosted-search-history.test.js
+ create mode 100644 tests/unit/codex-sse-error-before-output.test.js
+ create mode 100644 tests/unit/kimi-portable-responses-input.test.js
+ create mode 100644 tests/unit/kiro-namespace-descriptors.test.js
+ create mode 100644 tests/unit/openai-responses-agent-messages.test.js
+ create mode 100644 tests/unit/openai-responses-incomplete.test.js
+ create mode 100644 tests/unit/openai-responses-namespaces.test.js
+ create mode 100644 tests/unit/openai-responses-web-search.test.js
+ create mode 100644 tests/unit/responses-output-index.test.js
+
+diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
+index a27d3ea9..f0919503 100644
+--- a/open-sse/config/runtimeConfig.js
++++ b/open-sse/config/runtimeConfig.js
+@@ -67,6 +67,13 @@ export const DEFAULT_MIN_TOKENS = 32000;
+ 
+ export const TOKEN_SAVER_HEADER = "x-9router-token-saver";
+ 
++export const PORTABLE_COLLABORATION = {
++  header: "x-9router-portable-collaboration",
++  namespace: "collaboration",
++  messageTools: ["spawn_agent", "send_message", "followup_task"],
++  aliasPrefix: "collab_plain_",
++};
++
+ // Retry config for 429 responses (legacy - kept for backward compatibility)
+ export const RETRY_CONFIG = {
+   maxAttempts: 2,
+diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
+index f637307e..56aae02c 100644
+--- a/open-sse/executors/codex.js
++++ b/open-sse/executors/codex.js
+@@ -312,6 +312,13 @@ export class CodexExecutor extends BaseExecutor {
+         result.response = codexSseErrorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, peek.message || CODEX_MODEL_CAPACITY_MESSAGE);
+         return result;
+       }
++      // A terminal error event before any user-visible output is a failed
++      // attempt, not a transient overload — surface it instead of retrying.
++      if (peek.status) {
++        args.log?.warn?.("RETRY", `CODEX | SSE error before output "${peek.message || peek.matched}" → ${peek.status}`);
++        result.response = codexSseErrorResponse(peek.status, peek.message || peek.matched);
++        return result;
++      }
+       if (attempt >= attempts) {
+         args.log?.warn?.("RETRY", `CODEX | SSE overloaded "${peek.matched}" — retries exhausted (${attempt}/${attempts})`);
+         result.response = codexSseErrorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, peek.message || peek.matched);
+@@ -325,16 +332,18 @@ export class CodexExecutor extends BaseExecutor {
+   }
+ 
+   // Peek first N bytes of SSE body to detect upstream transient errors.
+-  // Returns { matched: string|null, message: string|null, accountFallback: boolean, replacementBody: ReadableStream|null }.
++  // Returns { matched: string|null, message: string|null, accountFallback: boolean, status: number|null, replacementBody: ReadableStream|null }.
+   // Caller must use replacementBody when no error matched (original body has been read).
+   async _peekSseTransientError(response) {
+-    if (!response || !response.ok || !response.body) return { matched: null, message: null, accountFallback: false, replacementBody: null };
++    if (!response || !response.ok || !response.body) return { matched: null, message: null, accountFallback: false, status: null, replacementBody: null };
+     const reader = response.body.getReader();
+     const decoder = new TextDecoder();
+     const chunks = [];
+     let text = "";
+     let matched = null;
+     let accountFallback = false;
++    let sseError = null;
++    let lineScanOffset = 0;
+     try {
+       while (text.length < CODEX_SSE_PEEK_BYTES) {
+         const { done, value } = await reader.read();
+@@ -346,16 +355,54 @@ export class CodexExecutor extends BaseExecutor {
+         if (accountHit) { matched = accountHit; accountFallback = true; break; }
+         const retryHit = CODEX_SSE_RETRY_PATTERNS.find(p => lowerText.includes(p));
+         if (retryHit) { matched = retryHit; break; }
+-        if (CODEX_SSE_USER_OUTPUT_PATTERNS.some(p => lowerText.includes(p))) break;
++        // Error events are terminal only while they precede user-visible output;
++        // past that point the stream must reach the client untouched.
++        let outputIdx = -1;
++        for (const pattern of CODEX_SSE_USER_OUTPUT_PATTERNS) {
++          const idx = lowerText.indexOf(pattern);
++          if (idx !== -1 && (outputIdx === -1 || idx < outputIdx)) outputIdx = idx;
++        }
++        const scanEnd = outputIdx === -1 ? text.lastIndexOf("\n") : Math.min(text.lastIndexOf("\n"), outputIdx);
++        while (lineScanOffset <= scanEnd) {
++          const nl = text.indexOf("\n", lineScanOffset);
++          if (nl === -1 || nl > scanEnd) break;
++          const line = text.slice(lineScanOffset, nl);
++          lineScanOffset = nl + 1;
++          if (!line.startsWith("data:")) continue;
++          const data = line.slice(5).trim();
++          if (!data || data === "[DONE]") continue;
++          try {
++            const event = JSON.parse(data);
++            if (event?.type === "error" || event?.type === "response.failed") {
++              const err = event.type === "response.failed" ? event.response?.error : event.error;
++              sseError = {
++                type: event.type,
++                status: (err?.type === "invalid_request_error" || err?.code === "invalid_request_error")
++                  ? HTTP_STATUS.BAD_REQUEST : HTTP_STATUS.BAD_GATEWAY,
++              };
++            }
++          } catch { /* ignore non-JSON SSE data lines */ }
++          if (sseError) break;
++        }
++        if (sseError || outputIdx !== -1) break;
+       }
+     } catch (e) {
+       dbg("CODEX", `peek read error: ${e.message}`);
+     }
+ 
+-    if (matched) {
++    if (matched || sseError) {
+       try { await reader.cancel(); } catch { /* noop */ }
+       try { reader.releaseLock(); } catch { /* noop */ }
+-      return { matched, message: extractSseErrorMessage(text, matched), accountFallback, replacementBody: null };
++      if (matched) {
++        return { matched, message: extractSseErrorMessage(text, matched), accountFallback, status: null, replacementBody: null };
++      }
++      return {
++        matched: sseError.type,
++        message: extractSseErrorMessage(text, sseError.type),
++        accountFallback: false,
++        status: sseError.status,
++        replacementBody: null,
++      };
+     }
+ 
+     reader.releaseLock();
+@@ -379,7 +426,7 @@ export class CodexExecutor extends BaseExecutor {
+         try { upstreamReader?.cancel(reason); } catch { /* noop */ }
+       },
+     });
+-    return { matched: null, message: null, accountFallback: false, replacementBody };
++    return { matched: null, message: null, accountFallback: false, status: null, replacementBody };
+   }
+ 
+   // Parse Codex usage_limit_reached to extract precise resetsAtMs; fallback to default otherwise
+@@ -423,7 +470,13 @@ export class CodexExecutor extends BaseExecutor {
+     // Register hosted search before choosing transport; Lite cannot execute it.
+     const autoWebSearch = body._autoCodexWebSearch === true;
+     delete body._autoCodexWebSearch;
+-    if (autoWebSearch && !body.tools?.some?.(tool => tool?.type === "web_search")) {
++    // History with hosted web_search_call items requires the tool to be declared;
++    // otherwise upstream answers 200 with a terminal SSE error. The /compact
++    // endpoint was not observed failing this way, so its request is left unchanged.
++    const hasHostedSearchHistory = !this._isCompact && Array.isArray(body.input)
++      && body.input.some(item => item?.type === "web_search_call");
++    if ((autoWebSearch || hasHostedSearchHistory)
++      && !body.tools?.some?.(tool => tool?.type === "web_search")) {
+       body.tools = [...(Array.isArray(body.tools) ? body.tools : []), { type: "web_search" }];
+     }
+     // Hosted search cannot run from a Lite input prefix. When switching to
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index aa275eb3..cdf1bc84 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -1,7 +1,9 @@
+-import { detectFormat, getTargetFormat, resolveTransport } from "../services/provider.js";
++import { detectFormat, getTargetFormat, resolveTransport, supportsNativeGemini } from "../services/provider.js";
+ import { translateRequest } from "../translator/index.js";
+-import { applyThinking, extractThinking, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
++import { applyThinking, applyNativeGeminiThinking, extractThinking, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
+ import { FORMATS } from "../translator/formats.js";
++import { toPortableResponsesInput } from "../translator/formats/responsesApi.js";
++import { hasUndeliverableAgentMessage, preparePortableCollaboration } from "../translator/concerns/portableCollaboration.js";
+ import { normalizeClaudePassthrough, anchorClaudeCache } from "../translator/formats/claude.js";
+ import { createStreamController } from "../utils/streamHandler.js";
+ import { refreshWithRetry } from "../services/tokenRefresh.js";
+@@ -10,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
+ import { PROVIDERS } from "../config/providers.js";
+ import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
+ import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
+-import { HTTP_STATUS, TOKEN_SAVER_HEADER } from "../config/runtimeConfig.js";
++import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER } from "../config/runtimeConfig.js";
+ import { handleBypassRequest } from "../utils/bypassHandler.js";
+ import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+ import { getExecutor } from "../executors/index.js";
+@@ -60,8 +62,9 @@ export function stripContinuityFields(body) {
+   return body;
+ }
+ 
+-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
++export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
+   const { provider, model } = modelInfo;
++  if (clientSignal?.aborted) return createErrorResult(499, "Request aborted");
+   const requestStartTime = Date.now();
+   // Stable per-session color so all lines of one CLI conversation share a tag
+   const sessionSeed = (() => {
+@@ -236,6 +239,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   if (passthrough) {
+     log?.debug?.("PASSTHROUGH", `${clientTool} → ${provider} | native lossless`);
+     translatedBody = { ...body, model: stripThinkingSuffix(upstreamModel) };
++    if (nativeGemini) {
++      translatedBody = applyNativeGeminiThinking(upstreamModel, translatedBody, provider, providerThinking);
++      // Routing/action controls belong to the router, not GenerateContent JSON.
++      delete translatedBody.model;
++      delete translatedBody.stream;
++    }
+     if (provider === "codex") {
+       const suffixThinking = {};
+       applyThinking(sourceFormat, upstreamModel, suffixThinking, provider);
+diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
+index 70420821..48370115 100644
+--- a/open-sse/handlers/chatCore/nonStreamingHandler.js
++++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
+@@ -97,7 +97,10 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
+   }
+ 
+   const usage = responseBody.usage || {};
+-  const status = choice.finish_reason === "tool_calls" ? "completed" : (choice.finish_reason === "stop" ? "completed" : (choice.finish_reason || "completed"));
++  // Responses has no "length"/"content_filter" status: a cut-off turn is `incomplete` with a reason.
++  const incompleteReason = choice.finish_reason === "length" ? "max_output_tokens"
++    : choice.finish_reason === "content_filter" ? "content_filter" : null;
++  const status = incompleteReason ? "incomplete" : "completed";
+ 
+   return {
+     id: `resp_${responseBody.id || ""}`.replace(/^resp_chatcmpl-/, "resp_"),
+@@ -107,11 +110,14 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
+     status,
+     background: false,
+     error: null,
++    ...(incompleteReason ? { incomplete_details: { reason: incompleteReason } } : {}),
+     output,
+     usage: {
+       input_tokens: usage.prompt_tokens || usage.input_tokens || 0,
+       output_tokens: usage.completion_tokens || usage.output_tokens || 0,
+       total_tokens: usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
++      ...(usage.prompt_tokens_details ? { input_tokens_details: usage.prompt_tokens_details } : {}),
++      ...(usage.completion_tokens_details ? { output_tokens_details: usage.completion_tokens_details } : {}),
+     },
+   };
+ }
+@@ -119,7 +125,7 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
+ /**
+  * Translate non-streaming response body from provider format → OpenAI format.
+  */
+-export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames = null) {
++export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames = null, turnScope = null, sessionId = null, serverPartsSessionId = null) {
+   if (targetFormat === sourceFormat) return responseBody;
+   // Provider responded in OpenAI Chat Completions shape but the client speaks
+   // Responses API — convert so tool_calls/text surface as Responses `output`.
+diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
+index 7f933bf2..09219bdc 100644
+--- a/open-sse/handlers/chatCore/streamingHandler.js
++++ b/open-sse/handlers/chatCore/streamingHandler.js
+@@ -24,7 +24,7 @@ const CODEX_SOURCE_TO_TARGET = {
+ /**
+  * Determine which SSE transform stream to use based on provider/format.
+  */
+-function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials }) {
++function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials, nativeJson, nativeResponseProjection }) {
+   const isDroidCLI = userAgent?.toLowerCase().includes("droid") || userAgent?.toLowerCase().includes("codex-cli");
+   // Responses-API providers (e.g. codex) emit Responses SSE → translate into client format
+   const isResponsesProvider = PROVIDERS[provider]?.format === FORMATS.OPENAI_RESPONSES;
+diff --git a/open-sse/translator/concerns/portableCollaboration.js b/open-sse/translator/concerns/portableCollaboration.js
+new file mode 100644
+index 00000000..9de15911
+--- /dev/null
++++ b/open-sse/translator/concerns/portableCollaboration.js
+@@ -0,0 +1,86 @@
++import { createHash } from "node:crypto";
++import { PORTABLE_COLLABORATION } from "../../config/runtimeConfig.js";
++import { FERNET_ENCRYPTED_CONTENT_PREFIX } from "../formats/responsesApi.js";
++
++/** True when opaque agent content would leave no readable task after translation. */
++export function hasUndeliverableAgentMessage(input) {
++  return Array.isArray(input) && input.some(item => {
++    if (item?.type !== "agent_message" || !Array.isArray(item.content)) return false;
++    const opaque = item.content.some(part => part?.type === "encrypted_content"
++      && typeof part.encrypted_content === "string"
++      && part.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX));
++    if (!opaque) return false;
++    let text = item.content.flatMap(part => {
++      if (part?.type === "input_text" && typeof part.text === "string") return [part.text];
++      if (part?.type === "encrypted_content" && typeof part.encrypted_content === "string"
++        && !part.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX)) return [part.encrypted_content];
++      return [];
++    }).join("\n").trim();
++    if (text.startsWith("Message Type:")) {
++      const lines = text.split(/\r?\n/);
++      while (lines.length && (!lines[0].trim() || /^(Message Type|Task name|Sender):/.test(lines[0].trimStart()))) lines.shift();
++      text = lines.join("\n").replace(/^\s*Payload:[ \t]*/, "");
++    }
++    return text.trim() === "";
++  });
++}
++
++export function preparePortableCollaboration(body) {
++  const namespace = PORTABLE_COLLABORATION.namespace;
++  const toolNameMap = new Map();
++  const aliases = new Map();
++  const reserved = new Set();
++  const inputs = Array.isArray(body.input) ? body.input : [];
++  const lists = [body.tools, ...inputs.filter(item => item?.type === "additional_tools").map(item => item.tools)];
++  for (const tools of lists) for (const tool of Array.isArray(tools) ? tools : []) {
++    if (tool?.type !== "namespace" && typeof tool?.name === "string") reserved.add(tool.name);
++  }
++  for (const item of inputs) if (!item?.namespace && typeof item?.name === "string") reserved.add(item.name);
++  const aliasFor = (name, type = "function") => {
++    if (aliases.has(name)) return aliases.get(name);
++    const hash = createHash("sha256").update(JSON.stringify([namespace, name])).digest("hex").slice(0, 16);
++    const base = PORTABLE_COLLABORATION.aliasPrefix + String(name).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 30) + "_" + hash;
++    let alias = base;
++    for (let n = 1; reserved.has(alias); n++) alias = base.slice(0, 58) + "_" + n;
++    reserved.add(alias); aliases.set(name, alias);
++    toolNameMap.set(alias, { name, namespace, type });
++    return alias;
++  };
++  const rewriteTools = tools => !Array.isArray(tools) ? tools : tools.flatMap(tool => {
++    if (tool?.type !== "namespace" || tool.name !== namespace || !Array.isArray(tool.tools)) return [tool];
++    return tool.tools.map(child => {
++      if (child?.type !== "function" && child?.type !== "custom") return child;
++      const description = [tool.description, child.description].filter(text => typeof text === "string" && text).join("\n");
++      const out = { ...child, name: aliasFor(child.name, child.type), ...(description ? { description } : {}) };
++      const message = child.parameters?.properties?.message;
++      if (PORTABLE_COLLABORATION.messageTools.includes(child.name) && message && typeof message === "object" && !Array.isArray(message)) {
++        const { encrypted, ...plainMessage } = message;
++        out.parameters = { ...child.parameters, properties: { ...child.parameters.properties, message: plainMessage } };
++      }
++      return out;
++    });
++  });
++  // Allocate declarations before history so collisions resolve consistently.
++  const tools = rewriteTools(body.tools);
++  const input = inputs.map(item => item?.type === "additional_tools" ? { ...item, tools: rewriteTools(item.tools) } : item);
++  const rewriteChoice = choice => {
++    if (!choice || typeof choice !== "object" || Array.isArray(choice)) return choice;
++    if (choice.namespace === namespace && typeof choice.name === "string") {
++      const { namespace: _, ...rest } = choice;
++      return { ...rest, name: aliasFor(choice.name, choice.type === "custom" ? "custom" : "function") };
++    }
++    if (choice.type === "allowed_tools" && Array.isArray(choice.tools)) return { ...choice, tools: choice.tools.map(rewriteChoice) };
++    return choice;
++  };
++  const rewritten = { ...body };
++  if (Array.isArray(body.tools)) rewritten.tools = tools;
++  if (Array.isArray(body.input)) rewritten.input = input.map(item => {
++    if ((item?.type === "function_call" || item?.type === "custom_tool_call") && item.namespace === namespace && typeof item.name === "string") {
++      const { namespace: _, ...rest } = item;
++      return { ...rest, name: aliasFor(item.name, item.type === "custom_tool_call" ? "custom" : "function") };
++    }
++    return item;
++  });
++  if (body.tool_choice) rewritten.tool_choice = rewriteChoice(body.tool_choice);
++  return { body: toolNameMap.size ? rewritten : body, toolNameMap };
++}
+diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
+index 5454f9f3..ca2e59a8 100644
+--- a/open-sse/translator/formats/responsesApi.js
++++ b/open-sse/translator/formats/responsesApi.js
+@@ -26,6 +26,87 @@ export function normalizeResponsesInput(input) {
+ // Strict Responses upstreams reject overlong call_ids with InputValidationError (#393).
+ export const MAX_RESPONSES_CALL_ID_LEN = 64;
+ 
++// OpenAI reasoning items carry Fernet-encrypted blobs; other providers' own
++// encrypted_content values use different ciphertexts and must be preserved.
++export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
++
++// Codex's observed plaintext task carrier (an agent_message encrypted_content part) is converted
++// here to input_text; known OpenAI Fernet ciphertext stays opaque.
++export function normalizeResponsesAgentMessage(item) {
++  if (!item || typeof item !== "object" || Array.isArray(item) || item.type !== "agent_message") return item;
++  const content = Array.isArray(item.content)
++    ? item.content.map((part) => (part?.type === "encrypted_content"
++        && typeof part.encrypted_content === "string"
++        && !part.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX)
++      ? { type: RESPONSES_ITEM.INPUT_TEXT, text: part.encrypted_content }
++      : part))
++    : item.content;
++  return { ...item, type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content };
++}
++
++function reasoningHasReadableText(item) {
++  const blocks = [
++    ...(Array.isArray(item.summary) ? item.summary : []),
++    ...(Array.isArray(item.content) ? item.content : []),
++  ];
++  return blocks.some((b) =>
++    (typeof b === "string" && b.trim() !== "")
++    || (typeof b?.text === "string" && b.text.trim() !== ""));
++}
++
++/**
++ * Rewrite provider-specific Responses input items into portable shapes.
++ * Codex CLI histories contain multi-agent and delegation items that strict
++ * Responses upstreams (e.g. Kimi Code) reject with 400:
++ * - agent_message → user message built from its input_text parts and plaintext encrypted_content
++ *   task carriers (dropped if none); Fernet ciphertext parts are left out
++ * - function_call_output/custom_tool_call_output without call_id → user message
++ *   from its output (string as-is; array → input_text/input_image parts; dropped if empty)
++ * - reasoning whose encrypted_content is an OpenAI Fernet token and which carries
++ *   no readable summary/content text → dropped (undecryptable for other providers)
++ * Everything else is returned as the same object; the caller's array is not mutated.
++ */
++export function toPortableResponsesInput(input) {
++  if (!Array.isArray(input)) return input;
++  const out = [];
++  for (const item of input) {
++    if (!item || typeof item !== "object" || Array.isArray(item)) {
++      out.push(item);
++      continue;
++    }
++    if (item.type === "agent_message") {
++      const message = normalizeResponsesAgentMessage(item);
++      const parts = Array.isArray(message.content)
++        ? message.content.filter((c) => c?.type === RESPONSES_ITEM.INPUT_TEXT)
++        : [];
++      if (parts.length > 0) {
++        out.push({ type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content: parts });
++      }
++      continue;
++    }
++    if ((item.type === RESPONSES_ITEM.FUNCTION_CALL_OUTPUT
++        || item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL_OUTPUT) && !item.call_id) {
++      const parts = Array.isArray(item.output)
++        ? item.output.filter((c) => c?.type === RESPONSES_ITEM.INPUT_TEXT || c?.type === RESPONSES_ITEM.INPUT_IMAGE)
++        : (typeof item.output === "string" && item.output !== ""
++            ? [{ type: RESPONSES_ITEM.INPUT_TEXT, text: item.output }]
++            : []);
++      if (parts.length > 0) {
++        out.push({ type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content: parts });
++      }
++      continue;
++    }
++    if (item.type === RESPONSES_ITEM.REASONING
++      && typeof item.encrypted_content === "string"
++      && item.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX)
++      && !reasoningHasReadableText(item)) {
++      continue;
++    }
++    out.push(item);
++  }
++  return out;
++}
++
+ // Fallback ids share one Date.now() when a batch of items is sanitized in a tight
+ // loop — a per-process sequence keeps same-millisecond ids unique so
+ // function_call ↔ function_call_output correlation never collides.
+@@ -100,7 +181,8 @@ export function convertResponsesApiFormat(body) {
+   const inputItems = normalizeResponsesInput(body.input);
+   if (!inputItems) return body;
+ 
+-  for (const item of inputItems) {
++  for (const rawItem of inputItems) {
++    const item = normalizeResponsesAgentMessage(rawItem);
+     // Determine item type - Droid CLI sends role-based items without 'type' field
+     // Fallback: if no type but has role property, treat as message
+     const itemType = item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);
+diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
+index 59d90319..96de324a 100644
+--- a/open-sse/translator/index.js
++++ b/open-sse/translator/index.js
+@@ -207,11 +207,24 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+       const { body: cloakedBody, toolNameMap } = cloakClaudeTools(result);
+       result = cloakedBody;
+       if (toolNameMap?.size > 0) {
+-        result._toolNameMap = toolNameMap;
++        const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
++        for (const [key, value] of toolNameMap) merged.set(key, value);
++        result._toolNameMap = merged;
+       }
+     }
+   }
+ 
++  if (sourceToolNameMap) {
++    const targetMap = result._toolNameMap instanceof Map ? result._toolNameMap : null;
++    const merged = new Map();
++    if (targetMap) for (const [key, value] of targetMap) merged.set(key, value);
++    for (const [key, value] of sourceToolNameMap) {
++      if (value !== null && typeof value === "object") merged.set(key, value);
++      else if (!merged.has(key)) merged.set(key, value);
++    }
++    if (merged.size > 0) result._toolNameMap = merged;
++  }
++
+   // Antigravity cloaking disabled
+   // if (provider === FORMATS.ANTIGRAVITY && body.userAgent !== FORMATS.ANTIGRAVITY) {
+   //   const { cloakedBody, toolNameMap } = AntigravityExecutor.cloakTools(result);
+diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
+index e5c62aec..ddddd41d 100644
+--- a/open-sse/translator/request/openai-responses.js
++++ b/open-sse/translator/request/openai-responses.js
+@@ -4,10 +4,12 @@
+  * Responses API uses: { input: [...], instructions: "..." }
+  * Chat API uses: { messages: [...] }
+  */
++import { createHash } from "crypto";
+ import { register } from "../index.js";
+ import { FORMATS } from "../formats.js";
+ import {
+   normalizeResponsesInput,
++  normalizeResponsesAgentMessage,
+   clampResponsesCallId,
+   coerceResponsesArguments,
+   coerceResponsesOutput,
+@@ -37,10 +39,47 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+   let pendingReasoningEncrypted = "";
+   const additionalTools = [];
+   const customToolNames = new Set();
++  const namespaceToolMap = new Map();
++  const aliasCache = new Map();
++  const reservedNames = new Set();
++
++  const reserveToolName = (tool) => {
++    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return;
++    if (tool.type === "namespace") return;
++    const n = tool.function?.name ?? tool.name;
++    if (typeof n === "string" && n.trim()) reservedNames.add(n.trim());
++  };
++  for (const tool of Array.isArray(body.tools) ? body.tools : []) reserveToolName(tool);
++
++  const aliasFor = (namespace, name) => {
++    const identity = JSON.stringify([namespace, name]);
++    if (aliasCache.has(identity)) return aliasCache.get(identity);
++    const stem = `ns_${namespace}_${name}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40);
++    const hash = createHash("sha256").update(identity).digest("hex").slice(0, 16);
++    const base = `${stem}_${hash}`;
++    let alias = base;
++    for (let i = 1; reservedNames.has(alias); i++) {
++      const suffix = `_${i}`;
++      alias = `${base.slice(0, 64 - suffix.length)}${suffix}`;
++    }
++    reservedNames.add(alias);
++    aliasCache.set(identity, alias);
++    return alias;
++  };
+ 
+   const inputItems = normalizeResponsesInput(body.input);
+   if (!inputItems) return body;
+ 
++  for (const item of inputItems) {
++    if (item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS && Array.isArray(item.tools)) {
++      for (const tool of item.tools) reserveToolName(tool);
++    }
++    else if ((item?.type === RESPONSES_ITEM.FUNCTION_CALL || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL)
++      && !item?.namespace && typeof item.name === "string" && item.name.trim()) {
++      reservedNames.add(item.name.trim());
++    }
++  }
++
+   // Extract reasoning text from summary[].text (encrypted_content is continuity-only)
+   const extractReasoningText = (item) => {
+     if (Array.isArray(item.summary)) {
+@@ -61,7 +100,8 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+     pendingReasoningEncrypted = "";
+   };
+ 
+-  for (const item of inputItems) {
++  for (const rawItem of inputItems) {
++    const item = normalizeResponsesAgentMessage(rawItem);
+     // Determine item type - Droid CLI sends role-based items without 'type' field
+     // Fallback: if no type but has role property, treat as message
+     const itemType = item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);
+@@ -113,7 +153,12 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+       }
+       // Skip items with empty/missing name — Codex/OpenAI reject nameless tool calls (#444)
+       if (!item.name || typeof item.name !== "string" || item.name.trim() === "") continue;
+-      if (itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL) customToolNames.add(item.name);
++      const namespace = typeof item.namespace === "string" && item.namespace.trim() ? item.namespace.trim() : null;
++      const callName = namespace ? aliasFor(namespace, item.name) : item.name;
++      if (namespace) {
++        namespaceToolMap.set(callName, { name: item.name, namespace, type: itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL ? "custom" : "function" });
++      }
++      if (itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL) customToolNames.add(callName);
+       const toolInput = itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL
+         ? { input: typeof item.input === "string" ? item.input : JSON.stringify(item.input ?? "") }
+         : item.arguments;
+@@ -121,7 +166,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+         id: item.call_id,
+         type: OPENAI_BLOCK.FUNCTION,
+         function: {
+-          name: item.name,
++          name: callName,
+           arguments: typeof toolInput === "string" ? toolInput : JSON.stringify(toolInput ?? {})
+         }
+       });
+@@ -178,29 +223,50 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+   // explicit `name` field and cannot be represented as Chat Completions function declarations.
+   // Filter them out to avoid sending nameless functionDeclarations to downstream providers
+   // such as Gemini, which strictly validates function names.
+-  const responseTools = [
+-    ...(Array.isArray(body.tools) ? body.tools : []),
+-    ...additionalTools,
+-  ];
++  const responseTools = [];
++  for (const tool of [...(Array.isArray(body.tools) ? body.tools : []), ...additionalTools]) {
++    if (tool && typeof tool === "object" && !Array.isArray(tool) && tool.type === "namespace") {
++      if (typeof tool.name === "string" && tool.name.trim() && Array.isArray(tool.tools)) {
++        for (const child of tool.tools) {
++          if (child?.type === "function" || child?.type === "custom") responseTools.push({ child, ns: tool });
++        }
++      }
++      continue;
++    }
++    responseTools.push({ child: tool, ns: null });
++  }
+   if (responseTools.length > 0) {
+     result.tools = responseTools
+-      .map(tool => {
++      .map(({ child: tool, ns }) => {
++        if (!tool || typeof tool !== "object" || Array.isArray(tool)) return null;
++        // Hosted web_search has no function declaration. Flag it for Gemini-native
++        // targets that can serve googleSearch; cached-only (external_web_access:false)
++        // and domain-restricted variants cannot be honored upstream, so they stay dropped.
++        if (tool.type === "web_search") {
++          const restricted = Array.isArray(tool.filters?.allowed_domains) && tool.filters.allowed_domains.length > 0;
++          if (tool.external_web_access !== false && !restricted) result._webSearch = true;
++          return null;
++        }
+         // Already in Chat Completions format: { type: "function", function: { name, ... } }
+-        if (tool.function) return tool;
++        if (tool.function && !ns) return tool;
+         // Responses API function/custom tool: { type, name, description, parameters|format }.
+         // Chat Completions has no freeform custom-tool declaration, so expose custom
+         // tools as functions with one raw `input` string while retaining their names
+         // in translator-only metadata for the response conversion.
+         const name = tool.name;
+         if (!name || typeof name !== "string" || name.trim() === "") return null;
++        const wireName = ns ? aliasFor(ns.name.trim(), name) : name;
++        if (ns) namespaceToolMap.set(wireName, { name, namespace: ns.name.trim(), type: tool.type === "custom" ? "custom" : "function" });
++        const label = ns ? `[${ns.name.trim()}.${name}]` : "";
++        const nsDescription = ns ? String(ns.description || "") : "";
+         if (tool.type === "custom") {
+-          customToolNames.add(name);
++          customToolNames.add(wireName);
+           const formatHint = [tool.format?.syntax, tool.format?.definition].filter(Boolean).join("\n");
+           return {
+             type: OPENAI_BLOCK.FUNCTION,
+             function: {
+-              name,
+-              description: [String(tool.description || ""), formatHint].filter(Boolean).join("\n\n"),
++              name: wireName,
++              description: [label, String(tool.description || ""), nsDescription, formatHint].filter(Boolean).join("\n\n"),
+               parameters: {
+                 type: "object",
+                 properties: {
+@@ -220,8 +286,8 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+         return {
+           type: OPENAI_BLOCK.FUNCTION,
+           function: {
+-            name,
+-            description: String(tool.description || ""),
++            name: wireName,
++            description: [label, String(tool.description || ""), nsDescription].filter(Boolean).join("\n\n"),
+             parameters: normalizeToolParameters(tool.parameters),
+             strict: tool.strict
+           }
+@@ -231,6 +297,16 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+   }
+   if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
+ 
++  if (result.tool_choice && typeof result.tool_choice === "object" && !Array.isArray(result.tool_choice)
++    && result.tool_choice.type === "function" && typeof result.tool_choice.name === "string") {
++    const choice = result.tool_choice;
++    const choiceNs = typeof choice.namespace === "string" && choice.namespace.trim() ? choice.namespace.trim() : null;
++    const choiceName = choiceNs ? aliasFor(choiceNs, choice.name) : choice.name;
++    if (choiceNs) namespaceToolMap.set(choiceName, { name: choice.name, namespace: choiceNs, type: "function" });
++    result.tool_choice = { type: "function", function: { name: choiceName } };
++  }
++  if (namespaceToolMap.size > 0) result._toolNameMap = namespaceToolMap;
++
+   // Cleanup Responses API specific fields
+   // Map Responses-only max_output_tokens to Chat max_tokens (avoid leaking unknown field upstream)
+   if (result.max_output_tokens !== undefined) {
+@@ -318,7 +394,7 @@ function buildReasoningInputItem(msg) {
+ /**
+  * Convert OpenAI Chat Completions to OpenAI Responses API format
+  */
+-export function openaiToOpenAIResponsesRequest(model, body, stream, credentials) {
++export function openaiToOpenAIResponsesRequest(model, body, stream, credentials, { inferReasoningSummary = true } = {}) {
+   // Body already in Responses API format (e.g. Cursor CLI calling /chat/completions with input[])
+   if (body.input) {
+     const out = { ...body, model, stream: true };
+diff --git a/open-sse/translator/response/claude-to-openai.js b/open-sse/translator/response/claude-to-openai.js
+index 42a82a66..3e0906e1 100644
+--- a/open-sse/translator/response/claude-to-openai.js
++++ b/open-sse/translator/response/claude-to-openai.js
+@@ -5,6 +5,7 @@ import { buildChunk } from "../concerns/chunk.js";
+ import { toOpenAIUsage } from "../concerns/usage.js";
+ import { reasoningDelta } from "../concerns/reasoning.js";
+ import { toOpenAIFinish } from "../concerns/finishReason.js";
++import { resolveToolName } from "../../utils/opencodeFingerprint.js";
+ 
+ // Create OpenAI chunk helper
+ function createChunk(state, delta, finishReason = null) {
+@@ -62,7 +63,7 @@ export function claudeToOpenAIResponse(chunk, state) {
+       } else if (block?.type === CLAUDE_BLOCK.TOOL_USE) {
+         const toolCallIndex = state.toolCallIndex++;
+         // Restore original tool name from mapping (Claude OAuth)
+-        const toolName = state.toolNameMap?.get(block.name) || block.name;
++        const toolName = state.toolNameMap ? resolveToolName(block.name, state.toolNameMap).name : block.name;
+         const toolCall = {
+           index: toolCallIndex,
+           id: block.id,
+diff --git a/open-sse/translator/response/gemini-to-openai.js b/open-sse/translator/response/gemini-to-openai.js
+index e7e5267d..c2b6b82d 100644
+--- a/open-sse/translator/response/gemini-to-openai.js
++++ b/open-sse/translator/response/gemini-to-openai.js
+@@ -6,7 +6,8 @@ import { toOpenAIUsage } from "../concerns/usage.js";
+ import { reasoningDelta } from "../concerns/reasoning.js";
+ import { encodeDataUri } from "../concerns/image.js";
+ import { toOpenAIFinish } from "../concerns/finishReason.js";
+-import { storeGeminiThoughtSignature } from "../../services/thoughtSignatureStore.js";
++import { resolveToolName } from "../../utils/opencodeFingerprint.js";
++import { storeGeminiThoughtSignature, storeGeminiTurnSignature, storeGeminiServerParts, storeGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
+ 
+ // Build chunk meta for current gemini state
+ function chunkMeta(state) {
+@@ -17,13 +18,19 @@ function chunkMeta(state) {
+ function emitFunctionCall(functionCall, state, signature = null) {
+   const rawName = functionCall.name;
+   // Restore original tool name from mapping (AG cloaking)
+-  const fcName = state.toolNameMap?.get(rawName) || rawName;
++  const fcName = state.toolNameMap ? resolveToolName(rawName, state.toolNameMap).name : rawName;
+   const fcArgs = functionCall.args || {};
+   const toolCallIndex = state.functionIndex++;
+   const callId = functionCall.id || `${fcName}-${Date.now()}-${toolCallIndex}`;
+   if (signature) {
+     storeGeminiThoughtSignature(callId, signature, state.sessionId, state.model);
+   }
++  // Server-side parts accumulated so far in this turn belong to this call: they
++  // must be replayed verbatim ahead of its functionCall on later requests.
++  if (state.geminiServerParts?.length) {
++    storeGeminiServerParts(callId, state.geminiServerParts, state.serverPartsSessionId, state.model, state.turnScope);
++    state.geminiServerParts = [];
++  }
+   const toolCall = {
+     id: callId,
+     index: toolCallIndex,
+diff --git a/open-sse/translator/response/kiro-to-claude.js b/open-sse/translator/response/kiro-to-claude.js
+index d9fc0aab..e5cd2621 100644
+--- a/open-sse/translator/response/kiro-to-claude.js
++++ b/open-sse/translator/response/kiro-to-claude.js
+@@ -15,6 +15,7 @@
+  */
+ import { register } from "../index.js";
+ import { FORMATS } from "../formats.js";
++import { resolveToolName } from "../../utils/opencodeFingerprint.js";
+ 
+ function stopThinkingBlock(state, results) {
+   if (!state.thinkingBlockStarted) return;
+@@ -51,7 +52,7 @@ function convertFinishReason(reason) {
+ function restoreToolName(stateOrData, name) {
+   const raw = name || "";
+   const map = stateOrData?.toolNameMap || stateOrData?._toolNameMap;
+-  return map && typeof map.get === "function" && map.has(raw) ? map.get(raw) : raw;
++  return resolveToolName(raw, map).name;
+ }
+ 
+ export function kiroToClaudeResponse(chunk, state) {
+diff --git a/open-sse/translator/response/kiro-to-openai.js b/open-sse/translator/response/kiro-to-openai.js
+index 8e713fd7..c0f2f7cf 100644
+--- a/open-sse/translator/response/kiro-to-openai.js
++++ b/open-sse/translator/response/kiro-to-openai.js
+@@ -10,6 +10,7 @@ import { toOpenAIUsage } from "../concerns/usage.js";
+ import { fallbackToolCallId } from "../concerns/toolCall.js";
+ import { reasoningDelta } from "../concerns/reasoning.js";
+ import { toOpenAIFinish } from "../concerns/finishReason.js";
++import { resolveToolName } from "../../utils/opencodeFingerprint.js";
+ 
+ // Build chunk meta for current kiro state
+ function chunkMeta(state) {
+@@ -25,7 +26,7 @@ function chunkMeta(state) {
+ function restoreToolName(state, name) {
+   const raw = name || "";
+   const map = state?.toolNameMap;
+-  return map && typeof map.get === "function" && map.has(raw) ? map.get(raw) : raw;
++  return resolveToolName(raw, map).name;
+ }
+ 
+ export function kiroToOpenAIResponse(chunk, state) {
+diff --git a/open-sse/translator/response/openai-responses.js b/open-sse/translator/response/openai-responses.js
+index 1499a2a5..2e5cc352 100644
+--- a/open-sse/translator/response/openai-responses.js
++++ b/open-sse/translator/response/openai-responses.js
+@@ -9,6 +9,7 @@ import { buildUsage } from "../concerns/usage.js";
+ import { fallbackToolCallId } from "../concerns/toolCall.js";
+ import { reasoningDelta, extractReasoningText } from "../concerns/reasoning.js";
+ import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, OPENAI_FINISH, MODEL_FALLBACK } from "../schema/index.js";
++import { resolveToolName } from "../../utils/opencodeFingerprint.js";
+ 
+ /**
+  * Translate OpenAI chunk to Responses API events
+@@ -153,6 +154,7 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
+ 
+   // Handle finish_reason
+   if (choice.finish_reason) {
++    state.responsesFinishReason = choice.finish_reason;
+     for (const i in state.msgItemAdded) closeMessage(state, emit, i);
+     closeReasoning(state, emit);
+     for (const i in state.funcCallIds) closeToolCall(state, emit, i);
+@@ -176,21 +178,36 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
+ }
+ 
+ // Helper functions
++// Every output item needs its own output_index within the response. Chat chunks only carry
++// per-kind indices (choice index for text, tool_calls index for calls), and reasoning has none,
++// so using them directly made reasoning, the message and the first tool call all claim 0: clients
++// saw repeated output_item.done indices and response.completed.output kept only the last item.
++// Slots are handed out in the order the items first appear.
++function outputSlot(state, kind, key) {
++  state.outputSlots ??= new Map();
++  const id = `${kind}:${key}`;
++  if (!state.outputSlots.has(id)) {
++    state.outputSlots.set(id, state.nextOutputIndex ?? 0);
++    state.nextOutputIndex = (state.nextOutputIndex ?? 0) + 1;
++  }
++  return state.outputSlots.get(id);
++}
++
+ function startReasoning(state, emit, idx) {
+   if (!state.reasoningId) {
+     state.reasoningId = `rs_${state.responseId}_${idx}`;
+-    state.reasoningIndex = idx;
++    state.reasoningIndex = outputSlot(state, "reasoning", 0);
+     
+     emit("response.output_item.added", {
+       type: "response.output_item.added",
+-      output_index: idx,
++      output_index: state.reasoningIndex,
+       item: { id: state.reasoningId, type: RESPONSES_ITEM.REASONING, summary: [] }
+     });
+ 
+     emit("response.reasoning_summary_part.added", {
+       type: "response.reasoning_summary_part.added",
+       item_id: state.reasoningId,
+-      output_index: idx,
++      output_index: state.reasoningIndex,
+       summary_index: 0,
+       part: { type: RESPONSES_ITEM.SUMMARY_TEXT, text: "" }
+     });
+@@ -253,7 +270,7 @@ function emitTextContent(state, emit, idx, content) {
+     
+     emit("response.output_item.added", {
+       type: "response.output_item.added",
+-      output_index: idx,
++      output_index: outputSlot(state, "message", idx),
+       item: { id: msgId, type: RESPONSES_ITEM.MESSAGE, content: [], role: ROLE.ASSISTANT }
+     });
+   }
+@@ -264,7 +281,7 @@ function emitTextContent(state, emit, idx, content) {
+     emit("response.content_part.added", {
+       type: "response.content_part.added",
+       item_id: `msg_${state.responseId}_${idx}`,
+-      output_index: idx,
++      output_index: outputSlot(state, "message", idx),
+       content_index: 0,
+       part: { type: RESPONSES_ITEM.OUTPUT_TEXT, annotations: [], logprobs: [], text: "" }
+     });
+@@ -273,7 +290,7 @@ function emitTextContent(state, emit, idx, content) {
+   emit("response.output_text.delta", {
+     type: "response.output_text.delta",
+     item_id: `msg_${state.responseId}_${idx}`,
+-    output_index: idx,
++    output_index: outputSlot(state, "message", idx),
+     content_index: 0,
+     delta: content,
+     logprobs: []
+@@ -292,7 +309,7 @@ function closeMessage(state, emit, idx) {
+     emit("response.output_text.done", {
+       type: "response.output_text.done",
+       item_id: msgId,
+-      output_index: parseInt(idx),
++      output_index: outputSlot(state, "message", idx),
+       content_index: 0,
+       text: fullText,
+       logprobs: []
+@@ -301,7 +318,7 @@ function closeMessage(state, emit, idx) {
+     emit("response.content_part.done", {
+       type: "response.content_part.done",
+       item_id: msgId,
+-      output_index: parseInt(idx),
++      output_index: outputSlot(state, "message", idx),
+       content_index: 0,
+       part: { type: RESPONSES_ITEM.OUTPUT_TEXT, annotations: [], logprobs: [], text: fullText }
+     });
+@@ -315,16 +332,20 @@ function closeMessage(state, emit, idx) {
+ 
+     emit("response.output_item.done", {
+       type: "response.output_item.done",
+-      output_index: parseInt(idx),
++      output_index: outputSlot(state, "message", idx),
+       item
+     });
+ 
+-    recordCompletedOutputItem(state, parseInt(idx), item);
++    recordCompletedOutputItem(state, outputSlot(state, "message", idx), item);
+   }
+ }
+ 
+ function isCustomTool(state, name) {
+-  return !!name && state.customToolNames?.has(name);
++  if (!name) return false;
++  if (state.customToolNames?.has(name)) return true;
++  const resolved = resolveToolName(name, state.toolNameMap);
++  if (resolved.descriptor) return resolved.descriptor.type === "custom";
++  return !!resolved.name && state.customToolNames?.has(resolved.name) === true;
+ }
+ 
+ function extractCustomToolInput(argumentsText) {
+@@ -354,7 +375,7 @@ function emitToolCall(state, emit, tc) {
+ 
+     emit("response.output_item.added", {
+       type: "response.output_item.added",
+-      output_index: tcIdx,
++      output_index: outputSlot(state, "call", tcIdx),
+       item: {
+         id: `${custom ? "ctc" : "fc"}_${callId}`,
+         type: custom ? RESPONSES_ITEM.CUSTOM_TOOL_CALL : RESPONSES_ITEM.FUNCTION_CALL,
+@@ -373,7 +394,7 @@ function emitToolCall(state, emit, tc) {
+       emit("response.function_call_arguments.delta", {
+         type: "response.function_call_arguments.delta",
+         item_id: `fc_${refCallId}`,
+-        output_index: tcIdx,
++        output_index: outputSlot(state, "call", tcIdx),
+         delta: tc.function.arguments
+       });
+     }
+@@ -395,20 +416,20 @@ function closeToolCall(state, emit, idx) {
+       emit("response.custom_tool_call_input.delta", {
+         type: "response.custom_tool_call_input.delta",
+         item_id: `ctc_${callId}`,
+-        output_index: parseInt(idx),
++        output_index: outputSlot(state, "call", idx),
+         delta: input
+       });
+       emit("response.custom_tool_call_input.done", {
+         type: "response.custom_tool_call_input.done",
+         item_id: `ctc_${callId}`,
+-        output_index: parseInt(idx),
++        output_index: outputSlot(state, "call", idx),
+         input
+       });
+     } else {
+       emit("response.function_call_arguments.done", {
+         type: "response.function_call_arguments.done",
+         item_id: `fc_${callId}`,
+-        output_index: parseInt(idx),
++        output_index: outputSlot(state, "call", idx),
+         arguments: args
+       });
+     }
+@@ -423,11 +444,11 @@ function closeToolCall(state, emit, idx) {
+ 
+     emit("response.output_item.done", {
+       type: "response.output_item.done",
+-      output_index: parseInt(idx),
++      output_index: outputSlot(state, "call", idx),
+       item
+     });
+ 
+-    recordCompletedOutputItem(state, parseInt(idx), item);
++    recordCompletedOutputItem(state, outputSlot(state, "call", idx), item);
+ 
+     state.funcItemDone[idx] = true;
+     state.funcArgsDone[idx] = true;
+@@ -461,16 +482,19 @@ function collectCompletedOutputItems(state) {
+ function sendCompleted(state, emit) {
+   if (!state.completedSent) {
+     state.completedSent = true;
+-    emit("response.completed", {
+-      type: "response.completed",
++    const incompleteReason = state.responsesFinishReason === OPENAI_FINISH.LENGTH ? "max_output_tokens"
++      : state.responsesFinishReason === OPENAI_FINISH.CONTENT_FILTER ? "content_filter" : null;
++    emit(incompleteReason ? "response.incomplete" : "response.completed", {
++      type: incompleteReason ? "response.incomplete" : "response.completed",
+       response: {
+         id: state.responseId,
+         object: "response",
+         created_at: state.created,
+-        status: "completed",
++        status: incompleteReason ? "incomplete" : "completed",
+         background: false,
+         error: null,
+         output: collectCompletedOutputItems(state),
++        ...(incompleteReason ? { incomplete_details: { reason: incompleteReason } } : {}),
+         ...(state.responsesUsage ? { usage: state.responsesUsage } : {})
+       }
+     });
+diff --git a/open-sse/translator/response/openai-to-antigravity.js b/open-sse/translator/response/openai-to-antigravity.js
+index b0b360a0..98d4ff7a 100644
+--- a/open-sse/translator/response/openai-to-antigravity.js
++++ b/open-sse/translator/response/openai-to-antigravity.js
+@@ -1,6 +1,7 @@
+ import { register } from "../index.js";
+ import { FORMATS } from "../formats.js";
+ import { GEMINI_ROLE, OPENAI_FINISH, GEMINI_FINISH } from "../schema/index.js";
++import { resolveToolName } from "../../utils/opencodeFingerprint.js";
+ 
+ // Convert OpenAI SSE chunk to Antigravity SSE format
+ // Real Antigravity format:
+@@ -61,7 +62,7 @@ export function openaiToAntigravityResponse(chunk, state) {
+       let args = {};
+       try { args = JSON.parse(accum.arguments); } catch { /* empty */ }
+       // Restore original tool name if it was prefixed during cloaking
+-      const originalName = state.toolNameMap?.get(accum.name) || accum.name;
++      const originalName = state.toolNameMap ? resolveToolName(accum.name, state.toolNameMap).name : accum.name;
+       parts.push({
+         functionCall: {
+           name: originalName,
+diff --git a/open-sse/translator/schema/blocks.js b/open-sse/translator/schema/blocks.js
+index d2bb783c..31ced5f0 100644
+--- a/open-sse/translator/schema/blocks.js
++++ b/open-sse/translator/schema/blocks.js
+@@ -37,6 +37,7 @@ export const RESPONSES_ITEM = {
+   OUTPUT_TEXT: "output_text",
+   INPUT_TEXT: "input_text",
+   INPUT_IMAGE: "input_image",
++  INPUT_FILE: "input_file",
+   SUMMARY_TEXT: "summary_text",
+ };
+ 
+diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
+index 184bbe05..3fcdc1cc 100644
+--- a/open-sse/utils/opencodeFingerprint.js
++++ b/open-sse/utils/opencodeFingerprint.js
+@@ -270,6 +270,22 @@ export function takeRenamedToolNames(body) {
+ 
+ // Response side -------------------------------------------------------------
+ 
++export function resolveToolName(name, map) {
++  if (typeof name !== "string" || !map) return { name, descriptor: null };
++  const seen = new Set();
++  let current = name;
++  while (!seen.has(current) && map.has(current)) {
++    seen.add(current);
++    const value = map.get(current);
++    if (typeof value === "string") {
++      current = value;
++      continue;
++    }
++    return { name: current, descriptor: value && typeof value === "object" ? value : null };
++  }
++  return { name: current, descriptor: null };
++}
++
+ /** Restore caller tool spellings in supported response/event shapes. */
+ export function restoreToolNames(payload, map) {
+   if (!map?.size || !payload) return payload;
+@@ -282,11 +298,33 @@ export function restoreToolNames(payload, map) {
+     out[key] = value;
+   };
+ 
++  const restoreResponsesItem = (item) => {
++    if (typeof item.namespace === "string" && item.namespace) return item;
++    const resolved = resolveToolName(item.name, map);
++    if (resolved.descriptor) {
++      return { ...item, name: resolved.descriptor.name, namespace: resolved.descriptor.namespace };
++    }
++    return resolved.name === item.name ? item : { ...item, name: resolved.name };
++  };
++
++  if ((payload.type === "function_call" || payload.type === "custom_tool_call") && typeof payload.name === "string") {
++    if (typeof payload.namespace === "string" && payload.namespace) return out;
++    if (map.has(payload.name)) {
++      const resolved = resolveToolName(payload.name, map);
++      if (resolved.descriptor) {
++        put("name", resolved.descriptor.name);
++        put("namespace", resolved.descriptor.namespace);
++      } else if (resolved.name !== payload.name) {
++        put("name", resolved.name);
++      }
++    }
++  }
++
+   // Claude streaming content_block_start event.
+   if (payload.type === "content_block_start") {
+     const block = payload.content_block;
+     if (block?.type === "tool_use" && typeof block.name === "string" && map.has(block.name)) {
+-      put("content_block", { ...block, name: map.get(block.name) });
++      put("content_block", { ...block, name: resolveToolName(block.name, map).name });
+     }
+   }
+ 
+@@ -294,7 +332,7 @@ export function restoreToolNames(payload, map) {
+   if (Array.isArray(payload.content)) {
+     put("content", payload.content.map((block) =>
+       block?.type === "tool_use" && typeof block.name === "string" && map.has(block.name)
+-        ? { ...block, name: map.get(block.name) }
++        ? { ...block, name: resolveToolName(block.name, map).name }
+         : block));
+   }
+ 
+@@ -310,7 +348,7 @@ export function restoreToolNames(payload, map) {
+           const name = call?.function?.name;
+           if (typeof name === "string" && map.has(name)) {
+             changed = true;
+-            return { ...call, function: { ...call.function, name: map.get(name) } };
++            return { ...call, function: { ...call.function, name: resolveToolName(name, map).name } };
+           }
+           return call;
+         });
+@@ -323,15 +361,25 @@ export function restoreToolNames(payload, map) {
+   // OpenAI Responses final JSON body.
+   if (Array.isArray(payload.output)) {
+     put("output", payload.output.map((item) =>
+-      item?.type === "function_call" && typeof item.name === "string" && map.has(item.name)
+-        ? { ...item, name: map.get(item.name) }
++      (item?.type === "function_call" || item?.type === "custom_tool_call") && typeof item.name === "string"
++        ? restoreResponsesItem(item)
+         : item));
+   }
+ 
+   // OpenAI Responses SSE events such as response.output_item.added/done.
+   const item = payload.item;
+-  if (item?.type === "function_call" && typeof item.name === "string" && map.has(item.name)) {
+-    put("item", { ...item, name: map.get(item.name) });
++  if ((item?.type === "function_call" || item?.type === "custom_tool_call") && typeof item.name === "string") {
++    const restored = restoreResponsesItem(item);
++    if (restored !== item) put("item", restored);
++  }
++
++  if (payload.data && typeof payload.data === "object") {
++    const restored = restoreToolNames(payload.data, map);
++    if (restored !== payload.data) put("data", restored);
++  }
++  if (payload.response && typeof payload.response === "object") {
++    const restored = restoreToolNames(payload.response, map);
++    if (restored !== payload.response) put("response", restored);
+   }
+ 
+   return out;
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index 52720a31..14f3a287 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -448,7 +448,7 @@ export function createSSEStream(options = {}) {
+ 
+         // Responses same-format passthrough: re-emit with original event framing
+         if (keepsOpenAIResponsesFormat && openAIResponsesEventName) {
+-          const output = formatSSE({ event: openAIResponsesEventName, data: parsed }, sourceFormat);
++          const output = formatSSE({ event: openAIResponsesEventName, data: restoreToolNames(parsed, state.toolNameMap) }, sourceFormat);
+           reqLogger?.appendConvertedChunk?.(output);
+           controller.enqueue(sharedEncoder.encode(output));
+           currentOpenAIResponsesEvent = null;
+diff --git a/tests/unit/codex-hosted-search-history.test.js b/tests/unit/codex-hosted-search-history.test.js
+new file mode 100644
+index 00000000..e34ca443
+--- /dev/null
++++ b/tests/unit/codex-hosted-search-history.test.js
+@@ -0,0 +1,95 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++import { CodexExecutor } from "../../open-sse/executors/codex.js";
++
++const credentials = { connectionId: "fixture", accessToken: "fixture-token" };
++afterEach(() => vi.restoreAllMocks());
++
++const USER_MSG = { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] };
++const HOSTED_SEARCH = { type: "web_search_call", id: "ws_1", status: "completed" };
++
++describe("Codex hosted search history forces regular transport", () => {
++  it("declares web_search when a Lite request history contains web_search_call items", () => {
++    const executor = new CodexExecutor();
++    const body = executor.transformRequest("gpt-6.1-sol", {
++      model: "gpt-6.1-sol",
++      input: [USER_MSG, HOSTED_SEARCH],
++      instructions: "Client instructions",
++      tools: [],
++    }, true, credentials);
++
++    expect(body.tools).toContainEqual({ type: "web_search" });
++    expect(body.tools.filter(t => t.type === "web_search")).toHaveLength(1);
++    expect(body.input.some(item => item.type === "additional_tools")).toBe(false);
++    expect(body.input.some(item => item.type === "web_search_call")).toBe(true);
++    expect(body.instructions).toBe("Client instructions");
++    const headers = executor.buildHeaders(credentials, true, null, "gpt-6.1-sol", body);
++    expect(headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
++  });
++
++  it("keeps the Lite shape when the same request has no web_search_call history", () => {
++    const executor = new CodexExecutor();
++    const body = executor.transformRequest("gpt-6.1-sol", {
++      model: "gpt-6.1-sol",
++      input: [USER_MSG],
++      instructions: "Client instructions",
++      tools: [],
++    }, true, credentials);
++
++    expect(body.tools).toBeNull();
++    expect(body.input[0].type).toBe("additional_tools");
++    expect(body.instructions).toBe("");
++    const headers = executor.buildHeaders(credentials, true, null, "gpt-6.1-sol", body);
++    expect(headers["x-openai-internal-codex-responses-lite"]).toBe("true");
++  });
++
++  it("converts an existing Lite prefix to regular tools without duplicates", () => {
++    const executor = new CodexExecutor();
++    const fn = { type: "function", name: "run", parameters: { type: "object", properties: {} } };
++    const body = executor.transformRequest("gpt-6.1-sol", {
++      model: "gpt-6.1-sol",
++      input: [
++        { type: "additional_tools", role: "developer", tools: [fn] },
++        USER_MSG,
++        HOSTED_SEARCH,
++      ],
++      instructions: "",
++      tools: [],
++    }, true, credentials);
++
++    expect(body.tools).toHaveLength(2);
++    expect(body.tools.filter(t => t.type === "web_search")).toHaveLength(1);
++    expect(body.tools).toContainEqual(fn);
++    expect(body.input.some(item => item.type === "additional_tools")).toBe(false);
++    const headers = executor.buildHeaders(credentials, true, null, "gpt-6.1-sol", body);
++    expect(headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
++  });
++
++  it("does not inject web_search into compact requests", () => {
++    const executor = new CodexExecutor();
++    const body = executor.transformRequest("gpt-6.1-sol", {
++      model: "gpt-6.1-sol",
++      input: [USER_MSG, HOSTED_SEARCH],
++      instructions: "",
++      tools: [],
++      _compact: true,
++    }, true, credentials);
++
++    const tools = Array.isArray(body.tools) ? body.tools : [];
++    expect(tools.some(t => t.type === "web_search")).toBe(false);
++    const headers = executor.buildHeaders(credentials, true, null, "gpt-6.1-sol", body);
++    expect(headers["x-openai-internal-codex-responses-lite"]).toBe("true");
++  });
++
++  it("declares web_search for non-Lite cx models too", () => {
++    const executor = new CodexExecutor();
++    const body = executor.transformRequest("gpt-5.5", {
++      model: "gpt-5.5",
++      input: [USER_MSG, HOSTED_SEARCH],
++      tools: [],
++    }, true, credentials);
++
++    expect(body.tools).toContainEqual({ type: "web_search" });
++    expect(body.input.some(item => item.type === "web_search_call")).toBe(true);
++  });
++});
+diff --git a/tests/unit/codex-sse-error-before-output.test.js b/tests/unit/codex-sse-error-before-output.test.js
+new file mode 100644
+index 00000000..ec622c63
+--- /dev/null
++++ b/tests/unit/codex-sse-error-before-output.test.js
+@@ -0,0 +1,148 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++import { CodexExecutor } from "../../open-sse/executors/codex.js";
++import { handleComboChat } from "../../open-sse/services/combo.js";
++import * as proxyFetchModule from "../../open-sse/utils/proxyFetch.js";
++
++const credentials = { connectionId: "fixture", accessToken: "fixture-token" };
++afterEach(() => vi.restoreAllMocks());
++
++function streamFromText(text) {
++  const encoder = new TextEncoder();
++  return new ReadableStream({
++    start(controller) {
++      controller.enqueue(encoder.encode(text));
++      controller.close();
++    },
++  });
++}
++
++function sseResponse(text) {
++  return new Response(streamFromText(text), {
++    status: 200,
++    headers: { "Content-Type": "text/event-stream" },
++  });
++}
++
++const INTERNAL_ERROR_SSE = [
++  "event: error",
++  'data: {"type":"error","error":{"message":"response protection is unavailable","type":"internal_error"}}',
++  "",
++].join("\n");
++
++const INVALID_REQUEST_SSE = [
++  "event: error",
++  'data: {"type":"error","error":{"message":"No tool output found for function call call_1","type":"invalid_request_error"}}',
++  "",
++].join("\n");
++
++const RESPONSE_FAILED_SSE = [
++  "event: response.failed",
++  'data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"upstream exploded"}}}',
++  "",
++].join("\n");
++
++describe("Codex SSE error events before user output", () => {
++  it("maps a terminal internal_error event to 502 with the upstream message", async () => {
++    const peek = await new CodexExecutor()._peekSseTransientError(sseResponse(INTERNAL_ERROR_SSE));
++    expect(peek.status).toBe(502);
++    expect(peek.accountFallback).toBe(false);
++    expect(peek.message).toBe("response protection is unavailable");
++  });
++
++  it("maps an invalid_request_error event to 400", async () => {
++    const peek = await new CodexExecutor()._peekSseTransientError(sseResponse(INVALID_REQUEST_SSE));
++    expect(peek.status).toBe(400);
++    expect(peek.message).toBe("No tool output found for function call call_1");
++  });
++
++  it("maps response.failed with a nested error to 502 and its message", async () => {
++    const peek = await new CodexExecutor()._peekSseTransientError(sseResponse(RESPONSE_FAILED_SSE));
++    expect(peek.status).toBe(502);
++    expect(peek.message).toBe("upstream exploded");
++  });
++
++  it("streams an error that follows user-visible output through untouched", async () => {
++    const text = [
++      "event: response.output_text.delta",
++      'data: {"type":"response.output_text.delta","delta":"OK"}',
++      "",
++      "event: error",
++      'data: {"type":"error","error":{"message":"response protection is unavailable","type":"internal_error"}}',
++      "",
++    ].join("\n");
++    const peek = await new CodexExecutor()._peekSseTransientError(sseResponse(text));
++    expect(peek.matched).toBeNull();
++    expect(peek.status).toBeNull();
++    await expect(new Response(peek.replacementBody).text()).resolves.toBe(text);
++  });
++
++  it("keeps the capacity pattern as account fallback even inside an error event", async () => {
++    const peek = await new CodexExecutor()._peekSseTransientError(sseResponse([
++      "event: error",
++      'data: {"type":"error","error":{"message":"Selected model is at capacity. Please try a different model."}}',
++      "",
++    ].join("\n")));
++    expect(peek.accountFallback).toBe(true);
++    expect(peek.status).toBeNull();
++  });
++
++  it("keeps the overload pattern as a retryable transient match", async () => {
++    const peek = await new CodexExecutor()._peekSseTransientError(sseResponse([
++      "event: error",
++      'data: {"type":"error","error":{"type":"server_is_overloaded","message":"overloaded"}}',
++      "",
++    ].join("\n")));
++    expect(peek.matched).toBe("server_is_overloaded");
++    expect(peek.accountFallback).toBe(false);
++    expect(peek.status).toBeNull();
++  });
++
++  it("execute() turns a terminal SSE error into a JSON error response without retrying", async () => {
++    const fetchMock = vi.spyOn(proxyFetchModule, "proxyAwareFetch")
++      .mockResolvedValue(sseResponse(INTERNAL_ERROR_SSE));
++    const result = await new CodexExecutor().execute({
++      model: "gpt-6.1-sol",
++      body: { model: "gpt-6.1-sol", input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }] },
++      stream: true, credentials,
++    });
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(result.response.status).toBe(502);
++    const json = await result.response.json();
++    expect(json.error.message).toBe("response protection is unavailable");
++  });
++
++  it("a combo falls back to the next model when the first returns 200 + SSE internal_error", async () => {
++    const okSse = [
++      "event: response.output_text.delta",
++      'data: {"type":"response.output_text.delta","delta":"OK"}',
++      "",
++    ].join("\n");
++    const fetchMock = vi.spyOn(proxyFetchModule, "proxyAwareFetch");
++    fetchMock
++      .mockResolvedValueOnce(sseResponse(INTERNAL_ERROR_SSE))
++      .mockResolvedValueOnce(sseResponse(okSse));
++
++    const executor = new CodexExecutor();
++    const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
++    const result = await handleComboChat({
++      body: { model: "combo", input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }] },
++      models: ["codex/gpt-5.5", "codex/gpt-5.6-sol"],
++      handleSingleModel: async (body, modelStr) => {
++        const r = await executor.execute({
++          model: modelStr.split("/")[1],
++          body: { ...body, model: modelStr.split("/")[1] },
++          stream: true, credentials, log,
++        });
++        return r.response;
++      },
++      log,
++    });
++
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    expect(result.ok).toBe(true);
++    expect(log.info.mock.calls.some(c => String(c[1]).includes("codex/gpt-5.6-sol succeeded"))).toBe(true);
++    expect(log.info.mock.calls.some(c => String(c[1]).includes("codex/gpt-5.5 succeeded"))).toBe(false);
++    await expect(result.text()).resolves.toBe(okSse);
++  });
++});
+diff --git a/tests/unit/kimi-portable-responses-input.test.js b/tests/unit/kimi-portable-responses-input.test.js
+new file mode 100644
+index 00000000..b7b44647
+--- /dev/null
++++ b/tests/unit/kimi-portable-responses-input.test.js
+@@ -0,0 +1,318 @@
++// Portable Responses input for strict upstreams (quirks.portableResponsesInput).
++// Unit cases exercise toPortableResponsesInput directly; the integration case drives
++// the REAL handleChatCore with the kimi responses transport and asserts the body
++// that reaches the executor.
++import { describe, it, expect, vi, beforeEach } from "vitest";
++
++const { executeMock } = vi.hoisted(() => ({
++  executeMock: vi.fn(),
++}));
++
++vi.mock("../../open-sse/executors/index.js", () => ({
++  getExecutor: () => ({
++    noAuth: true,
++    execute: executeMock,
++  }),
++}));
++
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: async () => ({
++    logClientRawRequest: vi.fn(),
++    logRawRequest: vi.fn(),
++    logTargetRequest: vi.fn(),
++    logProviderResponse: vi.fn(),
++    logConvertedResponse: vi.fn(),
++    logError: vi.fn(),
++  }),
++}));
++
++vi.mock("../../open-sse/utils/stream.js", () => ({
++  COLORS: { red: "", reset: "" },
++  createPassthroughStreamWithLogger: vi.fn(() => new TransformStream()),
++  createSSETransformStreamWithLogger: vi.fn(() => new TransformStream()),
++}));
++
++vi.mock("uuid", () => ({
++  v4: () => "00000000-0000-4000-8000-000000000000",
++}));
++
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++}));
++
++vi.mock("../../open-sse/translator/concerns/image.js", () => ({
++  encodeDataUri: (mimeType, base64) => `data:${mimeType};base64,${base64}`,
++  parseDataUri: (url) => {
++    const m = /^data:([^;]+);base64,(.*)$/.exec(url);
++    return m ? { mimeType: m[1], base64: m[2] } : null;
++  },
++  fetchImageAsBase64: async () => null,
++}));
++
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++const { toPortableResponsesInput } = await import("../../open-sse/translator/formats/responsesApi.js");
++const { resolveTransport } = await import("../../open-sse/services/provider.js");
++
++const FERNET = "gAAAAABhY2NlcnNlcy1lbmNyeXB0ZWQ";
++const KIMI_REASONING = "WGQqTm90RmVybmV0";
++
++const RESPONSE_JSON = {
++  id: "resp_1", object: "response", created_at: 0, status: "completed", model: "test",
++  output: [{
++    type: "message", id: "msg_1", role: "assistant", status: "completed",
++    content: [{ type: "output_text", text: "ok", annotations: [] }],
++  }],
++};
++
++function okResponse() {
++  return new Response(JSON.stringify(RESPONSE_JSON), {
++    status: 200, headers: { "content-type": "application/json" },
++  });
++}
++
++describe("toPortableResponsesInput", () => {
++  it("rewrites agent_message to a user message with only its input_text parts", () => {
++    const agent = {
++      type: "agent_message", author: "a", recipient: "b",
++      content: [
++        { type: "input_text", text: "delegated ask" },
++        { type: "encrypted_content", encrypted_content: FERNET },
++      ],
++    };
++    const out = toPortableResponsesInput([agent]);
++    expect(out).toEqual([{
++      type: "message", role: "user",
++      content: [{ type: "input_text", text: "delegated ask" }],
++    }]);
++  });
++
++  it("drops agent_message without input_text parts", () => {
++    const out = toPortableResponsesInput([{
++      type: "agent_message",
++      content: [{ type: "encrypted_content", encrypted_content: FERNET }],
++    }]);
++    expect(out).toEqual([]);
++  });
++
++  it("rewrites call_id-less function_call_output with a string output", () => {
++    const out = toPortableResponsesInput([{
++      type: "function_call_output", name: "send_message_to_thread",
++      namespace: "codex_tui", output: "<codex_delegation>result</codex_delegation>",
++    }]);
++    expect(out).toEqual([{
++      type: "message", role: "user",
++      content: [{ type: "input_text", text: "<codex_delegation>result</codex_delegation>" }],
++    }]);
++  });
++
++  it("rewrites call_id-less custom_tool_call_output with array output to text/image parts", () => {
++    const image = { type: "input_image", image_url: "data:image/png;base64,x" };
++    const out = toPortableResponsesInput([{
++      type: "custom_tool_call_output", output: [
++        { type: "input_text", text: "part" },
++        image,
++        { type: "encrypted_content", encrypted_content: FERNET },
++      ],
++    }]);
++    expect(out).toEqual([{
++      type: "message", role: "user",
++      content: [{ type: "input_text", text: "part" }, image],
++    }]);
++  });
++
++  it("drops call_id-less tool outputs with empty output", () => {
++    const out = toPortableResponsesInput([
++      { type: "function_call_output", output: "" },
++      { type: "function_call_output", output: [] },
++      { type: "function_call_output" },
++    ]);
++    expect(out).toEqual([]);
++  });
++
++  it("drops Fernet-only reasoning with no readable summary or content", () => {
++    const out = toPortableResponsesInput([
++      { type: "reasoning", id: "rs_1", encrypted_content: FERNET, summary: [] },
++      { type: "reasoning", id: "rs_2", encrypted_content: `${FERNET}==`, summary: [{ type: "summary_text", text: "   " }] },
++    ]);
++    expect(out).toEqual([]);
++  });
++
++  it("preserves Fernet reasoning that carries readable summary text", () => {
++    const item = {
++      type: "reasoning", id: "rs_1", encrypted_content: FERNET,
++      summary: [{ type: "summary_text", text: "thought about it" }],
++    };
++    const out = toPortableResponsesInput([item]);
++    expect(out[0]).toBe(item);
++  });
++
++  it("preserves non-Fernet provider-native reasoning", () => {
++    const item = { type: "reasoning", id: "rs_QssX1", encrypted_content: KIMI_REASONING };
++    const out = toPortableResponsesInput([item]);
++    expect(out[0]).toBe(item);
++  });
++
++  it("leaves other items untouched and does not mutate the caller's array", () => {
++    const ws = { type: "web_search_call", id: "ws_1", status: "completed" };
++    const custom = { type: "custom_tool_call", call_id: "c1", name: "x", input: "{}" };
++    const paired = { type: "function_call_output", call_id: "c1", output: "done" };
++    const msg = { type: "message", role: "assistant", content: [{ type: "output_text", text: "hi" }] };
++    const input = [ws, custom, paired, msg];
++    const out = toPortableResponsesInput(input);
++    expect(out).toEqual(input);
++    expect(out[0]).toBe(ws);
++    expect(input).toHaveLength(4);
++  });
++});
++
++describe("handleChatCore applies portable Responses input per transport quirk", () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    executeMock.mockImplementation(async () => ({
++      response: okResponse(), url: "https://api.kimi.com/coding/v1/responses", headers: {},
++    }));
++  });
++
++  it("declares the quirk on the kimi openai-responses transport only", () => {
++    expect(resolveTransport("kimi", "openai-responses")?.quirks?.portableResponsesInput).toBe(true);
++    expect(resolveTransport("kimi", "openai")?.quirks?.portableResponsesInput).toBeUndefined();
++    expect(resolveTransport("kimi", "claude")?.quirks?.portableResponsesInput).toBeUndefined();
++  });
++
++  it("rewrites a Codex multi-agent history for the kimi Responses endpoint", async () => {
++    const result = await handleChatCore({
++      body: {
++        model: "kimi/kimi-k3", stream: false,
++        input: [
++          { type: "reasoning", id: "rs_1", encrypted_content: FERNET, summary: [] },
++          { type: "reasoning", id: "rs_kimi", encrypted_content: KIMI_REASONING },
++          { type: "web_search_call", id: "ws_1", status: "completed" },
++          { type: "function_call", call_id: "call_1", name: "run", arguments: "{}" },
++          { type: "function_call_output", call_id: "call_1", output: "tool out" },
++          { type: "function_call_output", name: "send_message_to_thread", namespace: "codex_tui", output: "delegated" },
++          {
++            type: "agent_message", author: "a", recipient: "b",
++            content: [{ type: "input_text", text: "agent text" }, { type: "encrypted_content", encrypted_content: FERNET }],
++          },
++          { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
++        ],
++      },
++      modelInfo: { provider: "kimi", model: "kimi-k3" },
++      credentials: { apiKey: "test-key", providerSpecificData: {} },
++      connectionId: "kimi-portable-test",
++      sourceFormatOverride: "openai-responses",
++      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
++    });
++
++    expect(result.success).toBe(true);
++    const { credentials: creds, body: sent } = executeMock.mock.calls.at(-1)[0];
++    expect(creds.runtimeTransport?.format).toBe("openai-responses");
++    expect(Array.isArray(sent.input)).toBe(true);
++    expect(sent.input.some(i => i.type === "agent_message")).toBe(false);
++    expect(sent.input.some(i => i.type === "reasoning" && String(i.encrypted_content || "").startsWith("gAAAAA"))).toBe(false);
++    expect(sent.input).toContainEqual({ type: "reasoning", id: "rs_kimi", encrypted_content: KIMI_REASONING });
++    expect(sent.input.some(i => i.type === "web_search_call")).toBe(true);
++    expect(sent.input).toContainEqual({ type: "function_call_output", call_id: "call_1", output: "tool out" });
++    expect(sent.input).toContainEqual({
++      type: "message", role: "user", content: [{ type: "input_text", text: "agent text" }],
++    });
++    expect(sent.input).toContainEqual({
++      type: "message", role: "user", content: [{ type: "input_text", text: "delegated" }],
++    });
++  });
++
++  it("does not transform a codex provider request", async () => {
++    const input = [
++      { type: "agent_message", content: [{ type: "input_text", text: "agent text" }] },
++      { type: "reasoning", id: "rs_1", encrypted_content: FERNET, summary: [] },
++      { type: "function_call_output", name: "send_message_to_thread", output: "delegated" },
++      { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
++    ];
++    const result = await handleChatCore({
++      body: { model: "cx/gpt-5.5", stream: false, input: structuredClone(input) },
++      modelInfo: { provider: "codex", model: "gpt-5.5" },
++      credentials: { accessToken: "tok", providerSpecificData: {} },
++      connectionId: "cx-portable-test",
++      sourceFormatOverride: "openai-responses",
++      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
++    });
++
++    expect(result.success).toBe(true);
++    const { body: sent } = executeMock.mock.calls.at(-1)[0];
++    expect(sent.input).toEqual(input);
++  });
++
++  it.each([
++    ["gemini", false], ["gemini", true],
++    ["aistudio", false], ["aistudio", true],
++    ["antigravity", false], ["antigravity", true],
++    ["kimi", false], ["kimi", true],
++  ])("rejects opaque task before %s execution (stream=%s)", async (provider, stream) => {
++    const input = [{ type: "agent_message", author: "/root", recipient: "/root/probe", content: [
++      { type: "input_text", text: "Message Type: NEW_TASK\nTask name: /root/probe\nSender: /root\nPayload:" },
++      { type: "encrypted_content", encrypted_content: FERNET },
++    ] }];
++    const model = provider === "kimi" ? "kimi-k3" : "gemini-3.8-flash";
++    const before = structuredClone(input);
++    const result = await handleChatCore({
++      body: { model, stream, input },
++      modelInfo: { provider, model },
++      credentials: { apiKey: "test-key", providerSpecificData: {} },
++      connectionId: "opaque-cross-format-test",
++      sourceFormatOverride: "openai-responses",
++      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
++    });
++    expect(result.success).toBe(false);
++    expect(result.response.status).toBe(400);
++    expect((await result.response.json()).error.message).toContain("encrypted Codex agent_message");
++    expect(executeMock).not.toHaveBeenCalled();
++    expect(input).toEqual(before);
++  });
++
++  it.each(["message", "agent_message"])("does not discard an unreadable task before a readable %s follow-up", async type => {
++    const opaque = { type: "agent_message", author: "/root", recipient: "/root/probe", content: [
++      { type: "input_text", text: "Message Type: NEW_TASK\nTask name: /root/probe\nSender: /root\nPayload:" },
++      { type: "encrypted_content", encrypted_content: FERNET },
++    ] };
++    const followup = type === "message"
++      ? { type, role: "user", content: [{ type: "input_text", text: "Continue under the original task constraints." }] }
++      : { type, author: "/root", recipient: "/root/probe", content: [
++          { type: "input_text", text: "Message Type: MESSAGE\nTask name: /root/probe\nSender: /root\nPayload:" },
++          { type: "encrypted_content", encrypted_content: "Continue under the original task constraints." },
++        ] };
++    const input = [opaque, followup];
++    const before = structuredClone(input);
++    const result = await handleChatCore({
++      body: { model: "kimi-k3", stream: false, input },
++      modelInfo: { provider: "kimi", model: "kimi-k3" },
++      credentials: { apiKey: "test-key", providerSpecificData: {} },
++      connectionId: "opaque-history-test", sourceFormatOverride: "openai-responses",
++      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
++    });
++    expect(result.success).toBe(false);
++    expect(result.response.status).toBe(400);
++    expect(executeMock).not.toHaveBeenCalled();
++    expect(input).toEqual(before);
++  });
++
++  it("keeps a native Codex metadata-only carrier unchanged", async () => {
++    const input = [{ type: "agent_message", author: "/root", recipient: "/root/probe", content: [
++      { type: "input_text", text: "Message Type: NEW_TASK\nTask name: /root/probe\nSender: /root\n\nPayload:" },
++      { type: "encrypted_content", encrypted_content: FERNET },
++    ] }];
++    const result = await handleChatCore({
++      body: { model: "cx/gpt-5.5", stream: false, input: structuredClone(input) },
++      modelInfo: { provider: "codex", model: "gpt-5.5" },
++      credentials: { accessToken: "tok", providerSpecificData: {} },
++      connectionId: "cx-opaque-native-test",
++      sourceFormatOverride: "openai-responses",
++      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
++    });
++    expect(result.success).toBe(true);
++    const { body: sent } = executeMock.mock.calls.at(-1)[0];
++    expect(sent.input).toEqual(input);
++  });
++});
+diff --git a/tests/unit/kiro-namespace-descriptors.test.js b/tests/unit/kiro-namespace-descriptors.test.js
+new file mode 100644
+index 00000000..a7104c88
+--- /dev/null
++++ b/tests/unit/kiro-namespace-descriptors.test.js
+@@ -0,0 +1,40 @@
++import { describe, expect, it } from "vitest";
++import { kiroToOpenAIResponse } from "../../open-sse/translator/response/kiro-to-openai.js";
++import { kiroToClaudeResponse, kiroToClaudeNonStreaming } from "../../open-sse/translator/response/kiro-to-claude.js";
++
++const wire = "alpha_read";
++const descriptorMap = () => new Map([[wire, { name: "read", namespace: "alpha", type: "function" }]]);
++const normalizedChunk = (name, delta = {}, finish = null) => ({
++  id: "chatcmpl-kiro", object: "chat.completion.chunk", created: 1, model: "kiro",
++  choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_kiro", type: "function", function: { name, arguments: '{"title":"x"}' } }], ...delta }, finish_reason: finish }],
++});
++
++describe("Kiro response adapters keep descriptor maps off the wire name", () => {
++  it("raw toolUseEvent yields the string wire alias", () => {
++    const out = kiroToOpenAIResponse({ toolUseEvent: { toolUseId: "call_kiro", name: wire, input: { title: "x" } } }, { toolNameMap: descriptorMap() });
++    const call = out.choices[0].delta.tool_calls[0];
++    expect(call.function.name).toBe(wire);
++    expect(call).toMatchObject({ id: "call_kiro" });
++    expect(call.function.arguments).toBe('{"title":"x"}');
++  });
++
++  it("executor-normalized chunk yields the string wire alias", () => {
++    const out = kiroToOpenAIResponse(normalizedChunk(wire), { toolNameMap: descriptorMap() });
++    expect(out.choices[0].delta.tool_calls[0].function.name).toBe(wire);
++  });
++
++  it("Kiro to Claude streaming and non-streaming yield the string wire alias", () => {
++    const state = { toolNameMap: descriptorMap(), nextBlockIndex: 0 };
++    const events = kiroToClaudeResponse(normalizedChunk(wire), state);
++    const start = events.find(e => e.type === "content_block_start");
++    expect(start.content_block.name).toBe(wire);
++    expect(start.content_block.id).toBe("call_kiro");
++    const message = kiroToClaudeNonStreaming({ _toolNameMap: descriptorMap(), choices: [{ message: { tool_calls: [{ id: "call_kiro", function: { name: wire, arguments: '{"title":"x"}' } }] }, finish_reason: "tool_calls" }] });
++    expect(message.content[0]).toMatchObject({ type: "tool_use", id: "call_kiro", name: wire, input: { title: "x" } });
++  });
++
++  it("plain string map entries still restore the original tool name", () => {
++    const out = kiroToOpenAIResponse(normalizedChunk("wire_plain"), { toolNameMap: new Map([["wire_plain", "original_tool"]]) });
++    expect(out.choices[0].delta.tool_calls[0].function.name).toBe("original_tool");
++  });
++});
+diff --git a/tests/unit/openai-responses-agent-messages.test.js b/tests/unit/openai-responses-agent-messages.test.js
+new file mode 100644
+index 00000000..beb6cef3
+--- /dev/null
++++ b/tests/unit/openai-responses-agent-messages.test.js
+@@ -0,0 +1,232 @@
++import { describe, expect, it } from "vitest";
++import "../translator/registerAll.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { convertResponsesApiFormat, normalizeResponsesAgentMessage, toPortableResponsesInput } from "../../open-sse/translator/formats/responsesApi.js";
++import { openaiResponsesToOpenAIRequest } from "../../open-sse/translator/request/openai-responses.js";
++import { hasUndeliverableAgentMessage, preparePortableCollaboration } from "../../open-sse/translator/concerns/portableCollaboration.js";
++
++const FERNET = "gAAAAABrXy-opaque-cipher";
++const REASONING_BLOB = "gAAAAAB_reasoning_opaque_blob";
++
++const headerFor = (type, task, sender) => `Message Type: ${type}\nTask name: ${task}\nSender: ${sender}`;
++
++const agent = (type, author, recipient, payload) => ({
++  type: "agent_message",
++  author,
++  recipient,
++  content: [
++    { type: "input_text", text: headerFor(type, "delivery_probe", author) },
++    { type: "encrypted_content", encrypted_content: payload },
++  ],
++});
++
++const newTask = agent("NEW_TASK", "/root", "/root/delivery_probe", "Reply with exactly DELIVERY_OK.");
++const message = agent("MESSAGE", "/root", "/root/delivery_probe", "Follow-up note.");
++const finalAnswer = agent("FINAL_ANSWER", "/root/delivery_probe", "/root", "Result: DELIVERY_OK.");
++
++const clone = (value) => structuredClone(value);
++const textOf = (msg) => (Array.isArray(msg.content) ? msg.content.map((p) => p.text).join("\n") : msg.content);
++const nativeContents = (out, format) => (format === FORMATS.ANTIGRAVITY ? out.request.contents : out.contents);
++
++describe("normalizeResponsesAgentMessage", () => {
++  it("returns non-agent items as the same object", () => {
++    const item = { type: "function_call", call_id: "c1", name: "x", arguments: "{}" };
++    expect(normalizeResponsesAgentMessage(item)).toBe(item);
++    const msg = { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] };
++    expect(normalizeResponsesAgentMessage(msg)).toBe(msg);
++  });
++
++  it.each([
++    ["NEW_TASK", newTask],
++    ["MESSAGE", message],
++    ["FINAL_ANSWER", finalAnswer],
++  ])("turns a %s plaintext carrier into an exact user message", (_label, item) => {
++    const out = normalizeResponsesAgentMessage(item);
++    expect(out).toEqual({
++      type: "message",
++      role: "user",
++      author: item.author,
++      recipient: item.recipient,
++      content: [
++        { type: "input_text", text: item.content[0].text },
++        { type: "input_text", text: item.content[1].encrypted_content },
++      ],
++    });
++  });
++
++  it("keeps Fernet ciphertext opaque", () => {
++    const out = normalizeResponsesAgentMessage({
++      type: "agent_message",
++      content: [{ type: "encrypted_content", encrypted_content: FERNET }],
++    });
++    expect(out.content).toEqual([{ type: "encrypted_content", encrypted_content: FERNET }]);
++  });
++});
++
++describe("agent_message plaintext task delivery", () => {
++  const cases = [
++    ["NEW_TASK", newTask, "/root", "/root/delivery_probe"],
++    ["MESSAGE", message, "/root", "/root/delivery_probe"],
++    ["FINAL_ANSWER", finalAnswer, "/root/delivery_probe", "/root"],
++  ];
++
++  it.each(cases)("%s header and payload appear exactly once, in order, via convertResponsesApiFormat", (_label, item) => {
++    const body = { model: "m", input: [item] };
++    const before = clone(body);
++    const out = convertResponsesApiFormat(body);
++    expect(out.messages).toEqual([{
++      role: "user",
++      content: [
++        { type: "text", text: item.content[0].text },
++        { type: "text", text: item.content[1].encrypted_content },
++      ],
++    }]);
++    expect(body).toEqual(before);
++  });
++
++  it.each(cases)("%s header and payload appear exactly once via openaiResponsesToOpenAIRequest", (_label, item) => {
++    const body = { model: "m", input: [item] };
++    const before = clone(body);
++    const out = openaiResponsesToOpenAIRequest("m", body, true, {});
++    expect(textOf(out.messages[0])).toBe(`${item.content[0].text}\n${item.content[1].encrypted_content}`);
++    expect(out.messages).toHaveLength(1);
++    expect(body).toEqual(before);
++  });
++
++  it("preserves escaped Unicode, newlines and trailing spaces byte for byte", () => {
++    const tricky = agent("NEW_TASK", "/root", "/root/delivery_probe", "l\u00ednea \u2603  \n\ttab  ");
++    const out = openaiResponsesToOpenAIRequest("m", { model: "m", input: [tricky] }, true, {});
++    expect(textOf(out.messages[0])).toBe(`${tricky.content[0].text}\nl\u00ednea \u2603  \n\ttab  `);
++  });
++
++  it("keeps the agent task after a real tool call and output, before assistant output", () => {
++    const input = [
++      { type: "function_call", call_id: "c1", name: "lookup", arguments: "{}" },
++      { type: "function_call_output", call_id: "c1", output: "ok" },
++      newTask,
++      { type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] },
++    ];
++    const out = convertResponsesApiFormat({ model: "m", input });
++    expect(out.messages.map((m) => m.role)).toEqual(["assistant", "tool", "user", "assistant"]);
++    expect(textOf(out.messages[2])).toContain("DELIVERY_OK");
++  });
++
++  it("keeps ordinary reasoning opaque and attached to the next assistant, never as user text", () => {
++    const input = [
++      newTask,
++      { type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] },
++      { type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] },
++    ];
++    const out = openaiResponsesToOpenAIRequest("m", { model: "m", input }, true, {});
++    const userTexts = out.messages.filter((m) => m.role === "user").map((m) => JSON.stringify(m));
++    expect(userTexts.join("\n")).not.toContain(REASONING_BLOB);
++    const assistant = out.messages.find((m) => m.role === "assistant");
++    expect(assistant.encrypted_content).toBe(REASONING_BLOB);
++  });
++
++  it("keeps a plaintext-only carrier as one user text part through the portable path", () => {
++    const only = { type: "agent_message", content: [{ type: "encrypted_content", encrypted_content: "plain payload" }] };
++    expect(toPortableResponsesInput([only])).toEqual([{
++      type: "message", role: "user", content: [{ type: "input_text", text: "plain payload" }],
++    }]);
++    const out = convertResponsesApiFormat({ model: "m", input: [only] });
++    expect(out.messages).toEqual([{ role: "user", content: [{ type: "text", text: "plain payload" }] }]);
++  });
++
++  it("keeps the existing Fernet portable outcomes unchanged", () => {
++    const mixed = { type: "agent_message", content: [
++      { type: "input_text", text: "kept" },
++      { type: "encrypted_content", encrypted_content: FERNET },
++    ] };
++    expect(toPortableResponsesInput([mixed])).toEqual([{
++      type: "message", role: "user", content: [{ type: "input_text", text: "kept" }],
++    }]);
++    const onlyFernet = { type: "agent_message", content: [{ type: "encrypted_content", encrypted_content: FERNET }] };
++    expect(toPortableResponsesInput([onlyFernet])).toEqual([]);
++  });
++
++  it("does not mutate the caller's body deeply", () => {
++    const body = { model: "m", input: [clone(newTask), clone(message), clone(finalAnswer)] };
++    const before = JSON.stringify(body);
++    openaiResponsesToOpenAIRequest("m", body, true, {});
++    convertResponsesApiFormat(clone(body));
++    toPortableResponsesInput(body.input);
++    expect(JSON.stringify(body)).toBe(before);
++  });
++
++  it("keeps the native Responses pass-through untouched", () => {
++    const body = { model: "m", input: [clone(newTask)] };
++    const before = JSON.stringify(body);
++    const out = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, "m", body, true, {}, "openai");
++    expect(JSON.stringify(out.input)).toBe(JSON.stringify([newTask]));
++    expect(JSON.stringify(body)).toBe(before);
++  });
++
++  it.each([
++    [FORMATS.GEMINI, "gemini"],
++    [FORMATS.GEMINI, "aistudio"],
++    [FORMATS.ANTIGRAVITY, "antigravity"],
++  ])("delivers the task once to native %s/%s contents with thinkingLevel high", (format, provider) => {
++    const body = { model: "gemini-3.8-flash", input: [clone(newTask)], reasoning: { effort: "high" } };
++    const before = JSON.stringify(body);
++    const out = translateRequest(FORMATS.OPENAI_RESPONSES, format, "gemini-3.8-flash", body, true, {}, provider);
++    const contents = nativeContents(out, format);
++    const texts = contents.flatMap((c) => c.parts.map((p) => p.text)).filter(Boolean);
++    expect(texts.filter((t) => t.startsWith("Message Type: NEW_TASK"))).toHaveLength(1);
++    expect(texts.filter((t) => t === "Reply with exactly DELIVERY_OK.")).toHaveLength(1);
++    const generation = format === FORMATS.ANTIGRAVITY ? out.request.generationConfig : out.generationConfig;
++    expect(generation.thinkingConfig.thinkingLevel).toBe("high");
++    expect(JSON.stringify(body)).toBe(before);
++  });
++});
++
++describe("opaque agent_message detection", () => {
++  const opaqueAgent = type => agent(type, "/root", "/root/delivery_probe", FERNET);
++
++  it.each(["NEW_TASK", "MESSAGE", "FINAL_ANSWER"])("flags opaque %s agent messages", type => {
++    expect(hasUndeliverableAgentMessage([opaqueAgent(type)])).toBe(true);
++  });
++
++  it("flags Fernet-only agent content", () => {
++    expect(hasUndeliverableAgentMessage([{ type: "agent_message", content: [{ type: "encrypted_content", encrypted_content: FERNET }] }])).toBe(true);
++  });
++
++  it("ignores plaintext agent messages, ordinary reasoning ciphertext and non-array input", () => {
++    expect(hasUndeliverableAgentMessage([newTask, message, finalAnswer])).toBe(false);
++    expect(hasUndeliverableAgentMessage([{ type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] }])).toBe(false);
++    expect(hasUndeliverableAgentMessage("text")).toBe(false);
++  });
++
++  it("returns the same body and an empty map when no collaboration tools are present", () => {
++    const body = { model: "m", tools: [{ type: "function", name: "read", parameters: { type: "object" } }], input: [clone(newTask)] };
++    const out = preparePortableCollaboration(body);
++    expect(out.body).toBe(body);
++    expect(out.toolNameMap.size).toBe(0);
++  });
++
++  it("keeps readable mixed and plaintext carriers deliverable", () => {
++    const mixed = { type: "agent_message", content: [{ type: "input_text", text: "delegated ask" }, { type: "encrypted_content", encrypted_content: FERNET }] };
++    const plaintext = { type: "agent_message", content: [{ type: "encrypted_content", encrypted_content: "plain task" }, { type: "encrypted_content", encrypted_content: FERNET }] };
++    expect(hasUndeliverableAgentMessage([mixed])).toBe(false);
++    expect(hasUndeliverableAgentMessage([plaintext])).toBe(false);
++  });
++
++  it("requires readable payload beyond the metadata envelope", () => {
++    const envelope = payload => ({ type: "agent_message", content: [
++      { type: "input_text", text: `Message Type: NEW_TASK\nTask name: /root/probe\nSender: /root\n\nPayload:${payload}` },
++      { type: "encrypted_content", encrypted_content: FERNET },
++    ] });
++    expect(hasUndeliverableAgentMessage([envelope("")])).toBe(true);
++    expect(hasUndeliverableAgentMessage([envelope(" Reply READY")])).toBe(false);
++  });
++
++  it("treats a metadata envelope split across input_text parts as metadata only", () => {
++    expect(hasUndeliverableAgentMessage([{ type: "agent_message", content: [
++      { type: "input_text", text: "Message Type: NEW_TASK" },
++      { type: "input_text", text: "Task name: /root/probe" },
++      { type: "input_text", text: "Sender: /root" },
++      { type: "encrypted_content", encrypted_content: FERNET },
++    ] }])).toBe(true);
++  });
++});
+diff --git a/tests/unit/openai-responses-incomplete.test.js b/tests/unit/openai-responses-incomplete.test.js
+new file mode 100644
+index 00000000..7a7a2bd9
+--- /dev/null
++++ b/tests/unit/openai-responses-incomplete.test.js
+@@ -0,0 +1,67 @@
++import { describe, expect, it } from "vitest";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.js";
++
++async function run(chunks, format, provider) {
++  const input = chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join("");
++  const stream = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(input)); controller.close(); } });
++  const output = await new Response(stream.pipeThrough(createSSETransformStreamWithLogger(format, FORMATS.OPENAI_RESPONSES, provider, null, null, "gemini-3.8-flash"))).text();
++  return output.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)));
++}
++
++const targets = [
++  [FORMATS.GEMINI, "gemini"],
++  [FORMATS.GEMINI, "aistudio"],
++  [FORMATS.ANTIGRAVITY, "antigravity"],
++];
++const usageMetadata = { promptTokenCount: 90, candidatesTokenCount: 10, thoughtsTokenCount: 10, cachedContentTokenCount: 40, totalTokenCount: 110 };
++const expectedUsage = { input_tokens: 90, output_tokens: 20, total_tokens: 110, input_tokens_details: { cached_tokens: 40 }, output_tokens_details: { reasoning_tokens: 10 } };
++
++for (const [format, provider] of targets) {
++  describe(`${provider} to Responses terminal truth`, () => {
++    for (const [finishReason, expectedReason] of [["MAX_TOKENS", "max_output_tokens"], ["SAFETY", "content_filter"]]) {
++      for (const text of ["", "частичный ответ"]) {
++        it(`${finishReason} with ${text ? "partial text" : "empty text"} is incomplete`, async () => {
++          const response = { candidates: [{ content: { parts: text ? [{ text }] : [] }, finishReason }], usageMetadata };
++          const events = await run([format === FORMATS.ANTIGRAVITY ? { response } : response], format, provider);
++          const terminals = events.filter(event => ["response.completed", "response.incomplete", "response.failed"].includes(event.type));
++          expect(terminals).toHaveLength(1);
++          expect(terminals[0]).toMatchObject({ type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: expectedReason }, error: null, usage: expectedUsage } });
++          expect(events.some(event => event.type === "response.completed")).toBe(false);
++        });
++      }
++    }
++    it("STOP still completes and retains usage", async () => {
++      const response = { candidates: [{ content: { parts: [{ text: "полный ответ" }] }, finishReason: "STOP" }], usageMetadata };
++      const events = await run([format === FORMATS.ANTIGRAVITY ? { response } : response], format, provider);
++      const terminals = events.filter(event => ["response.completed", "response.incomplete", "response.failed"].includes(event.type));
++      expect(terminals).toHaveLength(1);
++      expect(terminals[0]).toMatchObject({ type: "response.completed", response: { status: "completed", usage: expectedUsage } });
++      expect(terminals[0].response.incomplete_details).toBeUndefined();
++    });
++  });
++}
++
++it("direct OpenAI length retains its reason through a late usage trailer", async () => {
++  const events = await run([
++    { id: "fixture", choices: [{ index: 0, delta: { content: "partial" }, finish_reason: null }] },
++    { id: "fixture", choices: [{ index: 0, delta: {}, finish_reason: "length" }] },
++    { choices: [], usage: { prompt_tokens: 90, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 40 }, completion_tokens_details: { reasoning_tokens: 10 } } },
++  ], FORMATS.OPENAI, "openai");
++  const terminals = events.filter(event => ["response.completed", "response.incomplete", "response.failed"].includes(event.type));
++  expect(terminals).toHaveLength(1);
++  expect(terminals[0]).toMatchObject({ type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, usage: expectedUsage } });
++});
++
++it("native Responses incomplete is terminal without an added disconnect failure", async () => {
++  const events = await run([{ type: "response.incomplete", response: { id: "fixture", status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, usage: expectedUsage } }], FORMATS.OPENAI_RESPONSES, "codex");
++  expect(events.filter(event => event.type === "response.incomplete")).toHaveLength(1);
++  expect(events.some(event => event.type === "response.failed")).toBe(false);
++});
++
++it("terminal guard recognizes incomplete event and status fallback", async () => {
++  const { isOpenAIResponsesTerminalEvent } = await import("../../open-sse/utils/responsesStreamHelpers.js");
++  expect(isOpenAIResponsesTerminalEvent("response.incomplete", {})).toBe(true);
++  expect(isOpenAIResponsesTerminalEvent(null, { response: { status: "incomplete" } })).toBe(true);
++  expect(isOpenAIResponsesTerminalEvent(null, { response: { status: "in_progress" } })).toBe(false);
++});
+diff --git a/tests/unit/openai-responses-namespaces.test.js b/tests/unit/openai-responses-namespaces.test.js
+new file mode 100644
+index 00000000..98995a2d
+--- /dev/null
++++ b/tests/unit/openai-responses-namespaces.test.js
+@@ -0,0 +1,353 @@
++import { describe, expect, it } from "vitest";
++import "../translator/registerAll.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { RESPONSES_ITEM } from "../../open-sse/translator/schema/index.js";
++import { openaiResponsesToOpenAIRequest } from "../../open-sse/translator/request/openai-responses.js";
++import { restoreToolNames } from "../../open-sse/utils/opencodeFingerprint.js";
++import { createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.js";
++import { translateNonStreamingResponse } from "../../open-sse/handlers/chatCore/nonStreamingHandler.js";
++import { filterUsageForFormat } from "../../open-sse/utils/usageTracking.js";
++import { preparePortableCollaboration } from "../../open-sse/translator/concerns/portableCollaboration.js";
++
++const schema = { type: "object", properties: { title: { type: "string" }, count: { type: "integer" } }, required: ["title", "count"], additionalProperties: false };
++const leaf = () => ({ type: "function", name: "read", description: "Read the selected record.", parameters: schema });
++const fixture = () => ({
++  model: "gemini-3.8-flash",
++  tools: [
++    leaf(),
++    { type: "namespace", name: "alpha", description: "First source.", tools: [leaf(), { type: "custom", name: "patch", description: "Apply raw input.", format: { type: "grammar", syntax: "lark", definition: "start: TEXT" } }] },
++  ],
++  input: [
++    { type: RESPONSES_ITEM.ADDITIONAL_TOOLS, tools: [{ type: "namespace", name: "beta", tools: [leaf()] }] },
++    { type: "message", role: "user", content: [{ type: "input_text", text: "Read alpha, not beta." }] },
++    { type: "function_call", name: "read", namespace: "alpha", call_id: "call_alpha", arguments: '{"title":"record","count":3}' },
++    { type: "function_call_output", call_id: "call_alpha", output: '{"value":"actual"}' },
++    { type: "message", role: "user", content: [{ type: "input_text", text: "Continue." }] },
++  ],
++  tool_choice: { type: "function", name: "read", namespace: "beta" },
++});
++const alias = (map, namespace, name) => [...map].find(([, value]) => value && typeof value === "object" && value.namespace === namespace && value.name === name)?.[0];
++
++it("expands namespace declarations without conflating root or equal leaf names", () => {
++  const body = fixture();
++  const translated = openaiResponsesToOpenAIRequest(body.model, body, true, {});
++  expect(translated.tools).toHaveLength(4);
++  const alpha = alias(translated._toolNameMap, "alpha", "read");
++  const beta = alias(translated._toolNameMap, "beta", "read");
++  expect(alpha).toBeTruthy();
++  expect(beta).toBeTruthy();
++  expect(alpha).not.toBe(beta);
++  expect(translated.tools.map(tool => tool.function.name)).toContain("read");
++  expect(new Set(translated.tools.map(tool => tool.function.name)).size).toBe(4);
++  for (const name of [alpha, beta]) expect(name).toMatch(/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/);
++  expect(translated.tools.find(tool => tool.function.name === alpha).function.parameters).toEqual(schema);
++  expect(translated.messages.find(message => message.tool_calls)?.tool_calls[0]).toMatchObject({ id: "call_alpha", function: { name: alpha, arguments: '{"title":"record","count":3}' } });
++  expect(translated.messages.find(message => message.role === "tool")).toMatchObject({ tool_call_id: "call_alpha", content: '{"value":"actual"}' });
++  expect(translated.tool_choice).toEqual({ type: "function", function: { name: beta } });
++  const repeated = openaiResponsesToOpenAIRequest(body.model, fixture(), true, {});
++  expect(alias(repeated._toolNameMap, "alpha", "read")).toBe(alpha);
++  const historyOnly = openaiResponsesToOpenAIRequest(body.model, { input: body.input.filter(item => item.type !== RESPONSES_ITEM.ADDITIONAL_TOOLS) }, true, {});
++  expect(historyOnly.messages.find(message => message.tool_calls).tool_calls[0].function.name).toBe(alpha);
++});
++
++it("restores namespace identity after a chained rename in event and terminal output", () => {
++  const map = new Map([["provider_name", "wire_name"], ["wire_name", { name: "read", namespace: "alpha", type: "function" }]]);
++  const item = { type: "function_call", name: "provider_name", call_id: "call_1", arguments: "{}" };
++  const payload = { event: "response.output_item.done", data: { type: "response.output_item.done", item, response: { output: [item] } } };
++  const restored = restoreToolNames(payload, map);
++  expect(restored.data.item).toMatchObject({ name: "read", namespace: "alpha", call_id: "call_1", arguments: "{}" });
++  expect(restored.data.response.output[0]).toMatchObject({ name: "read", namespace: "alpha" });
++  expect(payload.data.item.name).toBe("provider_name");
++  expect(restoreToolNames({ type: "function_call", name: "wire_name" }, map)).toMatchObject({ name: "read", namespace: "alpha" });
++});
++
++for (const [format, provider] of [[FORMATS.GEMINI, "gemini"], [FORMATS.GEMINI, "aistudio"], [FORMATS.ANTIGRAVITY, "antigravity"]]) {
++  describe(`${provider} namespace SSE roundtrip`, () => {
++    for (const [name, type, args] of [["read", "function_call", { title: "record", count: 3 }], ["patch", "custom_tool_call", { input: "RAW_PATCH" }]]) {
++      it(`retains the namespace and ${type} identity`, async () => {
++        const translated = translateRequest(FORMATS.OPENAI_RESPONSES, format, "gemini-3.8-flash", fixture(), true, { projectId: "fixture" }, provider);
++        const wireName = alias(translated._toolNameMap, "alpha", name);
++        expect(wireName).toBeTruthy();
++        const native = { candidates: [{ content: { parts: [{ functionCall: { id: "call_wire", name: wireName, args } }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 90, candidatesTokenCount: 10, totalTokenCount: 100 } };
++        const chunk = format === FORMATS.ANTIGRAVITY ? { response: native } : native;
++        const input = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`)); controller.close(); } });
++        const transform = createSSETransformStreamWithLogger(format, FORMATS.OPENAI_RESPONSES, provider, null, translated._toolNameMap, "gemini-3.8-flash", null, null, null, null, translated._customToolNames);
++        const raw = await new Response(input.pipeThrough(transform)).text();
++        const events = raw.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)));
++        const done = events.find(event => event.type === "response.output_item.done");
++        expect(done.item).toMatchObject({ type, name, namespace: "alpha", call_id: "call_wire" });
++        if (type === "custom_tool_call") expect(done.item.input).toBe("RAW_PATCH");
++        else expect(JSON.parse(done.item.arguments)).toEqual(args);
++        const terminal = events.find(event => event.type === "response.completed");
++        expect(terminal.response.output[0]).toMatchObject({ type, name, namespace: "alpha", call_id: "call_wire" });
++      });
++    }
++  });
++}
++
++it("restores are idempotent: an already-projected item keeps leaf and namespace", () => {
++  const map = new Map([
++    ["wire", { name: "read", namespace: "alpha", type: "function" }],
++    ["read", "Read"],
++  ]);
++  const once = restoreToolNames({ type: "function_call", name: "wire", call_id: "c1", arguments: "{}" }, map);
++  expect(once).toMatchObject({ name: "read", namespace: "alpha" });
++  const twice = restoreToolNames(once, map);
++  expect(twice).toMatchObject({ name: "read", namespace: "alpha" });
++  const viaEvent = restoreToolNames({
++    event: "response.output_item.done",
++    data: {
++      type: "response.output_item.done",
++      item: { type: "function_call", name: "wire" },
++      response: { output: [{ type: "function_call", name: "wire" }] },
++    },
++  }, map);
++  expect(viaEvent.data.item).toMatchObject({ name: "read", namespace: "alpha" });
++  expect(viaEvent.data.response.output[0]).toMatchObject({ name: "read", namespace: "alpha" });
++  const twiceEvent = restoreToolNames(viaEvent, map);
++  expect(twiceEvent.data.item).toMatchObject({ name: "read", namespace: "alpha" });
++  expect(twiceEvent.data.response.output[0]).toMatchObject({ name: "read", namespace: "alpha" });
++});
++
++it("keeps namespace/leaf meaning in descriptions and custom grammar hints", () => {
++  const translated = openaiResponsesToOpenAIRequest("gemini-3.8-flash", fixture(), true, {});
++  const alphaAlias = alias(translated._toolNameMap, "alpha", "read");
++  const patchAlias = alias(translated._toolNameMap, "alpha", "patch");
++  const decl = translated.tools.find(t => t.function.name === alphaAlias);
++  expect(decl.function.description).toContain("[alpha.read]");
++  expect(decl.function.description).toContain("Read the selected record.");
++  expect(decl.function.description).toContain("First source.");
++  const patchDecl = translated.tools.find(t => t.function.name === patchAlias);
++  expect(patchDecl.function.description).toContain("Apply raw input.");
++  expect(patchDecl.function.description).toContain("lark");
++  expect(patchDecl.function.description).toContain("start: TEXT");
++  expect(translated._customToolNames).toContain(patchAlias);
++});
++
++for (const [target, provider, credentials] of [
++  [FORMATS.OPENAI, "openai", null],
++  [FORMATS.CLAUDE, "anthropic", { apiKey: "fixture-key" }],
++  [FORMATS.KIRO, "kiro", {}],
++]) {
++  it(`survives target ${target}: namespace descriptors remain in the translated map`, () => {
++    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, target, "gemini-3.8-flash", fixture(), true, credentials, provider);
++    expect(translated._toolNameMap instanceof Map).toBe(true);
++    const alphaAlias = alias(translated._toolNameMap, "alpha", "read");
++    const betaAlias = alias(translated._toolNameMap, "beta", "read");
++    expect(alphaAlias).toBeTruthy();
++    expect(betaAlias).toBeTruthy();
++    expect(translated._toolNameMap.get(alphaAlias)).toEqual({ name: "read", namespace: "alpha", type: "function" });
++  });
++}
++
++it("reserves root names before aliasing: a root tool named like a base alias wins deterministically", () => {
++  const baseline = openaiResponsesToOpenAIRequest("gemini-3.8-flash", fixture(), true, {});
++  const baseAlias = alias(baseline._toolNameMap, "alpha", "read");
++  const imposter = { type: "function", name: baseAlias, description: "Imposter root tool.", parameters: schema };
++  const nsAlpha = () => ({ type: "namespace", name: "alpha", tools: [leaf(), { type: "custom", name: "patch", description: "Apply raw input.", format: { type: "grammar", syntax: "lark", definition: "start: TEXT" } }] });
++  const orderA = fixture();
++  orderA.tools = [leaf(), imposter, nsAlpha()];
++  const orderB = fixture();
++  orderB.tools = [nsAlpha(), leaf(), imposter];
++  const translatedA = openaiResponsesToOpenAIRequest("gemini-3.8-flash", orderA, true, {});
++  const translatedB = openaiResponsesToOpenAIRequest("gemini-3.8-flash", orderB, true, {});
++  const aliasA = alias(translatedA._toolNameMap, "alpha", "read");
++  const aliasB = alias(translatedB._toolNameMap, "alpha", "read");
++  expect(aliasA).toBe(aliasB);
++  expect(aliasA).not.toBe(baseAlias);
++  expect(aliasA).toMatch(/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/);
++  expect(translatedA.tools.map(t => t.function.name)).toContain(baseAlias);
++  expect(translatedA.messages.find(m => m.tool_calls).tool_calls[0].function.name).toBe(aliasA);
++  expect(translatedA._toolNameMap.get(aliasA)).toEqual({ name: "read", namespace: "alpha", type: "function" });
++});
++
++it("ignores nested namespaces, hosted tools, and null children while keeping valid children", () => {
++  const body = fixture();
++  body.tools = [{
++    type: "namespace", name: "gamma", tools: [
++      { type: "namespace", name: "inner", tools: [leaf()] },
++      { type: "request_user_input" },
++      null,
++      leaf(),
++    ],
++  }];
++  const translated = openaiResponsesToOpenAIRequest(body.model, body, true, {});
++  expect(translated.tools).toHaveLength(2);
++  const gammaAlias = alias(translated._toolNameMap, "gamma", "read");
++  const betaAlias = alias(translated._toolNameMap, "beta", "read");
++  expect(gammaAlias).toBeTruthy();
++  expect(betaAlias).toBeTruthy();
++  expect(translated.tools.map(t => t.function.name)).toEqual(expect.arrayContaining([gammaAlias, betaAlias]));
++  expect(alias(translated._toolNameMap, "inner", "read")).toBeUndefined();
++});
++
++const jsonUsageMetadata = { promptTokenCount: 90, candidatesTokenCount: 10, thoughtsTokenCount: 10, cachedContentTokenCount: 40, totalTokenCount: 110 };
++const expectedJsonUsage = { input_tokens: 90, output_tokens: 20, total_tokens: 110, input_tokens_details: { cached_tokens: 40 }, output_tokens_details: { reasoning_tokens: 10 } };
++
++for (const [format, provider] of [[FORMATS.GEMINI, "gemini"], [FORMATS.GEMINI, "aistudio"], [FORMATS.ANTIGRAVITY, "antigravity"]]) {
++  describe(`${provider} namespace non-streaming JSON`, () => {
++    for (const [name, type, args] of [["read", "function_call", { title: "record", count: 3 }], ["patch", "custom_tool_call", { input: "RAW_PATCH" }]]) {
++      it(`retains the namespace and ${type} identity`, async () => {
++        const translated = translateRequest(FORMATS.OPENAI_RESPONSES, format, "gemini-3.8-flash", fixture(), true, { projectId: "fixture" }, provider);
++        const wireName = alias(translated._toolNameMap, "alpha", name);
++        expect(wireName).toBeTruthy();
++        const native = { candidates: [{ content: { role: "model", parts: [{ functionCall: { id: "call_json", name: wireName, args } }] }, finishReason: "STOP" }], usageMetadata: jsonUsageMetadata };
++        const body = format === FORMATS.ANTIGRAVITY ? { response: native } : native;
++        const result = translateNonStreamingResponse(body, format, FORMATS.OPENAI_RESPONSES, new Set(translated._customToolNames || []));
++        const restored = restoreToolNames(result, translated._toolNameMap);
++        const item = restored.output.find(i => i.type === type);
++        expect(item).toMatchObject({ type, name, namespace: "alpha", call_id: "call_json" });
++        if (type === "custom_tool_call") expect(item.input).toBe("RAW_PATCH");
++        else expect(JSON.parse(item.arguments)).toEqual(args);
++        expect(restored.usage).toEqual(expectedJsonUsage);
++        expect(filterUsageForFormat(restored.usage, FORMATS.OPENAI_RESPONSES)).toEqual(expectedJsonUsage);
++      });
++    }
++    it("keeps a generated fallback call_id when the native call omits id", () => {
++      const translated = translateRequest(FORMATS.OPENAI_RESPONSES, format, "gemini-3.8-flash", fixture(), true, { projectId: "fixture" }, provider);
++      const wireName = alias(translated._toolNameMap, "alpha", "read");
++      const native = { candidates: [{ content: { role: "model", parts: [{ functionCall: { name: wireName, args: {} } }] }, finishReason: "STOP" }], usageMetadata: jsonUsageMetadata };
++      const body = format === FORMATS.ANTIGRAVITY ? { response: native } : native;
++      const restored = restoreToolNames(translateNonStreamingResponse(body, format, FORMATS.OPENAI_RESPONSES, new Set(translated._customToolNames || [])), translated._toolNameMap);
++      const item = restored.output.find(i => i.type === "function_call");
++      expect(typeof item.call_id).toBe("string");
++      expect(item.call_id.length).toBeGreaterThan(0);
++      expect(item.call_id).not.toBe("call_json");
++      expect(item).toMatchObject({ name: "read", namespace: "alpha" });
++    });
++  });
++}
++
++const REASONING_BLOB = "gAAAAAB_reasoning_opaque_blob";
++const messageSchema = { type: "object", properties: { message: { type: "string", encrypted: true, description: "Task text." }, note: { type: "string", encrypted: true } }, required: ["message"], additionalProperties: false, strict: true };
++const collaborationTools = () => ({
++  type: "namespace",
++  name: "collaboration",
++  description: "Multi-agent tools.",
++  tools: [
++    { type: "function", name: "spawn_agent", description: "Start a child.", parameters: messageSchema, strict: true, vendorHint: "kept" },
++    { type: "function", name: "wait_agent", description: "Wait.", parameters: { type: "object", properties: { targets: { type: "array", encrypted: true } } } },
++    { type: "custom", name: "send_patch", description: "Raw.", format: { type: "text" } },
++  ],
++});
++const collaborationBody = () => ({
++  model: "gpt-5.5",
++  tools: [
++    { type: "function", name: "read", description: "Root read.", parameters: schema },
++    collaborationTools(),
++    { type: "namespace", name: "alpha", tools: [leaf()] },
++  ],
++  input: [
++    { type: RESPONSES_ITEM.ADDITIONAL_TOOLS, tools: [{ type: "namespace", name: "collaboration", tools: [{ type: "function", name: "followup_task", parameters: { type: "object", properties: { message: { type: "string", encrypted: true } } } }] }] },
++    { type: "function_call", namespace: "collaboration", name: "spawn_agent", call_id: "call_spawn", arguments: '{"message":"Task"}' },
++    { type: "function_call_output", call_id: "call_spawn", output: '{"ok":true}' },
++    { type: "custom_tool_call", namespace: "collaboration", name: "send_patch", call_id: "call_patch", input: "RAW" },
++    { type: "custom_tool_call_output", call_id: "call_patch", output: "done" },
++    { type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] },
++  ],
++  tool_choice: { type: "allowed_tools", mode: "auto", tools: [{ type: "function", name: "spawn_agent", namespace: "collaboration" }] },
++});
++
++describe("portable collaboration preparation", () => {
++  it("flattens collaboration declarations and drops encrypted only from the listed message schemas", () => {
++    const body = collaborationBody();
++    const before = JSON.stringify(body);
++    const { body: out, toolNameMap } = preparePortableCollaboration(body);
++    expect(JSON.stringify(body)).toBe(before);
++    const spawn = alias(toolNameMap, "collaboration", "spawn_agent");
++    const spawnTool = out.tools.find(tool => tool.name === spawn);
++    expect(spawnTool.description).toBe("Multi-agent tools.\nStart a child.");
++    expect(spawnTool.parameters.properties.message).toEqual({ type: "string", description: "Task text." });
++    expect(spawnTool.parameters.properties.note.encrypted).toBe(true);
++    expect(spawnTool).toMatchObject({ strict: true, vendorHint: "kept" });
++    expect(spawnTool.parameters).toMatchObject({ additionalProperties: false, required: ["message"] });
++    const waitTool = out.tools.find(tool => tool.name === alias(toolNameMap, "collaboration", "wait_agent"));
++    expect(waitTool.parameters.properties.targets.encrypted).toBe(true);
++    expect(toolNameMap.get(alias(toolNameMap, "collaboration", "send_patch"))).toEqual({ name: "send_patch", namespace: "collaboration", type: "custom" });
++    const followup = out.input[0].tools[0];
++    expect(followup.parameters.properties.message).toEqual({ type: "string" });
++  });
++
++  it("rewrites history calls and tool choices while leaving results and reasoning untouched", () => {
++    const body = collaborationBody();
++    const { body: out, toolNameMap } = preparePortableCollaboration(body);
++    const spawn = alias(toolNameMap, "collaboration", "spawn_agent");
++    const patch = alias(toolNameMap, "collaboration", "send_patch");
++    expect(out.input[1]).toEqual({ type: "function_call", name: spawn, call_id: "call_spawn", arguments: '{"message":"Task"}' });
++    expect(out.input[2]).toEqual(body.input[2]);
++    expect(out.input[3]).toEqual({ type: "custom_tool_call", name: patch, call_id: "call_patch", input: "RAW" });
++    expect(out.input[4]).toEqual(body.input[4]);
++    expect(out.input[5]).toEqual(body.input[5]);
++    expect(out.tool_choice.tools[0]).toEqual({ type: "function", name: spawn });
++  });
++
++  it("rewrites a direct namespaced tool_choice", () => {
++    const { body: out, toolNameMap } = preparePortableCollaboration({ model: "m", tools: [collaborationTools()], tool_choice: { type: "function", name: "spawn_agent", namespace: "collaboration" } });
++    expect(out.tool_choice).toEqual({ type: "function", name: alias(toolNameMap, "collaboration", "spawn_agent") });
++  });
++
++  it("keeps other namespaces and root tools unchanged", () => {
++    const body = collaborationBody();
++    const { body: out } = preparePortableCollaboration(body);
++    expect(out.tools[0]).toEqual(body.tools[0]);
++    expect(out.tools.at(-1)).toEqual(body.tools[2]);
++  });
++
++  it("resolves alias collisions with unrelated root tools deterministically", () => {
++    const first = preparePortableCollaboration(collaborationBody());
++    const base = alias(first.toolNameMap, "collaboration", "spawn_agent");
++    const body = collaborationBody();
++    body.tools.push({ type: "function", name: base, parameters: { type: "object" } });
++    const { toolNameMap } = preparePortableCollaboration(body);
++    expect(alias(toolNameMap, "collaboration", "spawn_agent")).toBe(`${base.slice(0, 58)}_1`);
++  });
++
++  it("restores collaboration identity in Responses SSE and terminal output while keeping the reasoning blob", async () => {
++    const { toolNameMap } = preparePortableCollaboration(collaborationBody());
++    const spawn = alias(toolNameMap, "collaboration", "spawn_agent");
++    const reasoning = { type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] };
++    const call = { type: "function_call", name: spawn, call_id: "call_spawn", arguments: '{"message":"Task"}' };
++    const events = [
++      { type: "response.output_item.added", item: call },
++      { type: "response.output_item.done", item: reasoning },
++      { type: "response.output_item.done", item: call },
++      { type: "response.completed", response: { output: [reasoning, call] } },
++    ];
++    const input = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""))); controller.close(); } });
++    const transform = createSSETransformStreamWithLogger(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, "codex", null, toolNameMap, "gpt-5.5", null, null, null, null, null);
++    const raw = await new Response(input.pipeThrough(transform)).text();
++    const out = raw.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)));
++    const added = out.find(event => event.type === "response.output_item.added");
++    expect(added.item).toMatchObject({ name: "spawn_agent", namespace: "collaboration", call_id: "call_spawn" });
++    const done = out.filter(event => event.type === "response.output_item.done");
++    expect(done.find(event => event.item.type === "function_call").item).toMatchObject({ name: "spawn_agent", namespace: "collaboration", call_id: "call_spawn", arguments: '{"message":"Task"}' });
++    expect(done.find(event => event.item.type === "reasoning").item).toEqual(reasoning);
++    const terminal = out.find(event => event.type === "response.completed");
++    expect(terminal.response.output[0]).toEqual(reasoning);
++    expect(terminal.response.output[1]).toMatchObject({ name: "spawn_agent", namespace: "collaboration", call_id: "call_spawn" });
++  });
++
++  it.each(["spawn_agent", "send_message", "followup_task"])("removes encrypted only from %s message schema", tool => {
++    const reasoning = { type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] };
++    const body = {
++      model: "gpt-5.5",
++      tools: [{ type: "namespace", name: "collaboration", tools: [{ type: "function", name: tool, parameters: messageSchema }] }],
++      input: [reasoning],
++    };
++    const { body: out, toolNameMap } = preparePortableCollaboration(body);
++    const flat = out.tools.find(item => item.name === alias(toolNameMap, "collaboration", tool));
++    expect(flat.parameters.properties.message).toEqual({ type: "string", description: "Task text." });
++    expect(flat.parameters.properties.note).toEqual({ type: "string", encrypted: true });
++    expect(out.input[0]).toEqual(reasoning);
++  });
++
++  it("restores terminal non-streaming output and keeps reasoning identical", () => {
++    const { toolNameMap } = preparePortableCollaboration(collaborationBody());
++    const spawn = alias(toolNameMap, "collaboration", "spawn_agent");
++    const reasoning = { type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] };
++    const restored = restoreToolNames({ type: "response", output: [reasoning, { type: "function_call", name: spawn, call_id: "call_spawn", arguments: "{}" }] }, toolNameMap);
++    expect(restored.output[0]).toEqual(reasoning);
++    expect(restored.output[1]).toMatchObject({ name: "spawn_agent", namespace: "collaboration" });
++  });
++});
+diff --git a/tests/unit/openai-responses-web-search.test.js b/tests/unit/openai-responses-web-search.test.js
+new file mode 100644
+index 00000000..58519791
+--- /dev/null
++++ b/tests/unit/openai-responses-web-search.test.js
+@@ -0,0 +1,310 @@
++import { describe, expect, it } from "vitest";
++import "../translator/registerAll.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.js";
++import { translateNonStreamingResponse } from "../../open-sse/handlers/chatCore/nonStreamingHandler.js";
++import { getGeminiThoughtSignatureSync } from "../../open-sse/services/thoughtSignatureStore.js";
++
++const MODEL = "gemini-3.8-flash";
++
++const recordVersion = () => ({
++  type: "function",
++  name: "record_version",
++  description: "Record the discovered version.",
++  parameters: { type: "object", properties: { version: { type: "string" } }, required: ["version"], additionalProperties: false },
++});
++
++const userMessage = () => ({ type: "message", role: "user", content: [{ type: "input_text", text: "Use Google Search to find the Node.js LTS version, then call record_version." }] });
++
++const requestBody = (tools) => ({
++  model: MODEL,
++  instructions: "You are a precise assistant.",
++  tools,
++  input: [userMessage()],
++  tool_choice: "auto",
++});
++
++const webSearch = { type: "web_search", external_web_access: true };
++
++// Shapes follow the live AIStudio probe (websearch-probe/aistudio.json): thought text,
++// then alternating toolCall/toolResponse parts, then a thought, then the functionCall.
++const thought = (text) => ({ text, thought: true });
++const searchCall = (id, sig, queries) => ({ thoughtSignature: sig, toolCall: { toolType: "GOOGLE_SEARCH_WEB", args: { queries }, id } });
++const searchResponse = (id, sig, payload) => ({ thoughtSignature: sig, toolResponse: { toolType: "GOOGLE_SEARCH_WEB", response: payload, id } });
++const CALL_SIG = "call-signature";
++const probeParts = [
++  thought("Plan: search, then record."),
++  searchCall("call_393179", "sig-1", ["Node js releases LTS", "Node js current LTS version"]),
++  searchResponse("call_393179", "sig-2", { search_suggestions: "<style>.c{display:flex}</style>", results: "v24.21.0 LTS, v26.11.1 Current" }),
++  thought("The LTS line is 24.x."),
++  searchCall("call_393227", "sig-3", ["\"record_version\" node lts"]),
++  searchResponse("call_393227", "sig-4", { search_suggestions: "<style/>.chip{padding:5px}</style>", results: "24.21.0 is LTS" }),
++  thought("24.21.0 is the current LTS."),
++  { functionCall: { name: "record_version", args: { version: "24.21.0" }, id: "call_393372" }, thoughtSignature: CALL_SIG },
++];
++const serverParts = probeParts.filter(part => part.toolCall || part.toolResponse);
++
++const nativeResponse = (parts) => ({
++  candidates: [{ content: { role: "model", parts }, finishReason: "STOP" }],
++  usageMetadata: { promptTokenCount: 602, candidatesTokenCount: 22, thoughtsTokenCount: 1357, totalTokenCount: 1981 },
++  modelVersion: MODEL,
++});
++
++async function runStream(chunks, credentials) {
++  const input = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(chunks.map(c => `data: ${JSON.stringify(c)}\n\n`).join(""))); controller.close(); } });
++  const transform = createSSETransformStreamWithLogger(FORMATS.GEMINI, FORMATS.OPENAI_RESPONSES, "aistudio", null, null, MODEL, null, null, null, null, null, credentials);
++  const raw = await new Response(input.pipeThrough(transform)).text();
++  return raw.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)));
++}
++
++describe("Responses web_search request translation", () => {
++  for (const provider of ["gemini", "aistudio"]) {
++    it(`enables googleSearch with server-side invocations for ${provider}`, () => {
++      const credentials = {};
++      const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([recordVersion(), webSearch]), true, credentials, provider);
++      const kinds = translated.tools.map(t => Object.keys(t)[0]);
++      expect(kinds).toContain("googleSearch");
++      expect(kinds).toContain("functionDeclarations");
++      expect(translated.tools.find(t => t.googleSearch)).toEqual({ googleSearch: {} });
++      const declarations = translated.tools.find(t => t.functionDeclarations).functionDeclarations;
++      expect(declarations.map(d => d.name)).toEqual(["record_version"]);
++      expect(translated.toolConfig.includeServerSideToolInvocations).toBe(true);
++      expect(translated.toolConfig.functionCallingConfig).toEqual({ mode: "AUTO" });
++      expect("_webSearch" in translated).toBe(false);
++      expect(JSON.stringify(translated)).not.toContain("web_search");
++    });
++  }
++
++  it("enables googleSearch when web_search is the only tool", () => {
++    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([webSearch]), true, {}, "gemini");
++    expect(translated.tools).toEqual([{ googleSearch: {} }]);
++    expect(translated.toolConfig).toEqual({ includeServerSideToolInvocations: true });
++  });
++
++  for (const [label, format, provider, model, tools] of [
++    ["antigravity", FORMATS.ANTIGRAVITY, "antigravity", MODEL, undefined],
++    ["gemini-cli", FORMATS.GEMINI_CLI, "gemini-cli", MODEL, undefined],
++    ["non-Gemini-3 model", FORMATS.GEMINI, "gemini", "gemini-2.5-flash", undefined],
++    ["vertex", FORMATS.VERTEX, "vertex", MODEL, undefined],
++    ["external_web_access:false", FORMATS.GEMINI, "gemini", MODEL, [{ type: "function", name: "record_version", description: "Record the discovered version.", parameters: { type: "object", properties: { version: { type: "string" } }, required: ["version"], additionalProperties: false } }, { type: "web_search", external_web_access: false }]],
++    ["allowed_domains filter", FORMATS.GEMINI, "gemini", MODEL, [{ type: "function", name: "record_version", description: "Record the discovered version.", parameters: { type: "object", properties: { version: { type: "string" } }, required: ["version"], additionalProperties: false } }, { type: "web_search", external_web_access: true, filters: { allowed_domains: ["nodejs.org"] } }]],
++  ]) {
++    it(`does not enable googleSearch for ${label}`, () => {
++      const base = requestBody(tools || [recordVersion(), webSearch]);
++      const withSearch = translateRequest(FORMATS.OPENAI_RESPONSES, format, model, base, true, { projectId: "p" }, provider);
++      const plain = { ...base, tools: [recordVersion()] };
++      const withoutSearch = translateRequest(FORMATS.OPENAI_RESPONSES, format, model, plain, true, { projectId: "p" }, provider);
++      const strip = (o) => { const c = structuredClone(o); delete c._webSearch; delete c.requestId; delete c.sessionId; if (c.request) { delete c.request.requestId; delete c.request.sessionId; } return c; };
++      expect(strip(withSearch)).toEqual(strip(withoutSearch));
++      expect(JSON.stringify(withSearch)).not.toContain("googleSearch");
++      expect(JSON.stringify(withSearch)).not.toContain("includeServerSideToolInvocations");
++    });
++  }
++
++  it("never puts web_search into chat tools for a non-Gemini target", () => {
++    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, "gpt-5", requestBody([recordVersion(), webSearch]), true, {}, "openai");
++    expect(translated.tools).toHaveLength(1);
++    expect(translated.tools[0].function.name).toBe("record_version");
++    expect("_webSearch" in translated).toBe(false);
++  });
++});
++
++describe("server-executed tool parts in responses", () => {
++  const session = (sessionId = "web-search-conversation-fixture") => {
++    const credentials = { rawHeaders: { session_id: sessionId } };
++    translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([recordVersion(), webSearch]), true, credentials, "aistudio");
++    return credentials;
++  };
++
++  it("streams reasoning and one client function_call; server parts never leak and never steal signatures", async () => {
++    const credentials = session();
++    const events = await runStream([nativeResponse(probeParts)], credentials);
++    const done = events.filter(e => e.type === "response.output_item.done");
++    const call = done.find(e => e.item.type === "function_call");
++    expect(call.item).toMatchObject({ type: "function_call", name: "record_version", call_id: "call_393372" });
++    expect(JSON.parse(call.item.arguments)).toEqual({ version: "24.21.0" });
++    const serialized = JSON.stringify(events);
++    expect(serialized).not.toContain("toolCall");
++    expect(serialized).not.toContain("toolResponse");
++    expect(serialized).not.toContain("GOOGLE_SEARCH_WEB");
++    // The call keeps its own signature, not the preceding toolResponse signature.
++    expect(getGeminiThoughtSignatureSync("call_393372", credentials._clientSessionId, MODEL)).toBe(CALL_SIG);
++    const reasoning = done.find(e => e.item.type === "reasoning");
++    expect(reasoning).toBeTruthy();
++  });
++
++  it("does not attach a toolResponse signature to an unsigned functionCall", async () => {
++    const credentials = session();
++    const parts = [
++      searchCall("call_a", "sig-a", ["q"]),
++      searchResponse("call_a", "sig-b", { results: "r" }),
++      { functionCall: { name: "record_version", args: { version: "1" }, id: "call_unsigned" } },
++    ];
++    await runStream([nativeResponse(parts)], credentials);
++    expect(getGeminiThoughtSignatureSync("call_unsigned", credentials._clientSessionId, MODEL)).toBeNull();
++  });
++
++  it("replays stored server parts verbatim before the anchored functionCall", async () => {
++    const credentials = session();
++    await runStream([nativeResponse(probeParts)], credentials);
++    const next = {
++      model: MODEL,
++      instructions: "You are a precise assistant.",
++      tools: [recordVersion(), webSearch],
++      input: [
++        userMessage(),
++        { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
++        { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
++        { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
++      ],
++    };
++    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, true, credentials, "aistudio");
++    const modelTurn = translated.contents.find(c => c.role === "model");
++    const fcIndex = modelTurn.parts.findIndex(p => p.functionCall);
++    expect(fcIndex).toBeGreaterThan(0);
++    const leading = modelTurn.parts.slice(0, fcIndex);
++    expect(leading).toEqual(serverParts);
++    expect(modelTurn.parts[fcIndex]).toEqual({ functionCall: { id: "call_393372", name: "record_version", args: { version: "24.21.0" } }, thoughtSignature: CALL_SIG });
++    const toolTurn = translated.contents.find(c => c.parts?.[0]?.functionResponse);
++    expect(toolTurn.parts[0].functionResponse).toMatchObject({ id: "call_393372", name: "record_version" });
++  });
++
++  it("anchors server parts to the turn key when the turn ends on text", async () => {
++    const credentials = session();
++    const textParts = [
++      thought("Thinking about the answer."),
++      searchCall("call_t1", "sig-t1", ["q"]),
++      searchResponse("call_t1", "sig-t2", { results: "found" }),
++      { text: "The LTS version is 24.21.0." },
++    ];
++    const events = await runStream([nativeResponse(textParts)], credentials);
++    expect(JSON.stringify(events)).not.toContain("toolCall");
++    const next = {
++      model: MODEL,
++      instructions: "You are a precise assistant.",
++      tools: [recordVersion(), webSearch],
++      input: [
++        userMessage(),
++        { type: "reasoning", summary: [{ type: "summary_text", text: "Thinking about the answer." }] },
++        { type: "message", role: "assistant", content: [{ type: "output_text", text: "The LTS version is 24.21.0." }] },
++        { type: "message", role: "user", content: [{ type: "input_text", text: "Thanks." }] },
++      ],
++    };
++    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, true, credentials, "aistudio");
++    const modelTurn = translated.contents.find(c => c.role === "model");
++    const textIndex = modelTurn.parts.findIndex(p => p.text === "The LTS version is 24.21.0.");
++    const stored = textParts.filter(p => p.toolCall || p.toolResponse);
++    expect(modelTurn.parts.slice(textIndex - stored.length, textIndex)).toEqual(stored);
++  });
++
++  it("does not replay another session's server parts for the same call id and prompt", async () => {
++    const sessionA = session("web-search-session-a");
++    await runStream([nativeResponse(probeParts)], sessionA);
++    const history = {
++      model: MODEL,
++      instructions: "You are a precise assistant.",
++      tools: [recordVersion(), webSearch],
++      input: [
++        userMessage(),
++        { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
++        { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
++        { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
++      ],
++    };
++    const replayed = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), true, { rawHeaders: { session_id: "web-search-session-a" } }, "aistudio");
++    const turnA = replayed.contents.find(c => c.role === "model");
++    expect(turnA.parts.slice(0, turnA.parts.findIndex(p => p.functionCall))).toEqual(serverParts);
++    const other = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), true, { rawHeaders: { session_id: "web-search-session-b" } }, "aistudio");
++    const parts = other.contents.flatMap(c => c.parts);
++    expect(parts.some(p => p.toolCall || p.toolResponse)).toBe(false);
++    expect(JSON.stringify(other)).not.toContain("GOOGLE_SEARCH_WEB");
++    expect(parts.find(p => p.functionCall).functionCall.id).toBe("call_393372");
++  });
++
++  it("never shares plaintext server parts between headerless conversations on one provider credential", async () => {
++    const CONNECTION = "selected-provider-credential";
++    const history = () => ({
++      model: MODEL,
++      instructions: "You are a precise assistant.",
++      tools: [recordVersion(), webSearch],
++      input: [
++        userMessage(),
++        { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
++        { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
++        { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
++      ],
++    });
++    const open = (body) => {
++      const credentials = {};
++      const out = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, body, true, credentials, "aistudio", null, [], CONNECTION);
++      return { credentials, out };
++    };
++    const first = open(requestBody([recordVersion(), webSearch]));
++    await runStream([nativeResponse(probeParts)], first.credentials);
++    const second = open(history());
++    expect(second.credentials._clientSessionId).toBe(first.credentials._clientSessionId);
++    expect(first.credentials._geminiServerPartsSessionId).toBeNull();
++    expect(second.credentials._geminiServerPartsSessionId).toBeNull();
++    const parts = second.out.contents.flatMap(c => c.parts);
++    expect(parts.some(p => p.toolCall || p.toolResponse)).toBe(false);
++    expect(parts.find(p => p.functionCall).functionCall.id).toBe("call_393372");
++  });
++
++  const historyWithCall = (tools) => ({
++    model: MODEL,
++    instructions: "You are a precise assistant.",
++    tools,
++    input: [
++      userMessage(),
++      { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
++      { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
++      { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
++    ],
++  });
++
++  it("strips replayed server parts when the target cannot serve web search", async () => {
++    const credentials = session();
++    await runStream([nativeResponse(probeParts)], credentials);
++    const ag = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.ANTIGRAVITY, "gemini-3.8-flash-high", historyWithCall([recordVersion(), webSearch]), true, credentials, "antigravity");
++    const agParts = ag.request.contents.flatMap(c => c.parts);
++    expect(agParts.some(p => p.toolCall || p.toolResponse)).toBe(false);
++    const fc = agParts.find(p => p.functionCall);
++    expect(fc.functionCall).toEqual({ id: "call_393372", name: "record_version", args: { version: "24.21.0" } });
++    expect(fc.thoughtSignature).toBe(CALL_SIG);
++    expect(JSON.stringify(ag)).not.toContain("googleSearch");
++    expect(JSON.stringify(ag)).not.toContain("includeServerSideToolInvocations");
++    const noSearch = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, historyWithCall([recordVersion()]), true, credentials, "gemini");
++    const geminiParts = noSearch.contents.flatMap(c => c.parts);
++    expect(geminiParts.some(p => p.toolCall || p.toolResponse)).toBe(false);
++    expect(JSON.stringify(noSearch)).not.toContain("googleSearch");
++    expect(JSON.stringify(noSearch)).not.toContain("includeServerSideToolInvocations");
++    const enabled = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, historyWithCall([recordVersion(), webSearch]), true, credentials, "gemini");
++    const modelTurn = enabled.contents.find(c => c.role === "model");
++    const fcIndex = modelTurn.parts.findIndex(p => p.functionCall);
++    expect(modelTurn.parts.slice(0, fcIndex)).toEqual(serverParts);
++  });
++
++  it("captures and replays server parts through the non-streaming handler", () => {
++    const credentials = session();
++    const result = translateNonStreamingResponse(nativeResponse(probeParts), FORMATS.GEMINI, FORMATS.OPENAI_RESPONSES, null, credentials._geminiTurnScope, credentials._clientSessionId, credentials._geminiServerPartsSessionId);
++    const call = result.output.find(i => i.type === "function_call");
++    expect(call).toMatchObject({ name: "record_version", call_id: "call_393372" });
++    expect(getGeminiThoughtSignatureSync("call_393372", credentials._clientSessionId, MODEL)).toBe(CALL_SIG);
++    const next = {
++      model: MODEL,
++      instructions: "You are a precise assistant.",
++      tools: [recordVersion(), webSearch],
++      input: [
++        userMessage(),
++        { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
++        { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
++        { type: "message", role: "user", content: [{ type: "input_text", text: "Done?" }] },
++      ],
++    };
++    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, true, credentials, "aistudio");
++    const modelTurn = translated.contents.find(c => c.role === "model");
++    const fcIndex = modelTurn.parts.findIndex(p => p.functionCall);
++    expect(modelTurn.parts.slice(0, fcIndex)).toEqual(serverParts);
++  });
++});
+diff --git a/tests/unit/responses-output-index.test.js b/tests/unit/responses-output-index.test.js
+new file mode 100644
+index 00000000..f5b8bfdb
+--- /dev/null
++++ b/tests/unit/responses-output-index.test.js
+@@ -0,0 +1,78 @@
++import { describe, expect, it } from "vitest";
++
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { initState } from "../../open-sse/translator/index.js";
++import { openaiToOpenAIResponsesResponse } from "../../open-sse/translator/response/openai-responses.js";
++
++// Chat -> Responses stream: every output item (reasoning, message, each tool call) must get
++// its own output_index, and response.completed.output must keep all of them in emission order.
++// Regression: reasoning, the message and the first tool call all used index 0, so clients saw a
++// repeated output_item.done index and the reasoning item was overwritten in completed.output.
++function run(chunks) {
++  const state = { ...initState(FORMATS.OPENAI_RESPONSES), targetFormat: FORMATS.OPENAI };
++  const events = [];
++  for (const chunk of chunks) events.push(...openaiToOpenAIResponsesResponse(chunk, state));
++  events.push(...openaiToOpenAIResponsesResponse(null, state));
++  return events;
++}
++
++const chunk = (delta, finish_reason) => ({ id: "chatcmpl-1", choices: [{ index: 0, delta, ...(finish_reason ? { finish_reason } : {}) }] });
++const reasoning = (text) => chunk({ reasoning_content: text });
++const text = (t) => chunk({ content: t });
++const call = (index, id, name, args) => chunk({ tool_calls: [{ index, id, type: "function", function: { name, arguments: args } }] });
++const finish = (reason = "stop") => ({ id: "chatcmpl-1", choices: [{ index: 0, delta: {}, finish_reason: reason }], usage: { prompt_tokens: 5, completion_tokens: 5 } });
++
++const byEvent = (events, name) => events.filter((e) => e.event === name);
++const completed = (events) => byEvent(events, "response.completed")[0].data.response;
++
++function expectConsistentIndices(events) {
++  const added = byEvent(events, "response.output_item.added").map((e) => ({ index: e.data.output_index, id: e.data.item.id }));
++  const done = byEvent(events, "response.output_item.done").map((e) => ({ index: e.data.output_index, id: e.data.item.id }));
++  expect(new Set(added.map((a) => a.index)).size, "output_item.added indices must be unique").toBe(added.length);
++  expect(new Set(done.map((d) => d.index)).size, "output_item.done indices must be unique").toBe(done.length);
++  for (const item of added) {
++    expect(done.find((d) => d.id === item.id)?.index, `done index of ${item.id}`).toBe(item.index);
++  }
++  // Every event that names an item must use the index that item was added with.
++  const indexOf = new Map(added.map((a) => [a.id, a.index]));
++  for (const e of events) {
++    if (e.data?.item_id && e.data.output_index !== undefined) {
++      expect(e.data.output_index, `${e.event} for ${e.data.item_id}`).toBe(indexOf.get(e.data.item_id));
++    }
++  }
++  expect(added.map((a) => a.index)).toEqual(added.map((_, i) => i));
++  return added;
++}
++
++describe("Responses output_index allocation", () => {
++  it("gives reasoning and the following message different indices and keeps both in completed.output", () => {
++    const events = run([reasoning("think"), text("answer"), finish()]);
++    const added = expectConsistentIndices(events);
++    expect(added).toHaveLength(2);
++    expect(completed(events).output.map((o) => o.type)).toEqual(["reasoning", "message"]);
++  });
++
++  it("gives reasoning and the first tool call different indices", () => {
++    const events = run([reasoning("think"), call(0, "call_a", "lookup", "{\"q\":1}"), finish("tool_calls")]);
++    expectConsistentIndices(events);
++    expect(completed(events).output.map((o) => o.type)).toEqual(["reasoning", "function_call"]);
++  });
++
++  it("orders reasoning, message and parallel tool calls by first appearance", () => {
++    const events = run([
++      reasoning("think"), text("let me check"),
++      call(0, "call_a", "lookup", "{}"), call(1, "call_b", "lookup", "{}"),
++      finish("tool_calls"),
++    ]);
++    expectConsistentIndices(events);
++    expect(completed(events).output.map((o) => o.type)).toEqual(["reasoning", "message", "function_call", "function_call"]);
++    expect(completed(events).output.filter((o) => o.type === "function_call").map((o) => o.call_id)).toEqual(["call_a", "call_b"]);
++  });
++
++  it("keeps the old indices for the cases that never collided", () => {
++    const textOnly = run([text("a"), finish()]);
++    expect(byEvent(textOnly, "response.output_item.added")[0].data.output_index).toBe(0);
++    const calls = run([call(0, "call_a", "f", "{}"), call(1, "call_b", "f", "{}"), finish("tool_calls")]);
++    expect(byEvent(calls, "response.output_item.added").map((e) => e.data.output_index)).toEqual([0, 1]);
++  });
++});

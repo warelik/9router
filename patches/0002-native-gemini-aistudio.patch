@@ -1,0 +1,3383 @@
+From d7c2f4042296a9c6aca713e74dbcc2dafc9ac5a0 Mon Sep 17 00:00:00 2001
+From: Overlay Migration <overlay-migration@example.invalid>
+Date: Fri, 16 Oct 2026 08:36:02 +0000
+Subject: [PATCH 2/8] 0002 native-gemini-aistudio
+
+Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
+Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
+Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
+---
+ next.config.mjs                               |   8 +
+ open-sse/executors/base.js                    |   4 +
+ open-sse/executors/default.js                 |  35 +-
+ open-sse/handlers/chatCore.js                 |  61 ++-
+ .../handlers/chatCore/nonStreamingHandler.js  |  61 ++-
+ .../handlers/chatCore/streamingHandler.js     |  55 ++-
+ open-sse/providers/registry/aistudio.js       |  36 ++
+ open-sse/providers/registry/index.js          |   2 +
+ open-sse/services/provider.js                 |   9 +
+ .../translator/concerns/thinkingUnified.js    |  44 +-
+ open-sse/translator/formats/gemini.js         |  56 +++
+ open-sse/translator/index.js                  |  48 +-
+ open-sse/utils/proxyFetch.js                  |   2 +
+ open-sse/utils/stream.js                      | 140 +++++-
+ open-sse/utils/streamHandler.js               |  42 +-
+ open-sse/utils/streamHelpers.js               |   6 +
+ src/app/api/v1/models/[...model]/route.js     |  16 +-
+ src/app/api/v1alpha/models/[...path]/route.js |   2 +
+ src/app/api/v1beta/models/[...path]/route.js  |  89 +++-
+ src/sse/handlers/chat.js                      |  23 +-
+ tests/translator/golden-url-header.test.js    |   2 +
+ .../aistudio-native-response-format.test.js   | 191 ++++++++
+ tests/unit/aistudio-provider.test.js          |  50 +++
+ .../unit/gemini-native-alpha-contract.test.js | 112 +++++
+ tests/unit/gemini-native-api-version.test.js  | 173 ++++++++
+ tests/unit/gemini-native-core.test.js         | 409 +++++++++++++++++
+ tests/unit/gemini-native-endpoint.test.js     |  58 ++-
+ .../unit/gemini-native-entry-contract.test.js | 238 ++++++++++
+ tests/unit/gemini-native-proxy-abort.test.js  |  80 ++++
+ tests/unit/gemini-native-stream.test.js       | 410 ++++++++++++++++++
+ .../unit/native-public-gemini-rewrite.test.js |  67 +++
+ 31 files changed, 2446 insertions(+), 83 deletions(-)
+ create mode 100644 open-sse/providers/registry/aistudio.js
+ create mode 100644 src/app/api/v1alpha/models/[...path]/route.js
+ create mode 100644 tests/unit/aistudio-native-response-format.test.js
+ create mode 100644 tests/unit/aistudio-provider.test.js
+ create mode 100644 tests/unit/gemini-native-alpha-contract.test.js
+ create mode 100644 tests/unit/gemini-native-api-version.test.js
+ create mode 100644 tests/unit/gemini-native-core.test.js
+ create mode 100644 tests/unit/gemini-native-entry-contract.test.js
+ create mode 100644 tests/unit/gemini-native-proxy-abort.test.js
+ create mode 100644 tests/unit/gemini-native-stream.test.js
+ create mode 100644 tests/unit/native-public-gemini-rewrite.test.js
+
+diff --git a/next.config.mjs b/next.config.mjs
+index fb225595..90f88f87 100644
+--- a/next.config.mjs
++++ b/next.config.mjs
+@@ -90,6 +90,14 @@ const nextConfig = {
+         source: "/v1beta",
+         destination: "/api/v1beta"
+       },
++      {
++        source: "/v1alpha/:path*",
++        destination: "/api/v1alpha/:path*"
++      },
++      {
++        source: "/v1alpha",
++        destination: "/api/v1alpha"
++      },
+       {
+         source: "/v1/:path*",
+         destination: "/api/v1/:path*"
+diff --git a/open-sse/executors/base.js b/open-sse/executors/base.js
+index 71e26deb..0b8778be 100644
+--- a/open-sse/executors/base.js
++++ b/open-sse/executors/base.js
+@@ -165,6 +165,10 @@ export class BaseExecutor {
+         return { response, url, headers, transformedBody };
+       } catch (error) {
+         clearTimeout(connectTimer);
++        if (signal?.aborted) {
++          if (error?.name === "AbortError") throw error;
++          throw new DOMException("Request aborted", "AbortError");
++        }
+         lastError = error;
+         const isConnectTimeout = connectCtrl.signal.aborted && error.name === "AbortError";
+         dbg("FETCH", `${this.provider.toUpperCase()} ✖ ${error.name}: ${error.message}${isConnectTimeout ? " (connect timeout)" : ""}`);
+diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
+index a2961460..bc135e75 100644
+--- a/open-sse/executors/default.js
++++ b/open-sse/executors/default.js
+@@ -8,6 +8,7 @@ import { buildClineHeaders } from "../shared/clineAuth.js";
+ import { proxyAwareFetch } from "../utils/proxyFetch.js";
+ import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
+ import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
++import { adaptAIStudioStructuredOutput } from "../translator/formats/gemini.js";
+ import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
+ 
+ // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
+@@ -115,7 +116,10 @@ export class DefaultExecutor extends BaseExecutor {
+       stripUnsupportedParams(this.provider, model, transformed);
+     }
+ 
+-    return injectReasoningContent({ provider: this.provider, model, body: transformed });
++    const injected = injectReasoningContent({ provider: this.provider, model, body: transformed });
++    return isResponsesWire(this.provider, this.config, credentials)
++      ? normalizeResponsesReasoning(injected)
++      : injected;
+   }
+ 
+   applyNousAttribution(model, body, stream, credentials) {
+@@ -180,7 +184,21 @@ export class DefaultExecutor extends BaseExecutor {
+     }
+     // gemini-format: build :streamGenerateContent / :generateContent path
+     if (this.config.format === "gemini") {
+-      return `${this.config.baseUrl}/${model}:${stream ? "streamGenerateContent?alt=sse" : "generateContent"}`;
++      // The caller has resolved the provider wire version. Format it without
++      // overriding that routing decision for any Gemini-format provider.
++      const nativeVersion = credentials?.nativeGeminiPassthrough
++        && ["v1", "v1alpha"].includes(credentials.nativeGeminiRequest?.apiVersion)
++        ? credentials.nativeGeminiRequest.apiVersion : null;
++      const baseUrl = nativeVersion
++        ? this.config.baseUrl.replace("/v1beta/", `/${nativeVersion}/`) : this.config.baseUrl;
++      const url = new URL(`${baseUrl}/${model}:${stream ? "streamGenerateContent" : "generateContent"}`);
++      const nativeQuery = credentials?.nativeGeminiRequest?.query;
++      if (credentials?.nativeGeminiPassthrough && Array.isArray(nativeQuery)) {
++        for (const [key, value] of nativeQuery) {
++          if (key !== "key" && key !== "$key") url.searchParams.append(key, value);
++        }
++      } else if (stream) url.searchParams.set("alt", "sse");
++      return url.toString();
+     }
+     // urlSuffix (e.g. ?beta=true) declared per-provider in registry
+     if (this.config.urlSuffix) {
+@@ -213,6 +231,19 @@ export class DefaultExecutor extends BaseExecutor {
+     // Hooks run BEFORE auth so dynamic overlays can't clobber the token.
+     for (const hook of desc.hooks || []) HEADER_HOOKS[hook]?.(headers, credentials);
+     applyAuth(headers, desc, credentials);
++    if (credentials?.nativeGeminiPassthrough) {
++      const reserved = new Set(Object.keys(headers).map(key => key.toLowerCase()));
++      const privateHeaders = new Set([
++        "authorization", "proxy-authorization", "x-goog-api-key", "x-api-key", "cookie", "set-cookie",
++        "host", "content-length", "connection", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer",
++      ]);
++      for (const [name, value] of Object.entries(credentials.nativeGeminiRequest?.headers || {})) {
++        const lower = name.toLowerCase();
++        if (!privateHeaders.has(lower) && !reserved.has(lower) && !lower.startsWith("x-forwarded-") && !lower.startsWith("x-9router-")) {
++          headers[name] = value;
++        }
++      }
++    }
+ 
+     // anthropic-compatible-* nodes serving a real Claude model sit in front of
+     // Anthropic itself (a rotating multi-account proxy, a corporate gateway),
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index ef5b0698..827ce9b7 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -160,7 +160,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   const preTranslateRtkLine = formatRtkLog(preTranslateRtk);
+   if (preTranslateRtkLine) console.log(preTranslateRtkLine);
+ 
+-  const clientRequestedStreaming = body.stream === true || sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI;
++  const clientRequestedStreaming = body.stream === true || (body.stream !== false && (sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI));
+   const providerRequiresStreaming = PROVIDERS[provider]?.forceStream === true;
+   let stream = providerRequiresStreaming ? true : (body.stream !== false);
+ 
+@@ -189,15 +189,33 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   const reqLogger = await createRequestLogger(sourceFormat, targetFormat, model);
+   if (clientRawRequest) reqLogger.logClientRawRequest(clientRawRequest.endpoint, clientRawRequest.body, clientRawRequest.headers);
+   reqLogger.logRawRequest(body);
++  // Reject opaque-only tasks before a translator or strict Responses transport drops their payload; readable mixed histories keep the provider's existing contract.
++  if (sourceFormat === FORMATS.OPENAI_RESPONSES
++    && (targetFormat !== FORMATS.OPENAI_RESPONSES || effectiveTransport?.quirks?.portableResponsesInput)
++    && hasUndeliverableAgentMessage(body.input)) {
++    return createErrorResult(HTTP_STATUS.BAD_REQUEST,
++      "This history contains an encrypted Codex agent_message that this provider cannot read. Enable portable collaboration on the parent and start a new child with a plaintext task; existing encrypted task history cannot be recovered by this route.");
++  }
+   log?.debug?.("FORMAT", `${sourceFormat} → ${targetFormat} | stream=${stream}`);
+ 
+   // Native passthrough: CLI tool and provider are the same ecosystem
+   // Skip all translation/normalization — only model and Bearer are swapped
+   const clientTool = detectClientTool(clientRawRequest?.headers || {}, body);
+-  const passthrough = isNativePassthrough(clientTool, provider);
++  const passthrough = nativeGemini || isNativePassthrough(clientTool, provider);
+ 
+   // Expose raw client headers to translators/executors for session-id resolution
+   if (credentials) credentials.rawHeaders = clientRawRequest?.headers || {};
++  if (provider === "antigravity" && credentials) credentials.nativeGeminiPassthrough = nativeAntigravity;
++  if (nativeGemini && credentials) {
++    credentials.nativeGeminiPassthrough = true;
++    credentials.nativeGeminiRequest = {
++      query: clientRawRequest?.queryParams,
++      headers: clientRawRequest?.headers || {},
++      // Client and provider versions are separate routing decisions. The
++      // browser-authenticated AIStudio generation API uses its beta wire.
++      apiVersion: provider === "aistudio" ? "v1beta" : clientRawRequest?.apiVersion,
++    };
++  }
+ 
+   // Auto-strip media blocks the model can't read (vision/audio/pdf) before translation.
+   if (!passthrough) {
+@@ -240,10 +258,25 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+     }
+     toolNameMap = translatedBody._toolNameMap;
+     delete translatedBody._toolNameMap;
+-    customToolNames = translatedBody._customToolNames;
++    customToolNames = translatedBody._customToolNames ? new Set(translatedBody._customToolNames) : null;
+     delete translatedBody._customToolNames;
+     translatedBody.model = stripThinkingSuffix(upstreamModel);
+     stripContinuityFields(translatedBody);
++    // Strict Responses upstreams (quirks.portableResponsesInput) reject Codex
++    // multi-agent/delegation history items — rewrite them to portable shapes.
++    if (effectiveTransport?.quirks?.portableResponsesInput
++      && targetFormat === FORMATS.OPENAI_RESPONSES
++      && Array.isArray(translatedBody.input)) {
++      translatedBody.input = toPortableResponsesInput(translatedBody.input);
++    }
++  }
++
++  const portableCollaboration = Object.entries(clientRawRequest?.headers || {}).some(
++    ([name, value]) => name.toLowerCase() === PORTABLE_COLLABORATION.header && String(value).toLowerCase() === "true");
++  if (portableCollaboration && sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES) {
++    const prepared = preparePortableCollaboration(translatedBody);
++    translatedBody = prepared.body;
++    if (prepared.toolNameMap.size) toolNameMap = new Map([...(toolNameMap || []), ...prepared.toolNameMap]);
+   }
+ 
+   // Tool normalization: MCP-equivalent built-in dedup (Claude clients) + same-name
+@@ -356,6 +389,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${model} | ${msgCount} msgs`);
+ 
+   const streamController = createStreamController({
++    clientSignal,
+     onDisconnect: (reason) => {
+       trackPendingRequest(model, provider, connectionId, false);
+       if (onDisconnect) onDisconnect(reason);
+@@ -368,6 +402,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+     connectionProxyEnabled: credentials?.providerSpecificData?.connectionProxyEnabled === true,
+     connectionProxyUrl: credentials?.providerSpecificData?.connectionProxyUrl || "",
+     connectionNoProxy: credentials?.providerSpecificData?.connectionNoProxy || "",
++    strictProxy: credentials?.providerSpecificData?.strictProxy === true,
+     vercelRelayUrl: credentials?.providerSpecificData?.vercelRelayUrl || "",
+     // Strict pools must never silently fall back to a direct connection —
+     // honored on the Cursor AgentService h2 path and in proxyFetch (#4333).
+@@ -408,7 +443,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   let providerResponseFormat = targetFormat;
+   try {
+     const result = await executor.execute({
+-      model,
++      model: nativeGemini ? stripThinkingSuffix(upstreamModel) : model,
+       body: translatedBody,
+       stream,
+       credentials,
+@@ -477,7 +512,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+         }
+         try {
+           const retryResult = await executor.execute({
+-            model,
++            model: nativeGemini ? stripThinkingSuffix(upstreamModel) : model,
+             body: translatedBody,
+             stream,
+             credentials,
+@@ -504,6 +539,17 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+ 
+   // Provider returned error
+   if (!providerResponse.ok) {
++    let nativeErrorResponse = null;
++    if (nativeGemini) {
++      const headers = new Headers(providerResponse.headers);
++      // fetch exposes decoded bytes; forwarding compressed-length headers makes
++      // native clients decompress them twice or wait for bytes that cannot arrive.
++      for (const name of ["content-encoding", "content-length", "transfer-encoding"]) headers.delete(name);
++      headers.set("Access-Control-Allow-Origin", "*");
++      nativeErrorResponse = new Response(providerResponse.clone().body, {
++        status: providerResponse.status, statusText: providerResponse.statusText, headers,
++      });
++    }
+     trackPendingRequest(model, provider, connectionId, false, true);
+     const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
+     appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
+@@ -524,10 +570,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+       log.errorLine(reqTag, "✗", `ERROR ${statusCode} · ${provider}/${model} · ${Date.now() - requestStartTime}ms${urlStr}\n    ${errMsg}`);
+     }
+     reqLogger.logError(new Error(message), finalBody || translatedBody);
+-    return createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
++    const result = createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
++    return nativeErrorResponse ? { ...result, response: nativeErrorResponse, nativeResponse: true } : result;
+   }
+ 
+-  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };
++  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log, nativeResponseProjection };
+   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
+   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
+ 
+diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
+index 44aae537..ac79c218 100644
+--- a/open-sse/handlers/chatCore/nonStreamingHandler.js
++++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
+@@ -14,6 +14,28 @@ import { decloakToolNames } from "../../utils/claudeCloaking.js";
+ import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
+ import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
+ 
++function parseToolArguments(value) {
++  if (!value) return {};
++  if (typeof value === "object") return value;
++  try {
++    return JSON.parse(value);
++  } catch {
++    return {};
++  }
++}
++
++function nativeGeminiErrorResult(providerResponse, status, message, responseBody = null) {
++  const headers = new Headers(providerResponse.headers);
++  for (const name of ["content-encoding", "content-length", "transfer-encoding"]) headers.delete(name);
++  headers.set("Content-Type", "application/json");
++  headers.set("Access-Control-Allow-Origin", "*");
++  const result = createErrorResult(status, message);
++  return {
++    ...result,
++    nativeResponse: true,
++    response: Response.json(responseBody || { error: { code: status, status: "INTERNAL", message } }, { status, headers }),
++  };
++}
+ /**
+  * Convert an OpenAI Chat Completions non-streaming response body into the
+  * OpenAI Responses API shape. Used when a Responses-format client (e.g. Codex)
+@@ -234,12 +256,19 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
+ /**
+  * Handle non-streaming response from provider.
+  */
+-export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log }) {
++export async function handleNonStreamingResponse({ credentials, providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log, nativeResponseProjection }) {
+   trackDone();
++  const isNativeGeminiResponse = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
+   const contentType = providerResponse.headers.get("content-type") || "";
+   let responseBody;
+ 
+   if (contentType.includes("text/event-stream")) {
++    if (isNativeGeminiResponse) {
++      const message = "Unexpected streaming response for non-streaming Gemini request";
++      try { await providerResponse.body?.cancel(message); } catch { /* Keep the framing error even if upstream cancellation fails. */ }
++      appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
++      return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, message);
++    }
+     const sseText = await providerResponse.text();
+     const parsed = parseSSEToOpenAIResponse(sseText, model);
+     if (!parsed) {
+@@ -253,6 +282,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
+     } catch (err) {
+       appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
+       console.error(`[ChatCore] Failed to parse JSON from ${provider}:`, err.message);
++      if (isNativeGeminiResponse) return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
+       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
+     }
+   }
+@@ -263,6 +293,25 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
+   responseBody = unwrapClineEnvelope(responseBody, provider);
+ 
+   reqLogger.logProviderResponse(providerResponse.status, providerResponse.statusText, providerResponse.headers, responseBody);
++  if (isNativeGeminiResponse) {
++    const projected = nativeResponseProjection?.masks?.some(value => String(value ?? "").trim() && String(value).trim() !== "*");
++    const validObject = responseBody !== null && typeof responseBody === "object" && !Array.isArray(responseBody);
++    if (!validObject || (!projected && Object.keys(responseBody).length === 0)) {
++      const message = `Invalid native Gemini response from ${provider}`;
++      appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
++      return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, message);
++    }
++    if (responseBody.error) {
++      const reportedCode = Number(responseBody.error.code);
++      const status = Number.isInteger(reportedCode) && reportedCode >= 400 && reportedCode <= 599
++        ? reportedCode : HTTP_STATUS.BAD_GATEWAY;
++      const message = typeof responseBody.error.message === "string"
++        ? responseBody.error.message : `Native Gemini error from ${provider}`;
++      appendLog({ status: `FAILED ${status}` });
++      const validError = typeof responseBody.error === "object" && !Array.isArray(responseBody.error);
++      return nativeGeminiErrorResult(providerResponse, status, message, validError ? responseBody : null);
++    }
++  }
+   if (onRequestSuccess) {
+     Promise.resolve()
+       .then(onRequestSuccess)
+@@ -288,7 +337,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
+   const isResponsesResponse = sourceFormat === FORMATS.OPENAI_RESPONSES && translatedResponse?.object === "response";
+ 
+   // Fix finish_reason for tool_calls: some providers return non-standard values (e.g. "other")
+-  if (translatedResponse?.choices?.[0]) {
++  if (!isNativeGeminiResponse && translatedResponse?.choices?.[0]) {
+     const choice = translatedResponse.choices[0];
+     const msg = choice.message;
+     const hasToolCalls = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
+@@ -298,27 +347,27 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
+   }
+ 
+   // Ensure OpenAI-required fields
+-  if (!isClaudeMessageResponse && !isResponsesResponse) {
++  if (!isClaudeMessageResponse && !isResponsesResponse && !isNativeGeminiResponse) {
+     if (!translatedResponse.object) translatedResponse.object = "chat.completion";
+     if (!translatedResponse.created) translatedResponse.created = Math.floor(Date.now() / 1000);
+   }
+ 
+   // Strip Azure-specific fields
+-  if (!isClaudeMessageResponse && !isResponsesResponse) {
++  if (!isClaudeMessageResponse && !isResponsesResponse && !isNativeGeminiResponse) {
+     delete translatedResponse.prompt_filter_results;
+     if (translatedResponse?.choices) {
+       for (const choice of translatedResponse.choices) delete choice.content_filter_results;
+     }
+   }
+ 
+-  if (translatedResponse?.usage) {
++  if (!isNativeGeminiResponse && translatedResponse?.usage) {
+     translatedResponse.usage = filterUsageForFormat(addBufferToUsage(translatedResponse.usage), sourceFormat);
+   }
+ 
+   // Strip reasoning_content only when content is non-empty.
+   // When content is empty (e.g. thinking models that used all tokens for reasoning),
+   // reasoning_content is the only useful output and must be preserved.
+-  if (!isClaudeMessageResponse && !isResponsesResponse && translatedResponse?.choices) {
++  if (!isClaudeMessageResponse && !isResponsesResponse && !isNativeGeminiResponse && translatedResponse?.choices) {
+     for (const choice of translatedResponse.choices) {
+       if (choice?.message?.reasoning_content && choice.message.content) {
+         delete choice.message.reasoning_content;
+diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
+index 55106fd5..7f933bf2 100644
+--- a/open-sse/handlers/chatCore/streamingHandler.js
++++ b/open-sse/handlers/chatCore/streamingHandler.js
+@@ -35,25 +35,17 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
+     return createSSETransformStreamWithLogger(FORMATS.OPENAI_RESPONSES, codexTarget, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
+   }
+ 
+-  if (needsTranslation(targetFormat, sourceFormat)) {
++  if (needsTranslation(targetFormat, sourceFormat) || toolNameMap?.size) {
+     return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
+   }
+ 
+-  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey);
++  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, sourceFormat, nativeJson, nativeResponseProjection);
+ }
+ 
+ /**
+  * Handle streaming response — pipe provider SSE through transform stream to client.
+  */
+-export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, pxpipe, reqTag, log, credentials }) {
+-  if (onRequestSuccess) {
+-    Promise.resolve()
+-      .then(onRequestSuccess)
+-      .catch(err => {
+-        console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
+-      });
+-  }
+-
++export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, pxpipe, reqTag, log, credentials, nativeResponseProjection }) {
+   // When upstream returns HTML/text instead of SSE (e.g. Cloudflare 5xx error
+   // page), piping it through the SSE transform stream causes Next.js
+   // "failed to pipe response" and crashes the chat router. Read the body,
+@@ -68,31 +60,50 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+     const sanitizedTitle = (titleMatch?.[1] || '').replace(/<[^>]*>/g, '').replace(/[\r\n]+/g, ' ').trim().slice(0, 160);
+     const shortMsg = sanitizedTitle
+       || (bodyText.length < 200 ? bodyText.replace(/<[^>]*>/g, '').trim().slice(0, 160) : `Upstream returned non-SSE response (${upstreamContentType})`);
+-    const status = providerResponse.status || 502;
++    const status = providerResponse.status >= 400 ? providerResponse.status : HTTP_STATUS.BAD_GATEWAY;
+     if (log?.errorLine) log.errorLine(reqTag, "✗", `BLOCKED ${status} · ${provider}/${model} · non-SSE (${upstreamContentType})\n    ${shortMsg}`);
+     else console.warn(`[STREAM] ${provider} | ${model} | blocked pipe: ${shortMsg} [${status}]`);
+     streamController?.handleError?.(new Error(`upstream non-SSE: ${status}`));
+     return {
+       success: false,
+-      response: new Response(JSON.stringify({ error: { message: `[${status}]: ${shortMsg}` } }), {
++      status,
++      error: shortMsg,
++      nativeResponse: sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI,
++      response: new Response(JSON.stringify({ error: {
++        message: `[${status}]: ${shortMsg}`,
++        ...(sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI ? {
++          code: status,
++          status: ({ 400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED", 404: "NOT_FOUND", 429: "RESOURCE_EXHAUSTED", 503: "UNAVAILABLE", 504: "DEADLINE_EXCEEDED" })[status] || "INTERNAL",
++        } : {}),
++      } }), {
+         status,
+-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
++        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', ...upstreamResponseHeaders(providerResponse.headers) },
+       }),
+     };
+   }
+ 
+-  const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials });
++  if (onRequestSuccess) {
++    Promise.resolve()
++      .then(onRequestSuccess)
++      .catch(err => {
++        console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
++      });
++  }
++
++  const nativeGeminiJson = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
++    && upstreamContentType.includes("application/json");
++  const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
+ 
+   // Terminal bytes when the stream aborts after HTTP 200 was already sent, so the
+   // client sees a real error instead of a silently truncated stream.
+   // Responses passthrough keeps its own response.failed shape; every other client
+   // format gets the OpenAI error frame + [DONE], or `event: error` for Claude.
+   const isResponsesPassthrough = sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES;
+-  const onAbortTerminal = isResponsesPassthrough
++  const onAbortTerminal = nativeGeminiJson ? null : isResponsesPassthrough
+     ? buildAbortedResponsesTerminalBytes
+     : (message) => buildStreamErrorBytes(HTTP_STATUS.GATEWAY_TIMEOUT, message, sourceFormat);
+   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
+-  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs);
++  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, nativeGeminiJson);
+ 
+   saveRequestDetail(buildRequestDetail({
+     provider, model, connectionId,
+@@ -110,7 +121,15 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+ 
+   return {
+     success: true,
+-    response: new Response(transformedBody, { headers: { ...SSE_HEADERS, ...upstreamResponseHeaders(providerResponse.headers) } })
++    response: new Response(transformedBody, { headers: {
++      ...SSE_HEADERS,
++      ...upstreamResponseHeaders(providerResponse.headers),
++      // Gemini streamGenerateContent also supports native JSON framing when
++      // alt=sse is absent. Its transparent body must keep the upstream media type.
++      ...(sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI && upstreamContentType
++        ? { "Content-Type": providerResponse.headers.get("content-type") }
++        : {}),
++    } })
+   };
+ }
+ 
+diff --git a/open-sse/providers/registry/aistudio.js b/open-sse/providers/registry/aistudio.js
+new file mode 100644
+index 00000000..71b07e57
+--- /dev/null
++++ b/open-sse/providers/registry/aistudio.js
+@@ -0,0 +1,36 @@
++// AIStudioToAPI (https://github.com/iBUHub/AIStudioToAPI): a local bridge that drives Google AI
++// Studio in a browser. Only its Gemini-native `/v1beta` surface returns the real
++// `thoughtSignature` of a thinking turn; its OpenAI and Claude surfaces drop it (or fake it), and
++// without it the model cannot use its own earlier reasoning. So this provider talks Gemini wire.
++// The model list is whatever the bridge serves, hence passthroughModels and no seeded ids.
++export default {
++  id: "aistudio",
++  priority: 60,
++  alias: "aistudio",
++  display: {
++    name: "AIStudioToAPI",
++    icon: "diamond",
++    color: "#4285F4",
++    textIcon: "AS",
++    website: "https://github.com/iBUHub/AIStudioToAPI",
++    notice: {
++      text: "Local bridge on 127.0.0.1:7860 (Gemini-native wire). The API key is one of API_KEYS from the bridge's env file.",
++    },
++  },
++  category: "apikey",
++  authType: "apikey",
++  authModes: ["apikey"],
++  transport: {
++    baseUrl: "http://127.0.0.1:7860/v1beta/models",
++    format: "gemini",
++    validateUrl: "http://127.0.0.1:7860/v1/models",
++    auth: {
++      apiKey: {
++        header: "x-goog-api-key",
++        scheme: "raw",
++      },
++    },
++  },
++  models: [],
++  passthroughModels: true,
++};
+diff --git a/open-sse/providers/registry/index.js b/open-sse/providers/registry/index.js
+index 3053d25a..cb57687e 100644
+--- a/open-sse/providers/registry/index.js
++++ b/open-sse/providers/registry/index.js
+@@ -138,6 +138,7 @@ import p135 from "./minimax-code-global.js";
+ import p136 from "./bedrock.js";
+ import p137 from "./bedrock-xai.js";
+ import p138 from "./nous.js";
++import p139 from "./aistudio.js";
+ export default [
+   p0,
+   p1,
+@@ -276,4 +277,5 @@ export default [
+   p136,
+   p137,
+   p138,
++  p139,
+ ];
+diff --git a/open-sse/services/provider.js b/open-sse/services/provider.js
+index 50f0589d..a15cb6fa 100644
+--- a/open-sse/services/provider.js
++++ b/open-sse/services/provider.js
+@@ -142,6 +142,15 @@ export function getTargetFormat(provider, credentials = null) {
+   return config.format || "openai";
+ }
+ 
++// Antigravity's Gemini chat API wraps GenerateContent in a Cloud Code envelope.
++// Its executor can adapt that envelope without translating the Gemini payload.
++// Other Antigravity models (including image generation) keep their own path.
++export function supportsNativeGemini(provider, model) {
++  if (getTargetFormat(provider) === "gemini") return true;
++  return provider === "antigravity" && typeof model === "string"
++    && model.startsWith("gemini-") && !/image|imagen/i.test(model);
++}
++
+ // Resolve which transport to use for a provider given the client sourceFormat.
+ // Multi-endpoint providers (transport.transports[]) pick the entry matching sourceFormat
+ // to avoid lossy translation; falls back to the default transport when no match.
+diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
+index 1ee65771..8deab900 100644
+--- a/open-sse/translator/concerns/thinkingUnified.js
++++ b/open-sse/translator/concerns/thinkingUnified.js
+@@ -440,11 +440,53 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
+ 
+   const fmt = resolveFormat(targetFormat, cleanModel, provider);
+   const supportedLevels = getThinkingLevels(provider, cleanModel);
++  // A translated/native Responses request already owns its wire options; preserve explicit effort and opaque reasoning fields without inventing a summary.
++  if (preserveResponsesOptions && targetFormat === "openai-responses") {
++    const current = body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning) ? body.reasoning : {};
++    const rawEffort = body.reasoning_effort ?? current.effort;
++    const inferred = cfg.mode === "none" ? "none" : toLevel(cfg);
++    const effort = !override && rawEffort !== undefined ? rawEffort : normalizeOpenAILevel(inferred, supportedLevels);
++    if (effort !== null && effort !== undefined) body.reasoning = { ...current, effort };
++    delete body.reasoning_effort;
++    return body;
++  }
+   // Anthropic's `display` (summarized | omitted) decides whether thinking text
+   // comes back at all; keep what the client asked for instead of resetting it.
+   // An OpenAI-shaped client's ask arrives via the captured intent instead.
+   const display = typeof body.thinking?.display === "string" ? body.thinking.display : intent?.display;
+   stripAll(body);
+-  applyFormat(fmt, body, cfg, caps, supportedLevels, display);
++  applyFormat(fmt, body, cfg, caps, supportedLevels, display, servesAnthropicClaude(provider, cleanModel));
+   return body;
+ }
++
++// A native Gemini client already chose provider-native settings. Preserve them;
++// only a model suffix or an absent client setting permits a router default.
++export function applyNativeGeminiThinking(model, body, provider, providerThinking = null) {
++  const { override } = parseSuffix(model);
++  const generationKey = body.generation_config ? "generation_config" : "generationConfig";
++  const generation = body[generationKey] || {};
++  const thinkingKey = generation.thinking_config ? "thinking_config" : "thinkingConfig";
++  const clientThinking = generation[thinkingKey] || {};
++  const explicit = ["thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"]
++    .some(key => Object.hasOwn(clientThinking, key));
++  if (!override && explicit) return body;
++  const mode = providerThinking?.mode;
++  const intent = override || (!mode || mode === "auto" ? null
++    : mode === "on" ? { mode: "budget", budget: 10000 }
++    : mode === "off" || mode === "none" ? { mode: "none" }
++    : { mode: "level", level: mode });
++  if (!intent) return body;
++
++  // Reuse the capability-aware mapping, without its translated-request output
++  // floor or its replacement of client-native options such as includeThoughts.
++  const mapped = applyThinking("gemini", model, {}, provider, intent).generationConfig?.thinkingConfig;
++  if (!mapped) return body;
++  const thinking = { ...clientThinking };
++  for (const key of ["thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"]) delete thinking[key];
++  if (mapped.thinkingLevel !== undefined) thinking.thinkingLevel = String(mapped.thinkingLevel).toUpperCase();
++  if (mapped.thinkingBudget !== undefined) thinking.thinkingBudget = mapped.thinkingBudget;
++  if (!Object.hasOwn(thinking, "includeThoughts") && !Object.hasOwn(thinking, "include_thoughts") && mapped.includeThoughts !== undefined) {
++    thinking.includeThoughts = mapped.includeThoughts;
++  }
++  return { ...body, [generationKey]: { ...generation, [thinkingKey]: thinking } };
++}
+diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
+index 71a71df3..ba24aade 100644
+--- a/open-sse/translator/formats/gemini.js
++++ b/open-sse/translator/formats/gemini.js
+@@ -447,6 +447,62 @@ export function cleanJSONSchemaForAntigravity(schema) {
+   return cleaned;
+ }
+ 
++const PROTO_SCHEMA_TYPES = new Set(["OBJECT", "ARRAY", "STRING", "NUMBER", "INTEGER", "BOOLEAN", "NULL"]);
++export function lowerProtoSchemaTypes(schema) {
++  if (!schema || typeof schema !== "object") return schema;
++  if (Array.isArray(schema)) {
++    for (const item of schema) lowerProtoSchemaTypes(item);
++    return schema;
++  }
++  if (typeof schema.type === "string" && PROTO_SCHEMA_TYPES.has(schema.type)) {
++    schema.type = schema.type.toLowerCase();
++  }
++  eachChildSchema(schema, lowerProtoSchemaTypes);
++  return schema;
++}
++
++const LEGACY_PROTO_SCHEMA_KEYS = new Set(["type", "format", "description", "nullable", "enum", "items", "properties", "required", "propertyOrdering"]);
++export function isLegacyGeminiSchema(schema) {
++  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return false;
++  for (const key of Object.keys(schema)) {
++    if (!LEGACY_PROTO_SCHEMA_KEYS.has(key)) return false;
++  }
++  if (schema.enum !== undefined && (!Array.isArray(schema.enum) || !schema.enum.every((v) => typeof v === "string"))) return false;
++  if (schema.properties !== undefined) {
++    if (typeof schema.properties !== "object" || schema.properties === null || Array.isArray(schema.properties)) return false;
++    for (const child of Object.values(schema.properties)) {
++      if (!isLegacyGeminiSchema(child)) return false;
++    }
++  }
++  if (schema.items !== undefined && !isLegacyGeminiSchema(schema.items)) return false;
++  return true;
++}
++
++export function adaptAIStudioStructuredOutput(body) {
++  if (!body || typeof body !== "object") return body;
++  const key = body.generation_config ? "generation_config" : "generationConfig";
++  const generation = body[key];
++  const schema = generation?.responseJsonSchema ?? generation?.response_json_schema;
++  const mime = generation?.responseMimeType ?? generation?.response_mime_type;
++  const conflictingAliases = generation && (
++    (Object.hasOwn(generation, "responseJsonSchema") && Object.hasOwn(generation, "response_json_schema")) ||
++    (Object.hasOwn(generation, "responseMimeType") && Object.hasOwn(generation, "response_mime_type"))
++  );
++  // The browser-authenticated API accepts the current responseFormat wire;
++  // its deprecated responseJsonSchema alias fails. Move the opaque schema
++  // to the documented replacement without compiling or relaxing it.
++  if (!conflictingAliases && schema !== undefined && mime === "application/json"
++    && !generation.responseFormat && !generation.response_format && !generation.responseSchema && !generation.response_schema) {
++    const mapped = { ...generation, responseFormat: { text: { mimeType: "APPLICATION_JSON", schema } } };
++    delete mapped.responseJsonSchema;
++    delete mapped.response_json_schema;
++    delete mapped.responseMimeType;
++    delete mapped.response_mime_type;
++    return { ...body, [key]: mapped };
++  }
++  return body;
++}
++
+ // Gemini / Cloud Code treat a `$ref` key inside functionResponse.response as a
+ // pointer to functionResponse.parts and reject the request with
+ // "The referenced name `#/$defs/...` in function_response.response does not match
+diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
+index cfccca84..972ddeb4 100644
+--- a/open-sse/translator/index.js
++++ b/open-sse/translator/index.js
+@@ -1,12 +1,13 @@
+ import { FORMATS } from "./formats.js";
+-import { ensureToolCallIds, fixMissingToolResponses } from "./concerns/toolCall.js";
++import { ensureToolCallIds, fixMissingToolResponses, isGeminiFamilyTarget } from "./concerns/toolCall.js";
+ import { prepareClaudeRequest, ensureTrailingUserTurn } from "./formats/claude.js";
+ import { cloakClaudeTools, decloakStreamChunk } from "../utils/claudeCloaking.js";
+ import { restoreToolNames } from "../utils/opencodeFingerprint.js";
+ import { filterToOpenAIFormat } from "./formats/openai.js";
++import { adaptAIStudioStructuredOutput } from "./formats/gemini.js";
+ import { normalizeThinkingConfig } from "../services/provider.js";
+-import { applyThinking, captureThinking } from "./concerns/thinkingUnified.js";
+-import { captureSessionId } from "../utils/sessionManager.js";
++import { applyThinking, captureThinking, stripThinkingSuffix } from "./concerns/thinkingUnified.js";
++import { captureSessionId, captureConversationId } from "../utils/sessionManager.js";
+ import { AntigravityExecutor } from "../executors/antigravity.js";
+ import { PROVIDERS } from "../providers/index.js";
+ import { ROLE, GEMINI_ROLE } from "./schema/roles.js";
+@@ -134,7 +135,46 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+     targetFormat === FORMATS.KIRO &&
+     (sourceFormat === FORMATS.OPENAI || sourceFormat === FORMATS.CLAUDE);
+   if (!kiroThinkingMappedByTranslator) {
+-    applyThinking(targetFormat, model, result, provider, thinkingIntent);
++    applyThinking(targetFormat, model, result, provider, thinkingIntent, { preserveResponsesOptions: targetFormat === FORMATS.OPENAI_RESPONSES });
++  }
++
++  if (sourceFormat !== targetFormat && targetFormat === FORMATS.GEMINI && provider === "aistudio") {
++    result = adaptAIStudioStructuredOutput(result);
++  }
++
++  // Hosted web_search (Codex Responses tools): only Gemini-3 models on the
++  // generateContent API can serve it — as a googleSearch tool entry plus
++  // toolConfig.includeServerSideToolInvocations. Antigravity/Gemini-CLI share the
++  // Cloud Code internal API which rejects that combination, and Vertex is
++  // unverified, so the flag is consumed without effect for them. The internal
++  // marker must never reach a provider body.
++  if (sourceFormat !== targetFormat && result && typeof result === "object") {
++    const wantsWebSearch = result._webSearch === true;
++    delete result._webSearch;
++    const webSearchEnabled = wantsWebSearch && targetFormat === FORMATS.GEMINI && (provider === "gemini" || provider === "aistudio")
++      && /^gemini-3/.test(stripThinkingSuffix(String(model ?? "").split("/").pop() || "") || "");
++    if (webSearchEnabled) {
++      result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
++      result.toolConfig = {
++        ...(result.toolConfig && typeof result.toolConfig === "object" && !Array.isArray(result.toolConfig) ? result.toolConfig : {}),
++        includeServerSideToolInvocations: true,
++      };
++    } else if (isGeminiFamilyTarget(targetFormat, model)) {
++      // The replay helper inserts stored server-side parts for any Gemini-family
++      // history, but only a web-search-enabled upstream can accept them. A fallback
++      // target (or a request without the web_search tool) must not receive them.
++      for (const contents of [result.contents, result.request?.contents]) {
++        if (!Array.isArray(contents)) continue;
++        for (const entry of contents) {
++          if (Array.isArray(entry?.parts)) {
++            entry.parts = entry.parts.filter(part => !(part && (part.toolCall || part.toolResponse)));
++          }
++        }
++        for (let i = contents.length - 1; i >= 0; i--) {
++          if (Array.isArray(contents[i]?.parts) && contents[i].parts.length === 0) contents.splice(i, 1);
++        }
++      }
++    }
+   }
+ 
+   // Always normalize to clean OpenAI format when target is OpenAI
+diff --git a/open-sse/utils/proxyFetch.js b/open-sse/utils/proxyFetch.js
+index af819cc5..aca2381b 100644
+--- a/open-sse/utils/proxyFetch.js
++++ b/open-sse/utils/proxyFetch.js
+@@ -358,6 +358,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
+       try {
+         return await fetchWithTlsFallback(url, options, proxyUrl);
+       } catch (proxyError) {
++        if (options.signal?.aborted || proxyError?.name === "AbortError") throw proxyError;
+         if (proxyOptions?.strictProxy === true) {
+           throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
+         }
+@@ -378,6 +379,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
+     try {
+       return await fetchWithTlsFallback(url, options, proxyUrl);
+     } catch (proxyError) {
++      if (options.signal?.aborted || proxyError?.name === "AbortError") throw proxyError;
+       // If strictProxy is enabled, fail hard instead of falling back to direct
+       if (proxyOptions?.strictProxy === true) {
+         throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index 790f59be..cf73241a 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -2,7 +2,9 @@ import { translateResponse, initState } from "../translator/index.js";
+ import { FORMATS } from "../translator/formats.js";
+ import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
+ import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
+-import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE } from "./streamHelpers.js";
++import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, buildStreamErrorBytes } from "./streamHelpers.js";
++import { HTTP_STATUS } from "../config/runtimeConfig.js";
++import { restoreToolNames } from "./opencodeFingerprint.js";
+ import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
+ import { dbg, isDebugEnabled } from "./debugLog.js";
+ 
+@@ -27,6 +29,38 @@ const STREAM_MODE = {
+ // forever when the upstream stalls with no usage trailer and no [DONE].
+ const PENDING_COMPLETION_FLUSH_MS = 3000;
+ 
++// Google response filtering uses fields/$fields or X-Goog-FieldMask. Empty
++// masks mean all fields; slash paths and parenthesized selectors are supported:
++// https://docs.cloud.google.com/apis/docs/system-parameters
++// https://developers.google.com/workspace/drive/api/guides/fields-parameter
++// Require a terminal only when every supplied projection clearly retains it.
++// Unknown selectors remain transparent instead of fabricating a failure.
++function nativeCandidateFieldIsVisible(projection, field) {
++  return (projection?.masks || []).every(value => {
++    const mask = String(value ?? "").replace(/\s/g, "");
++    if (!mask) return true;
++    const paths = [], prefixes = [];
++    let token = "";
++    const path = () => [prefixes.at(-1), token.replaceAll(".", "/")].filter(Boolean).join("/");
++    for (const character of mask) {
++      if (character === "(") {
++        if (!token) return false;
++        prefixes.push(path());
++        token = "";
++      } else if (character === "," || character === ")") {
++        if (token) paths.push(path());
++        token = "";
++        if (character === ")" && !prefixes.pop()) return false;
++      } else if (/[A-Za-z0-9_*/.]/.test(character)) token += character;
++      else return false;
++    }
++    if (prefixes.length) return false;
++    if (token) paths.push(path());
++    const aliases = field === "finishReason" ? ["finishReason", "finish_reason"] : [field];
++    return paths.some(selected => ["*", "candidates", "candidates/*", ...aliases.map(name => `candidates/${name}`)].includes(selected));
++  });
++}
++
+ /**
+  * Create unified SSE transform stream
+  * @param {object} options
+@@ -45,7 +79,7 @@ export function createSSEStream(options = {}) {
+   const {
+     mode = STREAM_MODE.TRANSLATE,
+     targetFormat,
+-    sourceFormat,
++    sourceFormat = FORMATS.OPENAI,
+     provider = null,
+     reqLogger = null,
+     toolNameMap = null,
+@@ -89,6 +123,44 @@ export function createSSEStream(options = {}) {
+   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
+   let finalized = false;
+   let completionFlushTimer = null;
++  const nativeGeminiCandidates = new Map();
++  let nativeGeminiFailureSeen = false;
++  let nativeGeminiResponseSeen = false;
++  let nativeGeminiMultipleCandidatesSeen = false;
++  let nativeGeminiAnyFinishSeen = false;
++  let nativeGeminiData = [];
++  let nativeGeminiJson = "";
++
++  const captureNativeGeminiBody = (parsed) => {
++    nativeGeminiResponseSeen = true;
++    const extracted = extractUsage(parsed);
++    if (extracted) usage = mergeUsage(usage, extracted);
++    const response = parsed.response || parsed;
++    if (response.error || response.promptFeedback?.blockReason) nativeGeminiFailureSeen = true;
++    if ((response.candidates || []).length > 1) nativeGeminiMultipleCandidatesSeen = true;
++    for (const [position, candidate] of (response.candidates || []).entries()) {
++      const finished = !!candidate.finishReason && candidate.finishReason !== "FINISH_REASON_UNSPECIFIED";
++      if (finished) nativeGeminiAnyFinishSeen = true;
++      const index = candidate.index ?? position;
++      nativeGeminiCandidates.set(index, nativeGeminiCandidates.get(index) || finished);
++    }
++    for (const part of response.candidates?.[0]?.content?.parts || []) {
++      if (typeof part.text !== "string") continue;
++      totalContentLength += part.text.length;
++      if (part.thought === true) accumulatedThinking += part.text;
++      else accumulatedContent += part.text;
++    }
++  };
++  const captureNativeGeminiLine = (line) => {
++    if (line.startsWith("data:")) {
++      nativeGeminiData.push(line.slice(5).replace(/^ /, "").replace(/\r$/, ""));
++      return;
++    }
++    if (line.trim() || !nativeGeminiData.length) return;
++    const parsed = parseSSELine(`data: ${nativeGeminiData.join("\n")}`, sourceFormat);
++    nativeGeminiData = [];
++    if (parsed) captureNativeGeminiBody(parsed);
++  };
+ 
+   // Usage/logging tail, callable from transform() as well as flush(): a client that
+   // closes right after the terminal event cancels the reader, and flush() never runs.
+@@ -143,6 +215,16 @@ export function createSSEStream(options = {}) {
+       const lines = buffer.split("\n");
+       buffer = lines.pop() || "";
+ 
++      if (nativeGeminiPassthrough) {
++        if (nativeJson) { nativeGeminiJson += text; buffer = ""; }
++        else for (const line of lines) captureNativeGeminiLine(line);
++        // Accounting observes complete lines; the client receives original
++        // bytes, including fragmented UTF-8, tool calls and usage-only trailers.
++        reqLogger?.appendConvertedChunk?.(text);
++        controller.enqueue(chunk);
++        return;
++      }
++
+       for (const line of lines) {
+         const trimmed = line.trim();
+         if (isDebugEnabled && trimmed) {
+@@ -430,6 +512,55 @@ export function createSSEStream(options = {}) {
+         if (remaining) buffer += remaining;
+ 
+         if (mode === STREAM_MODE.PASSTHROUGH) {
++          if (nativeGeminiPassthrough) {
++            if (nativeJson) {
++              nativeGeminiJson += remaining;
++              let nativeResponse;
++              try { nativeResponse = JSON.parse(nativeGeminiJson); }
++              catch {
++                controller.error(new Error("Upstream Gemini JSON stream ended with invalid or incomplete JSON"));
++                finalizeStream();
++                return;
++              }
++              const responses = Array.isArray(nativeResponse) ? nativeResponse : [nativeResponse];
++              if (!responses.length || responses.some(response => !response || typeof response !== "object" || Array.isArray(response))) {
++                controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
++                finalizeStream();
++                return;
++              }
++              for (const response of responses) captureNativeGeminiBody(response);
++            } else {
++              if (buffer.trim()) captureNativeGeminiLine(buffer);
++              captureNativeGeminiLine("");
++            }
++            if (!nativeGeminiResponseSeen) {
++              if (nativeJson) {
++                controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
++                finalizeStream();
++                return;
++              }
++              const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream returned no valid response", sourceFormat);
++              reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
++              controller.enqueue(failure);
++            } else if (observeNativeFinishReason && !nativeGeminiFailureSeen && (
++              // Without projected candidate IDs, separate terminal chunks can
++              // all occupy position zero. Do not assign them to fictitious IDs.
++              !observeNativeCandidateIndex && nativeGeminiMultipleCandidatesSeen
++                ? !nativeGeminiAnyFinishSeen
++                : [...nativeGeminiCandidates.values()].some(finished => !finished)
++            )) {
++              if (nativeJson) {
++                controller.error(new Error("Upstream Gemini JSON stream ended before a candidate finished"));
++                finalizeStream();
++                return;
++              }
++              const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream ended before a candidate finished", sourceFormat);
++              reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
++              controller.enqueue(failure);
++            }
++            finalizeStream();
++            return;
++          }
+           if (buffer) {
+             let output = buffer;
+             if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
+@@ -553,10 +684,13 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
+   });
+ }
+ 
+-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null) {
++export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null) {
+   return createSSEStream({
+     mode: STREAM_MODE.PASSTHROUGH,
+     provider,
++    sourceFormat,
++    nativeJson,
++    nativeResponseProjection,
+     reqLogger,
+     model,
+     connectionId,
+diff --git a/open-sse/utils/streamHandler.js b/open-sse/utils/streamHandler.js
+index fce01706..05967639 100644
+--- a/open-sse/utils/streamHandler.js
++++ b/open-sse/utils/streamHandler.js
+@@ -15,11 +15,21 @@ function getTimeString() {
+  * @param {string} options.provider - Provider name
+  * @param {string} options.model - Model name
+  */
+-export function createStreamController({ onDisconnect, onError, log, provider, model, reqTag = "" } = {}) {
++export function createStreamController({ onDisconnect, onError, log, provider, model, clientSignal, reqTag = "" } = {}) {
+   const abortController = new AbortController();
+   const startTime = Date.now();
+   let disconnected = false;
+   let abortTimeout = null;
++  const detachClientAbort = () => clientSignal?.removeEventListener("abort", onClientAbort);
++  const onClientAbort = () => {
++    if (disconnected) return;
++    disconnected = true;
++    detachClientAbort();
++    abortController.abort(clientSignal.reason);
++    onDisconnect?.({ reason: "client_closed", duration: Date.now() - startTime });
++  };
++  if (clientSignal?.aborted) onClientAbort();
++  else clientSignal?.addEventListener("abort", onClientAbort, { once: true });
+ 
+   // Only abnormal terminations are logged; normal completion is covered by "📊 done".
+   // isError uses errorLine (always shown, ignores LOG_LEVEL) so failures survive quiet levels.
+@@ -40,6 +50,7 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
+     handleDisconnect: (reason = "client_closed") => {
+       if (disconnected) return;
+       disconnected = true;
++      detachClientAbort();
+ 
+       // Debug-only: Responses API has no [DONE] sentinel, so codex/droid close the
+       // socket on every completed request. "📊 done" is the authoritative outcome line.
+@@ -57,6 +68,7 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
+     handleComplete: () => {
+       if (disconnected) return;
+       disconnected = true;
++      detachClientAbort();
+ 
+       if (abortTimeout) {
+         clearTimeout(abortTimeout);
+@@ -68,6 +80,7 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
+     handleError: (error) => {
+       if (disconnected) return;
+       disconnected = true;
++      detachClientAbort();
+ 
+       if (abortTimeout) {
+         clearTimeout(abortTimeout);
+@@ -98,8 +111,10 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
+  *
+  * @param {function} [onAbortTerminal] - Receives a human-readable abort
+  * message and returns terminal SSE bytes to emit downstream.
++ * @param {boolean} [propagateAbortErrors] - Reject interrupted JSON streams
++ * instead of treating transport closure as successful EOF.
+  */
+-export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null) {
++export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, propagateAbortErrors = false) {
+   const reader = transformStream.readable.getReader();
+   const writer = transformStream.writable.getWriter();
+   let terminalEmitted = false;
+@@ -117,6 +132,14 @@ export function createDisconnectAwareStream(transformStream, streamController, o
+   return new ReadableStream({
+     async pull(controller) {
+       if (!streamController.isConnected()) {
++        if (propagateAbortErrors) {
++          const error = new Error("Upstream stream interrupted");
++          streamController.handleError(error);
++          reader.cancel().catch(() => {});
++          writer.abort().catch(() => {});
++          controller.error(error);
++          return;
++        }
+         emitTerminal(controller);
+         controller.close();
+         return;
+@@ -158,7 +181,12 @@ export function createDisconnectAwareStream(transformStream, streamController, o
+         // Graceful close on network/abort, or when a structured terminal is available
+         // (Responses passthrough prefers response.failed + [DONE] over a raw transport error)
+         try {
+-          if (!wasConnected || isNetworkClose || onAbortTerminal) {
++          if (propagateAbortErrors) {
++            // A native JSON stream cannot receive an SSE error trailer. Keep
++            // a transport failure observable instead of closing partial JSON
++            // as though the upstream completed it.
++            controller.error(error);
++          } else if (!wasConnected || isNetworkClose || onAbortTerminal) {
+             emitTerminal(controller);
+             controller.close();
+           } else {
+@@ -191,8 +219,10 @@ export function createDisconnectAwareStream(transformStream, streamController, o
+  * @param {Response} providerResponse - Response from provider
+  * @param {TransformStream} transformStream - Transform stream for SSE
+  * @param {object} streamController - Stream controller from createStreamController
++ * @param {boolean} [propagateAbortErrors] - Preserve transport failures for
++ * native JSON framing, which cannot accept an SSE error trailer.
+  */
+-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS) {
++export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, propagateAbortErrors = false) {
+   let stallTimer = null;
+   let chunkCount = 0;
+   let totalBytes = 0;
+@@ -254,7 +284,7 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
+   return createDisconnectAwareStream(
+     { readable: transformedBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
+     wrappedController,
+-    onAbortTerminal ? () => onAbortTerminal(abortMessage) : null
++    onAbortTerminal ? () => onAbortTerminal(abortMessage) : null,
++    propagateAbortErrors
+   );
+ }
+-
+diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
+index ee4e720a..00dae23f 100644
+--- a/open-sse/utils/streamHelpers.js
++++ b/open-sse/utils/streamHelpers.js
+@@ -139,6 +139,12 @@ export function formatSSE(data, sourceFormat) {
+ export function buildStreamErrorBytes(statusCode, message, clientFormat) {
+   const { error } = buildErrorBody(statusCode, message);
+ 
++  if ([FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY].includes(clientFormat)) {
++    // Gemini clients decode every data payload as JSON and terminate at EOF.
++    // Keep the numeric failure code instead of an OpenAI symbolic error code.
++    return sharedEncoder.encode(formatSSE({ error: { code: statusCode, message: error.message } }, clientFormat));
++  }
++
+   const sse = clientFormat === FORMATS.CLAUDE
+     ? formatSSE({ type: "error", error }, FORMATS.CLAUDE)
+     : formatSSE({ error }, clientFormat) + SSE_DONE;
+diff --git a/src/app/api/v1/models/[...model]/route.js b/src/app/api/v1/models/[...model]/route.js
+index 77df20f3..6a17ea5e 100644
+--- a/src/app/api/v1/models/[...model]/route.js
++++ b/src/app/api/v1/models/[...model]/route.js
+@@ -17,12 +17,26 @@ export async function OPTIONS() {
+   return new Response(null, {
+     headers: {
+       "Access-Control-Allow-Origin": "*",
+-      "Access-Control-Allow-Methods": "GET, OPTIONS",
++      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+       "Access-Control-Allow-Headers": "*",
+     },
+   });
+ }
+ 
++// Stable Gemini generation shares this catch-all with OpenAI model metadata.
++// Keep metadata GET unchanged and translate only the route parameter's name.
++export async function POST(request, context) {
++  const params = await context.params;
++  const path = Array.isArray(params.model) ? params.model : [params.model];
++  if (!/:(?:generateContent|streamGenerateContent)$/.test(path.at(-1) || "")) {
++    return new Response(null, { status: 405, headers: { Allow: "GET, OPTIONS" } });
++  }
++  const { POST: handleGeminiGeneration } = await import("../../../v1beta/models/[...path]/route.js");
++  return handleGeminiGeneration(request, {
++    ...context, params: Promise.resolve({ ...params, path }),
++  });
++}
++
+ function json(data, options = {}) {
+   return Response.json(data, {
+     ...options,
+diff --git a/src/app/api/v1alpha/models/[...path]/route.js b/src/app/api/v1alpha/models/[...path]/route.js
+new file mode 100644
+index 00000000..a4a2e714
+--- /dev/null
++++ b/src/app/api/v1alpha/models/[...path]/route.js
+@@ -0,0 +1,2 @@
++// Alpha generation uses the same native request, auth and streaming handler.
++export { POST, OPTIONS } from "../../../v1beta/models/[...path]/route.js";
+diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
+index 19925a5c..8ba06fe9 100644
+--- a/src/app/api/v1beta/models/[...path]/route.js
++++ b/src/app/api/v1beta/models/[...path]/route.js
+@@ -9,6 +9,9 @@ import { getSettings } from "@/lib/localDb";
+ import { PROVIDER_MODELS } from "@/shared/constants/models";
+ import { GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS } from "open-sse/config/runtimeConfig.js";
+ import { initTranslators } from "open-sse/translator/index.js";
++import { getTargetFormat, supportsNativeGemini } from "open-sse/services/provider.js";
++import { getModelInfo } from "@/sse/services/model.js";
++import { proxyAwareFetch } from "open-sse/utils/proxyFetch.js";
+ import { getKeyAccessContext, enforceKeyAccessResolved } from "@/sse/services/keyAccess.js";
+ 
+ let initialized = false;
+@@ -48,8 +51,8 @@ export async function OPTIONS() {
+  * Gemini API field and Gemini CLI never sets it.
+  *
+  * The @google/genai SDK always uses :streamGenerateContent?alt=sse for chat.
+- * The upstream handleChat returns OpenAI SSE format; we transform it to
+- * Gemini SSE format on the fly via transformOpenAISSEToGeminiSSE().
++ * Gemini providers use the shared native passthrough. Other provider formats
++ * keep the existing Chat conversion and Gemini response adapter.
+  */
+ export async function POST(request, { params }) {
+   await ensureInitialized();
+@@ -83,7 +86,15 @@ export async function POST(request, { params }) {
+         .replace(":generateContent", "");
+     }
+ 
+-    const body = await request.json();
++    let body;
++    try {
++      body = await request.json();
++    } catch (error) {
++      if (error?.name !== "SyntaxError") throw error;
++      return Response.json({ error: {
++        code: 400, status: "INVALID_ARGUMENT", message: "Request body is not valid JSON",
++      } }, { status: 400, headers: { "Access-Control-Allow-Origin": "*" } });
++    }
+ 
+     if (isGeminiNativeTtsRequest(model, body)) {
+       return await forwardGeminiNativeRequest(request, body, model, action);
+@@ -94,27 +105,38 @@ export async function POST(request, { params }) {
+     //   :generateContent       => stream: false (plain JSON)
+     const stream = action === ":streamGenerateContent";
+ 
+-    // Convert Gemini request format to OpenAI/internal format
+-    const convertedBody = convertGeminiToInternal(body, model, stream);
++    const modelInfo = await getModelInfo(model);
++    const native = modelInfo.provider && (getTargetFormat(modelInfo.provider) === "gemini"
++      || (modelInfo.provider === "antigravity" && supportsNativeGemini(modelInfo.provider, modelInfo.model)));
++
++    // Keep the native request intact. The shared handler selects translation
++    // only when the chosen provider speaks a different wire format.
++    const convertedBody = native
++      ? { ...body, model, stream }
++      : convertGeminiToInternal(body, model, stream);
++    const headers = new Headers(request.headers);
++    const clientKey = extractGeminiClientApiKey(request);
++    if (clientKey) headers.set("Authorization", `Bearer ${clientKey}`);
+ 
+     // Create new request with converted body
+     const newRequest = new Request(request.url, {
+       method: "POST",
+-      headers: request.headers,
++      headers,
+       body: JSON.stringify(convertedBody),
++      signal: request.signal,
+     });
+ 
+-    const response = await handleChat(newRequest);
+-
+-    if (stream) {
+-      // Transform OpenAI SSE => Gemini SSE on the fly.
+-      // The @google/genai SDK always uses :streamGenerateContent?alt=sse and
+-      // expects Gemini SSE chunks (no [DONE] sentinel — stream just closes).
+-      return transformOpenAISSEToGeminiSSE(response, model);
+-    } else {
+-      // Convert OpenAI JSON response => Gemini GenerateContentResponse
+-      return await convertOpenAIResponseToGemini(response, model);
+-    }
++    const response = await handleChat(newRequest, {
++      endpoint: new URL(request.url).pathname,
++      body,
++      headers: Object.fromEntries(request.headers.entries()),
++      queryParams: [...new URL(request.url).searchParams.entries()].filter(([key]) => key !== "key" && key !== "$key"),
++      apiVersion: new URL(request.url).pathname.match(/\/(v1alpha|v1beta|v1)\/models\//)?.[1] || "v1beta",
++    }, native ? { sourceFormatOverride: "gemini", stream } : {});
++    if (native) return response;
++    return stream
++      ? transformOpenAISSEToGeminiSSE(response, model)
++      : await convertOpenAIResponseToGemini(response, model);
+   } catch (error) {
+     console.log("Error handling Gemini request:", error);
+     return Response.json(
+@@ -132,7 +154,7 @@ function extractGeminiClientApiKey(request) {
+   if (googleApiKey) return googleApiKey;
+ 
+   const url = new URL(request.url);
+-  return url.searchParams.get("key");
++  return url.searchParams.get("key") || url.searchParams.get("$key");
+ }
+ 
+ function normalizeGeminiNativeModel(model) {
+@@ -168,10 +190,12 @@ function isGeminiNativeTtsRequest(model, body) {
+ 
+ function buildGeminiNativeUrl(requestUrl, model, action) {
+   const sourceUrl = new URL(requestUrl);
+-  const upstreamUrl = new URL(`${GEMINI_NATIVE_BASE_URL}/${normalizeGeminiNativeModel(model)}${action}`);
++  const version = sourceUrl.pathname.match(/\/(v1alpha|v1beta|v1)\/models\//)?.[1] || "v1beta";
++  const baseUrl = GEMINI_NATIVE_BASE_URL.replace("/v1beta/", `/${version}/`);
++  const upstreamUrl = new URL(`${baseUrl}/${normalizeGeminiNativeModel(model)}${action}`);
+ 
+   for (const [key, value] of sourceUrl.searchParams.entries()) {
+-    if (key === "key") continue;
++    if (key === "key" || key === "$key") continue;
+     upstreamUrl.searchParams.append(key, value);
+   }
+ 
+@@ -293,7 +317,7 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
+ 
+     let upstreamResponse;
+     try {
+-      upstreamResponse = await fetch(upstreamUrl, {
++      upstreamResponse = await proxyAwareFetch(upstreamUrl, {
+         method: "POST",
+         headers: {
+           "Content-Type": request.headers.get("Content-Type") || "application/json",
+@@ -301,6 +325,11 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
+         },
+         body: bodyText,
+         signal: attemptController.signal,
++      }, {
++        connectionProxyEnabled: credentials?.providerSpecificData?.connectionProxyEnabled === true,
++        connectionProxyUrl: credentials?.providerSpecificData?.connectionProxyUrl || "",
++        connectionNoProxy: credentials?.providerSpecificData?.connectionNoProxy || "",
++        strictProxy: credentials?.providerSpecificData?.strictProxy === true,
+       });
+     } catch (error) {
+       const durationMs = Date.now() - startedAt;
+@@ -332,14 +361,28 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
+       return Response.json({ error: { message: errorText } }, { status });
+     } finally {
+       clearTimeout(timeout);
+-      request.signal?.removeEventListener("abort", abortAttempt);
++      if (!upstreamResponse?.ok || !upstreamResponse.body) {
++        request.signal?.removeEventListener("abort", abortAttempt);
++      }
+     }
+ 
+     console.log(`[GEMINI_NATIVE] upstream model=${modelId} status=${upstreamResponse.status} ms=${Date.now() - startedAt} conn=${safeConnection} ct=${upstreamResponse.headers.get("content-type") || "?"} cl=${upstreamResponse.headers.get("content-length") || "?"}`);
+ 
+     if (upstreamResponse.ok) {
+       await clearAccountError(credentials.connectionId, credentials, modelId);
+-      return new Response(upstreamResponse.body, {
++      const reader = upstreamResponse.body?.getReader();
++      const cleanup = () => request.signal?.removeEventListener("abort", abortAttempt);
++      const responseBody = reader ? new ReadableStream({
++        async pull(controller) {
++          try {
++            const { value, done } = await reader.read();
++            if (done) { cleanup(); controller.close(); }
++            else controller.enqueue(value);
++          } catch (error) { cleanup(); controller.error(error); }
++        },
++        cancel(reason) { cleanup(); attemptController.abort(); return reader.cancel(reason); },
++      }) : null;
++      return new Response(responseBody, {
+         status: upstreamResponse.status,
+         statusText: upstreamResponse.statusText,
+         headers: corsHeadersFrom(upstreamResponse),
+diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
+index 93b20e6f..bafdc974 100644
+--- a/src/sse/handlers/chat.js
++++ b/src/sse/handlers/chat.js
+@@ -32,7 +32,7 @@ import { getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../s
+  * Supports: OpenAI, Claude, Gemini, OpenAI Responses API formats
+  * Format detection and translation handled by translator
+  */
+-export async function handleChat(request, clientRawRequest = null) {
++export async function handleChat(request, clientRawRequest = null, options = {}) {
+   let body;
+   try {
+     body = await request.json();
+@@ -122,7 +122,7 @@ export async function handleChat(request, clientRawRequest = null) {
+             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
+             cleanRawReq = { ...clientRawRequest, body: cleanBody };
+           }
+-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
++          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options);
+         },
+         log,
+         comboName: modelStr,
+@@ -137,7 +137,7 @@ export async function handleChat(request, clientRawRequest = null) {
+       body,
+       models: augmentedModels,
+       handleSingleModel: withCapacityAdapterStripping(
+-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
++        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
+         adapterAdded
+       ),
+       log,
+@@ -157,7 +157,7 @@ export async function handleChat(request, clientRawRequest = null) {
+       body,
+       models: soloAugmented,
+       handleSingleModel: withCapacityAdapterStripping(
+-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
++        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
+         adapterAdded
+       ),
+       log,
+@@ -166,13 +166,13 @@ export async function handleChat(request, clientRawRequest = null) {
+     });
+   }
+ 
+-  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null);
++  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null, options);
+ }
+ 
+ /**
+  * Handle single model chat request
+  */
+-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null) {
++async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, options = {}) {
+   const modelInfo = await getModelInfo(modelStr);
+ 
+   // If provider is null, this might be a combo name - check and handle
+@@ -202,7 +202,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
+               cleanRawReq = { ...clientRawRequest, body: cleanBody };
+             }
+-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
++            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options);
+           },
+           log,
+           comboName: modelStr,
+@@ -217,7 +217,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+         body,
+         models: augmentedModels,
+         handleSingleModel: withCapacityAdapterStripping(
+-          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
++          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
+           adapterAdded
+         ),
+         log,
+@@ -242,12 +242,14 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+   let lastError = null;
+   let lastStatus = null;
+   let lastHeaders = null;
++  let lastNativeResponse = null;
+ 
+   while (true) {
+     const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { requestedModel: requestedModel || model });
+ 
+     // All accounts unavailable
+     if (!credentials || credentials.allRateLimited) {
++      if (lastNativeResponse) return lastNativeResponse;
+       if (credentials?.allRateLimited) {
+         const errorMsg = lastError || credentials.lastError || "Unavailable";
+         const status = HTTP_STATUS.SERVICE_UNAVAILABLE;
+@@ -306,8 +308,9 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+       providerThinking,
+       // Per-provider user overrides (custom headers / connect timeout) from settings
+       providerOverrides: (chatSettings.providerOverrides || {})[provider] || null,
++      clientSignal: request?.signal,
+       // Detect source format by endpoint + body
+-      sourceFormatOverride: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null,
++      sourceFormatOverride: options.sourceFormatOverride || (request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null),
+       onCredentialsRefreshed: async (newCreds) => {
+         await updateProviderCredentials(credentials.connectionId, {
+           ...newCreds,
+@@ -323,6 +326,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+     });
+ 
+     if (result.success) return result.response;
++    if (result.status === 499 || request?.signal?.aborted) return result.response;
+ 
+     // Antigravity 409/429: refresh live quota to get exact resetAt before locking
+     let quotaResetMs = null;
+@@ -347,6 +351,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+       lastError = result.error;
+       lastStatus = result.status;
+       lastHeaders = upstreamResponseHeaders(result.response?.headers);
++      if (result.nativeResponse || options.sourceFormatOverride === "gemini") lastNativeResponse = result.response;
+       continue;
+     }
+ 
+diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
+index 5e92bdf0..7137903a 100644
+--- a/tests/translator/golden-url-header.test.js
++++ b/tests/translator/golden-url-header.test.js
+@@ -21,6 +21,8 @@ const SPECIALIZED = new Set([
+   "codex", "cursor", "vertex", "vertex-partner", "opencode",
+   "opencode-go", "grok-web", "perplexity-web", "ollama-local", "commandcode",
+   "xiaomi-tokenplan", "mimo-free",
++  // Fork-only local bridge; its URL and header contract is locked by unit/aistudio-provider.test.js.
++  "aistudio",
+ ]);
+ 
+ // Sanitize header: khử token + field thời gian động (kimi X-Msh-Device-Id) để snapshot ổn định.
+diff --git a/tests/unit/aistudio-native-response-format.test.js b/tests/unit/aistudio-native-response-format.test.js
+new file mode 100644
+index 00000000..3b542347
+--- /dev/null
++++ b/tests/unit/aistudio-native-response-format.test.js
+@@ -0,0 +1,191 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { DefaultExecutor } from "../../open-sse/executors/default.js";
++
++// Current native GenerateContent documentation, verified 2026-10-06 via the
++// explicit 127.0.0.1:18080 CONNECT proxy (HTTP 200 for both):
++// https://ai.google.dev/gemini-api/docs/generate-content/structured-output
++// https://ai.google.dev/api/generate-content
++// REST TextResponseFormat.schema is a JSON Value: "The JSON schema that the
++// output should conform to." These tests establish transport preservation,
++// not backend enforcement of every possible keyword.
++
++const MODEL = "gemini-3.5-flash-lite";
++const credentials = {
++  apiKey: "fixture-bridge-key",
++  nativeGeminiPassthrough: true,
++};
++function opaqueSchema() {
++  return {
++    $id: "urn:fixture:opaque",
++    $defs: { item: { type: "integer", enum: [3, 7], default: 3 } },
++    type: "object",
++    properties: {
++      title: { type: "string", enum: ["KEEP_TITLE"], minLength: 1 },
++      count: { $ref: "#/$defs/item" },
++      tuple: { type: "array", prefixItems: [{ type: "string" }, { type: "integer" }], items: false },
++      payload: { type: "object", default: { type: "customer", anyOf: "literal", responseJsonSchema: "literal" } },
++    },
++    required: ["title", "count"],
++    additionalProperties: false,
++    // Unknown future keywords/values are opaque at this boundary; existence
++    // here does not claim backend support or enforcement.
++    futureKeyword: { type: "customer", task: { args: [false, 3, { $ref: "literal-data" }] } },
++  };
++}
++function body() {
++  return {
++    contents: [{ role: "user", parts: [{ text: "Return the structured output" }] }],
++    generationConfig: {
++      responseMimeType: "application/json",
++      responseJsonSchema: opaqueSchema(),
++      maxOutputTokens: 2048,
++      thinkingConfig: { thinking_level: "HIGH", include_thoughts: false },
++      seed: 19,
++      temperature: 0,
++    },
++    cachedContent: "cachedContents/fixture",
++    tools: [{ functionDeclarations: [{ name: "task", parametersJsonSchema: { type: "object", additionalProperties: false } }] }],
++    labels: { fixture: "fixed" },
++  };
++}
++function transform(input, provider = "aistudio", creds = credentials, stream = false) {
++  return new DefaultExecutor(provider).transformRequest(MODEL, input, stream, creds);
++}
++
++describe("AIStudio native modern structured output compatibility", () => {
++  beforeEach(() => {
++    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("Request transform must not make network calls"); }));
++  });
++  afterEach(() => vi.unstubAllGlobals());
++
++  it("moves the original schema opaquely without changing constraints, defaults, refs or literal values", () => {
++    const input = body();
++    const snapshot = structuredClone(input);
++    const schema = input.generationConfig.responseJsonSchema;
++    const output = transform(input);
++    expect(output.generationConfig.responseFormat).toEqual({ text: { mimeType: "APPLICATION_JSON", schema } });
++    expect(output.generationConfig.responseFormat.text.schema).toBe(schema);
++    expect(output.generationConfig.responseFormat.text.schema).toEqual(snapshot.generationConfig.responseJsonSchema);
++    expect(output.generationConfig.responseJsonSchema).toBeUndefined();
++    expect(output.generationConfig.responseMimeType).toBeUndefined();
++    const { responseJsonSchema, responseMimeType, ...settings } = snapshot.generationConfig;
++    const { responseFormat, ...actualSettings } = output.generationConfig;
++    expect(actualSettings).toEqual(settings);
++    for (const name of ["contents", "tools", "cachedContent", "labels"]) expect(output[name]).toEqual(snapshot[name]);
++    expect(input).toEqual(snapshot);
++    expect(global.fetch).not.toHaveBeenCalled();
++  });
++
++  for (const generationName of ["generationConfig", "generation_config"]) {
++    for (const spelling of ["camel", "snake"]) {
++      it(`accepts ${generationName} and ${spelling} schema/MIME names`, () => {
++        const input = body();
++        const settings = input.generationConfig;
++        if (spelling === "snake") {
++          settings.response_json_schema = settings.responseJsonSchema;
++          settings.response_mime_type = settings.responseMimeType;
++          delete settings.responseJsonSchema;
++          delete settings.responseMimeType;
++        }
++        if (generationName === "generation_config") {
++          input.generation_config = settings;
++          delete input.generationConfig;
++        }
++        const snapshot = structuredClone(input);
++        const output = transform(input);
++        expect(output[generationName].responseFormat.text).toEqual({ mimeType: "APPLICATION_JSON", schema: opaqueSchema() });
++        expect(output[generationName].maxOutputTokens).toBe(2048);
++        expect(output[generationName].thinkingConfig).toEqual(settings.thinkingConfig);
++        for (const name of ["responseJsonSchema", "response_json_schema", "responseMimeType", "response_mime_type"]) expect(output[generationName][name]).toBeUndefined();
++        expect(input).toEqual(snapshot);
++      });
++    }
++  }
++
++  for (const schema of [true, false]) {
++    it(`keeps a boolean JSON Schema (${schema}) opaque`, () => {
++      const input = body();
++      input.generationConfig.responseJsonSchema = schema;
++      expect(transform(input).generationConfig.responseFormat.text.schema).toBe(schema);
++    });
++  }
++
++  for (const key of ["responseFormat", "response_format", "responseSchema", "response_schema"]) {
++    it(`does not merge or override an explicit conflicting ${key}`, () => {
++      const input = body();
++      input.generationConfig[key] = { text: { mimeType: "TEXT_PLAIN", schema: { type: "string" } }, future: { type: "literal" } };
++      const snapshot = structuredClone(input);
++      expect(transform(input)).toEqual(snapshot);
++    });
++  }
++
++  it("does not choose between conflicting camel and snake schema aliases", () => {
++    const input = body();
++    input.generationConfig.response_json_schema = { type: "integer", minimum: 99 };
++    const snapshot = structuredClone(input);
++    expect(transform(input)).toEqual(snapshot);
++    expect(input).toEqual(snapshot);
++  });
++
++  it("does not choose between conflicting camel and snake MIME aliases", () => {
++    const input = body();
++    input.generationConfig.response_mime_type = "text/plain";
++    const snapshot = structuredClone(input);
++    expect(transform(input)).toEqual(snapshot);
++    expect(input).toEqual(snapshot);
++  });
++
++  it("leaves old responseSchema requests unchanged", () => {
++    const input = body();
++    input.generationConfig.responseSchema = { type: "OBJECT", properties: { count: { type: "INTEGER", minimum: 3, maximum: 3 } } };
++    delete input.generationConfig.responseJsonSchema;
++    const snapshot = structuredClone(input);
++    expect(transform(input)).toEqual(snapshot);
++  });
++
++  it("leaves current responseFormat requests unchanged", () => {
++    const input = body();
++    input.generationConfig.responseFormat = { text: { mimeType: "APPLICATION_JSON", schema: opaqueSchema() }, audio: { future: "opaque" } };
++    delete input.generationConfig.responseJsonSchema;
++    delete input.generationConfig.responseMimeType;
++    const snapshot = structuredClone(input);
++    expect(transform(input)).toEqual(snapshot);
++  });
++
++  for (const mime of [undefined, "", null, "text/plain", "text/x.enum"]) {
++    it(`does not invent JSON MIME for ${JSON.stringify(mime)}`, () => {
++      const input = body();
++      if (mime === undefined) delete input.generationConfig.responseMimeType;
++      else input.generationConfig.responseMimeType = mime;
++      const snapshot = structuredClone(input);
++      expect(transform(input)).toEqual(snapshot);
++    });
++  }
++
++  for (const provider of ["gemini", "openai"]) {
++    it(`does not apply the AIStudio compatibility mapping to ${provider}`, () => {
++      const input = body();
++      const snapshot = structuredClone(input);
++      expect(transform(input, provider)).toEqual(snapshot);
++    });
++  }
++
++  it("does not alter already-translated client requests", () => {
++    const input = body();
++    const snapshot = structuredClone(input);
++    expect(transform(input, "aistudio", { apiKey: "fixture-bridge-key" })).toEqual(snapshot);
++  });
++
++  it("emits a stable provider body across repetitions and streaming modes without network work", () => {
++    const input = body();
++    const executor = new DefaultExecutor("aistudio");
++    const a = executor.transformRequest(MODEL, structuredClone(input), false, credentials);
++    const b = executor.transformRequest(MODEL, structuredClone(input), true, credentials);
++    expect(JSON.stringify(a)).toBe(JSON.stringify(b));
++    expect(JSON.stringify(a)).toBe(JSON.stringify(executor.transformRequest(MODEL, structuredClone(input), false, credentials)));
++    const headers = executor.buildHeaders(credentials, false, executor.buildUrl(MODEL, false, 0, credentials), MODEL, a);
++    expect(headers["x-goog-api-key"]).toBe("fixture-bridge-key");
++    expect(headers.Authorization).toBeUndefined();
++    expect(global.fetch).not.toHaveBeenCalled();
++  });
++});
+diff --git a/tests/unit/aistudio-provider.test.js b/tests/unit/aistudio-provider.test.js
+new file mode 100644
+index 00000000..7c42dbcb
+--- /dev/null
++++ b/tests/unit/aistudio-provider.test.js
+@@ -0,0 +1,50 @@
++import { describe, it, expect } from "vitest";
++
++import { PROVIDERS } from "../../open-sse/config/providers.js";
++import { DefaultExecutor } from "../../open-sse/executors/default.js";
++import { getModelInfoCore } from "../../open-sse/services/model.js";
++import { getTargetFormat } from "../../open-sse/services/provider.js";
++
++// "aistudio" is the local AIStudioToAPI bridge spoken to on its Gemini-native /v1beta surface:
++// only that surface carries the real thoughtSignature. The bridge decides which models exist, so
++// nothing here names a model: the id below is an arbitrary string the bridge could serve.
++const MODEL = "model-served-by-the-bridge";
++const EXPECT_PLAIN_HEADERS = { "Content-Type": "application/json", "x-goog-api-key": "bridge-key" };
++const EXPECT_SSE_HEADERS = { ...EXPECT_PLAIN_HEADERS, Accept: "text/event-stream" };
++
++describe("aistudio provider (Gemini wire to the local bridge)", () => {
++  const cfg = PROVIDERS.aistudio;
++
++  it("is registered and speaks the Gemini wire", () => {
++    expect(cfg).toBeTruthy();
++    expect(cfg.format).toBe("gemini");
++    expect(getTargetFormat("aistudio", {})).toBe("gemini");
++  });
++
++  it("locks the full non-streaming and streaming URLs (exact origin, no query beyond alt=sse)", () => {
++    const ex = new DefaultExecutor("aistudio");
++    expect(cfg.baseUrl).toBe("http://127.0.0.1:7860/v1beta/models");
++    expect(ex.buildUrl(MODEL, false, 0, {})).toBe(`http://127.0.0.1:7860/v1beta/models/${MODEL}:generateContent`);
++    expect(ex.buildUrl(MODEL, true, 0, {})).toBe(`http://127.0.0.1:7860/v1beta/models/${MODEL}:streamGenerateContent?alt=sse`);
++  });
++
++  it("locks the complete header set for both modes (x-goog-api-key, no Authorization)", () => {
++    const ex = new DefaultExecutor("aistudio");
++    const plain = ex.buildHeaders({ apiKey: "bridge-key" }, false, ex.buildUrl(MODEL, false, 0, {}), MODEL);
++    const sse = ex.buildHeaders({ apiKey: "bridge-key" }, true, ex.buildUrl(MODEL, true, 0, {}), MODEL);
++    expect(plain).toEqual(EXPECT_PLAIN_HEADERS);
++    expect(sse).toEqual(EXPECT_SSE_HEADERS);
++  });
++
++  it("forwards any model id the bridge serves without a registry list", async () => {
++    expect(cfg.passthroughModels ?? true).toBeTruthy();
++    const info = await getModelInfoCore(`aistudio/${MODEL}`, {});
++    expect(info.provider).toBe("aistudio");
++    expect(info.model).toBe(MODEL);
++  });
++
++  it("carries no Google OAuth client material of its own", () => {
++    expect(cfg.clientId).toBeUndefined();
++    expect(cfg.clientSecret).toBeUndefined();
++  });
++});
+diff --git a/tests/unit/gemini-native-alpha-contract.test.js b/tests/unit/gemini-native-alpha-contract.test.js
+new file mode 100644
+index 00000000..786d167e
+--- /dev/null
++++ b/tests/unit/gemini-native-alpha-contract.test.js
+@@ -0,0 +1,112 @@
++// Kept outside the inherited stable-version contract: trusted-test overlays
++// must not erase alpha entry, provider resolution, or route-graph coverage.
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { existsSync, readdirSync } from "node:fs";
++
++const mocks = vi.hoisted(() => ({ network: vi.fn(), handleChat: vi.fn() }));
++vi.mock("../../src/app/api/v1/models/route.js", () => ({ buildModelsList: async () => [] }));
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: mocks.network }));
++vi.mock("@/sse/handlers/chat.js", () => ({ handleChat: mocks.handleChat }));
++vi.mock("@/sse/services/model.js", () => ({ getModelInfo: async value => {
++  const slash = value.indexOf("/");
++  return slash < 0 ? { provider: "gemini", model: value } : { provider: value.slice(0, slash), model: value.slice(slash + 1) };
++} }));
++vi.mock("@/sse/services/auth.js", () => ({
++  getProviderCredentials: async () => ({ apiKey: "fixture-provider-key", connectionId: "fixture", providerSpecificData: {} }),
++  isValidApiKey: async () => true, markAccountUnavailable: async () => ({ shouldFallback: false }), clearAccountError: async () => {},
++}));
++vi.mock("@/lib/localDb", () => ({ getSettings: async () => ({ requireApiKey: true }) }));
++vi.mock("../../open-sse/executors/index.js", async () => {
++  const { DefaultExecutor } = await import("../../open-sse/executors/default.js");
++  return { getExecutor: provider => new DefaultExecutor(provider) };
++});
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({ createRequestLogger: async () => new Proxy({}, { get: (_target, key) => key === "then" ? undefined : vi.fn() }) }));
++vi.mock("@/lib/usageDb.js", () => ({ trackPendingRequest: vi.fn(), appendRequestLog: vi.fn(async () => {}), saveRequestDetail: vi.fn(async () => {}), saveRequestUsage: vi.fn(async () => {}) }));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({ makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }) }));
++
++const alpha = await import("../../src/app/api/v1alpha/models/[...path]/route.js");
++const stable = await import("../../src/app/api/v1/models/[...model]/route.js");
++const beta = await import("../../src/app/api/v1beta/models/[...path]/route.js");
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++const { DefaultExecutor } = await import("../../open-sse/executors/default.js");
++const model = "gemini-3.5-flash-lite";
++const input = { contents: [{ role: "user", parts: [{ text: "Alpha task" }] }], generationConfig: { maxOutputTokens: 2048, thinkingConfig: { thinkingLevel: "LOW", includeThoughts: false } }, futureTask: { type: "customer", args: [3] } };
++const reply = { candidates: [{ content: { role: "model", parts: [{ text: "ALPHA_OK" }] }, finishReason: "STOP" }] };
++let credentials;
++
++describe("native Gemini alpha generation contract", () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("DIRECT_NETWORK_FORBIDDEN"); }));
++    mocks.network.mockImplementation(async (_url, options) => new Response(JSON.stringify(options.headers.Accept ? [reply] : reply), { headers: { "Content-Type": "application/json" } }));
++    mocks.handleChat.mockImplementation(async (request, raw, options) => {
++      const body = await request.json();
++      const slash = body.model.indexOf("/");
++      const provider = slash < 0 ? "gemini" : body.model.slice(0, slash);
++      const selectedModel = slash < 0 ? body.model : body.model.slice(slash + 1);
++      credentials = { apiKey: "fixture-provider-key", connectionId: "fixture", providerSpecificData: {} };
++      const result = await handleChatCore({ body, modelInfo: { provider, model: selectedModel }, credentials,
++        sourceFormatOverride: options.sourceFormatOverride, clientRawRequest: raw, clientSignal: request.signal,
++        connectionId: "fixture", userAgent: "native-alpha-test", providerThinking: { mode: "high" },
++        log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
++      });
++      return result.response;
++    });
++  });
++  afterEach(() => vi.unstubAllGlobals());
++
++  it("shares the actual native POST/OPTIONS and contains only one active alpha catch-all", () => {
++    expect(alpha.POST).toBe(beta.POST);
++    expect(alpha.OPTIONS).toBe(beta.OPTIONS);
++    const directory = new URL("../../src/app/api/v1alpha/models/", import.meta.url);
++    const routes = readdirSync(directory, { withFileTypes: true })
++      .filter(entry => entry.isDirectory() && /^\[\.\.\..+\]$/.test(entry.name))
++      .filter(entry => existsSync(new URL(`${entry.name}/route.js`, directory))).map(entry => entry.name);
++    expect(routes).toEqual(["[...path]"]);
++  });
++
++  it("keeps the live browser-auth v1 404 regression protected from inherited test overlays", async () => {
++    const savedError = { error: { code: 404, status: "INTERNAL", message: 'Proxy browser error: Google API returned error: 404 NOT_FOUND {"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}' } };
++    mocks.network.mockImplementation(async url => new URL(url).pathname.startsWith("/v1/models/")
++      ? Response.json(savedError, { status: 404 }) : Response.json(reply));
++    const request = new Request(`https://router.test/v1/models/aistudio/${model}:generateContent?$key=fixture-client-key&fields=candidates`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
++    const response = await stable.POST(request, { params: Promise.resolve({ model: ["aistudio", `${model}:generateContent`] }) });
++    expect(response.status).toBe(200);
++    expect(await response.json()).toEqual(reply);
++    expect(mocks.handleChat.mock.calls[0][1].apiVersion).toBe("v1");
++    expect(credentials.nativeGeminiRequest.apiVersion).toBe("v1beta");
++    expect(new URL(mocks.network.mock.calls[0][0]).pathname).toBe(`/v1beta/models/${model}:generateContent`);
++    expect(JSON.parse(mocks.network.mock.calls[0][1].body)).toEqual(input);
++    expect(mocks.network).toHaveBeenCalledOnce();
++    expect(global.fetch).not.toHaveBeenCalled();
++  });
++
++  for (const provider of ["gemini", "aistudio"]) {
++    it(`${provider}: the generic executor formats an explicitly resolved alpha version`, () => {
++      const executor = new DefaultExecutor(provider);
++      const url = executor.buildUrl(model, false, 0, { nativeGeminiPassthrough: true, nativeGeminiRequest: { apiVersion: "v1alpha" } });
++      expect(new URL(url).pathname).toBe(`/v1alpha/models/${model}:generateContent`);
++    });
++
++    for (const action of ["generateContent", "streamGenerateContent"]) {
++      it(`${provider}: actual alpha POST and core resolve the provider wire while retaining client version/body`, async () => {
++        const request = new Request(`https://router.test/v1alpha/models/${provider}/${model}:${action}?$key=fixture-client-key&fields=candidates`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
++        const response = await alpha.POST(request, { params: Promise.resolve({ path: [provider, `${model}:${action}`] }) });
++        expect(response.status).toBe(200);
++        await response.text();
++        expect(mocks.handleChat).toHaveBeenCalledOnce();
++        const [, raw, options] = mocks.handleChat.mock.calls[0];
++        expect(raw.apiVersion).toBe("v1alpha");
++        expect(raw.body).toEqual(input);
++        expect(raw.queryParams).toEqual([["fields", "candidates"]]);
++        expect(options.stream).toBe(action === "streamGenerateContent");
++        const wireVersion = provider === "aistudio" ? "v1beta" : "v1alpha";
++        expect(credentials.nativeGeminiRequest.apiVersion).toBe(wireVersion);
++        expect(new URL(mocks.network.mock.calls[0][0]).pathname).toBe(`/${wireVersion}/models/${model}:${action}`);
++        expect(JSON.parse(mocks.network.mock.calls[0][1].body)).toEqual(input);
++        expect(mocks.network).toHaveBeenCalledOnce();
++        expect(global.fetch).not.toHaveBeenCalled();
++      });
++    }
++  }
++});
+diff --git a/tests/unit/gemini-native-api-version.test.js b/tests/unit/gemini-native-api-version.test.js
+new file mode 100644
+index 00000000..fa44646c
+--- /dev/null
++++ b/tests/unit/gemini-native-api-version.test.js
+@@ -0,0 +1,173 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { readdirSync, existsSync } from "node:fs";
++import { DefaultExecutor } from "../../open-sse/executors/default.js";
++
++const mocks = vi.hoisted(() => ({ handleChat: vi.fn(), proxyAwareFetch: vi.fn(), getProviderCredentials: vi.fn(), buildModelsList: vi.fn() }));
++vi.mock("../../src/app/api/v1/models/route.js", () => ({ buildModelsList: mocks.buildModelsList }));
++vi.mock("@/sse/handlers/chat.js", () => ({ handleChat: mocks.handleChat }));
++vi.mock("@/sse/services/model.js", () => ({
++  getModelInfo: async model => {
++    const slash = model.indexOf("/");
++    return slash < 0 ? { provider: "gemini", model } : { provider: model.slice(0, slash), model: model.slice(slash + 1) };
++  },
++}));
++vi.mock("@/sse/services/auth.js", () => ({
++  getProviderCredentials: mocks.getProviderCredentials,
++  isValidApiKey: async () => true,
++  markAccountUnavailable: async () => ({ shouldFallback: false }),
++  clearAccountError: async () => {},
++}));
++vi.mock("@/lib/localDb", () => ({ getSettings: async () => ({ requireApiKey: true }) }));
++vi.mock("open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: mocks.proxyAwareFetch }));
++const stable = await import("../../src/app/api/v1/models/[...model]/route.js");
++const beta = await import("../../src/app/api/v1beta/models/[...path]/route.js");
++const MODEL = "gemini-3.5-flash-lite";
++function body() {
++  return { contents: [{ role: "user", parts: [{ text: "Initialize this task" }] }], generationConfig: { maxOutputTokens: 2048, thinkingConfig: { thinkingLevel: "HIGH", includeThoughts: false }, seed: 7 }, futureTask: { type: "customer", args: [3] } };
++}
++
++describe("Gemini native stable and beta API versions", () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    mocks.handleChat.mockImplementation(async () => Response.json({ candidates: [{ content: { role: "model", parts: [{ text: "done" }] }, finishReason: "STOP" }] }));
++    mocks.getProviderCredentials.mockResolvedValue({ apiKey: "fixture-provider-key", connectionId: "fixture-connection", providerSpecificData: {} });
++    mocks.proxyAwareFetch.mockImplementation(async () => Response.json({ candidates: [{ content: { role: "model", parts: [{ text: "audio fixture" }] } }] }));
++    mocks.buildModelsList.mockResolvedValue([]);
++  });
++
++  it("the v1 model route exposes generation POST while retaining GET and OPTIONS", async () => {
++    expect(typeof stable.POST).toBe("function");
++    expect(typeof stable.GET).toBe("function");
++    const response = await stable.OPTIONS();
++    expect(response.status).toBe(200);
++    expect(response.headers.get("access-control-allow-methods")).toContain("POST");
++    expect(response.headers.get("access-control-allow-methods")).toContain("GET");
++  });
++
++  // The earlier isolated alias tests missed the existing [...model] directory:
++  // handler identity passed while Next rejected competing [...path]/[...model]
++  // route patterns. Protect the actual filesystem route graph, not exports.
++  it("has one active catch-all model route that Next can compile without ambiguous slugs", () => {
++    const directory = new URL("../../src/app/api/v1/models/", import.meta.url);
++    const routes = readdirSync(directory, { withFileTypes: true })
++      .filter(entry => entry.isDirectory() && /^\[\.\.\..+\]$/.test(entry.name))
++      .filter(entry => ["js", "jsx", "ts", "tsx"].some(extension => existsSync(new URL(`${entry.name}/route.${extension}`, directory))))
++      .map(entry => entry.name);
++    expect(routes).toEqual(["[...model]"]);
++  });
++
++  it("preserves provider-prefixed OpenAI metadata GET independently of Gemini generation", async () => {
++    const metadata = { id: "openai/example-model", object: "model", owned_by: "openai", context_length: 10000 };
++    mocks.buildModelsList.mockResolvedValueOnce([metadata]);
++    const response = await stable.GET(new Request("https://router.test/v1/models/openai/example-model"), { params: Promise.resolve({ model: ["openai", "example-model"] }) });
++    expect(response.status).toBe(200);
++    expect(await response.json()).toEqual(metadata);
++    expect(mocks.buildModelsList).toHaveBeenCalledWith(["llm"]);
++    expect(mocks.handleChat).not.toHaveBeenCalled();
++    expect(mocks.proxyAwareFetch).not.toHaveBeenCalled();
++  });
++
++  it("preserves capability-list metadata GET", async () => {
++    const metadata = { id: "image/example-model", object: "model", owned_by: "image" };
++    mocks.buildModelsList.mockResolvedValueOnce([metadata]);
++    const response = await stable.GET(new Request("https://router.test/v1/models/image"), { params: Promise.resolve({ model: ["image"] }) });
++    expect(await response.json()).toEqual({ object: "list", data: [metadata] });
++    expect(mocks.buildModelsList).toHaveBeenCalledWith(["image"]);
++    expect(mocks.handleChat).not.toHaveBeenCalled();
++  });
++
++  for (const segment of [MODEL, `${MODEL}:generateContentExtra`, `${MODEL}:countTokens`]) {
++    it(`rejects non-generation metadata POST ${segment} before delegation`, async () => {
++      const response = await stable.POST(new Request(`https://router.test/v1/models/${segment}`, { method: "POST" }), { params: Promise.resolve({ model: [segment] }) });
++      expect(response.status).toBe(405);
++      expect(response.headers.get("allow")).toBe("GET, OPTIONS");
++      expect(mocks.handleChat).not.toHaveBeenCalled();
++      expect(mocks.proxyAwareFetch).not.toHaveBeenCalled();
++    });
++  }
++
++  for (const provider of ["gemini", "aistudio"]) {
++    for (const version of ["v1", "v1beta"]) {
++      for (const action of ["generateContent", "streamGenerateContent"]) {
++        it(`${provider}: ${version} ${action} preserves native input and forwards API version metadata`, async () => {
++          const input = body();
++          const query = action === "streamGenerateContent" ? "?alt=sse&key=fixture-client-key&fields=candidates" : "?key=fixture-client-key&fields=candidates";
++          const url = `https://router.test/${version}/models/${provider}/${MODEL}:${action}${query}`;
++          const request = new Request(url, { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": "fixture-client-key" }, body: JSON.stringify(input) });
++          const route = version === "v1" ? stable : beta;
++          const routeParams = version === "v1" ? { model: [provider, `${MODEL}:${action}`] } : { path: [provider, `${MODEL}:${action}`] };
++          const response = await route.POST(request, { params: Promise.resolve(routeParams) });
++          expect(response.status).toBe(200);
++          expect(mocks.handleChat).toHaveBeenCalledTimes(1);
++          const [forwarded, raw, options] = mocks.handleChat.mock.calls[0];
++          const stream = action === "streamGenerateContent";
++          expect(await forwarded.json()).toEqual({ ...input, model: `${provider}/${MODEL}`, stream });
++          expect(forwarded.url).toBe(url);
++          expect(raw.body).toEqual(input);
++          expect(raw.apiVersion).toBe(version);
++          expect(raw.queryParams).not.toContainEqual(["key", "fixture-client-key"]);
++          expect(options).toMatchObject({ sourceFormatOverride: "gemini", stream });
++          const credentials = { nativeGeminiPassthrough: true, nativeGeminiRequest: { apiVersion: raw.apiVersion, query: raw.queryParams } };
++          const executor = new DefaultExecutor(provider);
++          const upstream = new URL(executor.buildUrl(MODEL, stream, 0, credentials));
++          expect(upstream.pathname).toBe(`/${version}/models/${MODEL}:${action}`);
++          expect(upstream.searchParams.get("fields")).toBe("candidates");
++          expect(upstream.searchParams.has("key")).toBe(false);
++          expect(mocks.proxyAwareFetch).not.toHaveBeenCalled();
++        });
++      }
++    }
++  }
++
++  it("the native AUDIO path forwards stable v1 to Google", async () => {
++    const input = { contents: [{ parts: [{ text: "Speak" }] }], generationConfig: { responseModalities: ["AUDIO"] } };
++    const request = new Request("https://router.test/v1/models/tts-model:generateContent?key=fixture-client-key&fields=candidates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
++    const response = await stable.POST(request, { params: Promise.resolve({ model: ["tts-model:generateContent"] }) });
++    expect(response.status).toBe(200);
++    expect(mocks.handleChat).not.toHaveBeenCalled();
++    expect(mocks.proxyAwareFetch).toHaveBeenCalledTimes(1);
++    const [url, options] = mocks.proxyAwareFetch.mock.calls[0];
++    expect(new URL(url).pathname).toBe("/v1/models/tts-model:generateContent");
++    expect(new URL(url).searchParams.has("key")).toBe(false);
++    expect(JSON.parse(options.body)).toEqual(input);
++  });
++
++  for (const version of ["v1", "v1beta"]) {
++    it(`${version} accepts the documented $key alias without sending either client key upstream`, async () => {
++      const input = body();
++      const request = new Request(`https://router.test/${version}/models/gemini/${MODEL}:generateContent?$key=fixture-client-key&fields=candidates`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
++      const route = version === "v1" ? stable : beta;
++      const params = version === "v1" ? { model: ["gemini", `${MODEL}:generateContent`] } : { path: ["gemini", `${MODEL}:generateContent`] };
++      expect((await route.POST(request, { params: Promise.resolve(params) })).status).toBe(200);
++      const [forwarded, raw] = mocks.handleChat.mock.calls[0];
++      expect(forwarded.headers.get("authorization")).toBe("Bearer fixture-client-key");
++      expect(raw.queryParams).toEqual([["fields", "candidates"]]);
++      const executor = new DefaultExecutor("gemini");
++      const credentials = { nativeGeminiPassthrough: true, nativeGeminiRequest: { apiVersion: version, query: [["key", "fixture-client-key"], ["$key", "fixture-client-key"], ["fields", "candidates"]] } };
++      const upstream = new URL(executor.buildUrl(MODEL, false, 0, credentials));
++      expect(upstream.searchParams.has("key")).toBe(false);
++      expect(upstream.searchParams.has("$key")).toBe(false);
++      expect(upstream.searchParams.get("fields")).toBe("candidates");
++    });
++  }
++
++  it("accepts the $key alias on the native AUDIO path without leaking it to Google", async () => {
++    const input = { contents: [{ parts: [{ text: "Speak" }] }], generationConfig: { responseModalities: ["AUDIO"] } };
++    const request = new Request("https://router.test/v1beta/models/tts-model:generateContent?$key=fixture-client-key&fields=candidates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
++    expect((await beta.POST(request, { params: Promise.resolve({ path: ["tts-model:generateContent"] }) })).status).toBe(200);
++    const [url, options] = mocks.proxyAwareFetch.mock.calls[0];
++    expect(new URL(url).searchParams.has("$key")).toBe(false);
++    expect(new URL(url).searchParams.has("key")).toBe(false);
++    expect(options.headers["x-goog-api-key"]).toBe("fixture-provider-key");
++    expect(JSON.parse(options.body)).toEqual(input);
++  });
++
++  it("does not change a translated client's configured provider API version", () => {
++    for (const provider of ["gemini", "aistudio"]) {
++      const executor = new DefaultExecutor(provider);
++      const url = new URL(executor.buildUrl(MODEL, false, 0, { nativeGeminiRequest: { apiVersion: "v1" } }));
++      expect(url.pathname).toBe(`/v1beta/models/${MODEL}:generateContent`);
++    }
++  });
++
++});
+diff --git a/tests/unit/gemini-native-core.test.js b/tests/unit/gemini-native-core.test.js
+new file mode 100644
+index 00000000..0f736640
+--- /dev/null
++++ b/tests/unit/gemini-native-core.test.js
+@@ -0,0 +1,409 @@
++// Real chat core + DefaultExecutor HTTP preparation. Only network/accounting
++// boundaries are replaced. No provider requests, secrets, or live DB writes.
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++const { network, executors } = vi.hoisted(() => ({ network: vi.fn(), executors: new Map() }));
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: network }));
++vi.mock("../../open-sse/executors/index.js", async () => {
++  const { DefaultExecutor } = await import("../../open-sse/executors/default.js");
++  return { getExecutor(provider) {
++    if (!executors.has(provider)) executors.set(provider, new DefaultExecutor(provider));
++    return executors.get(provider);
++  } };
++});
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: async () => new Proxy({}, { get: (_target, name) => name === "then" ? undefined : vi.fn() }),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(), appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}), saveRequestUsage: vi.fn(async () => {}),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++const { FORMATS } = await import("../../open-sse/translator/formats.js");
++const model = "gemini-3.5-flash-lite";
++const nativeReply = {
++  candidates: [{ index: 0, content: { role: "model", parts: [
++    { text: "THOUGHT", thought: true, thoughtSignature: "opaque-original-thought" },
++    { functionCall: { id: "original-output-id", name: "init_worker", args: { task: "ARBITRARY_INIT_TASK" } }, thoughtSignature: "opaque-original-call" },
++  ] }, finishReason: "STOP", groundingMetadata: { webSearchQueries: ["q"] } }],
++  usageMetadata: { promptTokenCount: 4096, cachedContentTokenCount: 2048, candidatesTokenCount: 17, thoughtsTokenCount: 20, totalTokenCount: 4133 },
++  modelVersion: model, responseId: "native-reply-id",
++};
++function body(generation = { maxOutputTokens: 2048, thinkingConfig: { thinkingLevel: "LOW", includeThoughts: false } }) {
++  return {
++    systemInstruction: { parts: [{ text: "System A" }, { text: "System B" }] },
++    contents: [
++      { role: "user", parts: [{ text: "Run task" }] },
++      { role: "model", parts: [{ functionCall: { id: "original-input-id", name: "read_seed", args: { init: { type: "customer", task: "INITIALIZATION_TASK" } } }, thoughtSignature: "opaque-input-signature" }] },
++      { role: "user", parts: [{ functionResponse: { id: "original-input-id", name: "read_seed", response: { result: "DEPENDENT_RESULT", nested: { type: "customer" } } } }, { inlineData: { mimeType: "image/png", data: "aW1hZ2U=" } }] },
++    ],
++    tools: [{ functionDeclarations: [{ name: "read_seed", parametersJsonSchema: { type: "object", properties: { type: { type: "string" } }, additionalProperties: false } }] }],
++    toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["read_seed"] } },
++    generationConfig: generation, cachedContent: "cachedContents/native-test",
++    futureOpaqueExtension: { init_task: "FUTURE_INIT_TASK", nested: { type: "customer" } },
++  };
++}
++const quiet = Object.fromEntries(["debug", "info", "warn", "error", "line", "errorLine"].map(name => [name, vi.fn()]));
++async function run(provider, requestBody = body(), { suffix = "", stream = false, mode = "high", signal, ua = "Some arbitrary Gemini client", queryParams = [], clientHeaders = {}, onRequestSuccess, apiVersion = "v1beta", rawRequest } = {}) {
++  return handleChatCore({
++    body: { ...structuredClone(requestBody), model: `${provider}/${model}${suffix}`, stream },
++    modelInfo: { provider, model: model + suffix }, sourceFormatOverride: FORMATS.GEMINI,
++    userAgent: ua, log: quiet, clientSignal: signal,
++    onRequestSuccess,
++    credentials: { apiKey: "offline-provider-key", connectionId: "offline-native-test", providerSpecificData: { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy.invalid:18080", strictProxy: true } },
++    connectionId: "offline-native-test", providerThinking: { mode },
++    rtkEnabled: false, headroomEnabled: false, cavemanEnabled: false, ponytailEnabled: false, pxpipeEnabled: false,
++    clientRawRequest: rawRequest || { endpoint: `/${apiVersion}/models/${provider}/${model}${suffix}:${stream ? "streamGenerateContent" : "generateContent"}`, apiVersion, body: structuredClone(requestBody), queryParams, headers: { "user-agent": ua, ...clientHeaders } },
++  });
++}
++const wireBody = () => JSON.parse(network.mock.calls.at(-1)[1].body);
++
++describe("native Gemini requests through real chat core and executor", () => {
++  beforeEach(() => {
++    network.mockReset();
++    executors.clear();
++    network.mockImplementation(async () => Response.json(structuredClone(nativeReply)));
++    vi.stubGlobal("fetch", vi.fn(() => { throw Error("DIRECT_NETWORK_FORBIDDEN"); }));
++  });
++  afterEach(() => vi.unstubAllGlobals());
++
++  for (const provider of ["gemini", "aistudio"]) {
++    it(`${provider}: arbitrary client retains all history/tools/settings and strict proxy on the provider wire`, async () => {
++      const original = body();
++      const result = await run(provider, original);
++      expect(result.success).toBe(true);
++      expect(network).toHaveBeenCalledOnce();
++      expect(wireBody()).toEqual(original);
++      expect(wireBody()).not.toHaveProperty("model");
++      expect(wireBody()).not.toHaveProperty("stream");
++      expect(network.mock.calls[0][2]).toMatchObject({ strictProxy: true, connectionProxyEnabled: true, connectionProxyUrl: "http://proxy.invalid:18080" });
++      expect(global.fetch).not.toHaveBeenCalled();
++      expect(await result.response.json()).toEqual(nativeReply);
++    });
++
++    it.each(["v1", "v1beta"])(`${provider}: resolves provider wire independently from client %s without changing raw client metadata`, async apiVersion => {
++      const original = body();
++      const rawRequest = { endpoint: `/${apiVersion}/models/${provider}/${model}:generateContent`, apiVersion, body: structuredClone(original), queryParams: [], headers: {} };
++      const before = structuredClone(rawRequest);
++      const result = await run(provider, original, { rawRequest });
++      expect(result.success).toBe(true);
++      const wireVersion = provider === "aistudio" ? "v1beta" : apiVersion;
++      expect(new URL(network.mock.calls[0][0]).pathname).toBe(`/${wireVersion}/models/${model}:generateContent`);
++      expect(wireBody()).toEqual(original);
++      expect(rawRequest).toEqual(before);
++      expect(network).toHaveBeenCalledOnce();
++      await result.response.text();
++    });
++
++    it.each([
++      ["camel HIGH", { maxOutputTokens: 2048, thinkingConfig: { thinkingLevel: "HIGH", includeThoughts: false } }],
++      ["camel LOW", { maxOutputTokens: 2048, thinkingConfig: { thinkingLevel: "LOW", includeThoughts: false } }],
++      ["budget zero", { maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0, includeThoughts: false } }],
++      ["SDK snake HIGH", { maxOutputTokens: 2048, thinkingConfig: { thinking_level: "HIGH", include_thoughts: false } }],
++      ["SDK snake LOW", { maxOutputTokens: 2048, thinkingConfig: { thinking_level: "LOW", include_thoughts: false } }],
++    ])(`${provider}: preserves explicit %s rather than replacing it with provider high`, async (_name, generation) => {
++      const original = body(generation);
++      const result = await run(provider, original);
++      expect(result.success).toBe(true);
++      expect(wireBody()).toEqual(original);
++      await result.response.text();
++    });
++
++    it(`${provider}: adds a missing high default without changing client limits or include_thoughts=false`, async () => {
++      const generation = { maxOutputTokens: 2048, temperature: 0, thinkingConfig: { include_thoughts: false } };
++      const original = body(generation);
++      const result = await run(provider, original);
++      expect(wireBody()).toEqual({ ...original, generationConfig: { ...generation, thinkingConfig: { include_thoughts: false, thinkingLevel: "HIGH" } } });
++      await result.response.text();
++    });
++
++    it(`${provider}: suffix overrides effort explicitly without raising the output limit or leaking into the Google URI`, async () => {
++      const result = await run(provider, body(), { suffix: "(high)" });
++      const thinking = wireBody().generationConfig.thinkingConfig;
++      expect(thinking).toEqual({ thinkingLevel: "HIGH", includeThoughts: false });
++      expect(wireBody().generationConfig.maxOutputTokens).toBe(2048);
++      expect(network.mock.calls[0][0]).not.toContain("(high)");
++      expect(new URL(network.mock.calls[0][0]).pathname).toContain(`${model}:generateContent`);
++      await result.response.text();
++    });
++
++    it(`${provider}: fully snake-case native thinking keeps zero budget and disabled thought display`, async () => {
++      const original = body();
++      delete original.generationConfig;
++      original.generation_config = { max_output_tokens: 2048, thinking_config: { thinking_budget: 0, include_thoughts: false } };
++      const result = await run(provider, original);
++      expect(wireBody()).toEqual(original);
++      await result.response.text();
++    });
++
++    it(`${provider}: preserves client query parameters and ordinary headers while replacing client credentials`, async () => {
++      const result = await run(provider, body(), {
++        stream: true,
++        queryParams: [["key", "client-router-key"], ["alt", "json"], ["future_param", "one"], ["future_param", "two"], ["prettyPrint", "false"]],
++        clientHeaders: { Authorization: "Bearer client-router-key", "x-goog-api-key": "client-router-key", "x-goog-user-project": "fixture-project", "x-future-native": "fixture-value", cookie: "client-session=fixture" },
++      });
++      const url = new URL(network.mock.calls[0][0]);
++      expect(url.searchParams.has("key")).toBe(false);
++      expect(url.searchParams.get("alt")).toBe("json");
++      expect(url.searchParams.getAll("future_param")).toEqual(["one", "two"]);
++      expect(url.searchParams.get("prettyPrint")).toBe("false");
++      const headers = new Headers(network.mock.calls[0][1].headers);
++      expect(headers.get("x-goog-api-key")).toBe("offline-provider-key");
++      expect(headers.get("authorization")).toBeNull();
++      expect(headers.get("cookie")).toBeNull();
++      expect(headers.get("x-goog-user-project")).toBe("fixture-project");
++      expect(headers.get("x-future-native")).toBe("fixture-value");
++      await result.response.text();
++    });
++
++    it(`${provider}: native stream action with JSON framing preserves upstream content type and raw array bytes`, async () => {
++      const raw = `[ ${JSON.stringify(nativeReply)} ]`;
++      network.mockImplementationOnce(async () => new Response(raw, { headers: { "Content-Type": "application/json; charset=utf-8" } }));
++      const result = await run(provider, body(), { stream: true, queryParams: [["alt", "json"]] });
++      expect(result.response.headers.get("content-type")).toBe("application/json; charset=utf-8");
++      expect(await result.response.text()).toBe(raw);
++    });
++
++    it.each([
++      ["fields query", [["fields", "candidates/content/parts/text"]], {}],
++      ["$fields query", [["$fields", "candidates(content(parts(text)))"]], {}],
++      ["fieldmask header", [], { "X-Goog-FieldMask": "candidates.content.parts.text" }],
++    ])(`${provider}: %s projection remains transparent through the real core and stream observer`, async (_name, queryParams, clientHeaders) => {
++      const projected = { candidates: [{ content: { parts: [{ text: "completed projected output" }] } }] };
++      for (const nativeJson of [false, true]) {
++        const raw = nativeJson ? JSON.stringify([projected]) : `data: ${JSON.stringify(projected)}\n\n`;
++        network.mockImplementationOnce(async () => new Response(raw, { headers: { "Content-Type": nativeJson ? "application/json" : "text/event-stream" } }));
++        const original = body();
++        const result = await run(provider, original, { stream: true, queryParams, clientHeaders });
++        expect(result.success).toBe(true);
++        expect(await result.response.text()).toBe(raw);
++        expect(wireBody()).toEqual(original);
++        const url = new URL(network.mock.calls.at(-1)[0]);
++        for (const [name, value] of queryParams) expect(url.searchParams.get(name)).toBe(value);
++        const headers = new Headers(network.mock.calls.at(-1)[1].headers);
++        for (const [name, value] of Object.entries(clientHeaders)) expect(headers.get(name)).toBe(value);
++      }
++    });
++
++    it(`${provider}: stream=false selects generateContent and returns native JSON with no Chat bookkeeping`, async () => {
++      const result = await run(provider);
++      expect(new URL(network.mock.calls[0][0]).pathname.endsWith(":generateContent")).toBe(true);
++      expect(network.mock.calls[0][1].headers.Accept).toBeUndefined();
++      const response = await result.response.json();
++      expect(response).toEqual(nativeReply);
++      expect(response).not.toHaveProperty("object");
++      expect(response).not.toHaveProperty("created");
++      expect(response.usageMetadata.cachedContentTokenCount).toBe(2048);
++    });
++
++    it(`${provider}: a native error inside HTTP 200 is an error before success callbacks and retains details`, async () => {
++      const error = { error: { code: 400, status: "INVALID_ARGUMENT", message: "fixture bad config", details: [{ field: "maxOutputTokens" }] }, futureDiagnostic: { type: "customer" } };
++      const succeeded = vi.fn();
++      network.mockImplementationOnce(async () => Response.json(error, { headers: { "Retry-After": "17", "Content-Encoding": "gzip", "Content-Length": "700" } }));
++      const result = await run(provider, body(), { onRequestSuccess: succeeded });
++      expect(result.success).toBe(false);
++      expect(result.status).toBe(400);
++      expect(result.nativeResponse).toBe(true);
++      expect(result.response.status).toBe(400);
++      expect(result.response.headers.get("retry-after")).toBe("17");
++      expect(result.response.headers.get("content-encoding")).toBeNull();
++      expect(result.response.headers.get("content-length")).toBeNull();
++      expect(await result.response.json()).toEqual(error);
++      expect(succeeded).not.toHaveBeenCalled();
++      expect(network).toHaveBeenCalledOnce();
++    });
++
++    it(`${provider}: unexpected SSE on native generateContent fails without a Chat pivot or success callback`, async () => {
++      const succeeded = vi.fn();
++      const cancelled = vi.fn();
++      const upstream = new ReadableStream({
++        start(controller) { controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(nativeReply)}\n\n`)); },
++        cancel: cancelled,
++      });
++      network.mockImplementationOnce(async () => new Response(upstream, { headers: { "Content-Type": "text/event-stream" } }));
++      const result = await run(provider, body(), { onRequestSuccess: succeeded });
++      expect(result.success).toBe(false);
++      expect(result.status).toBe(502);
++      expect(await result.response.json()).toMatchObject({ error: { code: 502, message: expect.stringContaining("Unexpected streaming response") } });
++      expect(succeeded).not.toHaveBeenCalled();
++      expect(cancelled).toHaveBeenCalledOnce();
++      expect(network).toHaveBeenCalledOnce();
++    });
++
++    it(`${provider}: HTML inside streaming HTTP 200 returns native 502 rather than an empty SDK success`, async () => {
++      const succeeded = vi.fn();
++      network.mockImplementationOnce(async () => new Response("<html><title>Upstream unavailable</title></html>", { headers: { "Content-Type": "text/html", "Retry-After": "17" } }));
++      const result = await run(provider, body(), { stream: true, onRequestSuccess: succeeded });
++      expect(result.success).toBe(false);
++      expect(result.status).toBe(502);
++      expect(result.response.status).toBe(502);
++      expect(result.response.headers.get("retry-after")).toBe("17");
++      expect(await result.response.json()).toMatchObject({ error: { code: 502, status: "INTERNAL", message: expect.stringContaining("Upstream unavailable") } });
++      expect(succeeded).not.toHaveBeenCalled();
++      expect(network).toHaveBeenCalledOnce();
++    });
++
++    it(`${provider}: HTTP 200 quota errors remain retriable native 429 errors`, async () => {
++      const error = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota", details: [{ retryDelay: "17s" }] } };
++      network.mockImplementationOnce(async () => Response.json(error));
++      const result = await run(provider);
++      expect(result.success).toBe(false);
++      expect(result.response.status).toBe(429);
++      expect(await result.response.json()).toEqual(error);
++    });
++
++    it.each([
++      ["null", null],
++      ["empty array", []],
++      ["response array", [nativeReply]],
++      ["string", "unexpected response"],
++      ["scalar", 17],
++      ["empty object", {}],
++    ])(`${provider}: rejects invalid native JSON response shape %s rather than a successful empty SDK result`, async (_shape, response) => {
++      const succeeded = vi.fn();
++      network.mockImplementationOnce(async () => Response.json(response));
++      const result = await run(provider, body(), { onRequestSuccess: succeeded });
++      expect(result.success).toBe(false);
++      expect(result.response.status).toBe(502);
++      expect(await result.response.json()).toMatchObject({ error: { code: 502, status: "INTERNAL", message: expect.stringContaining("Invalid native Gemini response") } });
++      expect(succeeded).not.toHaveBeenCalled();
++    });
++
++    it.each([
++      [[["fields", "modelStatus"]], {}],
++      [[["$fields", "modelStatus"]], {}],
++      [[], { "x-goog-fieldmask": "modelStatus" }],
++    ])(`${provider}: preserves a deliberately projected empty native JSON object`, async (queryParams, clientHeaders) => {
++      network.mockImplementationOnce(async () => Response.json({}));
++      const result = await run(provider, body(), { queryParams, clientHeaders });
++      expect(result.success).toBe(true);
++      expect(result.response.status).toBe(200);
++      expect(await result.response.json()).toEqual({});
++    });
++
++    it.each([
++      { promptFeedback: { blockReason: "SAFETY" } },
++      { candidates: [{ index: 0, finishReason: "MAX_TOKENS", content: { role: "model", parts: [] } }] },
++      { futureNativeResult: { task: { type: "customer", value: 9 } } },
++    ])(`${provider}: preserves native blocked, finished zero-content and nonempty future responses`, async response => {
++      network.mockImplementationOnce(async () => Response.json(response));
++      const result = await run(provider);
++      expect(result.success).toBe(true);
++      expect(await result.response.json()).toEqual(response);
++    });
++
++    it(`${provider}: unknown native root fields never enter Chat finish, reasoning or usage mutators`, async () => {
++      const response = { ...structuredClone(nativeReply),
++        choices: [{ finish_reason: "NATIVE_OPAQUE_FINISH", message: { content: "future native field", reasoning_content: "preserve this opaque value", tool_calls: [{ id: "opaque-future-call" }] } }],
++        usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3, futureMetric: { type: "customer" } },
++      };
++      network.mockImplementationOnce(async () => Response.json(response));
++      const result = await run(provider);
++      expect(result.success).toBe(true);
++      expect(await result.response.json()).toEqual(response);
++    });
++
++    it(`${provider}: repeated native history preserves the exact provider request prefix`, async () => {
++      const original = body();
++      const first = await run(provider, original);
++      await first.response.text();
++      const second = await run(provider, original);
++      await second.response.text();
++      expect(network).toHaveBeenCalledTimes(2);
++      expect(network.mock.calls[1][1].body).toBe(network.mock.calls[0][1].body);
++      expect(wireBody().cachedContent).toBe(original.cachedContent);
++    });
++
++    it(`${provider}: streaming forwards calls/signatures and finish-before-usage to an arbitrary native SDK`, async () => {
++      const chunks = [{ ...nativeReply, usageMetadata: undefined }, { usageMetadata: nativeReply.usageMetadata }];
++      const sse = chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join("");
++      network.mockImplementationOnce(async () => new Response(sse, { headers: { "Content-Type": "text/event-stream" } }));
++      const result = await run(provider, body(), { stream: true });
++      expect(new URL(network.mock.calls[0][0]).pathname.endsWith(":streamGenerateContent")).toBe(true);
++      expect(await result.response.text()).toBe(sse);
++    });
++
++    it(`${provider}: native 429 preserves original error bytes, RetryInfo and Retry-After`, async () => {
++      const raw = '{ "error": { "code": 429, "status": "RESOURCE_EXHAUSTED", "message": "fixture quota", "details": [{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"17s"}] } }';
++      // Node fetch has already decoded gzip but keeps these upstream headers.
++      network.mockImplementationOnce(async () => new Response(raw, { status: 429, headers: {
++        "Content-Type": "application/json", "Retry-After": "17", "Content-Encoding": "gzip",
++        "Content-Length": "109", "Transfer-Encoding": "chunked",
++      } }));
++      const result = await run(provider);
++      expect(result.success).toBe(false);
++      expect(result.response.status).toBe(429);
++      expect(result.response.headers.get("retry-after")).toBe("17");
++      expect(result.response.headers.get("content-encoding")).toBeNull();
++      expect(result.response.headers.get("content-length")).toBeNull();
++      expect(result.response.headers.get("transfer-encoding")).toBeNull();
++      expect(await result.response.text()).toBe(raw);
++      expect(network).toHaveBeenCalledOnce();
++      expect(global.fetch).not.toHaveBeenCalled();
++    });
++
++    it(`${provider}: pre-aborted client does not start a provider request`, async () => {
++      const client = new AbortController();
++      client.abort();
++      const result = await run(provider, body(), { signal: client.signal });
++      expect(result.response.status).toBe(499);
++      expect(network).not.toHaveBeenCalled();
++      expect(global.fetch).not.toHaveBeenCalled();
++    });
++
++    it(`${provider}: abort during fetch cancels the real executor signal without retry or direct fallback`, async () => {
++      const client = new AbortController();
++      network.mockImplementationOnce((_url, options) => new Promise((_resolve, reject) => {
++        options.signal.addEventListener("abort", () => reject(new DOMException("fixture abort", "AbortError")), { once: true });
++        client.abort();
++      }));
++      const result = await run(provider, body(), { signal: client.signal });
++      expect(result.response.status).toBe(499);
++      expect(network.mock.calls[0][1].signal.aborted).toBe(true);
++      expect(network).toHaveBeenCalledOnce();
++      expect(global.fetch).not.toHaveBeenCalled();
++    });
++  }
++
++  it("an OpenAI Chat client still translates to Gemini and receives a Chat completion", async () => {
++    network.mockImplementationOnce(async () => Response.json({ candidates: [{ content: { parts: [{ text: "translated reply" }] }, finishReason: "STOP" }], modelVersion: model }));
++    const result = await handleChatCore({
++      body: { model: `gemini/${model}`, stream: false, messages: [{ role: "user", content: "chat prompt" }] },
++      modelInfo: { provider: "gemini", model }, sourceFormatOverride: FORMATS.OPENAI,
++      credentials: { apiKey: "offline-key", providerSpecificData: {} }, log: quiet,
++      rtkEnabled: false, headroomEnabled: false, cavemanEnabled: false, ponytailEnabled: false, pxpipeEnabled: false,
++    });
++    expect(wireBody().contents[0].parts[0].text).toBe("chat prompt");
++    const json = await result.response.json();
++    expect(json.object).toBe("chat.completion");
++    expect(json.choices[0].message.content).toBe("translated reply");
++  });
++});
++
++describe("AIStudio stable client provider routing regression", () => {
++  it("avoids the saved browser-auth v1 404 through the real core while the generic formatter still honors v1", async () => {
++    network.mockReset();
++    executors.clear();
++    const original = body();
++    const rawRequest = { endpoint: `/v1/models/aistudio/${model}:generateContent`, apiVersion: "v1", body: structuredClone(original), queryParams: [["fields", "candidates"]], headers: {} };
++    const before = structuredClone(rawRequest);
++    const savedBrowserError = { error: { code: 404, status: "INTERNAL", message: 'Proxy browser error: Google API returned error: 404 NOT_FOUND {"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}' } };
++    network.mockImplementation(async url => new URL(url).pathname.startsWith("/v1/models/")
++      ? Response.json(savedBrowserError, { status: 404 }) : Response.json(nativeReply));
++    const result = await run("aistudio", original, { rawRequest });
++    expect(result.success).toBe(true);
++    expect(result.response.status).toBe(200);
++    expect(await result.response.json()).toEqual(nativeReply);
++    expect(new URL(network.mock.calls[0][0]).pathname).toBe(`/v1beta/models/${model}:generateContent`);
++    expect(new URL(network.mock.calls[0][0]).searchParams.get("fields")).toBe("candidates");
++    expect(wireBody()).toEqual(original);
++    expect(rawRequest).toEqual(before);
++    expect(network).toHaveBeenCalledOnce();
++    const generic = executors.get("aistudio").buildUrl(model, false, 0, { nativeGeminiPassthrough: true, nativeGeminiRequest: { apiVersion: "v1" } });
++    expect(new URL(generic).pathname).toBe(`/v1/models/${model}:generateContent`);
++  });
++});
+diff --git a/tests/unit/gemini-native-endpoint.test.js b/tests/unit/gemini-native-endpoint.test.js
+index 83a8716c..27ec128b 100644
+--- a/tests/unit/gemini-native-endpoint.test.js
++++ b/tests/unit/gemini-native-endpoint.test.js
+@@ -1,4 +1,4 @@
+-import { beforeEach, describe, expect, it, vi } from "vitest";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ const mocks = vi.hoisted(() => ({
+   handleChat: vi.fn(),
+@@ -7,6 +7,8 @@ const mocks = vi.hoisted(() => ({
+   getProviderCredentials: vi.fn(),
+   markAccountUnavailable: vi.fn(),
+   clearAccountError: vi.fn(),
++  getModelInfo: vi.fn(),
++  proxyAwareFetch: vi.fn(),
+ }));
+ 
+ vi.mock("@/sse/handlers/chat.js", () => ({
+@@ -24,6 +26,19 @@ vi.mock("@/lib/localDb", () => ({
+   getSettings: mocks.getSettings,
+ }));
+ 
++vi.mock("@/sse/services/model.js", () => ({
++  getModelInfo: mocks.getModelInfo,
++}));
++
++// proxyFetch captures the native fetch at module import; explicitly replace the
++// transport boundary so these tests can never call Google with fixture keys.
++vi.mock("open-sse/utils/proxyFetch.js", () => ({
++  proxyAwareFetch: (...args) => {
++    if (!vi.isMockFunction(global.fetch)) throw new Error("Offline Gemini test requires mocked fetch");
++    return mocks.proxyAwareFetch(...args);
++  },
++}));
++
+ const { GET } = await import("../../src/app/api/v1beta/models/route.js");
+ const { POST } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
+ 
+@@ -68,17 +83,26 @@ describe("Gemini native v1beta endpoint", () => {
+       providerSpecificData: {},
+     });
+     mocks.markAccountUnavailable.mockResolvedValue({ shouldFallback: false });
+-    global.fetch = vi.fn().mockResolvedValue(
++    mocks.getModelInfo.mockImplementation(async model => {
++      const separator = model.indexOf("/");
++      return separator < 0
++        ? { provider: "gemini", model }
++        : { provider: model.slice(0, separator), model: model.slice(separator + 1) };
++    });
++    mocks.proxyAwareFetch.mockImplementation((...args) => global.fetch(...args));
++    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+       new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] }), {
+         status: 200,
+         headers: { "Content-Type": "application/json" },
+       })
+-    );
++    ));
+     mocks.handleChat.mockResolvedValue(
+       Response.json({ candidates: [{ content: { parts: [{ text: "chat" }] } }] })
+     );
+   });
+ 
++  afterEach(() => vi.unstubAllGlobals());
++
+   it("lists Gemini TTS models using standard Google model names", async () => {
+     const response = await GET();
+     const body = await response.json();
+@@ -246,9 +270,37 @@ describe("Gemini native v1beta endpoint", () => {
+     });
+ 
+     expect(mocks.handleChat).toHaveBeenCalledTimes(1);
++    const [request, clientRawRequest, options] = mocks.handleChat.mock.calls[0];
++    expect(await request.json()).toEqual({ ...body, model: "gemini-2.5-flash", stream: false });
++    expect(clientRawRequest.body).toEqual(body);
++    expect(options).toMatchObject({ sourceFormatOverride: "gemini", stream: false });
+     expect(global.fetch).not.toHaveBeenCalled();
+   });
+ 
++  it("passes strict proxy requirements to the native AUDIO transport", async () => {
++    mocks.getProviderCredentials.mockResolvedValueOnce({
++      apiKey: "real-gemini-key",
++      connectionId: "gemini-conn",
++      providerSpecificData: {
++        connectionProxyEnabled: true,
++        connectionProxyUrl: "http://127.0.0.1:18080",
++        connectionNoProxy: "localhost",
++        strictProxy: true,
++      },
++    });
++    const response = await POST(makeGeminiRequest("gemini-3.1-flash-tts-preview:generateContent", audioBody()), {
++      params: Promise.resolve({ path: ["gemini-3.1-flash-tts-preview:generateContent"] }),
++    });
++    expect(response.status).toBe(200);
++    expect(mocks.proxyAwareFetch).toHaveBeenCalledTimes(1);
++    expect(mocks.proxyAwareFetch.mock.calls[0][2]).toEqual({
++      connectionProxyEnabled: true,
++      connectionProxyUrl: "http://127.0.0.1:18080",
++      connectionNoProxy: "localhost",
++      strictProxy: true,
++    });
++  });
++
+   it("does not hijack provider-prefixed non-Gemini audio requests", async () => {
+     await POST(makeGeminiRequest("openai/gpt-4o-mini-tts:generateContent", audioBody()), {
+       params: Promise.resolve({ path: ["openai", "gpt-4o-mini-tts:generateContent"] }),
+diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
+new file mode 100644
+index 00000000..6e3a47e4
+--- /dev/null
++++ b/tests/unit/gemini-native-entry-contract.test.js
+@@ -0,0 +1,238 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import fs from "node:fs";
++import path from "node:path";
++import vm from "node:vm";
++import { fileURLToPath } from "node:url";
++
++// Real endpoint + handler control flow. Only imported service boundaries are
++// replaced; no database, external fetch, model, or provider account is contacted.
++const root = fileURLToPath(new URL("../../", import.meta.url));
++function moduleSource(relative) {
++  return fs.readFileSync(path.join(root, relative), "utf8")
++    .replace(/^import[\s\S]*?;\s*$/gm, "")
++    .replace(/^export /gm, "");
++}
++function nativeBody() {
++  return {
++    systemInstruction: { parts: [{ text: "Initialization instruction" }] },
++    contents: [
++      { role: "user", parts: [{ text: "Use the tool result" }] },
++      { role: "model", parts: [{ functionCall: { id: "call-1", name: "task", args: { type: "customer", task: "init" } }, thoughtSignature: "fixture-provider-signature" }] },
++      { role: "user", parts: [{ functionResponse: { id: "call-1", name: "task", response: { result: { type: "customer", value: 9 } } } }] },
++    ],
++    tools: [{ functionDeclarations: [{ name: "task", parametersJsonSchema: { type: "object", properties: { type: { type: "string" } }, additionalProperties: false } }] }],
++    toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["task"] } },
++    generationConfig: { maxOutputTokens: 2048, temperature: 0, seed: 7, thinkingConfig: { thinking_level: "HIGH", include_thoughts: false } },
++    cachedContent: "cachedContents/fixture",
++    labels: { trace: "fixture" },
++    // A hypothetical future opaque extension: this is not a claim about a
++    // currently supported subagent protocol or its actual field names.
++    futureInitialization: { task: "fixture", args: { type: "customer" } },
++  };
++}
++let context;
++let services;
++function load() {
++  services = {
++    getSettings: vi.fn().mockResolvedValue({ requireApiKey: true }),
++    isValidApiKey: vi.fn().mockImplementation(async key => key === "router-key"),
++    getKeyAccessContext: vi.fn(async () => null),
++    enforceKeyAccess: vi.fn(async () => null),
++    enforceKeyAccessResolved: vi.fn(async () => null),
++    filterAdapterModels: vi.fn(async (_keyAccess, models) => models),
++    getProviderCredentials: vi.fn().mockResolvedValue({ apiKey: "provider-key", connectionId: "fixture-connection", providerSpecificData: {} }),
++    markAccountUnavailable: vi.fn().mockResolvedValue({ shouldFallback: false }),
++    clearAccountError: vi.fn().mockResolvedValue(undefined),
++    handleChatCore: vi.fn().mockImplementation(async () => ({ success: true, response: Response.json({ candidates: [{ content: { role: "model", parts: [{ text: "done" }] }, finishReason: "STOP" }] }) })),
++    fetch: vi.fn().mockResolvedValue(Response.json({ candidates: [{ content: { parts: [{ inlineData: { mimeType: "audio/pcm", data: "AA==" } }] } }] })),
++  };
++  const quiet = Object.fromEntries(["log", "debug", "warn", "error", "info"].map(k => [k, () => {}]));
++  quiet.maskKey = () => "masked-test-key";
++  context = {
++    ...services, console: quiet, log: quiet,
++    Request, Response, Headers, URL, Buffer, AbortController, ReadableStream,
++    TextEncoder, TextDecoder, TransformStream, setTimeout, clearTimeout,
++    GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS: 50,
++    PROVIDER_MODELS: { gemini: [], "gemini-tts-models": [] },
++    initTranslators: async () => {},
++    HTTP_STATUS: { BAD_REQUEST: 400, UNAUTHORIZED: 401, NOT_FOUND: 404, SERVICE_UNAVAILABLE: 503 },
++    FORMATS: { GEMINI: "gemini", OPENAI: "openai" },
++    DEFAULT_HEADROOM_URL: "http://unused.test",
++    getComboModels: async () => null,
++    getTargetFormat: provider => ["gemini", "aistudio"].includes(provider) ? "gemini" : "openai",
++    proxyAwareFetch: (...args) => services.fetch(...args),
++    getModelInfo: async model => { const i = model.indexOf("/"); return { provider: i < 0 ? "gemini" : model.slice(0, i), model: i < 0 ? model : model.slice(i + 1) }; },
++    stripModelContextMarker: model => ({ model, contextMarker: null }),
++    detectRequiredCapabilities: () => new Set(),
++    augmentModelsWithCapacityAdapter: models => models,
++    handleBypassRequest: () => null,
++    checkAndRefreshToken: async (_provider, credentials) => credentials,
++    clearAntigravityStrikes: () => {},
++    getPxpipeTransform: async () => null,
++    appendPxpipeEvent: () => {},
++    detectFormatByEndpoint: () => null,
++    upstreamResponseHeaders: headers => Object.fromEntries(headers || []),
++    updateProviderCredentials: async () => {},
++    errorResponse: (status, message, headers) => Response.json({ error: { message } }, { status, headers }),
++    unavailableResponse: (status, message) => Response.json({ error: { message } }, { status }),
++  };
++  vm.createContext(context);
++  // Reuse the real key extraction implementation, not a permissive test copy.
++  const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
++  const start = auth.indexOf("export function extractApiKey(");
++  const end = auth.indexOf("/**", start);
++  vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
++  vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
++}
++function request(provider, action, body = nativeBody(), { headers = { Authorization: "Bearer router-key" }, query = "", signal } = {}) {
++  const model = "gemini-3.5-flash-lite(high)";
++  const url = `https://router.test/v1beta/models/${provider}/${model}:${action}${query}`;
++  const req = new Request(url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body), signal });
++  return { req, params: { params: Promise.resolve({ path: [provider, `${model}:${action}`] }) } };
++}
++async function call(provider, action, body, options) {
++  const { req, params } = request(provider, action, body, options);
++  const response = await context.POST(req, params);
++  if (response.status === 500) throw new Error(await response.clone().text());
++  return response;
++}
++
++describe("native Gemini endpoint entry contract", () => {
++  beforeEach(load);
++
++  for (const provider of ["gemini", "aistudio"]) {
++    it(`${provider}: preserves native tool history, settings and arbitrary opaque extensions`, async () => {
++      const original = nativeBody();
++      const response = await call(provider, "generateContent", original);
++      expect(response.status).toBe(200);
++      expect(services.handleChatCore).toHaveBeenCalledTimes(1);
++      const options = services.handleChatCore.mock.calls[0][0];
++      for (const [key, value] of Object.entries(original)) expect(options.body[key], key).toEqual(value);
++      expect(options.modelInfo.provider).toBe(provider);
++      expect(options.body.model).toBe(`${provider}/gemini-3.5-flash-lite(high)`);
++      expect(options.sourceFormatOverride).toBe("gemini");
++      expect(options.body.stream).toBe(false);
++      expect(services.fetch).not.toHaveBeenCalled();
++    });
++
++    for (const auth of ["google-header", "query", "query-alias", "bearer"]) {
++      it(`${provider}: accepts ${auth} router credentials before selecting a provider`, async () => {
++        const options = auth === "google-header" ? { headers: { "x-goog-api-key": "router-key" } }
++          : auth === "query" ? { headers: {}, query: "?key=router-key" }
++          : auth === "query-alias" ? { headers: {}, query: "?$key=router-key" }
++          : { headers: { Authorization: "Bearer router-key" } };
++        const response = await call(provider, "generateContent", nativeBody(), options);
++        expect(response.status).toBe(200);
++        expect(services.isValidApiKey).toHaveBeenCalledWith("router-key");
++        expect(services.handleChatCore).toHaveBeenCalledTimes(1);
++      });
++    }
++
++    it(`${provider}: rejects a bad Google-style router credential without provider calls`, async () => {
++      const response = await call(provider, "generateContent", nativeBody(), { headers: { "x-goog-api-key": "invalid" } });
++      expect(response.status).toBe(401);
++      expect(services.handleChatCore).not.toHaveBeenCalled();
++      expect(services.getProviderCredentials).not.toHaveBeenCalled();
++    });
++
++    it(`${provider}: malformed JSON is a non-retryable native client error without provider calls`, async () => {
++      const req = new Request(`https://router.test/v1beta/models/${provider}/gemini-3.5-flash-lite:generateContent`, {
++        method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer router-key" }, body: '{"contents":[',
++      });
++      const response = await context.POST(req, { params: Promise.resolve({ path: [provider, "gemini-3.5-flash-lite:generateContent"] }) });
++      expect(response.status).toBe(400);
++      expect(response.headers.get("access-control-allow-origin")).toBe("*");
++      expect(await response.json()).toEqual({ error: { code: 400, status: "INVALID_ARGUMENT", message: "Request body is not valid JSON" } });
++      expect(services.getProviderCredentials).not.toHaveBeenCalled();
++      expect(services.handleChatCore).not.toHaveBeenCalled();
++      expect(services.fetch).not.toHaveBeenCalled();
++    });
++
++    it(`${provider}: action determines streaming and provider-native frames return unchanged`, async () => {
++      const payload = 'data: {"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-1","name":"task","args":{"value":9}},"thoughtSignature":"fixture"}]}}]}\n\ndata: {"usageMetadata":{"cachedContentTokenCount":4096}}\n\n';
++      services.handleChatCore.mockImplementationOnce(async options => ({ success: true, response: new Response(payload, { headers: { "Content-Type": "text/event-stream" } }) }));
++      const response = await call(provider, "streamGenerateContent");
++      expect(services.handleChatCore.mock.calls[0][0].body.stream).toBe(true);
++      expect(await response.text()).toBe(payload);
++    });
++
++    it(`${provider}: client abort remains connected to the core provider signal`, async () => {
++      const abort = new AbortController();
++      await call(provider, "generateContent", nativeBody(), { signal: abort.signal });
++      const options = services.handleChatCore.mock.calls[0][0];
++      expect(options.clientSignal).toBeDefined();
++      expect(options.clientSignal.aborted).toBe(false);
++      abort.abort();
++      expect(options.clientSignal.aborted).toBe(true);
++    });
++
++    it(`${provider}: native error category/details and Retry-After survive an exhausted account fallback`, async () => {
++      const error = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "fixture quota", details: [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "17s" }] } };
++      services.getProviderCredentials.mockResolvedValueOnce({ apiKey: "provider-key", connectionId: "fixture-connection", providerSpecificData: {} }).mockResolvedValueOnce(null);
++      services.markAccountUnavailable.mockResolvedValueOnce({ shouldFallback: true });
++      services.handleChatCore.mockResolvedValueOnce({ success: false, status: 429, error: "fixture quota", response: Response.json(error, { status: 429, headers: { "Retry-After": "17" } }) });
++      const response = await call(provider, "generateContent");
++      expect(response.status).toBe(429);
++      expect(response.headers.get("retry-after")).toBe("17");
++      expect(await response.json()).toEqual(error);
++    });
++
++    for (const [first, second] of [["account-a", "account-b"], ["account-b", "account-a"]]) {
++      it(`${provider}: ${first} to ${second} fallback preserves signed tool history and native settings`, async () => {
++        const original = nativeBody();
++        const credentials = id => ({ apiKey: `fixture-${id}-key`, connectionId: id, providerSpecificData: {} });
++        services.getProviderCredentials.mockReset()
++          .mockResolvedValueOnce(credentials(first))
++          .mockResolvedValueOnce(credentials(second));
++        services.markAccountUnavailable.mockResolvedValueOnce({ shouldFallback: true });
++        services.handleChatCore
++          .mockResolvedValueOnce({ success: false, status: 429, error: "fixture quota", nativeResponse: true, response: Response.json({ error: { code: 429, status: "RESOURCE_EXHAUSTED" } }, { status: 429 }) })
++          .mockImplementationOnce(async options => {
++            await options.onRequestSuccess();
++            return { success: true, response: Response.json({ candidates: [{ content: { parts: [{ text: "continued tool task" }] }, finishReason: "STOP" }] }) };
++          });
++        const response = await call(provider, "generateContent", original, { query: "?fields=candidates" });
++        expect(response.status).toBe(200);
++        expect((await response.json()).candidates[0].content.parts[0].text).toBe("continued tool task");
++        expect(services.handleChatCore).toHaveBeenCalledTimes(2);
++        const attempts = services.handleChatCore.mock.calls.map(([options]) => options);
++        expect(attempts.map(options => options.connectionId)).toEqual([first, second]);
++        for (const options of attempts) {
++          expect(options.sourceFormatOverride).toBe("gemini");
++          expect(options.body).toEqual({ ...original, model: `${provider}/gemini-3.5-flash-lite(high)`, stream: false });
++          expect(options.clientRawRequest.body).toEqual(original);
++          expect(options.clientRawRequest.queryParams).toEqual([["fields", "candidates"]]);
++        }
++        expect(services.getProviderCredentials.mock.calls[1][1].has(first)).toBe(true);
++        expect(services.markAccountUnavailable).toHaveBeenCalledTimes(1);
++        expect(services.markAccountUnavailable.mock.calls[0][0]).toBe(first);
++        expect(services.clearAccountError.mock.calls[0][0]).toBe(second);
++      });
++    }
++  }
++
++  it("Gemini AUDIO abort after fetch headers cancels the existing native upstream operation", async () => {
++    const abort = new AbortController();
++    const audio = { contents: [{ parts: [{ text: "Speak" }] }], generationConfig: { responseModalities: ["AUDIO"] } };
++    const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('data: {"candidates":[]}\n\n')); } });
++    services.fetch.mockResolvedValueOnce(new Response(body, { headers: { "Content-Type": "text/event-stream" } }));
++    const req = new Request("https://router.test/v1beta/models/gemini/tts-model:streamGenerateContent", { method: "POST", headers: { Authorization: "Bearer router-key", "Content-Type": "application/json" }, body: JSON.stringify(audio), signal: abort.signal });
++    const response = await context.POST(req, { params: Promise.resolve({ path: ["gemini", "tts-model:streamGenerateContent"] }) });
++    expect(response.status).toBe(200);
++    expect(services.fetch).toHaveBeenCalledTimes(1);
++    const signal = services.fetch.mock.calls[0][1].signal;
++    abort.abort();
++    expect(signal.aborted).toBe(true);
++    await response.body.cancel();
++  });
++
++  it("a foreign-provider request keeps the existing translated route", async () => {
++    const response = await call("openai", "generateContent", { contents: [{ role: "user", parts: [{ text: "hello" }] }] });
++    expect(response.status).toBe(200);
++    const options = services.handleChatCore.mock.calls[0][0];
++    expect(options.modelInfo.provider).toBe("openai");
++    expect(options.body.messages).toEqual([{ role: "user", content: "hello" }]);
++    expect(services.fetch).not.toHaveBeenCalled();
++  });
++});
+diff --git a/tests/unit/gemini-native-proxy-abort.test.js b/tests/unit/gemini-native-proxy-abort.test.js
+new file mode 100644
+index 00000000..ca4ae99e
+--- /dev/null
++++ b/tests/unit/gemini-native-proxy-abort.test.js
+@@ -0,0 +1,80 @@
++// The actual proxy layer captures originalFetch at import time. Stub that
++// boundary first; unlike core dispatch tests this exercises its catch/fallback
++// logic and BaseExecutor retries without allowing any network traffic.
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++let fetchBoundary;
++let proxyAwareFetch;
++let DefaultExecutor;
++
++beforeEach(async () => {
++  vi.resetModules();
++  fetchBoundary = vi.fn();
++  vi.stubGlobal("fetch", fetchBoundary);
++  ({ proxyAwareFetch } = await import("../../open-sse/utils/proxyFetch.js"));
++  ({ DefaultExecutor } = await import("../../open-sse/executors/default.js"));
++});
++afterEach(() => {
++  vi.restoreAllMocks();
++  vi.unstubAllGlobals();
++});
++
++const proxy = strictProxy => ({ connectionProxyEnabled: true, connectionProxyUrl: "http://offline-proxy.invalid:18080", strictProxy });
++
++describe("native Gemini cancellation through the real proxy layer", () => {
++  it.each([
++    ["regular proxy", "https://generativelanguage.googleapis.com/v1beta/models/offline:generateContent", true],
++    ["regular non-strict proxy", "https://generativelanguage.googleapis.com/v1beta/models/offline:generateContent", false],
++    ["MITM bypass proxy", "https://cloudcode-pa.googleapis.com/v1internal:generateContent", true],
++    ["MITM bypass non-strict proxy", "https://cloudcode-pa.googleapis.com/v1internal:generateContent", false],
++  ])("keeps AbortError identity and avoids direct fallback: %s", async (_name, url, strict) => {
++    const abort = new DOMException("offline cancellation", "AbortError");
++    fetchBoundary.mockRejectedValue(abort);
++    await expect(proxyAwareFetch(url, { signal: AbortSignal.abort() }, proxy(strict))).rejects.toBe(abort);
++    expect(fetchBoundary).toHaveBeenCalledOnce();
++    expect(fetchBoundary.mock.calls[0][1].dispatcher).toBeDefined();
++  });
++
++  it("preserves strict proxy failure instead of silently retrying the direct connection", async () => {
++    fetchBoundary.mockRejectedValue(new Error("offline proxy refused"));
++    await expect(proxyAwareFetch("https://generativelanguage.googleapis.com/offline", {}, proxy(true))).rejects.toThrow("Proxy required but failed");
++    expect(fetchBoundary).toHaveBeenCalledOnce();
++    expect(fetchBoundary.mock.calls[0][1].dispatcher).toBeDefined();
++  });
++
++  it("retains the existing permitted direct fallback for a non-strict non-abort error", async () => {
++    fetchBoundary.mockRejectedValueOnce(new Error("offline proxy refused")).mockResolvedValueOnce(new Response("offline fallback result"));
++    const response = await proxyAwareFetch("https://generativelanguage.googleapis.com/offline", {}, proxy(false));
++    expect(await response.text()).toBe("offline fallback result");
++    expect(fetchBoundary).toHaveBeenCalledTimes(2);
++    expect(fetchBoundary.mock.calls[0][1].dispatcher).toBeDefined();
++    expect(fetchBoundary.mock.calls[1][1].dispatcher).toBeUndefined();
++  });
++
++  it.each(["gemini", "aistudio"])("%s: non-DOMException abort reason does not trigger executor retries and clears the connect timer", async provider => {
++    const client = new AbortController();
++    const customReason = new Error("offline caller cancelled with custom reason");
++    fetchBoundary.mockImplementationOnce(async (_url, options) => {
++      client.abort(customReason);
++      expect(options.signal.aborted).toBe(true);
++      throw customReason;
++    });
++    const setTimer = vi.spyOn(globalThis, "setTimeout");
++    const clearTimer = vi.spyOn(globalThis, "clearTimeout");
++    const executor = new DefaultExecutor(provider);
++    const operation = executor.execute({
++      model: "gemini-3.5-flash-lite", body: { contents: [{ role: "user", parts: [{ text: "offline abort" }] }] }, stream: false,
++      credentials: { apiKey: "offline-key", providerSpecificData: {} }, signal: client.signal, proxyOptions: proxy(true),
++    });
++    try {
++      await expect(operation).rejects.toMatchObject({ name: "AbortError" });
++      expect(fetchBoundary).toHaveBeenCalledOnce();
++      const timerHandles = setTimer.mock.results.filter(result => result.type === "return").map(result => result.value);
++      expect(timerHandles.length).toBeGreaterThan(0);
++      for (const handle of timerHandles) expect(clearTimer).toHaveBeenCalledWith(handle);
++    } finally {
++      // Keep a failed cleanup assertion from leaving a live 60-second timer.
++      for (const result of setTimer.mock.results) if (result.type === "return") clearTimeout(result.value);
++    }
++  });
++});
+diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
+new file mode 100644
+index 00000000..0717461c
+--- /dev/null
++++ b/tests/unit/gemini-native-stream.test.js
+@@ -0,0 +1,410 @@
++import { describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++}));
++
++const { createPassthroughStreamWithLogger } = await import("../../open-sse/utils/stream.js");
++const { buildStreamErrorBytes } = await import("../../open-sse/utils/streamHelpers.js");
++const { createStreamController, pipeWithDisconnect } = await import("../../open-sse/utils/streamHandler.js");
++const { handleStreamingResponse } = await import("../../open-sse/handlers/chatCore/streamingHandler.js");
++const { FORMATS } = await import("../../open-sse/translator/formats.js");
++
++const encode = text => new TextEncoder().encode(text);
++const frame = body => `data: ${JSON.stringify(body)}\r\n\r\n`;
++const chunk = {
++  responseId: "native-response",
++  candidates: [{ index: 0, content: { role: "model", parts: [
++    { text: "проверка", thought: true, thoughtSignature: "opaque-native-signature" },
++    { functionCall: { id: "original-call-id", name: "init_worker", args: { task: { message: "INITIALIZATION_TASK", nested: [1, false] } } }, thoughtSignature: "opaque-tool-signature" },
++    { functionResponse: { id: "original-result-id", name: "other_worker", response: { result: "DEPENDENT_RESULT" } } },
++    { inlineData: { mimeType: "image/png", data: "aW1hZ2U=" } },
++    { futureNativeField: { future: true } },
++  ] }, finishReason: "STOP", groundingMetadata: { webSearchQueries: ["query"] } }],
++  modelVersion: "gemini-native-test",
++};
++const lateUsage = { usageMetadata: { promptTokenCount: 4096, candidatesTokenCount: 7, thoughtsTokenCount: 20, cachedContentTokenCount: 2048, totalTokenCount: 4123 } };
++const inputStream = chunks => new ReadableStream({ start(controller) { for (const value of chunks) controller.enqueue(value); controller.close(); } });
++const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nativeJson = false, projection = null) => createPassthroughStreamWithLogger(provider, null, "gemini-native-test", null, null, complete, null, source, nativeJson, projection);
++const readText = stream => new Response(stream).text();
++
++describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
++  it.each(["gemini", "aistudio", "future-native-provider"])("does not append Chat DONE or mutate Parts/usage through %s", async provider => {
++    const original = frame(chunk) + frame(lateUsage);
++    const bytes = encode(original);
++    const completed = vi.fn();
++    const output = await readText(inputStream(Array.from(bytes, value => Uint8Array.of(value))).pipeThrough(nativeTransform(provider, FORMATS.GEMINI, completed)));
++    expect(output).toBe(original);
++    expect(output).not.toContain("[DONE]");
++    expect(completed).toHaveBeenCalledOnce();
++    expect(completed.mock.calls[0][0]).toEqual({ content: "", thinking: "проверка" });
++    expect(completed.mock.calls[0][1].cached_tokens).toBe(2048);
++  });
++
++  it.each([FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY])("uses EOF rather than DONE for %s even on an unknown provider", async source => {
++    const original = frame({ response: chunk }) + frame({ response: lateUsage });
++    expect(await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("unlisted-provider", source)))).toBe(original);
++  });
++
++  it("preserves an EOF tail without a newline and captures its late usage", async () => {
++    const original = frame(chunk) + `data: ${JSON.stringify(lateUsage)}`;
++    const completed = vi.fn();
++    expect(await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, completed)))).toBe(original);
++    expect(completed.mock.calls[0][1].cached_tokens).toBe(2048);
++  });
++
++  it("preserves unknown fields, SSE comments and multiline JSON exactly", async () => {
++    const partial = frame({ candidates: [{ index: 0, content: { parts: [{ text: "prefix" }] } }] });
++    const original = partial + ': heartbeat\n\ndata: {"candidates":[\ndata: {"index":0,"finishReason":"STOP","futureField":true}]}\n\n';
++    expect(await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("aistudio")))).toBe(original);
++  });
++
++  it("keeps a Gemini upstream Chat client terminated with Chat DONE", async () => {
++    const original = 'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n';
++    const output = await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("gemini", FORMATS.OPENAI)));
++    expect(output).toContain('"content":"hi"');
++    expect(output.trimEnd().endsWith("data: [DONE]")).toBe(true);
++  });
++
++  it("keeps upstream native errors and details without a synthetic success", async () => {
++    const original = frame({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota", details: [{ retryDelay: "2s" }] } });
++    expect(await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("aistudio")))).toBe(original);
++  });
++
++  it("expresses premature EOF as native failure after retaining partial content", async () => {
++    const partial = frame({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: "partial" }] } }] });
++    const output = await readText(inputStream([encode(partial)]).pipeThrough(nativeTransform("aistudio")));
++    expect(output.startsWith(partial)).toBe(true);
++    const error = JSON.parse(output.slice(partial.length).trim().slice(5));
++    expect(error.error).toMatchObject({ code: 502, message: expect.stringContaining("before a candidate finished") });
++    expect(output).not.toContain("[DONE]");
++  });
++
++  it("tracks separate candidates without accepting one terminal as another's completion", async () => {
++    const prefix = frame({ candidates: [{ index: 0, finishReason: "STOP" }, { index: 1, content: { parts: [{ text: "partial" }] } }] });
++    const incomplete = await readText(inputStream([encode(prefix)]).pipeThrough(nativeTransform("aistudio")));
++    expect(incomplete).toContain('"code":502');
++    const complete = prefix + frame({ candidates: [{ index: 1, finishReason: "STOP" }] }) + frame(lateUsage);
++    expect(await readText(inputStream([encode(complete)]).pipeThrough(nativeTransform("aistudio")))).toBe(complete);
++  });
++
++  it("does not treat the unspecified finish-reason enum as a terminal", async () => {
++    const partial = { candidates: [{ index: 0, finishReason: "FINISH_REASON_UNSPECIFIED", content: { parts: [{ text: "partial" }] } }] };
++    const terminal = { candidates: [{ index: 0, finishReason: "STOP" }] };
++    const sse = frame(partial);
++    const failed = await readText(inputStream([encode(sse)]).pipeThrough(nativeTransform("gemini")));
++    expect(failed.startsWith(sse)).toBe(true);
++    expect(failed).toContain('"code":502');
++    await expect(readText(inputStream([encode(JSON.stringify([partial]))])
++      .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, true)))).rejects.toThrow("before a candidate finished");
++    const completeSse = sse + frame(terminal);
++    expect(await readText(inputStream([encode(completeSse)]).pipeThrough(nativeTransform("gemini")))).toBe(completeSse);
++    const completeJson = JSON.stringify([partial, terminal]);
++    expect(await readText(inputStream([encode(completeJson)]).pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, true)))).toBe(completeJson);
++  });
++
++  it.each([
++    { promptFeedback: { blockReason: "SAFETY" } },
++    { candidates: [{ index: 0, finishReason: "SAFETY", safetyRatings: [{ blocked: true }] }] },
++    lateUsage,
++  ])("does not fabricate failure for a refusal, empty finished candidate or usage-only response", async body => {
++    const original = frame(body);
++    expect(await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("aistudio")))).toBe(original);
++  });
++});
++
++describe("native response projections preserve requested data without inventing completion failures", () => {
++  const filtered = { candidates: [{ content: { parts: [{ text: "completed projected answer" }] } }] };
++
++  it.each([
++    "candidates/content/parts/text",
++    "candidates.content.parts.text",
++    "candidates(content(parts(text)))",
++    "modelVersion,candidates(content/parts/text)",
++    "future_selector[0]",
++  ])("preserves a finished response with unobservable finishReason under %s", async mask => {
++    for (const nativeJson of [false, true]) {
++      const original = nativeJson ? JSON.stringify([filtered]) : frame(filtered);
++      const output = await readText(inputStream([encode(original)])
++        .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, nativeJson, { masks: [mask] })));
++      expect(output).toBe(original);
++    }
++  });
++
++  it.each([
++    "*",
++    "candidates",
++    "candidates/*",
++    "candidates.finishReason",
++    "candidates/finish_reason",
++    "candidates(finishReason,content)",
++    "candidates(content(parts(text)),finishReason)",
++    "candidates(*)",
++    "",
++  ])("still rejects incomplete candidates when %s exposes the native terminal", async mask => {
++    const original = frame(filtered);
++    const output = await readText(inputStream([encode(original)])
++      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, false, { masks: [mask] })));
++    expect(output.startsWith(original)).toBe(true);
++    expect(output.slice(original.length)).toContain('"code":502');
++    await expect(readText(inputStream([encode(JSON.stringify([filtered]))])
++      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, true, { masks: [mask] })))).rejects.toThrow("before a candidate finished");
++  });
++
++  it("does not infer terminal visibility from conflicting query and header projections", async () => {
++    const original = frame(filtered);
++    const output = await readText(inputStream([encode(original)])
++      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, false, { masks: ["candidates/finishReason", "candidates/content"] })));
++    expect(output).toBe(original);
++  });
++
++  it("does not assign terminal chunks to positions when a multi-candidate projection hides index", async () => {
++    const responses = [
++      { candidates: [
++        { content: { parts: [{ text: "first candidate" }] } },
++        { content: { parts: [{ text: "second candidate" }] } },
++      ] },
++      { candidates: [{ finishReason: "STOP" }] },
++      { candidates: [{ finishReason: "STOP" }] },
++    ];
++    for (const nativeJson of [false, true]) {
++      const original = nativeJson ? JSON.stringify(responses) : responses.map(frame).join("");
++      expect(await readText(inputStream([encode(original)])
++        .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, nativeJson, { masks: ["candidates(content,finishReason)"] })))).toBe(original);
++    }
++  });
++
++  it("still rejects an indexed unfinished candidate when index is included in the projection", async () => {
++    const responses = [
++      { candidates: [
++        { index: 0, content: { parts: [{ text: "first candidate" }] } },
++        { index: 1, content: { parts: [{ text: "unfinished second candidate" }] } },
++      ] },
++      { candidates: [{ index: 0, finishReason: "STOP" }] },
++    ];
++    const projection = { masks: ["candidates(content,finishReason,index)"] };
++    const original = responses.map(frame).join("");
++    const output = await readText(inputStream([encode(original)])
++      .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, false, projection)));
++    expect(output.startsWith(original)).toBe(true);
++    expect(output.slice(original.length)).toContain('"code":502');
++    await expect(readText(inputStream([encode(JSON.stringify(responses))])
++      .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, true, projection)))).rejects.toThrow("before a candidate finished");
++  });
++
++  it("requires at least one visible terminal for multiple candidates even when their index is hidden", async () => {
++    const response = { candidates: [
++      { content: { parts: [{ text: "first partial candidate" }] } },
++      { content: { parts: [{ text: "second partial candidate" }] } },
++    ] };
++    const projection = { masks: ["candidates(content,finishReason)"] };
++    const original = frame(response);
++    const output = await readText(inputStream([encode(original)])
++      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, false, projection)));
++    expect(output.startsWith(original)).toBe(true);
++    expect(output.slice(original.length)).toContain('"code":502');
++    await expect(readText(inputStream([encode(JSON.stringify([response]))])
++      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, true, projection)))).rejects.toThrow("before a candidate finished");
++  });
++
++  it.each(["", ": heartbeat\n\n"])("reports a native failure for empty SSE transport %j even under a projection", async raw => {
++    const output = await readText(inputStream([encode(raw)])
++      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, false, { masks: ["candidates/content"] })));
++    expect(output.startsWith(raw)).toBe(true);
++    expect(output.slice(raw.length)).toContain('"code":502');
++    expect(output).not.toContain("[DONE]");
++  });
++
++  it.each(["", "[]", '[{"candidates":['])('keeps projected malformed or empty JSON %j as an error, without SSE bytes', async raw => {
++    await expect(readText(inputStream([encode(raw)])
++      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, true, { masks: ["candidates/content"] })))).rejects.toThrow(/Upstream Gemini JSON stream/);
++  });
++
++  it("preserves a projected empty object returned for an absent optional field", async () => {
++    expect(await readText(inputStream([encode("{}")])
++      .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, true, { masks: ["modelStatus"] })))).toBe("{}");
++    const original = frame({});
++    expect(await readText(inputStream([encode(original)])
++      .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, false, { masks: ["modelStatus"] })))).toBe(original);
++  });
++
++  it("retains provider errors and details when finishReason is excluded", async () => {
++    const failure = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota", details: [{ retryDelay: "2s" }] } };
++    for (const nativeJson of [false, true]) {
++      const original = nativeJson ? JSON.stringify(failure) : frame(failure);
++      expect(await readText(inputStream([encode(original)])
++        .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, nativeJson, { masks: ["candidates/content"] })))).toBe(original);
++    }
++  });
++
++  it("still reports upstream aborts on a projected JSON response", async () => {
++    let pulls = 0;
++    const upstream = new ReadableStream({ pull(controller) {
++      if (pulls++ === 0) controller.enqueue(encode(JSON.stringify([filtered])));
++      else controller.error(new Error("socket hang up"));
++    } });
++    const controller = createStreamController({ provider: "aistudio", model: "test", log: { errorLine: vi.fn() } });
++    const result = await handleStreamingResponse({
++      providerResponse: new Response(upstream, { headers: { "Content-Type": "application/json" } }),
++      provider: "aistudio", model: "test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++      body: {}, stream: true, requestStartTime: Date.now(), streamController: controller,
++      nativeResponseProjection: { masks: ["candidates/content"] },
++    });
++    await expect(result.response.text()).rejects.toThrow("socket hang up");
++  });
++});
++
++describe("native stream integration and failure cleanup", () => {
++  it("preserves an upstream HTML 403 as a native error and never reports request success", async () => {
++    const succeeded = vi.fn();
++    const result = await handleStreamingResponse({
++      providerResponse: new Response("<html><title>Forbidden</title></html>", { status: 403, headers: { "Content-Type": "text/html" } }),
++      provider: "aistudio", model: "test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++      body: {}, stream: true, requestStartTime: Date.now(), onRequestSuccess: succeeded,
++      streamController: createStreamController({ provider: "aistudio", model: "test", log: { errorLine: vi.fn() } }),
++      log: { errorLine: vi.fn() },
++    });
++    expect(result.success).toBe(false);
++    expect(result.status).toBe(403);
++    expect(result.response.status).toBe(403);
++    expect(await result.response.json()).toMatchObject({ error: { code: 403, status: "PERMISSION_DENIED", message: expect.stringContaining("Forbidden") } });
++    expect(succeeded).not.toHaveBeenCalled();
++  });
++
++  it("passes the native client format through the real streaming handler", async () => {
++    const original = frame(chunk) + frame(lateUsage);
++    const controller = createStreamController({ provider: "aistudio", model: "gemini-native-test" });
++    const result = await handleStreamingResponse({
++      providerResponse: new Response(inputStream([encode(original)]), { headers: { "content-type": "text/event-stream" } }),
++      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++      body: { contents: [{ role: "user", parts: [{ text: "task" }] }] }, stream: true, requestStartTime: Date.now(),
++      streamController: controller,
++    });
++    expect(result.success).toBe(true);
++    expect(await result.response.text()).toBe(original);
++  });
++
++  it.each([FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY])("builds a native numeric abort error without DONE for %s", source => {
++    const output = new TextDecoder().decode(buildStreamErrorBytes(504, "stream stall timeout", source));
++    expect(JSON.parse(output.trim().slice(5))).toEqual({ error: { code: 504, message: "stream stall timeout" } });
++    expect(output).not.toContain("[DONE]");
++  });
++
++  it("cancels an active native upstream when the client disconnects", async () => {
++    const cancelled = vi.fn();
++    const disconnected = vi.fn();
++    const controller = createStreamController({ provider: "aistudio", model: "test", onDisconnect: disconnected });
++    const upstream = new ReadableStream({ start(c) { c.enqueue(encode(frame(chunk))); }, cancel: cancelled });
++    const output = pipeWithDisconnect({ body: upstream }, nativeTransform("aistudio"), controller, message => buildStreamErrorBytes(504, message, FORMATS.GEMINI), 5000);
++    const reader = output.getReader();
++    await reader.read();
++    await reader.cancel("fixture client disconnected");
++    await vi.waitFor(() => expect(cancelled).toHaveBeenCalledOnce());
++    expect(disconnected).toHaveBeenCalledOnce();
++  });
++
++  it("aborts a stalled native generation and emits a parseable error without DONE", async () => {
++    const controller = createStreamController({ provider: "aistudio", model: "test", log: { errorLine: vi.fn() } });
++    const upstream = new ReadableStream({ start(c) { c.enqueue(encode(frame(chunk))); controller.signal.addEventListener("abort", () => c.error(new Error("aborted")), { once: true }); } });
++    const output = pipeWithDisconnect({ body: upstream }, nativeTransform("aistudio"), controller, message => buildStreamErrorBytes(504, message, FORMATS.GEMINI), 30);
++    const text = await readText(output);
++    expect(text).toContain('"code":504');
++    expect(text).toContain('"stream stall timeout"');
++    expect(text).not.toContain("[DONE]");
++    expect(controller.signal.aborted).toBe(true);
++  });
++
++  it("preserves a complete JSON-framed native stream and its media type", async () => {
++    const original = `[ ${JSON.stringify(chunk)}, ${JSON.stringify(lateUsage)} ]`;
++    const controller = createStreamController({ provider: "aistudio", model: "test" });
++    const result = await handleStreamingResponse({
++      providerResponse: new Response(inputStream([encode(original)]), { headers: { "Content-Type": "application/json" } }),
++      provider: "aistudio", model: "test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++      body: {}, stream: true, requestStartTime: Date.now(), streamController: controller,
++    });
++    expect(result.response.headers.get("content-type")).toBe("application/json");
++    expect(await result.response.text()).toBe(original);
++  });
++
++  it("captures JSON-array usage and thoughts while preserving byte-fragmented UTF-8 and multiline framing", async () => {
++    const original = JSON.stringify([chunk, lateUsage], null, 2);
++    const complete = vi.fn();
++    const bytes = encode(original);
++    const output = await readText(inputStream(Array.from(bytes, value => Uint8Array.of(value)))
++      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, complete, true)));
++    expect(output).toBe(original);
++    expect(complete.mock.calls[0][0].thinking).toBe("проверка");
++    expect(complete.mock.calls[0][1].cached_tokens).toBe(2048);
++  });
++
++  it.each([
++    ["empty transport", ""],
++    ["empty response array", "[]"],
++    ["incomplete JSON", '[{"candidates":['],
++    ["unfinished candidate in syntactically valid JSON", JSON.stringify([{ candidates: [{ index: 0, content: { parts: [{ text: "partial" }] } }] }])],
++  ])("rejects %s at clean native JSON EOF", async (_name, raw) => {
++    const controller = createStreamController({ provider: "aistudio", model: "test", log: { errorLine: vi.fn() } });
++    const result = await handleStreamingResponse({
++      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "Content-Type": "application/json" } }),
++      provider: "aistudio", model: "test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++      body: {}, stream: true, requestStartTime: Date.now(), streamController: controller,
++    });
++    await expect(result.response.text()).rejects.toThrow(/Upstream Gemini JSON stream/);
++  });
++
++  it.each([
++    { promptFeedback: { blockReason: "SAFETY" } },
++    { candidates: [{ index: 0, finishReason: "SAFETY", content: { parts: [] } }] },
++    lateUsage,
++  ])("accepts valid JSON refusals, empty finished candidates and usage-only native responses", async response => {
++    const original = JSON.stringify(response);
++    expect(await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, true)))).toBe(original);
++  });
++
++  it("rejects a JSON-framed native stream interrupted by an upstream network error", async () => {
++    let pulls = 0;
++    const upstream = new ReadableStream({ pull(c) {
++      if (pulls++ === 0) c.enqueue(encode('[{"candidates":['));
++      else c.error(new Error("socket hang up"));
++    } });
++    const controller = createStreamController({ provider: "aistudio", model: "test", log: { errorLine: vi.fn() } });
++    const result = await handleStreamingResponse({
++      providerResponse: new Response(upstream, { headers: { "Content-Type": "application/json" } }),
++      provider: "aistudio", model: "test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++      body: {}, stream: true, requestStartTime: Date.now(), streamController: controller,
++    });
++    expect(result.response.headers.get("content-type")).toBe("application/json");
++    await expect(result.response.text()).rejects.toThrow("socket hang up");
++  });
++
++  it("rejects native JSON consumption on a stall instead of appending an SSE error or closing successfully", async () => {
++    const controller = createStreamController({ provider: "aistudio", model: "test", log: { errorLine: vi.fn() } });
++    const upstream = new ReadableStream({ start(c) {
++      c.enqueue(encode('[{"candidates":['));
++      controller.signal.addEventListener("abort", () => c.error(new Error("aborted native JSON")), { once: true });
++    } });
++    const output = pipeWithDisconnect({ body: upstream }, nativeTransform("aistudio"), controller, null, 30, true);
++    await expect(readText(output)).rejects.toThrow("aborted native JSON");
++    expect(controller.signal.aborted).toBe(true);
++  });
++
++  it("cancels the provider while a client is reading a partial native JSON array", async () => {
++    const cancelled = vi.fn();
++    const controller = createStreamController({ provider: "aistudio", model: "test" });
++    const upstream = new ReadableStream({ start(c) { c.enqueue(encode('[{"candidates":[')); }, cancel: cancelled });
++    const result = await handleStreamingResponse({
++      providerResponse: new Response(upstream, { headers: { "Content-Type": "application/json" } }),
++      provider: "aistudio", model: "test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++      body: {}, stream: true, requestStartTime: Date.now(), streamController: controller,
++    });
++    const reader = result.response.body.getReader();
++    expect(new TextDecoder().decode((await reader.read()).value)).toBe('[{"candidates":[');
++    await reader.cancel("client JSON reader cancelled");
++    await vi.waitFor(() => expect(cancelled).toHaveBeenCalledOnce());
++  });
++});
+diff --git a/tests/unit/native-public-gemini-rewrite.test.js b/tests/unit/native-public-gemini-rewrite.test.js
+new file mode 100644
+index 00000000..78978a37
+--- /dev/null
++++ b/tests/unit/native-public-gemini-rewrite.test.js
+@@ -0,0 +1,67 @@
++// The deployed alpha failure occurred before any API handler/provider call:
++// importing the private route does not test Next's public rewrite front door.
++import { describe, expect, it } from "vitest";
++import { existsSync } from "node:fs";
++import nextConfig from "../../next.config.mjs";
++import { getPathMatch } from "next/dist/shared/lib/router/utils/path-match.js";
++import { prepareDestination } from "next/dist/shared/lib/router/utils/prepare-destination.js";
++
++const rules = await nextConfig.rewrites();
++function rewrite(url, rewrites = rules) {
++  const input = new URL(url);
++  const query = {};
++  for (const name of new Set(input.searchParams.keys())) {
++    const values = input.searchParams.getAll(name);
++    query[name] = values.length === 1 ? values[0] : values;
++  }
++  for (const rule of rewrites) {
++    const params = getPathMatch(rule.source, { removeUnnamedParams: true })(input.pathname);
++    if (params === false) continue;
++    return { rule, ...prepareDestination({ destination: rule.destination, params, query, appendParamsToQuery: true }) };
++  }
++  return null;
++}
++
++describe("public native Gemini generation rewrites", () => {
++  for (const version of ["v1", "v1beta", "v1alpha"]) {
++    it(`${version} registers both public root and wildcard destinations`, () => {
++      expect(rules).toContainEqual({ source: `/${version}/:path*`, destination: `/api/${version}/:path*` });
++      expect(rules).toContainEqual({ source: `/${version}`, destination: `/api/${version}` });
++    });
++
++    it(`${version} resolves the public root through Next's real matcher`, () => {
++      const resolved = rewrite(`https://router.test/${version}?fields=models&key=fixture-client-key`);
++      expect(resolved).not.toBeNull();
++      expect(resolved.parsedDestination.pathname).toBe(`/api/${version}`);
++      expect(resolved.parsedDestination.query).toEqual({ fields: "models", key: "fixture-client-key" });
++    });
++
++    for (const provider of ["gemini", "aistudio"]) {
++      for (const action of ["generateContent", "streamGenerateContent"]) {
++        it(`${version} ${provider} ${action} preserves native provider/model/action/query on the public path`, () => {
++          const suffix = `/models/${provider}/gemini-3.5-flash-lite(high):${action}`;
++          const resolved = rewrite(`https://router.test/${version}${suffix}?alt=sse&$key=fixture-client-key&fields=candidates(content,finishReason)&trace=one&trace=two`);
++          expect(resolved).not.toBeNull();
++          expect(resolved.parsedDestination.pathname).toBe(`/api/${version}${suffix}`);
++          expect(resolved.parsedDestination.query).toEqual({
++            alt: "sse", "$key": "fixture-client-key", fields: "candidates(content,finishReason)", trace: ["one", "two"],
++          });
++          expect(resolved.parsedDestination.query.path).toBeUndefined();
++          expect(resolved.parsedDestination.hostname).toBeNull();
++        });
++      }
++    }
++  }
++
++  it("reproduces the local alpha 404 front door when its rewrites are absent despite the private handler", () => {
++    expect(existsSync(new URL("../../src/app/api/v1alpha/models/[...path]/route.js", import.meta.url))).toBe(true);
++    const withoutAlpha = rules.filter(rule => !rule.source.startsWith("/v1alpha"));
++    expect(rewrite("https://router.test/v1alpha/models/aistudio/gemini-3.5-flash-lite:generateContent", withoutAlpha)).toBeNull();
++    expect(rewrite("https://router.test/v1beta/models/aistudio/gemini-3.5-flash-lite:generateContent", withoutAlpha)?.parsedDestination.pathname)
++      .toBe("/api/v1beta/models/aistudio/gemini-3.5-flash-lite:generateContent");
++  });
++
++  it("does not rewrite a lookalike API version", () => {
++    expect(rewrite("https://router.test/v1alphabet/models/gemini/gemini-3.5-flash-lite:generateContent")).toBeNull();
++  });
++});

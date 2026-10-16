@@ -1,0 +1,2353 @@
+From bb9e3b8700cdc57d273aeac31540505d72df011c Mon Sep 17 00:00:00 2001
+From: Overlay Migration <overlay-migration@example.invalid>
+Date: Fri, 16 Oct 2026 08:36:02 +0000
+Subject: [PATCH 3/8] 0003 native-antigravity
+
+Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
+Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
+Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
+---
+ open-sse/executors/antigravity.js             | 126 +++-
+ .../translator/request/openai-to-gemini.js    |  12 +-
+ open-sse/utils/antigravityNative.js           | 491 +++++++++++++++
+ ...igravity-native-disabled-functions.test.js | 364 +++++++++++
+ tests/unit/antigravity-native-gemini.test.js  | 579 +++++++++++++++++
+ .../antigravity-native-json-output.test.js    | 591 ++++++++++++++++++
+ .../antigravity-native-sdk-heartbeat.test.js  |  38 ++
+ 7 files changed, 2181 insertions(+), 20 deletions(-)
+ create mode 100644 open-sse/utils/antigravityNative.js
+ create mode 100644 tests/unit/antigravity-native-disabled-functions.test.js
+ create mode 100644 tests/unit/antigravity-native-gemini.test.js
+ create mode 100644 tests/unit/antigravity-native-json-output.test.js
+ create mode 100644 tests/unit/antigravity-native-sdk-heartbeat.test.js
+
+diff --git a/open-sse/executors/antigravity.js b/open-sse/executors/antigravity.js
+index b117092d..5df81449 100644
+--- a/open-sse/executors/antigravity.js
++++ b/open-sse/executors/antigravity.js
+@@ -8,6 +8,7 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
+ import { cleanJSONSchemaForAntigravity, normalizeGeminiContents } from "../translator/formats/gemini.js";
+ import { DEFAULT_THINKING_AG_SIGNATURE } from "../config/defaultThinkingSignature.js";
+ import { getGeminiThoughtSignatureSync } from "../services/thoughtSignatureStore.js";
++import { unwrapAntigravityResponse, validateAntigravityFieldMask } from "../utils/antigravityNative.js";
+ 
+ // Sanitize function name: Gemini requires [a-zA-Z_][a-zA-Z0-9_.:\-]{0,63}
+ function sanitizeFunctionName(name) {
+@@ -55,6 +56,60 @@ const stripBlacklisted = obj => {
+   for (const key of ANTIGRAVITY_REQUEST_BLACKLIST) delete obj[key];
+ };
+ 
++function rewriteSystemPrompt(request) {
++  if (!request.systemInstruction?.parts) return;
++  for (const part of request.systemInstruction.parts) {
++    if (typeof part.text !== "string") continue;
++    for (const { from, to } of ANTIGRAVITY_PROMPT_REWRITES) part.text = part.text.replaceAll(from, to);
++  }
++}
++
++function nativeGeminiRequestsJsonOutput(body) {
++  if (!body || typeof body !== "object") return false;
++  return [body.generationConfig, body.generation_config].some(config =>
++    config && typeof config === "object"
++    && (config.responseMimeType === "application/json" || config.response_mime_type === "application/json")
++  );
++}
++
++function nativeGeminiUsesResponseSchema(request) {
++  return [request.generationConfig, request.generation_config].some(config =>
++    config && typeof config === "object"
++    && (Object.prototype.hasOwnProperty.call(config, "responseSchema")
++      || Object.prototype.hasOwnProperty.call(config, "response_schema"))
++  );
++}
++
++function nativeGeminiDisablesFunctionCalling(request) {
++  return [request.toolConfig, request.tool_config].some(toolConfig => {
++    if (!toolConfig || typeof toolConfig !== "object") return false;
++    return [toolConfig.functionCallingConfig, toolConfig.function_calling_config].some(config =>
++      config && typeof config === "object" && config.mode === "NONE"
++    );
++  });
++}
++
++function removeDisabledNativeGeminiDeclarations(request) {
++  if (!request || typeof request !== "object" || Array.isArray(request)
++    || !nativeGeminiUsesResponseSchema(request) || !nativeGeminiDisablesFunctionCalling(request)
++    || !Array.isArray(request.tools)) return;
++
++  const remainingTools = [];
++  for (const toolGroup of request.tools) {
++    if (!toolGroup || typeof toolGroup !== "object" || Array.isArray(toolGroup)) {
++      remainingTools.push(toolGroup);
++      continue;
++    }
++    const hadDeclarations = Object.prototype.hasOwnProperty.call(toolGroup, "functionDeclarations")
++      || Object.prototype.hasOwnProperty.call(toolGroup, "function_declarations");
++    delete toolGroup.functionDeclarations;
++    delete toolGroup.function_declarations;
++    if (Object.keys(toolGroup).length || !hadDeclarations) remainingTools.push(toolGroup);
++  }
++  if (remainingTools.length) request.tools = remainingTools;
++  else delete request.tools;
++}
++
+ // Image generation model name patterns
+ const IMAGE_MODEL_PATTERNS = [
+   /image/i,
+@@ -172,6 +227,30 @@ export class AntigravityExecutor extends BaseExecutor {
+   transformRequest(model, body, stream, credentials) {
+     const projectId = credentials?.projectId || this.generateProjectId();
+ 
++    if (credentials?.nativeGeminiPassthrough) {
++      const request = structuredClone(body);
++      // Antigravity can emit a forbidden tool call when a native JSON Schema
++      // request disables calling but still carries function declarations.
++      // Preserve built-in/unknown tools and every other request field.
++      removeDisabledNativeGeminiDeclarations(request);
++      delete request.model;
++      delete request.stream;
++      const rawSessionId = request.sessionId || resolveSessionId({
++        headers: credentials.rawHeaders, body,
++        connectionId: credentials.email || credentials.connectionId, scope: "antigravity",
++      });
++      request.sessionId = toNumericSessionId(rawSessionId) || rawSessionId;
++      rewriteSystemPrompt(request);
++      this._lastSessionId = request.sessionId;
++      // Keep the provider's existing IDE/auth fingerprint. In particular, chat
++      // must omit requestType, and the client payload must not replace it.
++      return {
++        project: projectId, model, userAgent: "antigravity",
++        requestId: buildIdeRequestId({ body: {}, request, credentials, model, requestType: "agent" }),
++        request,
++      };
++    }
++
+     // OpenAI clients may include stream_options even for non-streaming calls.
+     // Google generateContent rejects that combination before processing the request.
+     if (stream !== true) delete body.stream_options;
+@@ -228,6 +307,7 @@ export class AntigravityExecutor extends BaseExecutor {
+ 
+     // ─── Standard (non-image) request ───
+     // Fix contents for Claude models via Antigravity
++    const geminiBacked = !String(body.model || model || "").toLowerCase().includes("claude");
+     const rawContents = (body.request?.contents || []).map(c => {
+       let role = c.role;
+       // functionResponse must be role "user" for Claude models
+@@ -267,7 +347,7 @@ export class AntigravityExecutor extends BaseExecutor {
+         parts: modifiedParts || parts || [],
+       };
+     });
+-    const contents = normalizeGeminiContents(rawContents, model);
++    const contents = normalizeGeminiContents(rawContents, model, { synthesizeTerminalToolResponse: !geminiBacked });
+ 
+     // Sanitize tool schemas and function names before sending to Antigravity.
+     let tools = body.request?.tools;
+@@ -281,13 +361,19 @@ export class AntigravityExecutor extends BaseExecutor {
+           const name = sanitizeFunctionName(fn.name);
+           if (seenToolNames.has(name)) continue;
+           seenToolNames.add(name);
+-          allDeclarations.push({
+-            ...fn,
+-            name,
+-            parameters: fn.parameters
+-              ? cleanJSONSchemaForAntigravity(structuredClone(fn.parameters))
+-              : { type: "object", properties: { reason: { type: "string", description: "Brief explanation" } }, required: ["reason"] }
+-          });
++          const decl = { ...fn, name };
++          if (geminiBacked) {
++            if (decl.parametersJsonSchema !== undefined) {
++              delete decl.parameters;
++            } else if (decl.parameters !== undefined) {
++              decl.parameters = cleanJSONSchemaForAntigravity(structuredClone(decl.parameters));
++            }
++          } else {
++            decl.parameters = decl.parameters
++              ? cleanJSONSchemaForAntigravity(structuredClone(decl.parameters))
++              : { type: "object", properties: { reason: { type: "string", description: "Brief explanation" } }, required: ["reason"] };
++          }
++          allDeclarations.push(decl);
+         }
+       }
+       tools = allDeclarations.length > 0 ? [{ functionDeclarations: allDeclarations }] : [];
+@@ -299,14 +385,7 @@ export class AntigravityExecutor extends BaseExecutor {
+     
+     // Rewrite competing-client branding in system prompts (e.g. Zed's Claude prompt,
+     // OpenCode naming) so Antigravity doesn't flag the request with a 429 Quota Exhausted.
+-    if (requestWithoutTools.systemInstruction?.parts) {
+-      for (const part of requestWithoutTools.systemInstruction.parts) {
+-        if (typeof part.text !== "string") continue;
+-        for (const { from, to } of ANTIGRAVITY_PROMPT_REWRITES) {
+-          part.text = part.text.replaceAll(from, to);
+-        }
+-      }
+-    }
++    rewriteSystemPrompt(requestWithoutTools);
+ 
+     const generationConfig = { ...(requestWithoutTools.generationConfig || {}) };
+     if (generationConfig.maxOutputTokens > MAX_ANTIGRAVITY_OUTPUT_TOKENS) {
+@@ -320,7 +399,7 @@ export class AntigravityExecutor extends BaseExecutor {
+       ...(tools && { tools }),
+       sessionId,
+       safetySettings: undefined,
+-      ...(tools?.length > 0 && { toolConfig: { functionCallingConfig: { mode: "VALIDATED" } } })
++      ...(tools?.length > 0 && { toolConfig: (geminiBacked && _originalToolConfig) || { functionCallingConfig: { mode: "VALIDATED" } } })
+     };
+ 
+     // Strip blacklisted thinking fields from top-level body (set by thinkingUnified.js at root, not body.request)
+@@ -346,6 +425,19 @@ export class AntigravityExecutor extends BaseExecutor {
+     };
+   }
+ 
++  async execute(options) {
++    const jsonOutput = Boolean(options.credentials?.nativeGeminiPassthrough && nativeGeminiRequestsJsonOutput(options.body));
++    if (options.credentials?.nativeGeminiPassthrough) {
++      const error = validateAntigravityFieldMask(options.credentials.nativeGeminiRequest);
++      if (error) return { response: Response.json(error, { status: 400 }), headers: {}, url: null, transformedBody: null };
++    }
++    const result = await super.execute(options);
++    if (options.credentials?.nativeGeminiPassthrough) {
++      result.response = await unwrapAntigravityResponse(result.response, options.stream, options.credentials.nativeGeminiRequest, { jsonOutput });
++    }
++    return result;
++  }
++
+   async refreshCredentials(credentials, log, proxyOptions = null) {
+     if (!credentials.refreshToken) return null;
+ 
+diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
+index 182abf93..7b36bbfc 100644
+--- a/open-sse/translator/request/openai-to-gemini.js
++++ b/open-sse/translator/request/openai-to-gemini.js
+@@ -367,11 +367,14 @@ function wrapInCloudCodeEnvelope(model, geminiCLI, credentials = null, isAntigra
+   }
+ 
+   if (geminiCLI.tools?.length > 0) {
+-    envelope.request.toolConfig = {
++    envelope.request.toolConfig = geminiCLI.toolConfig || {
+       functionCallingConfig: { mode: "VALIDATED" }
+     };
+   }
+ 
++  if (geminiCLI._customToolNames) envelope._customToolNames = geminiCLI._customToolNames;
++  if (geminiCLI._toolNameMap) envelope._toolNameMap = geminiCLI._toolNameMap;
++
+   return envelope;
+ }
+ 
+@@ -504,6 +507,9 @@ function wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials = nu
+     envelope.request.systemInstruction = { role: GEMINI_ROLE.USER, parts: systemParts };
+   }
+ 
++  if (claudeRequest._customToolNames) envelope._customToolNames = claudeRequest._customToolNames;
++  if (claudeRequest._toolNameMap) envelope._toolNameMap = claudeRequest._toolNameMap;
++
+   envelope.request.contents = normalizeGeminiContents(envelope.request.contents, model);
+   return envelope;
+ }
+@@ -521,11 +527,11 @@ export function openaiToAntigravityRequest(model, body, stream, credentials = nu
+     return wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials);
+   }
+ 
+-  const geminiCLI = openaiToGeminiCLIRequest(model, body, stream);
++  const geminiCLI = openaiToGeminiCLIRequest(model, body, stream, credentials);
+   return wrapInCloudCodeEnvelope(model, geminiCLI, credentials, true);
+ }
+ 
+ // Register
+ register(FORMATS.OPENAI, FORMATS.GEMINI, openaiToGeminiRequest, null);
+-register(FORMATS.OPENAI, FORMATS.GEMINI_CLI, (model, body, stream, credentials) => wrapInCloudCodeEnvelope(model, openaiToGeminiCLIRequest(model, body, stream), credentials), null);
++register(FORMATS.OPENAI, FORMATS.GEMINI_CLI, (model, body, stream, credentials) => wrapInCloudCodeEnvelope(model, openaiToGeminiCLIRequest(model, body, stream, credentials), credentials), null);
+ register(FORMATS.OPENAI, FORMATS.ANTIGRAVITY, openaiToAntigravityRequest, null);
+diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
+new file mode 100644
+index 00000000..228e3443
+--- /dev/null
++++ b/open-sse/utils/antigravityNative.js
+@@ -0,0 +1,491 @@
++// Adapt Cloud Code's response envelope, keeping the Gemini payload available
++// to the existing native response validation, usage observer and client.
++function unwrap(value) {
++  if (Array.isArray(value)) return value.map(unwrap);
++  if (value && typeof value === "object" && Object.hasOwn(value, "response") && !value.error) {
++    const { response, ...metadata } = value;
++    if (response === null || typeof response !== "object" || Array.isArray(response) || !Object.keys(response).length) {
++      return { error: { code: 502, status: "INTERNAL", message: "Invalid Antigravity response envelope" } };
++    }
++    return { ...metadata, ...response };
++  }
++  return value;
++}
++
++function responseHeaders(response, contentType) {
++  const headers = new Headers(response.headers);
++  for (const name of ["content-length", "content-encoding", "transfer-encoding"]) headers.delete(name);
++  headers.set("Content-Type", contentType);
++  return headers;
++}
++
++function fieldMaskSyntaxError(source, index, reason) {
++  return new Error(`Invalid ${source} field mask at position ${index + 1}: ${reason}`);
++}
++
++function parseFieldMask(rawMask, source) {
++  const text = String(rawMask ?? "").trim();
++  if (!text) return null;
++
++  const root = { all: false, children: new Map() };
++  let index = 0;
++  const fail = reason => { throw fieldMaskSyntaxError(source, index, reason); };
++  const skipWhitespace = () => {
++    while (index < text.length && /\s/.test(text[index])) index++;
++  };
++  const readField = () => {
++    skipWhitespace();
++    if (text[index] === "*") {
++      index++;
++      return "*";
++    }
++    const start = index;
++    while (index < text.length && /[A-Za-z0-9_]/.test(text[index])) index++;
++    const field = text.slice(start, index);
++    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(field)) fail("expected a field name");
++    return field;
++  };
++  const childAt = (node, field) => {
++    if (field === "*") {
++      node.all = true;
++      return node;
++    }
++    let child = node.children.get(field);
++    if (!child) {
++      child = { all: false, children: new Map() };
++      node.children.set(field, child);
++    }
++    return child;
++  };
++  const isPathSeparator = character => source === "x-goog-fieldmask"
++    ? character === "."
++    : character === "/" || character === ".";
++
++  const parseSelectors = (parent, closing) => {
++    let selectorCount = 0;
++    while (true) {
++      skipWhitespace();
++      if (index >= text.length) {
++        if (closing) fail("expected ')' to close a field group");
++        return selectorCount;
++      }
++      if (text[index] === ")") {
++        if (!closing) fail("unexpected ')'");
++        index++;
++        return selectorCount;
++      }
++      if (text[index] === ",") fail("empty field selector");
++
++      const fields = [readField()];
++      while (true) {
++        skipWhitespace();
++        if (!isPathSeparator(text[index])) break;
++        index++;
++        fields.push(readField());
++      }
++      const wildcardIndex = fields.indexOf("*");
++      if (wildcardIndex !== -1 && wildcardIndex !== fields.length - 1) {
++        fail("wildcard must be the final path component");
++      }
++
++      let target = parent;
++      for (const field of fields) target = childAt(target, field);
++
++      skipWhitespace();
++      if (text[index] === "(") {
++        if (fields.at(-1) === "*") fail("wildcard cannot contain a field group");
++        index++;
++        if (parseSelectors(target, true) === 0) fail("field group cannot be empty");
++      } else target.all = true;
++      selectorCount++;
++
++      skipWhitespace();
++      if (text[index] === ",") {
++        index++;
++        skipWhitespace();
++        if (index >= text.length || (closing && text[index] === ")")) fail("empty field selector");
++        continue;
++      }
++      if (text[index] === ")") {
++        if (!closing) fail("unexpected ')'");
++        index++;
++        return selectorCount;
++      }
++      if (index >= text.length) {
++        if (closing) fail("expected ')' to close a field group");
++        return selectorCount;
++      }
++      fail("expected ',' or the end of the field mask");
++    }
++  };
++
++  parseSelectors(root, false);
++  if (root.all) return null;
++  return root;
++}
++
++function nativeResponseMasks(nativeRequest = {}) {
++  const query = new URLSearchParams(nativeRequest.query || []);
++  const masks = [];
++  for (const name of ["fields", "$fields"]) {
++    for (const value of query.getAll(name)) {
++      const parsed = parseFieldMask(value, name);
++      if (parsed) masks.push(parsed);
++    }
++  }
++
++  const headers = nativeRequest.headers;
++  let headerMask = null;
++  if (headers && typeof headers.get === "function") {
++    headerMask = headers.get("x-goog-fieldmask");
++  } else if (headers && typeof headers === "object") {
++    for (const [name, value] of Object.entries(headers)) {
++      if (name.toLowerCase() !== "x-goog-fieldmask") continue;
++      headerMask = Array.isArray(value) ? value.join(",") : value;
++      break;
++    }
++  }
++  if (headerMask != null) {
++    const parsed = parseFieldMask(headerMask, "x-goog-fieldmask");
++    if (parsed) masks.push(parsed);
++  }
++  return masks;
++}
++
++function isNativeError(value) {
++  return value !== null && typeof value === "object" && !Array.isArray(value)
++    && Object.prototype.hasOwnProperty.call(value, "error");
++}
++
++function projectValue(value, selector) {
++  if (selector.all) return value;
++  if (Array.isArray(value)) {
++    // Preserve array positions; an unmatched object item becomes an empty object.
++    return value.map(item => {
++      const projected = projectValue(item, selector);
++      return projected === undefined ? (item === null ? null : {}) : projected;
++    });
++  }
++  if (value === null) return null;
++  if (typeof value !== "object") return undefined;
++
++  const projected = Object.create(null);
++  for (const [field, childSelector] of selector.children) {
++    if (!Object.prototype.hasOwnProperty.call(value, field)) continue;
++    if (childSelector.all || childSelector.children.size === 0) {
++      projected[field] = value[field];
++      continue;
++    }
++    const child = projectValue(value[field], childSelector);
++    if (child !== undefined) projected[field] = child;
++  }
++  return projected;
++}
++
++function applyNativeResponseMasks(value, masks) {
++  if (!masks.length) return value;
++  if (Array.isArray(value)) {
++    return value.map(item => isNativeError(item) ? item : applyNativeResponseMasks(item, masks));
++  }
++  if (isNativeError(value)) return value;
++
++  let projected = value;
++  for (const mask of masks) {
++    projected = projectValue(projected, mask);
++    if (projected === undefined) return {};
++  }
++  return projected;
++}
++
++function isOrdinaryNativeTextPart(part) {
++  return part && typeof part.text === "string"
++    && !part.thought
++    && !part.functionCall && !part.function_call
++    && !part.functionResponse && !part.function_response;
++}
++
++function nativeJsonFenceOpeningStatus(text) {
++  const leadingWhitespace = /^\s*/.exec(text)?.[0].length || 0;
++  const opening = text.slice(leadingWhitespace);
++  if (!opening) return "start";
++  if ("```".startsWith(opening)) return "possible";
++  if (!opening.startsWith("```")) return "plain";
++
++  const suffix = opening.slice(3);
++  if (/^[ \t]*\r?\n/.test(suffix)) return "open";
++  if (/^[ \t]*\r?$/.test(suffix) || "json".startsWith(suffix)) return "possible";
++  if (suffix.startsWith("json")) {
++    const languageSuffix = suffix.slice(4);
++    if (/^[ \t]*\r?\n/.test(languageSuffix)) return "open";
++    if (/^[ \t]*\r?$/.test(languageSuffix)) return "possible";
++  }
++  return "plain";
++}
++
++function nativeJsonFenceRemovalRanges(text) {
++  const opening = /^(\s*)```(?:json)?[ \t]*\r?\n/.exec(text);
++  if (!opening) return null;
++
++  let trimmedEnd = text.length;
++  while (trimmedEnd > 0 && /\s/.test(text[trimmedEnd - 1])) trimmedEnd--;
++  const closingStart = trimmedEnd - 3;
++  if (closingStart < opening[0].length || text.slice(closingStart, trimmedEnd) !== "```") return null;
++  const closingLineStart = text.lastIndexOf("\n", closingStart - 1) + 1;
++  if (!/^[ \t]*$/.test(text.slice(closingLineStart, closingStart))) return null;
++
++  const inner = text.slice(opening[0].length, closingStart);
++  try { JSON.parse(inner); }
++  catch { return null; }
++
++  return [
++    [opening[1].length, opening[0].length],
++    [closingStart, trimmedEnd],
++  ];
++}
++
++function removeNativeJsonFenceRanges(spans, ranges) {
++  const byPart = new Map();
++  for (const [rangeStart, rangeEnd] of ranges) {
++    for (const span of spans) {
++      const overlapStart = Math.max(rangeStart, span.start);
++      const overlapEnd = Math.min(rangeEnd, span.end);
++      if (overlapStart >= overlapEnd) continue;
++      const partRanges = byPart.get(span.part) || [];
++      partRanges.push([overlapStart - span.start, overlapEnd - span.start]);
++      byPart.set(span.part, partRanges);
++    }
++  }
++  for (const [part, partRanges] of byPart) {
++    let text = part.text;
++    partRanges.sort((left, right) => right[0] - left[0]);
++    for (const [start, end] of partRanges) text = text.slice(0, start) + text.slice(end);
++    part.text = text;
++  }
++}
++
++function nativeCandidateText(candidate) {
++  const spans = [];
++  let text = "";
++  const parts = candidate?.content?.parts;
++  if (!Array.isArray(parts)) return { text, spans };
++  for (const part of parts) {
++    if (!isOrdinaryNativeTextPart(part)) continue;
++    const start = text.length;
++    text += part.text;
++    spans.push({ part, start, end: text.length });
++  }
++  return { text, spans };
++}
++
++function normalizeNativeJsonResponse(value) {
++  if (Array.isArray(value)) {
++    for (const item of value) normalizeNativeJsonResponse(item);
++    return value;
++  }
++  if (!value || typeof value !== "object" || isNativeError(value) || !Array.isArray(value.candidates)) return value;
++  for (const candidate of value.candidates) {
++    if (!candidate || (candidate.finishReason ?? candidate.finish_reason) !== "STOP") continue;
++    const { text, spans } = nativeCandidateText(candidate);
++    const ranges = nativeJsonFenceRemovalRanges(text);
++    if (ranges) removeNativeJsonFenceRanges(spans, ranges);
++  }
++  return value;
++}
++
++function updateNativeJsonStreamStates(value, states) {
++  if (Array.isArray(value)) {
++    value.forEach(item => updateNativeJsonStreamStates(item, states));
++    return;
++  }
++  if (!value || typeof value !== "object" || isNativeError(value) || !Array.isArray(value.candidates)) return;
++
++  value.candidates.forEach((candidate, position) => {
++    if (!candidate || typeof candidate !== "object") return;
++    const candidateIndex = Number.isInteger(candidate.index) ? candidate.index : position;
++    let state = states.get(candidateIndex);
++    if (!state) {
++      state = { status: "start", text: "", spans: [] };
++      states.set(candidateIndex, state);
++    }
++
++    if (["start", "possible", "open"].includes(state.status)) {
++      const parts = candidate.content?.parts;
++      if (Array.isArray(parts)) {
++        for (const part of parts) {
++          if (!isOrdinaryNativeTextPart(part)) continue;
++          const start = state.text.length;
++          state.text += part.text;
++          state.spans.push({ part, start, end: state.text.length });
++        }
++      }
++      if (state.status === "start" || state.status === "possible") {
++        state.status = nativeJsonFenceOpeningStatus(state.text);
++      }
++    }
++
++    const finishReason = candidate.finishReason ?? candidate.finish_reason;
++    if (finishReason === "STOP") {
++      if (state.status === "open") {
++        const ranges = nativeJsonFenceRemovalRanges(state.text);
++        if (ranges) {
++          removeNativeJsonFenceRanges(state.spans, ranges);
++          state.status = "stripped";
++        } else state.status = "done";
++      } else if (state.status === "start" || state.status === "possible") state.status = "done";
++    } else if (finishReason) state.status = "done";
++  });
++}
++
++function hasPendingNativeJsonFence(states) {
++  for (const state of states.values()) {
++    if (state.status === "possible" || state.status === "open") return true;
++  }
++  return false;
++}
++
++/**
++ * Validate fields/$fields and X-Goog-FieldMask before sending the request upstream.
++ * Returns null when valid, otherwise a native Gemini error object for a 400 response.
++ */
++export function validateAntigravityFieldMask(nativeRequest = {}) {
++  try {
++    nativeResponseMasks(nativeRequest);
++    return null;
++  } catch (error) {
++    return {
++      error: {
++        code: 400,
++        status: "INVALID_ARGUMENT",
++        message: error.message,
++      },
++    };
++  }
++}
++
++export async function unwrapAntigravityResponse(response, stream, nativeRequest = {}, { jsonOutput = false } = {}) {
++  let masks;
++  try {
++    masks = nativeResponseMasks(nativeRequest);
++  } catch (error) {
++    if (!response.ok) return response;
++    response.body?.cancel().catch(() => {});
++    return new Response(JSON.stringify({
++      error: { code: 400, status: "INVALID_ARGUMENT", message: error.message },
++    }), {
++      status: 400,
++      statusText: "Bad Request",
++      headers: responseHeaders(response, "application/json"),
++    });
++  }
++
++  const contentType = (response.headers.get("content-type") || "").toLowerCase();
++  if (!contentType.includes("application/json") && !contentType.includes("text/event-stream")) return response;
++  if (!contentType.includes("text/event-stream")) {
++    const text = await response.text();
++    let body = text;
++    try {
++      const nativeResponse = unwrap(JSON.parse(text));
++      const normalized = response.ok && jsonOutput ? normalizeNativeJsonResponse(nativeResponse) : nativeResponse;
++      body = JSON.stringify(response.ok ? applyNativeResponseMasks(normalized, masks) : normalized);
++    } catch { /* Native core reports invalid JSON. */ }
++    return new Response(body, {
++      status: response.status, statusText: response.statusText,
++      headers: responseHeaders(response, response.headers.get("content-type")),
++    });
++  }
++  // A unary request unexpectedly receiving SSE must still fail the existing
++  // native framing check instead of being aggregated into a fabricated answer.
++  if (!stream || !response.body) return response;
++  const query = new URLSearchParams(nativeRequest.query || []);
++  const json = (query.get("alt") || query.get("$alt")) !== "sse";
++  const decoder = new TextDecoder();
++  const encoder = new TextEncoder();
++  let buffer = "", data = [], started = false, failed = false;
++  const nativeJsonStates = new Map();
++  let pendingNativeResponses = [];
++  const writeNativeResponse = (nativeResponse, controller) => {
++    const payload = JSON.stringify(response.ok ? applyNativeResponseMasks(nativeResponse, masks) : nativeResponse);
++    controller.enqueue(encoder.encode(json ? `${started ? "," : "["}${payload}` : `data: ${payload}\n\n`));
++    started = true;
++  };
++  const flushPendingNativeResponses = controller => {
++    for (const nativeResponse of pendingNativeResponses) writeNativeResponse(nativeResponse, controller);
++    pendingNativeResponses = [];
++  };
++  const emit = (value, controller) => {
++    const values = Array.isArray(value) ? value : [value];
++    for (const item of values) {
++      const nativeResponse = unwrap(item);
++      if (!response.ok || !jsonOutput) {
++        writeNativeResponse(nativeResponse, controller);
++        continue;
++      }
++      if (isNativeError(nativeResponse)) {
++        flushPendingNativeResponses(controller);
++        writeNativeResponse(nativeResponse, controller);
++        continue;
++      }
++
++      updateNativeJsonStreamStates(nativeResponse, nativeJsonStates);
++      if (pendingNativeResponses.length || hasPendingNativeJsonFence(nativeJsonStates)) {
++        pendingNativeResponses.push(nativeResponse);
++        if (!hasPendingNativeJsonFence(nativeJsonStates)) flushPendingNativeResponses(controller);
++      } else writeNativeResponse(nativeResponse, controller);
++    }
++  };
++  const event = controller => {
++    if (!data.length || failed) { data = []; return; }
++    const value = data.join("\n");
++    data = [];
++    // Gemini terminates at EOF. Its finishReason is preserved independently.
++    if (value.trim() === "[DONE]") {
++      flushPendingNativeResponses(controller);
++      return;
++    }
++    try { emit(JSON.parse(value), controller); }
++    catch {
++      failed = true;
++      flushPendingNativeResponses(controller);
++      emit({ error: { code: 502, status: "INTERNAL", message: "Invalid Antigravity stream event" } }, controller);
++    }
++  };
++  const line = (value, controller) => {
++    if (!value) event(controller);
++    else if (value.startsWith("data:")) data.push(value.slice(5).replace(/^ /, ""));
++  };
++  const consume = (controller, final = false) => {
++    let match;
++    while ((match = /\r\n|\r|\n/.exec(buffer))) {
++      // Keep a trailing CR until we can distinguish CRLF from a lone CR.
++      if (!final && match[0] === "\r" && match.index === buffer.length - 1) break;
++      line(buffer.slice(0, match.index), controller);
++      buffer = buffer.slice(match.index + match[0].length);
++    }
++    if (final) {
++      if (buffer) line(buffer, controller);
++      buffer = "";
++      event(controller);
++    }
++  };
++  const body = response.body.pipeThrough(new TransformStream({
++    transform(chunk, controller) {
++      // Keep raw upstream activity visible to the existing stall detector,
++      // including comments and partial events that do not produce data yet.
++      // Google GenAI SDK 2.28 treats SSE comments as JSON. Empty lines are
++      // ignored by its parser and still keep upstream activity observable.
++      controller.enqueue(encoder.encode(json ? " " : "\n"));
++      buffer += decoder.decode(chunk, { stream: true });
++      consume(controller);
++    },
++    flush(controller) {
++      buffer += decoder.decode();
++      consume(controller, true);
++      flushPendingNativeResponses(controller);
++      if (json) controller.enqueue(encoder.encode(started ? "]" : "[]"));
++    },
++  }));
++  return new Response(body, {
++    status: response.status, statusText: response.statusText,
++    headers: responseHeaders(response, json ? "application/json" : "text/event-stream"),
++  });
++}
+diff --git a/tests/unit/antigravity-native-disabled-functions.test.js b/tests/unit/antigravity-native-disabled-functions.test.js
+new file mode 100644
+index 00000000..a3c2fd7c
+--- /dev/null
++++ b/tests/unit/antigravity-native-disabled-functions.test.js
+@@ -0,0 +1,364 @@
++// Native Gemini disabled-function structured-output controls through the
++// public route, real chat core, and real Antigravity executor.
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import fs from "node:fs";
++import path from "node:path";
++import vm from "node:vm";
++import { fileURLToPath } from "node:url";
++
++const { network, executorInstances } = vi.hoisted(() => ({
++  network: vi.fn(),
++  executorInstances: new Map(),
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: network }));
++vi.mock("../../open-sse/executors/index.js", async () => {
++  const { AntigravityExecutor } = await import("../../open-sse/executors/antigravity.js");
++  return {
++    getExecutor(provider) {
++      if (provider !== "antigravity") throw new Error(`Unexpected fixture provider: ${provider}`);
++      if (!executorInstances.has(provider)) executorInstances.set(provider, new AntigravityExecutor());
++      return executorInstances.get(provider);
++    },
++  };
++});
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: async () => new Proxy({}, {
++    get: (_target, name) => name === "then" ? undefined : vi.fn(),
++  }),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
++const { ANTIGRAVITY_HEADERS } = await import("../../open-sse/config/appConstants.js");
++
++const root = fileURLToPath(new URL("../../", import.meta.url));
++const MODEL = "gemini-3.8-flash-high";
++const quiet = Object.fromEntries(["debug", "info", "warn", "error", "line", "errorLine"].map(name => [name, vi.fn()]));
++const SCHEMA = {
++  type: "OBJECT",
++  properties: { code: { type: "STRING" } },
++  required: ["code"],
++  additionalProperties: false,
++  description: "Preserve this complete response schema.",
++};
++
++function makeBody({ schemaKey = "responseSchema", mode = "NONE" } = {}) {
++  return {
++    systemInstruction: { parts: [{ text: "Follow the task protocol." }] },
++    contents: [
++      { role: "user", parts: [{ text: "Read the image and return its code as JSON." }] },
++      { role: "model", parts: [
++        { text: "Earlier thought", thought: true, thoughtSignature: "history-thought-signature" },
++        { functionCall: { id: "history-call-31", name: "lookup_record", args: { key: "opaque" } }, thoughtSignature: "history-call-signature" },
++      ] },
++      { role: "user", parts: [
++        { functionResponse: { id: "history-call-31", name: "lookup_record", response: { record: { value: 31 } } } },
++        { inlineData: { mimeType: "image/png", data: "aW1hZ2UtYnl0ZXM=" } },
++        { futurePart: { preserve: true, token: "opaque-client-part" } },
++      ] },
++    ],
++    tools: [
++      {
++        functionDeclarations: [{
++          name: "forbidden_dummy",
++          description: "Must remain disabled in this control.",
++          parametersJsonSchema: { type: "OBJECT", properties: { code: { type: "STRING" } } },
++        }],
++        googleSearch: { dynamicRetrievalConfig: { mode: "MODE_UNSPECIFIED" } },
++        futureGroupField: { group: "search-and-functions", value: 1 },
++      },
++      {
++        function_declarations: [{ name: "inactive_snake_alias", parameters: { type: "OBJECT" } }],
++        urlContext: {},
++        futureGroupField: { group: "url-and-functions", value: 2 },
++      },
++      {
++        functionDeclarations: [{ name: "only_inactive_function", parameters: { type: "OBJECT" } }],
++      },
++    ],
++    toolConfig: { functionCallingConfig: { mode, allowedFunctionNames: ["forbidden_dummy"] } },
++    generationConfig: {
++      maxOutputTokens: 2048,
++      temperature: 0,
++      thinkingConfig: { thinkingLevel: "HIGH", includeThoughts: true },
++      responseMimeType: "application/json",
++      [schemaKey]: structuredClone(SCHEMA),
++    },
++    cachedContent: "cachedContents/native-prefix",
++    clientExtension: { continuation: { token: "opaque-future-field" } },
++  };
++}
++
++function responseForWire(wire) {
++  const declarationsRemain = (wire.request.tools || []).some(group =>
++    (group.functionDeclarations || []).length > 0 || (group.function_declarations || []).length > 0
++  );
++  const candidate = declarationsRemain
++    ? {
++        index: 0,
++        content: { role: "model", parts: [{
++          functionCall: { id: "provider-forbidden-call", name: "forbidden_dummy", args: { code: "4821" } },
++          thoughtSignature: "provider-function-signature",
++        }] },
++        finishReason: "STOP",
++      }
++    : {
++        index: 0,
++        content: { role: "model", parts: [{ text: "{\"code\":\"4821\"}" }] },
++        finishReason: "STOP",
++      };
++  return Response.json({ response: {
++    candidates: [candidate],
++    usageMetadata: { promptTokenCount: 81, candidatesTokenCount: 4, totalTokenCount: 85 },
++  } });
++}
++
++function moduleSource(relative) {
++  return fs.readFileSync(path.join(root, relative), "utf8")
++    .replace(/^import[\s\S]*?;\s*$/gm, "")
++    .replace(/^export /gm, "");
++}
++
++function loadPublicNativeRoute() {
++  const services = {
++    handleChatCore: vi.fn(options => handleChatCore(options)),
++    getSettings: vi.fn(async () => ({ requireApiKey: false })),
++    getProviderCredentials: vi.fn(async () => ({ accessToken: "offline-token", projectId: "fixture-project", connectionId: "route-fixture", providerSpecificData: {} })),
++    getModelInfo: vi.fn(async model => {
++      const index = model.indexOf("/");
++      return index < 0 ? { provider: null, model } : { provider: model.slice(0, index), model: model.slice(index + 1) };
++    }),
++    isValidApiKey: vi.fn(async () => true),
++    getKeyAccessContext: vi.fn(async () => null),
++    enforceKeyAccess: vi.fn(async () => null),
++    enforceKeyAccessResolved: vi.fn(async () => null),
++    filterAdapterModels: vi.fn(async (_keyAccess, models) => models),
++    markAccountUnavailable: vi.fn(async () => ({ shouldFallback: false })),
++    clearAccountError: vi.fn(async () => {}),
++    handleAntigravityQuotaError: vi.fn(async () => null),
++    clearAntigravityStrikes: vi.fn(),
++    getComboModels: vi.fn(async () => null),
++    augmentModelsWithCapacityAdapter: models => models,
++    withCapacityAdapterStripping: callback => callback,
++    getActiveAdapterStrategy: vi.fn(),
++    detectRequiredCapabilities: () => new Set(),
++    handleBypassRequest: () => null,
++    checkAndRefreshToken: vi.fn(async (_provider, credentials) => credentials),
++    updateProviderCredentials: vi.fn(async () => {}),
++    getProjectIdForConnection: vi.fn(async () => "fixture-project"),
++    getPxpipeTransform: vi.fn(async () => null),
++    appendPxpipeEvent: vi.fn(),
++    detectFormatByEndpoint: vi.fn(() => null),
++    stripModelContextMarker: model => ({ model, contextMarker: null }),
++    upstreamResponseHeaders: headers => Object.fromEntries(headers || []),
++    errorResponse: (status, message, headers) => Response.json({ error: { message } }, { status, headers }),
++    unavailableResponse: (status, message) => Response.json({ error: { message } }, { status }),
++    fetch: vi.fn(),
++  };
++  const logger = Object.fromEntries(["log", "debug", "info", "warn", "error"].map(name => [name, vi.fn()]));
++  logger.maskKey = () => "masked-fixture-key";
++  const context = {
++    ...services,
++    console: logger,
++    log: logger,
++    Request,
++    Response,
++    Headers,
++    URL,
++    Buffer,
++    AbortController,
++    ReadableStream,
++    TextEncoder,
++    TextDecoder,
++    TransformStream,
++    setTimeout,
++    clearTimeout,
++    GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS: 50,
++    PROVIDER_MODELS: { gemini: [], "gemini-tts-models": [] },
++    HTTP_STATUS: { BAD_REQUEST: 400, UNAUTHORIZED: 401, NOT_FOUND: 404, SERVICE_UNAVAILABLE: 503 },
++    FORMATS: { GEMINI: "gemini", OPENAI: "openai" },
++    DEFAULT_HEADROOM_URL: "http://unused.test",
++    getTargetFormat,
++    supportsNativeGemini,
++    initTranslators: async () => {},
++    proxyAwareFetch: (...args) => services.fetch(...args),
++    stripModelContextMarker: services.stripModelContextMarker,
++    detectRequiredCapabilities: services.detectRequiredCapabilities,
++    augmentModelsWithCapacityAdapter: services.augmentModelsWithCapacityAdapter,
++    handleBypassRequest: services.handleBypassRequest,
++    checkAndRefreshToken: services.checkAndRefreshToken,
++    getPxpipeTransform: services.getPxpipeTransform,
++    appendPxpipeEvent: services.appendPxpipeEvent,
++    detectFormatByEndpoint: services.detectFormatByEndpoint,
++    upstreamResponseHeaders: services.upstreamResponseHeaders,
++    updateProviderCredentials: services.updateProviderCredentials,
++    unavailableResponse: services.unavailableResponse,
++  };
++  vm.createContext(context);
++
++  const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
++  const start = auth.indexOf("export function extractApiKey(");
++  const end = auth.indexOf("/**", start);
++  vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
++  vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
++  return { context, services };
++}
++
++async function postNative(body) {
++  const { context, services } = loadPublicNativeRoute();
++  const modelPath = `antigravity/${MODEL}:generateContent`;
++  const request = new Request(`https://router.test/v1beta/models/${modelPath}`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json", Authorization: "Bearer router-client-key" },
++    body: JSON.stringify(body),
++  });
++  const response = await context.POST(request, {
++    params: Promise.resolve({ path: ["antigravity", `${MODEL}:generateContent`] }),
++  });
++  return { response, services };
++}
++
++function wireRequest(index = -1) {
++  return JSON.parse(network.mock.calls.at(index)[1].body);
++}
++
++function expectedBuiltinTools() {
++  return [
++    {
++      googleSearch: { dynamicRetrievalConfig: { mode: "MODE_UNSPECIFIED" } },
++      futureGroupField: { group: "search-and-functions", value: 1 },
++    },
++    {
++      urlContext: {},
++      futureGroupField: { group: "url-and-functions", value: 2 },
++    },
++  ];
++}
++
++describe("native Gemini disabled function declarations with JSON response schema", () => {
++  beforeEach(() => {
++    network.mockReset();
++    executorInstances.clear();
++    network.mockImplementation(async (_url, options) => responseForWire(JSON.parse(options.body)));
++    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("DIRECT_NETWORK_FORBIDDEN"); }));
++  });
++
++  afterEach(() => vi.unstubAllGlobals());
++
++  it.each([
++    ["responseSchema", "camelCase"],
++    ["response_schema", "snake_case"],
++  ])("removes only inactive function declarations for NONE with %s", async (schemaKey, _caseName) => {
++    const body = makeBody({ schemaKey, mode: "NONE" });
++    const before = structuredClone(body);
++    const { response, services } = await postNative(body);
++
++    expect(response.status).toBe(200);
++    const returned = await response.json();
++    const ordinaryText = returned.candidates[0].content.parts.find(part => typeof part.text === "string")?.text;
++    expect(JSON.parse(ordinaryText)).toEqual({ code: "4821" });
++    expect(returned.candidates[0].finishReason).toBe("STOP");
++    expect(returned.candidates[0].content.parts.some(part => part.functionCall)).toBe(false);
++    expect(services.handleChatCore).toHaveBeenCalledOnce();
++    expect(network).toHaveBeenCalledOnce();
++
++    const wire = wireRequest();
++    expect(wire).toMatchObject({
++      project: "fixture-project",
++      model: MODEL,
++      userAgent: "antigravity",
++      request: {
++        systemInstruction: before.systemInstruction,
++        contents: before.contents,
++        cachedContent: before.cachedContent,
++        clientExtension: before.clientExtension,
++        toolConfig: before.toolConfig,
++      },
++    });
++    expect(wire).not.toHaveProperty("requestType");
++    expect(wire.requestId).toMatch(/^agent\/.+\/\d+\/.+\/\d+$/);
++    expect(wire.request.generationConfig[schemaKey]).toEqual(SCHEMA);
++    expect(wire.request.generationConfig.responseMimeType).toBe("application/json");
++    expect(wire.request.generationConfig.maxOutputTokens).toBe(2048);
++    expect(wire.request.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "HIGH", includeThoughts: true });
++    expect(wire.request.toolConfig.functionCallingConfig).toEqual({ mode: "NONE", allowedFunctionNames: ["forbidden_dummy"] });
++    expect(wire.request.tools).toEqual(expectedBuiltinTools());
++    expect(wire.request.tools.flatMap(group => Object.keys(group))).toEqual([
++      "googleSearch", "futureGroupField", "urlContext", "futureGroupField",
++    ]);
++    expect(body).toEqual(before);
++
++    const headers = new Headers(network.mock.calls[0][1].headers);
++    expect(headers.get("authorization")).toBe("Bearer offline-token");
++    expect(headers.get("user-agent")).toBe(ANTIGRAVITY_HEADERS["User-Agent"]);
++  });
++
++  it("keeps declarations when only responseJsonSchema is present with NONE", async () => {
++    const body = makeBody({ schemaKey: "responseJsonSchema", mode: "NONE" });
++    const beforeTools = structuredClone(body.tools);
++    const { response } = await postNative(body);
++
++    expect(response.status).toBe(200);
++    const returned = await response.json();
++    expect(returned.candidates[0].content.parts[0].functionCall).toMatchObject({
++      id: "provider-forbidden-call",
++      name: "forbidden_dummy",
++    });
++    const wire = wireRequest();
++    expect(wire.request.generationConfig.responseJsonSchema).toEqual(SCHEMA);
++    expect(wire.request.generationConfig.responseSchema).toBeUndefined();
++    expect(wire.request.tools).toEqual(beforeTools);
++  });
++
++  it("preserves opaque nested request data without treating it as parent generation controls", async () => {
++    const body = makeBody({ schemaKey: "responseSchema", mode: "AUTO" });
++    delete body.generationConfig.responseSchema;
++    delete body.generationConfig.responseMimeType;
++    body.request = {
++      generationConfig: { responseSchema: SCHEMA, responseMimeType: "application/json" },
++      toolConfig: { functionCallingConfig: { mode: "NONE" } },
++      tools: [{ functionDeclarations: [{ name: "initialize_child_task", parameters: SCHEMA }] }],
++      initialMessage: { task: "opaque child initialization", context: "retain this packet" },
++    };
++    const before = structuredClone(body);
++    const text = '```json\n{"code":"4821"}\n```';
++    network.mockImplementationOnce(async () => Response.json({ response: {
++      candidates: [{ index: 0, content: { role: "model", parts: [{ text }] }, finishReason: "STOP" }],
++    } }));
++    const { response } = await postNative(body);
++    const returned = await response.json();
++    expect(returned.candidates[0].content.parts[0].text).toBe(text);
++    expect(wireRequest().request.request).toEqual(before.request);
++    expect(wireRequest().request.tools).toEqual(before.tools);
++    expect(body).toEqual(before);
++  });
++
++  it.each(["AUTO", "ANY", "VALIDATED", undefined])("keeps declarations for responseSchema with tool mode %s", async mode => {
++    const body = makeBody({ schemaKey: "responseSchema", mode });
++    const beforeTools = structuredClone(body.tools);
++    if (mode === undefined) delete body.toolConfig.functionCallingConfig.mode;
++    const { response } = await postNative(body);
++
++    expect(response.status).toBe(200);
++    const returned = await response.json();
++    expect(returned.candidates[0].content.parts[0].functionCall).toMatchObject({
++      id: "provider-forbidden-call",
++      name: "forbidden_dummy",
++    });
++    const wire = wireRequest();
++    expect(wire.request.generationConfig.responseSchema).toEqual(SCHEMA);
++    expect(wire.request.tools).toEqual(beforeTools);
++    expect(wire.request.toolConfig.functionCallingConfig.mode).toBe(mode);
++  });
++});
+diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
+new file mode 100644
+index 00000000..64764d26
+--- /dev/null
++++ b/tests/unit/antigravity-native-gemini.test.js
+@@ -0,0 +1,579 @@
++// Native Gemini → Antigravity regression coverage. The provider network and
++// accounting boundaries are replaced; the real chat core and Antigravity
++// executor own request/response adaptation.
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import fs from "node:fs";
++import path from "node:path";
++import vm from "node:vm";
++import { fileURLToPath } from "node:url";
++
++const { network, executorInstances } = vi.hoisted(() => ({
++  network: vi.fn(),
++  executorInstances: new Map(),
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: network }));
++vi.mock("../../open-sse/executors/index.js", async () => {
++  const { AntigravityExecutor } = await import("../../open-sse/executors/antigravity.js");
++  return {
++    getExecutor(provider) {
++      if (provider !== "antigravity") throw new Error(`Unexpected fixture provider: ${provider}`);
++      if (!executorInstances.has(provider)) executorInstances.set(provider, new AntigravityExecutor());
++      return executorInstances.get(provider);
++    },
++  };
++});
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: async () => new Proxy({}, {
++    get: (_target, name) => name === "then" ? undefined : vi.fn(),
++  }),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++const { FORMATS } = await import("../../open-sse/translator/formats.js");
++const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
++const { ANTIGRAVITY_HEADERS } = await import("../../open-sse/config/appConstants.js");
++
++const root = fileURLToPath(new URL("../../", import.meta.url));
++const MODEL = "gemini-3.8-flash-high";
++const quiet = Object.fromEntries(["debug", "info", "warn", "error", "line", "errorLine"].map(name => [name, vi.fn()]));
++
++function nativeBody() {
++  return {
++    systemInstruction: { parts: [{ text: "Follow the task protocol." }] },
++    contents: [
++      { role: "user", parts: [{ text: "Use the tool result and continue." }] },
++      { role: "model", parts: [
++        { text: "Earlier reasoning that remains available.", thought: true },
++        { functionCall: { id: "call-native-17", name: "lookup_record", args: { key: "opaque-9" } }, thoughtSignature: "native-call-signature" },
++      ] },
++      { role: "user", parts: [
++        { functionResponse: { id: "call-native-17", name: "lookup_record", response: { record: { kind: "customer", value: 17 } } } },
++        { inlineData: { mimeType: "image/png", data: "aW1hZ2UtYnl0ZXM=" } },
++      ] },
++    ],
++    tools: [
++      { functionDeclarations: [{ name: "lookup_record", parameters: { type: "OBJECT", properties: { key: { type: "STRING" } }, required: ["key"] } }] },
++      { functionDeclarations: [{ name: "finish_task", parameters: { type: "OBJECT", properties: { result: { type: "STRING" } } } }] },
++    ],
++    toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["lookup_record", "finish_task"] } },
++    generationConfig: {
++      maxOutputTokens: 3072,
++      temperature: 0,
++      thinkingConfig: { thinkingLevel: "HIGH", includeThoughts: true },
++      mediaResolution: "MEDIA_RESOLUTION_HIGH",
++    },
++    cachedContent: "cachedContents/native-prefix",
++    clientExtension: { continuation: { kind: "delegated-task", token: "fixture-state" } },
++  };
++}
++
++function makeCredentials() {
++  return {
++    accessToken: "offline-provider-token",
++    projectId: "fixture-project",
++    connectionId: "offline-antigravity-test",
++    providerSpecificData: {},
++  };
++}
++
++async function runNativeGemini(requestBody = nativeBody(), {
++  stream = false,
++  signal,
++  onRequestSuccess,
++  model = MODEL,
++  queryParams = [],
++  headers = {},
++} = {}) {
++  const rawBody = structuredClone(requestBody);
++  const credentials = makeCredentials();
++  const result = await handleChatCore({
++    body: { ...structuredClone(requestBody), model: `antigravity/${model}`, stream },
++    modelInfo: { provider: "antigravity", model },
++    sourceFormatOverride: FORMATS.GEMINI,
++    credentials,
++    clientRawRequest: {
++      endpoint: `/v1beta/models/antigravity/${model}:${stream ? "streamGenerateContent" : "generateContent"}`,
++      body: rawBody,
++      headers: { "user-agent": "native-gemini-fixture", ...headers },
++      queryParams,
++      apiVersion: "v1beta",
++    },
++    connectionId: credentials.connectionId,
++    userAgent: "native-gemini-fixture",
++    clientSignal: signal,
++    onRequestSuccess,
++    log: quiet,
++    providerThinking: { mode: "high" },
++    rtkEnabled: false,
++    headroomEnabled: false,
++    cavemanEnabled: false,
++    ponytailEnabled: false,
++    pxpipeEnabled: false,
++  });
++  return { result, credentials, rawBody };
++}
++
++function wireRequest() {
++  return JSON.parse(network.mock.calls.at(-1)[1].body);
++}
++
++function nativeChunk(text = "completed") {
++  return {
++    candidates: [{
++      index: 0,
++      content: { role: "model", parts: [{ text }] },
++      finishReason: "STOP",
++    }],
++  };
++}
++
++function sseFrame(value) {
++  return `data: ${JSON.stringify(value)}\r\n\r\n`;
++}
++
++function byteFragmentedStream(text) {
++  const bytes = new TextEncoder().encode(text);
++  return new ReadableStream({
++    start(controller) {
++      for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
++      controller.close();
++    },
++  });
++}
++
++function moduleSource(relative) {
++  return fs.readFileSync(path.join(root, relative), "utf8")
++    .replace(/^import[\s\S]*?;\s*$/gm, "")
++    .replace(/^export /gm, "");
++}
++
++function loadRouteHarness() {
++  const services = {
++    handleChatCore: vi.fn(options => handleChatCore(options)),
++    getSettings: vi.fn(async () => ({ requireApiKey: false })),
++    getProviderCredentials: vi.fn(async () => ({ accessToken: "offline-token", projectId: "fixture-project", connectionId: "route-fixture", providerSpecificData: {} })),
++    getModelInfo: vi.fn(async model => {
++      const index = model.indexOf("/");
++      return index < 0 ? { provider: null, model } : { provider: model.slice(0, index), model: model.slice(index + 1) };
++    }),
++    isValidApiKey: vi.fn(async () => true),
++    getKeyAccessContext: vi.fn(async () => null),
++    enforceKeyAccess: vi.fn(async () => null),
++    enforceKeyAccessResolved: vi.fn(async () => null),
++    filterAdapterModels: vi.fn(async (_keyAccess, models) => models),
++    markAccountUnavailable: vi.fn(async () => ({ shouldFallback: false })),
++    clearAccountError: vi.fn(async () => {}),
++    handleAntigravityQuotaError: vi.fn(async () => null),
++    clearAntigravityStrikes: vi.fn(),
++    getComboModels: vi.fn(async () => null),
++    augmentModelsWithCapacityAdapter: models => models,
++    withCapacityAdapterStripping: callback => callback,
++    getActiveAdapterStrategy: vi.fn(),
++    detectRequiredCapabilities: () => new Set(),
++    handleBypassRequest: () => null,
++    checkAndRefreshToken: vi.fn(async (_provider, credentials) => credentials),
++    updateProviderCredentials: vi.fn(async () => {}),
++    getProjectIdForConnection: vi.fn(async () => "fixture-project"),
++    getPxpipeTransform: vi.fn(async () => null),
++    appendPxpipeEvent: vi.fn(),
++    detectFormatByEndpoint: vi.fn(() => null),
++    stripModelContextMarker: model => ({ model, contextMarker: null }),
++    upstreamResponseHeaders: headers => Object.fromEntries(headers || []),
++    errorResponse: (status, message, headers) => Response.json({ error: { message } }, { status, headers }),
++    unavailableResponse: (status, message) => Response.json({ error: { message } }, { status }),
++    fetch: vi.fn(),
++  };
++  const logger = Object.fromEntries(["log", "debug", "info", "warn", "error"].map(name => [name, vi.fn()]));
++  logger.maskKey = () => "masked-fixture-key";
++  const context = {
++    ...services,
++    console: logger,
++    log: logger,
++    Request,
++    Response,
++    Headers,
++    URL,
++    Buffer,
++    AbortController,
++    ReadableStream,
++    TextEncoder,
++    TextDecoder,
++    TransformStream,
++    setTimeout,
++    clearTimeout,
++    GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS: 50,
++    PROVIDER_MODELS: { gemini: [], "gemini-tts-models": [] },
++    HTTP_STATUS: { BAD_REQUEST: 400, UNAUTHORIZED: 401, NOT_FOUND: 404, SERVICE_UNAVAILABLE: 503 },
++    FORMATS: { GEMINI: "gemini", OPENAI: "openai" },
++    DEFAULT_HEADROOM_URL: "http://unused.test",
++    getTargetFormat,
++    supportsNativeGemini,
++    initTranslators: async () => {},
++    proxyAwareFetch: (...args) => services.fetch(...args),
++    stripModelContextMarker: services.stripModelContextMarker,
++    detectRequiredCapabilities: services.detectRequiredCapabilities,
++    augmentModelsWithCapacityAdapter: services.augmentModelsWithCapacityAdapter,
++    handleBypassRequest: services.handleBypassRequest,
++    checkAndRefreshToken: services.checkAndRefreshToken,
++    getPxpipeTransform: services.getPxpipeTransform,
++    appendPxpipeEvent: services.appendPxpipeEvent,
++    detectFormatByEndpoint: services.detectFormatByEndpoint,
++    upstreamResponseHeaders: services.upstreamResponseHeaders,
++    updateProviderCredentials: services.updateProviderCredentials,
++    unavailableResponse: services.unavailableResponse,
++  };
++  vm.createContext(context);
++
++  const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
++  const start = auth.indexOf("export function extractApiKey(");
++  const end = auth.indexOf("/**", start);
++  vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
++  vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
++  return { context, services };
++}
++
++describe("native Gemini through Antigravity", () => {
++  beforeEach(() => {
++    network.mockReset();
++    executorInstances.clear();
++    network.mockImplementation(async () => Response.json({ response: nativeChunk() }));
++    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("DIRECT_NETWORK_FORBIDDEN"); }));
++  });
++  afterEach(() => vi.unstubAllGlobals());
++
++  it("wraps the native body for Antigravity while preserving continuation, controls and media meaning", async () => {
++    const original = nativeBody();
++    const before = structuredClone(original);
++    network.mockImplementationOnce(async () => Response.json({ response: nativeChunk("done") }));
++
++    const { result, credentials } = await runNativeGemini(original);
++    expect(result.success).toBe(true);
++    expect(credentials.nativeGeminiPassthrough).toBe(true);
++    expect(original).toEqual(before);
++
++    const wire = wireRequest();
++    expect(wire).toMatchObject({
++      project: "fixture-project",
++      model: MODEL,
++      userAgent: "antigravity",
++      request: {
++        systemInstruction: original.systemInstruction,
++        cachedContent: original.cachedContent,
++        clientExtension: original.clientExtension,
++        generationConfig: {
++          maxOutputTokens: 3072,
++          thinkingConfig: { thinkingLevel: "HIGH", includeThoughts: true },
++          mediaResolution: "MEDIA_RESOLUTION_HIGH",
++        },
++        toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["lookup_record", "finish_task"] } },
++      },
++    });
++    expect(wire.request.contents.map(item => item.role)).toEqual(["user", "model", "user"]);
++    expect(wire.request.contents[1].parts).toContainEqual({ text: "Earlier reasoning that remains available.", thought: true });
++    expect(wire.request.contents[1].parts).toContainEqual({
++      functionCall: { id: "call-native-17", name: "lookup_record", args: { key: "opaque-9" } },
++      thoughtSignature: "native-call-signature",
++    });
++    expect(wire.request.contents[2].parts).toContainEqual({
++      functionResponse: { id: "call-native-17", name: "lookup_record", response: { record: { kind: "customer", value: 17 } } },
++    });
++    expect(wire.request.contents[2].parts).toContainEqual({ inlineData: { mimeType: "image/png", data: "aW1hZ2UtYnl0ZXM=" } });
++    expect(wire.request.tools).toHaveLength(2);
++    expect(wire.request.tools).toEqual(original.tools);
++    expect(wire).not.toHaveProperty("requestType");
++    expect(wire.requestId).toMatch(/^agent\/[0-9a-f-]{36}\/\d+\/[0-9a-f-]{36}\/\d+$/);
++    const headers = new Headers(network.mock.calls[0][1].headers);
++    expect(headers.get("authorization")).toBe("Bearer offline-provider-token");
++    expect(headers.get("user-agent")).toBe(ANTIGRAVITY_HEADERS["User-Agent"]);
++    expect(wire.request.tools.flatMap(group => group.functionDeclarations.map(fn => fn.name)).sort()).toEqual(["finish_task", "lookup_record"]);
++    expect(await result.response.json()).toEqual(nativeChunk("done"));
++  });
++
++  it("unwraps byte-fragmented Antigravity SSE and keeps late usage after a finished tool call", async () => {
++    const call = {
++      candidates: [{ index: 0, content: { role: "model", parts: [
++        { functionCall: { id: "call-stream-23", name: "lookup_record", args: { key: "новое-значение" } }, thoughtSignature: "stream-signature" },
++      ] }, finishReason: "STOP" }],
++    };
++    const lateUsage = { usageMetadata: { promptTokenCount: 81, candidatesTokenCount: 12, cachedContentTokenCount: 64, totalTokenCount: 93 } };
++    const upstream = sseFrame({ response: call, serverTrace: "opaque" }) + sseFrame({ response: lateUsage });
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(upstream), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++
++    const { result } = await runNativeGemini(nativeBody(), { stream: true, queryParams: [["alt", "sse"]] });
++    expect(result.success).toBe(true);
++    const output = await result.response.text();
++    const frames = output.split(/\r?\n\r?\n/)
++      .filter(frame => frame.startsWith("data:"))
++      .map(frame => JSON.parse(frame.replace(/^data:\s*/, "")));
++    expect(frames).toEqual([{ ...call, serverTrace: "opaque" }, lateUsage]);
++    expect(frames[0].candidates[0].content.parts[0].functionCall).toEqual({
++      id: "call-stream-23", name: "lookup_record", args: { key: "новое-значение" },
++    });
++  });
++
++  it("adapts upstream SSE to the native JSON-array stream requested without alt=sse", async () => {
++    const first = nativeChunk("модель готова");
++    const usage = { usageMetadata: { promptTokenCount: 5000, cachedContentTokenCount: 4096, totalTokenCount: 5000 } };
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(sseFrame({ response: first }) + sseFrame({ response: usage })), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++    const { result } = await runNativeGemini(nativeBody(), { stream: true });
++    expect(result.response.headers.get("content-type")).toBe("application/json");
++    expect(await result.response.json()).toEqual([first, usage]);
++  });
++
++  it("retains native JSON Schema and disabled tool mode without touching ordinary argument keys", async () => {
++    const original = nativeBody();
++    original.tools = [{ functionDeclarations: [{ name: "lookup_record", parametersJsonSchema: {
++      type: "object", properties: { default: { type: "string", const: "required-value" } }, required: ["default"], additionalProperties: false,
++    } }] }];
++    original.toolConfig = { functionCallingConfig: { mode: "NONE" } };
++    original.contents[1].parts[1].functionCall.args = { default: "required-value", format: "user-data", title: "user-data" };
++    const { result } = await runNativeGemini(original);
++    expect(wireRequest().request.tools).toEqual(original.tools);
++    expect(wireRequest().request.toolConfig).toEqual(original.toolConfig);
++    expect(wireRequest().request.contents).toEqual(original.contents);
++    await result.response.text();
++  });
++
++  it.each([
++    ["nested query", [["fields", "candidates(content(parts(text))),usageMetadata(cachedContentTokenCount)"]], {}],
++    ["slash query", [["$fields", "candidates/content/parts/text,usageMetadata/cachedContentTokenCount"]], {}],
++    ["header", [], { "X-Goog-FieldMask": "candidates.content.parts.text,usageMetadata.cachedContentTokenCount" }],
++  ])("applies the client's %s projection to unary and both stream framings", async (_name, queryParams, headers) => {
++    const reply = { ...nativeChunk("selected"), usageMetadata: { promptTokenCount: 5000, cachedContentTokenCount: 4096 } };
++    const selected = { candidates: [{ content: { parts: [{ text: "selected" }] } }], usageMetadata: { cachedContentTokenCount: 4096 } };
++    for (const framing of ["unary", "sse", "json"]) {
++      network.mockImplementationOnce(async () => framing === "unary" ? Response.json({ response: reply })
++        : new Response(sseFrame({ response: reply }), { headers: { "Content-Type": "text/event-stream" } }));
++      const { result } = await runNativeGemini(nativeBody(), {
++        stream: framing !== "unary", queryParams: [...queryParams, ["alt", framing === "sse" ? "sse" : "json"]], headers,
++      });
++      expect(result.success).toBe(true);
++      if (framing === "sse") {
++        const text = await result.response.text();
++        expect(JSON.parse(text.split("\n").find(line => line.startsWith("data: ")).slice(6))).toEqual(selected);
++      } else expect(await result.response.json()).toEqual(framing === "unary" ? selected : [selected]);
++    }
++  });
++
++  it("a whole parent selector wins over a narrower selector for the same parent", async () => {
++    const reply = nativeChunk();
++    network.mockImplementationOnce(async () => Response.json({ response: reply }));
++    const { result } = await runNativeGemini(nativeBody(), { queryParams: [["fields", "candidates,candidates/content/parts/text"]] });
++    expect(await result.response.json()).toEqual(reply);
++  });
++
++  it("rejects a malformed field mask before any provider admission", async () => {
++    const { result } = await runNativeGemini(nativeBody(), { queryParams: [["fields", "candidates(content"]] });
++    expect(result.response.status).toBe(400);
++    expect(await result.response.json()).toMatchObject({ error: { code: 400, status: "INVALID_ARGUMENT" } });
++    expect(network).not.toHaveBeenCalled();
++  });
++
++  it("a valid field mask never hides an error inside a successful provider envelope", async () => {
++    const error = { error: { code: 400, status: "INVALID_ARGUMENT", message: "fixture failure", details: [{ reason: "keep" }] } };
++    network.mockImplementationOnce(async () => Response.json({ response: error }));
++    const { result } = await runNativeGemini(nativeBody(), { queryParams: [["fields", "candidates/content/parts/text"]] });
++    expect(result.response.status).toBe(400);
++    expect(await result.response.json()).toEqual(error);
++  });
++
++  it("keeps the existing system branding mask without rewriting task data or mutating the caller", async () => {
++    const original = nativeBody();
++    original.systemInstruction.parts[0].text = "OpenCode: follow the task protocol.";
++    original.contents[0].parts[0].text = "Read OpenCode/format.json";
++    const before = structuredClone(original);
++    const { result } = await runNativeGemini(original);
++    expect(wireRequest().request.systemInstruction.parts[0].text).toBe("Antigravity: follow the task protocol.");
++    expect(wireRequest().request.contents).toEqual(original.contents);
++    expect(original).toEqual(before);
++    await result.response.text();
++  });
++
++  it("unwraps a JSON-array stream without converting it to SSE or losing late usage", async () => {
++    const first = nativeChunk("модель готова");
++    const lateUsage = { usageMetadata: { promptTokenCount: 41, cachedContentTokenCount: 32, totalTokenCount: 41 } };
++    const raw = JSON.stringify([{ response: first }, { response: lateUsage }], null, 2);
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(raw), {
++      headers: { "Content-Type": "application/json; charset=utf-8" },
++    }));
++
++    const { result } = await runNativeGemini(nativeBody(), { stream: true });
++    expect(result.success).toBe(true);
++    expect(result.response.headers.get("content-type")).toMatch(/^application\/json/);
++    expect(JSON.parse(await result.response.text())).toEqual([first, lateUsage]);
++  });
++
++  it("reports a clean EOF before a candidate finishes as an incomplete native JSON stream", async () => {
++    const partial = { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "unfinished" }] } }] };
++    network.mockImplementationOnce(async () => new Response(JSON.stringify([{ response: partial }]), {
++      headers: { "Content-Type": "application/json" },
++    }));
++
++    const { result } = await runNativeGemini(nativeBody(), { stream: true });
++    expect(result.success).toBe(true);
++    await expect(result.response.text()).rejects.toThrow(/Upstream Gemini JSON stream|candidate finished/i);
++  });
++
++  it("does not invent a Gemini finish reason when an Antigravity SSE stream ends early", async () => {
++    const partial = { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "unfinished" }] } }] };
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(sseFrame({ response: partial })), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++
++    const { result } = await runNativeGemini(nativeBody(), { stream: true, queryParams: [["alt", "sse"]] });
++    const output = await result.response.text();
++    expect(output).toContain('"text":"unfinished"');
++    expect(output).toContain('"code":502');
++    expect(output).not.toContain('"finishReason":"STOP"');
++    expect(output).not.toContain("[DONE]");
++  });
++
++  it("keeps native provider error details and does not mark the request successful", async () => {
++    const error = { error: { code: 400, status: "INVALID_ARGUMENT", message: "fixture rejected", details: [{ field: "toolConfig" }] } };
++    const onRequestSuccess = vi.fn();
++    network.mockImplementationOnce(async () => Response.json(error, {
++      status: 400,
++      headers: { "Retry-After": "17" },
++    }));
++
++    const { result } = await runNativeGemini(nativeBody(), { onRequestSuccess });
++    expect(result.success).toBe(false);
++    expect(result.response.status).toBe(400);
++    expect(result.response.headers.get("retry-after")).toBe("17");
++    expect(await result.response.json()).toEqual(error);
++    expect(onRequestSuccess).not.toHaveBeenCalled();
++    expect(network).toHaveBeenCalledOnce();
++  });
++
++  it("turns an Antigravity HTTP-200 error envelope into the native Gemini error response", async () => {
++    const error = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "fixture quota", details: [{ retryDelay: "9s" }] } };
++    const onRequestSuccess = vi.fn();
++    network.mockImplementationOnce(async () => Response.json({ response: error }));
++
++    const { result } = await runNativeGemini(nativeBody(), { onRequestSuccess });
++    expect(result.success).toBe(false);
++    expect(result.response.status).toBe(429);
++    expect(await result.response.json()).toEqual(error);
++    expect(onRequestSuccess).not.toHaveBeenCalled();
++  });
++
++  it.each([[null], [[]], [{}], ["invalid"]])("does not treat a malformed envelope with trace metadata as a successful unary response: %j", async response => {
++    network.mockImplementationOnce(async () => Response.json({ response, serverTrace: "fixture" }));
++    const { result } = await runNativeGemini();
++    expect(result.success).toBe(false);
++    expect(result.response.status).toBe(502);
++    expect(await result.response.json()).toMatchObject({ error: { code: 502, message: "Invalid Antigravity response envelope" } });
++  });
++
++  it("cancelling the client stream cancels the Antigravity request", async () => {
++    let upstreamCancelled;
++    const cancelled = new Promise(resolve => { upstreamCancelled = resolve; });
++    let executorSignal;
++    const firstFrame = sseFrame({ response: nativeChunk("partial") });
++    const upstream = new ReadableStream({
++      start(controller) { controller.enqueue(new TextEncoder().encode(firstFrame)); },
++      cancel: upstreamCancelled,
++    });
++    network.mockImplementationOnce(async (_url, options) => {
++      executorSignal = options.signal;
++      return new Response(upstream, { headers: { "Content-Type": "text/event-stream" } });
++    });
++
++    const { result } = await runNativeGemini(nativeBody(), { stream: true });
++    const reader = result.response.body.getReader();
++    expect((await reader.read()).done).toBe(false);
++    await reader.cancel("fixture client cancelled");
++    await vi.waitFor(() => expect(executorSignal.aborted).toBe(true));
++    await expect(cancelled).resolves.toBeDefined();
++  });
++
++  it("leaves the Antigravity Claude request path on its existing translated wrapper", async () => {
++    const request = {
++      model: "antigravity/claude-sonnet-4-6",
++      messages: [{ role: "user", content: "Keep this Claude prompt." }],
++      max_tokens: 1024,
++      tools: [{ name: "lookup_record", description: "Look up", input_schema: { type: "object", properties: { key: { type: "string" } } } }],
++    };
++    network.mockImplementationOnce(async () => Response.json({ error: { code: 400, status: "INVALID_ARGUMENT", message: "fixture stop" } }, { status: 400 }));
++    const credentials = makeCredentials();
++    const result = await handleChatCore({
++      body: request,
++      modelInfo: { provider: "antigravity", model: "claude-sonnet-4-6" },
++      sourceFormatOverride: FORMATS.CLAUDE,
++      credentials,
++      clientRawRequest: { endpoint: "/v1/messages", body: structuredClone(request), headers: {}, queryParams: [] },
++      connectionId: credentials.connectionId,
++      log: quiet,
++      rtkEnabled: false,
++      headroomEnabled: false,
++      cavemanEnabled: false,
++      ponytailEnabled: false,
++      pxpipeEnabled: false,
++    });
++    expect(result.success).toBe(false);
++    expect(supportsNativeGemini("antigravity", "claude-sonnet-4-6")).toBe(false);
++    expect(credentials.nativeGeminiPassthrough).toBe(false);
++    const wire = wireRequest();
++    expect(wire.userAgent).toBe("antigravity");
++    expect(wire.request.contents[0]).toMatchObject({ role: "user", parts: [{ text: "Keep this Claude prompt." }] });
++    expect(wire.request.tools[0].functionDeclarations.map(fn => fn.name)).toContain("lookup_record");
++  });
++});
++
++describe("Gemini endpoint source selection for Antigravity", () => {
++  it("routes only supported Antigravity Gemini models through native Gemini core input", async () => {
++    expect(supportsNativeGemini("antigravity", MODEL)).toBe(true);
++    expect(supportsNativeGemini("antigravity", "claude-sonnet-4-6")).toBe(false);
++    expect(supportsNativeGemini("antigravity", "gemini-3.1-flash-image")).toBe(false);
++
++    network.mockReset();
++    executorInstances.clear();
++    const reply = { candidates: [{ index: 0, finishReason: "STOP", content: { role: "model", parts: [{
++      functionCall: { id: "returned-call", name: "lookup_record", args: { key: "actual-request" } }, thoughtSignature: "returned-state",
++    }] } }], usageMetadata: { cachedContentTokenCount: 4096 } };
++    network.mockImplementationOnce(async () => Response.json({ response: reply }));
++
++    const { context, services } = loadRouteHarness();
++    const original = nativeBody();
++    const url = `https://router.test/v1beta/models/antigravity/${MODEL}:generateContent?alt=json&trace=fixture&key=router-key`;
++    const request = new Request(url, {
++      method: "POST",
++      headers: { Authorization: "Bearer router-key", "Content-Type": "application/json" },
++      body: JSON.stringify(original),
++    });
++    const response = await context.POST(request, {
++      params: Promise.resolve({ path: ["antigravity", `${MODEL}:generateContent`] }),
++    });
++
++    expect(response.status).toBe(200);
++    expect(await response.json()).toEqual(reply);
++    expect(services.handleChatCore).toHaveBeenCalledOnce();
++    expect(network).toHaveBeenCalledOnce();
++    const options = services.handleChatCore.mock.calls[0][0];
++    expect(options.modelInfo).toEqual({ provider: "antigravity", model: MODEL });
++    expect(options.sourceFormatOverride).toBe("gemini");
++    expect(options.body).toEqual({ ...original, model: `antigravity/${MODEL}`, stream: false });
++    expect(options.clientRawRequest.body).toEqual(original);
++    expect(options.clientRawRequest.queryParams).toEqual([["alt", "json"], ["trace", "fixture"]]);
++    expect(options.credentials.nativeGeminiPassthrough).toBe(true);
++    expect(wireRequest().request.contents[1].parts).toContainEqual({
++      functionCall: { id: "call-native-17", name: "lookup_record", args: { key: "opaque-9" } },
++      thoughtSignature: "native-call-signature",
++    });
++  });
++});
+diff --git a/tests/unit/antigravity-native-json-output.test.js b/tests/unit/antigravity-native-json-output.test.js
+new file mode 100644
+index 00000000..2fe63a6f
+--- /dev/null
++++ b/tests/unit/antigravity-native-json-output.test.js
+@@ -0,0 +1,591 @@
++// Native Gemini JSON-output regression coverage through the public route, real
++// chat core, and real Antigravity executor. Only the upstream network boundary
++// and accounting services are mocked.
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import fs from "node:fs";
++import path from "node:path";
++import vm from "node:vm";
++import { fileURLToPath } from "node:url";
++
++const { network, executorInstances } = vi.hoisted(() => ({
++  network: vi.fn(),
++  executorInstances: new Map(),
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: network }));
++vi.mock("../../open-sse/executors/index.js", async () => {
++  const { AntigravityExecutor } = await import("../../open-sse/executors/antigravity.js");
++  return {
++    getExecutor(provider) {
++      if (provider !== "antigravity") throw new Error(`Unexpected fixture provider: ${provider}`);
++      if (!executorInstances.has(provider)) executorInstances.set(provider, new AntigravityExecutor());
++      return executorInstances.get(provider);
++    },
++  };
++});
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: async () => new Proxy({}, {
++    get: (_target, name) => name === "then" ? undefined : vi.fn(),
++  }),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
++const { ANTIGRAVITY_HEADERS } = await import("../../open-sse/config/appConstants.js");
++
++const root = fileURLToPath(new URL("../../", import.meta.url));
++const MODEL = "gemini-3.8-flash-high";
++const quiet = Object.fromEntries(["debug", "info", "warn", "error", "line", "errorLine"].map(name => [name, vi.fn()]));
++
++function jsonRequestBody() {
++  return {
++    systemInstruction: { parts: [{ text: "Follow the task protocol." }] },
++    contents: [
++      { role: "user", parts: [{ text: "Read the attached image and return its code as JSON." }] },
++      { role: "model", parts: [
++        { text: "Earlier reasoning that remains available.", thought: true, thoughtSignature: "history-thought-signature" },
++        { functionCall: { id: "history-call-23", name: "lookup_record", args: { key: "opaque-9" } }, thoughtSignature: "history-call-signature" },
++      ] },
++      { role: "user", parts: [
++        { functionResponse: { id: "history-call-23", name: "lookup_record", response: { record: { kind: "customer", value: 17 } } } },
++        { inlineData: { mimeType: "image/png", data: "aW1hZ2UtYnl0ZXM=" } },
++        { providerOpaquePart: { version: 4, identity: "preserve-me" } },
++      ] },
++    ],
++    tools: [{ functionDeclarations: [{
++      name: "forbidden_dummy",
++      description: "Declared but disabled by native toolConfig.",
++      parametersJsonSchema: { type: "OBJECT", properties: { code: { type: "STRING" } } },
++    }] }],
++    toolConfig: { functionCallingConfig: { mode: "NONE", allowedFunctionNames: ["forbidden_dummy"] } },
++    generationConfig: {
++      maxOutputTokens: 2048,
++      temperature: 0,
++      thinkingConfig: { thinkingLevel: "HIGH", includeThoughts: true },
++      responseMimeType: "application/json",
++      responseJsonSchema: {
++        type: "OBJECT",
++        properties: { code: { type: "STRING" } },
++        required: ["code"],
++        additionalProperties: false,
++      },
++    },
++    cachedContent: "cachedContents/native-prefix",
++    clientExtension: { continuation: { kind: "delegated-task", token: "opaque-client-state" } },
++  };
++}
++
++function moduleSource(relative) {
++  return fs.readFileSync(path.join(root, relative), "utf8")
++    .replace(/^import[\s\S]*?;\s*$/gm, "")
++    .replace(/^export /gm, "");
++}
++
++function loadPublicNativeRoute() {
++  const services = {
++    handleChatCore: vi.fn(options => handleChatCore(options)),
++    getSettings: vi.fn(async () => ({ requireApiKey: false })),
++    getProviderCredentials: vi.fn(async () => ({ accessToken: "offline-token", projectId: "fixture-project", connectionId: "route-fixture", providerSpecificData: {} })),
++    getModelInfo: vi.fn(async model => {
++      const index = model.indexOf("/");
++      return index < 0 ? { provider: null, model } : { provider: model.slice(0, index), model: model.slice(index + 1) };
++    }),
++    isValidApiKey: vi.fn(async () => true),
++    getKeyAccessContext: vi.fn(async () => null),
++    enforceKeyAccess: vi.fn(async () => null),
++    enforceKeyAccessResolved: vi.fn(async () => null),
++    filterAdapterModels: vi.fn(async (_keyAccess, models) => models),
++    markAccountUnavailable: vi.fn(async () => ({ shouldFallback: false })),
++    clearAccountError: vi.fn(async () => {}),
++    handleAntigravityQuotaError: vi.fn(async () => null),
++    clearAntigravityStrikes: vi.fn(),
++    getComboModels: vi.fn(async () => null),
++    augmentModelsWithCapacityAdapter: models => models,
++    withCapacityAdapterStripping: callback => callback,
++    getActiveAdapterStrategy: vi.fn(),
++    detectRequiredCapabilities: () => new Set(),
++    handleBypassRequest: () => null,
++    checkAndRefreshToken: vi.fn(async (_provider, credentials) => credentials),
++    updateProviderCredentials: vi.fn(async () => {}),
++    getProjectIdForConnection: vi.fn(async () => "fixture-project"),
++    getPxpipeTransform: vi.fn(async () => null),
++    appendPxpipeEvent: vi.fn(),
++    detectFormatByEndpoint: vi.fn(() => null),
++    stripModelContextMarker: model => ({ model, contextMarker: null }),
++    upstreamResponseHeaders: headers => Object.fromEntries(headers || []),
++    errorResponse: (status, message, headers) => Response.json({ error: { message } }, { status, headers }),
++    unavailableResponse: (status, message) => Response.json({ error: { message } }, { status }),
++    fetch: vi.fn(),
++  };
++  const logger = Object.fromEntries(["log", "debug", "info", "warn", "error"].map(name => [name, vi.fn()]));
++  logger.maskKey = () => "masked-fixture-key";
++  const context = {
++    ...services,
++    console: logger,
++    log: logger,
++    Request,
++    Response,
++    Headers,
++    URL,
++    Buffer,
++    AbortController,
++    ReadableStream,
++    TextEncoder,
++    TextDecoder,
++    TransformStream,
++    setTimeout,
++    clearTimeout,
++    GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS: 50,
++    PROVIDER_MODELS: { gemini: [], "gemini-tts-models": [] },
++    HTTP_STATUS: { BAD_REQUEST: 400, UNAUTHORIZED: 401, NOT_FOUND: 404, SERVICE_UNAVAILABLE: 503 },
++    FORMATS: { GEMINI: "gemini", OPENAI: "openai" },
++    DEFAULT_HEADROOM_URL: "http://unused.test",
++    getTargetFormat,
++    supportsNativeGemini,
++    initTranslators: async () => {},
++    proxyAwareFetch: (...args) => services.fetch(...args),
++    stripModelContextMarker: services.stripModelContextMarker,
++    detectRequiredCapabilities: services.detectRequiredCapabilities,
++    augmentModelsWithCapacityAdapter: services.augmentModelsWithCapacityAdapter,
++    handleBypassRequest: services.handleBypassRequest,
++    checkAndRefreshToken: services.checkAndRefreshToken,
++    getPxpipeTransform: services.getPxpipeTransform,
++    appendPxpipeEvent: services.appendPxpipeEvent,
++    detectFormatByEndpoint: services.detectFormatByEndpoint,
++    upstreamResponseHeaders: services.upstreamResponseHeaders,
++    updateProviderCredentials: services.updateProviderCredentials,
++    unavailableResponse: services.unavailableResponse,
++  };
++  vm.createContext(context);
++
++  const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
++  const start = auth.indexOf("export function extractApiKey(");
++  const end = auth.indexOf("/**", start);
++  vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
++  vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
++  return { context, services };
++}
++
++async function postNative(body = jsonRequestBody(), { stream = false, alt, headers = {} } = {}) {
++  const { context, services } = loadPublicNativeRoute();
++  const action = stream ? "streamGenerateContent" : "generateContent";
++  const modelPath = `antigravity/${MODEL}:${action}`;
++  const query = alt ? `?alt=${encodeURIComponent(alt)}` : "";
++  const request = new Request(`https://router.test/v1beta/models/${modelPath}${query}`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json", Authorization: "Bearer router-client-key", ...headers },
++    body: JSON.stringify(body),
++  });
++  const response = await context.POST(request, {
++    params: Promise.resolve({ path: [`antigravity`, `${MODEL}:${action}`] }),
++  });
++  return { response, services };
++}
++
++function sseFrame(value) {
++  return `data: ${JSON.stringify(value)}\r\n\r\n`;
++}
++
++function byteFragmentedStream(text) {
++  const bytes = new TextEncoder().encode(text);
++  return new ReadableStream({
++    start(controller) {
++      for (let offset = 0; offset < bytes.length; offset += 23) {
++        controller.enqueue(bytes.slice(offset, offset + 23));
++      }
++      controller.close();
++    },
++  });
++}
++
++function parseSseEvents(text) {
++  return text.split(/\r?\n\r?\n/).flatMap(block => {
++    const data = block.split(/\r?\n/)
++      .filter(line => line.startsWith("data:"))
++      .map(line => line.slice(5).replace(/^ /, ""))
++      .join("\n");
++    if (!data || data === "[DONE]") return [];
++    return [JSON.parse(data)];
++  });
++}
++
++function nativeTextParts(response, index = 0) {
++  return (response.candidates || [])
++    .filter(candidate => candidate.index === index)
++    .flatMap(candidate => candidate.content?.parts || [])
++    .filter(part => typeof part.text === "string" && !part.thought);
++}
++
++describe("native Gemini JSON output through public Antigravity route", () => {
++  beforeEach(() => {
++    network.mockReset();
++    executorInstances.clear();
++    network.mockImplementation(async () => Response.json({
++      response: { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }] },
++    }));
++    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("DIRECT_NETWORK_FORBIDDEN"); }));
++  });
++
++  afterEach(() => vi.unstubAllGlobals());
++
++  it("removes only the enclosing JSON fence on unary STOP and preserves the native request and response fields", async () => {
++    const requestBody = jsonRequestBody();
++    const inputCopy = structuredClone(requestBody);
++    const providerResponse = {
++      candidates: [
++        {
++          index: 3,
++          content: { role: "model", parts: [
++            { text: "```json\n{\"code\":\"4821\"}\n```", providerPartMeta: { part: 1 } },
++            { text: "private thought", thought: true, thoughtSignature: "provider-thought-signature", providerThoughtMeta: "keep" },
++          ] },
++          finishReason: "STOP",
++          providerCandidateMeta: { identity: "candidate-3" },
++        },
++        {
++          index: 9,
++          content: { role: "model", parts: [{
++            functionCall: { id: "provider-function-call-91", name: "forbidden_dummy", args: { code: "4821" } },
++            thoughtSignature: "provider-function-signature",
++            providerPartMeta: "keep-function-part",
++          }] },
++          finishReason: "STOP",
++          providerCandidateMeta: { identity: "candidate-9" },
++        },
++      ],
++      usageMetadata: { promptTokenCount: 81, candidatesTokenCount: 12, totalTokenCount: 93, cachedContentTokenCount: 64 },
++      modelVersion: "gemini-3.8-flash-high",
++      responseId: "provider-response-id-17",
++      providerEnvelopeMeta: { source: "antigravity", sequence: 11 },
++    };
++    network.mockImplementationOnce(async () => Response.json({ response: providerResponse, cloudCodeTrace: "keep-envelope-metadata" }));
++
++    const { response, services } = await postNative(requestBody);
++    expect(response.status).toBe(200);
++    const returned = await response.json();
++    expect(JSON.parse(nativeTextParts(returned, 3).map(part => part.text).join(""))).toEqual({ code: "4821" });
++    expect(nativeTextParts(returned, 3).map(part => part.text).join("")).toBe('{"code":"4821"}\n');
++    expect(returned.candidates.map(candidate => candidate.index)).toEqual([3, 9]);
++    expect(returned.candidates[0].providerCandidateMeta).toEqual({ identity: "candidate-3" });
++    expect(returned.candidates[0].content.parts[0]).toMatchObject({
++      providerPartMeta: { part: 1 },
++    });
++    expect(returned.candidates[0].content.parts[1]).toMatchObject({
++      text: "private thought",
++      thought: true,
++      thoughtSignature: "provider-thought-signature",
++      providerThoughtMeta: "keep",
++    });
++    expect(returned.candidates[1].content.parts[0]).toMatchObject({
++      functionCall: { id: "provider-function-call-91", name: "forbidden_dummy", args: { code: "4821" } },
++      thoughtSignature: "provider-function-signature",
++      providerPartMeta: "keep-function-part",
++    });
++    expect(returned.usageMetadata).toEqual(providerResponse.usageMetadata);
++    expect(returned.modelVersion).toBe(providerResponse.modelVersion);
++    expect(returned.responseId).toBe(providerResponse.responseId);
++    expect(returned.providerEnvelopeMeta).toEqual(providerResponse.providerEnvelopeMeta);
++
++    expect(network).toHaveBeenCalledOnce();
++    expect(services.handleChatCore).toHaveBeenCalledOnce();
++    const wire = JSON.parse(network.mock.calls[0][1].body);
++    expect(wire.request.generationConfig).toEqual(inputCopy.generationConfig);
++    expect(wire.request.toolConfig).toEqual(inputCopy.toolConfig);
++    expect(wire.request.tools).toEqual(inputCopy.tools);
++    expect(wire.request.contents).toEqual(inputCopy.contents);
++    expect(wire.request.cachedContent).toBe(inputCopy.cachedContent);
++    expect(wire.request.clientExtension).toEqual(inputCopy.clientExtension);
++    expect(wire.request.generationConfig.responseJsonSchema).toEqual(inputCopy.generationConfig.responseJsonSchema);
++    expect(wire.request.generationConfig.responseSchema).toBeUndefined();
++    expect(wire.request.generationConfig.responseMimeType).toBe("application/json");
++    expect(wire.request.generationConfig.maxOutputTokens).toBe(2048);
++    expect(wire.request.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "HIGH", includeThoughts: true });
++    expect(wire.request.toolConfig.functionCallingConfig).toEqual({ mode: "NONE", allowedFunctionNames: ["forbidden_dummy"] });
++    expect(requestBody).toEqual(inputCopy);
++    expect(wire).not.toHaveProperty("requestType");
++    expect(wire.userAgent).toBe("antigravity");
++    expect(wire.requestId).toMatch(/^agent\/.+\/\d+\/.+\/\d+$/);
++    expect(new Headers(network.mock.calls[0][1].headers).get("authorization")).toBe("Bearer offline-token");
++    expect(new Headers(network.mock.calls[0][1].headers).get("user-agent")).toBe(ANTIGRAVITY_HEADERS["User-Agent"]);
++  });
++
++  it("normalizes a signed ordinary JSON part and retransmits its exact signature in native continuation history", async () => {
++    const ordinarySignature = "eyJwcm92aWRlciI6ImFudGlncmF2aXR5Iiwic2Vzc2lvbiI6InNpZy0xIn0=";
++    const thoughtSignature = "eyJ0aG91Z2h0IjoiaGlzdG9yeS1zaWduYXR1cmUifQ==";
++    const thoughtPart = { text: "thought before ordinary output", thought: true, thoughtSignature, providerThoughtMeta: "keep-thought" };
++    const signedFencedPart = {
++      text: "```json\n{\"code\":\"4821\"}\n```",
++      thoughtSignature: ordinarySignature,
++      providerPartMeta: { carrier: "ordinary-text", sequence: 1 },
++    };
++    const firstProviderReply = {
++      candidates: [{
++        index: 12,
++        content: { role: "model", parts: [thoughtPart, signedFencedPart] },
++        finishReason: "STOP",
++        providerCandidateMeta: "signed-candidate",
++      }],
++      usageMetadata: { promptTokenCount: 91, candidatesTokenCount: 8, totalTokenCount: 99, cachedContentTokenCount: 64 },
++      providerEnvelopeMeta: { trace: "signed-unary" },
++    };
++    const continuationReply = {
++      candidates: [{
++        index: 0,
++        content: { role: "model", parts: [{
++          text: "{\"continued\":true}",
++          thoughtSignature: ordinarySignature,
++          providerPartMeta: { carrier: "ordinary-text", sequence: 2 },
++        }] },
++        finishReason: "STOP",
++      }],
++      usageMetadata: { promptTokenCount: 102, candidatesTokenCount: 4, totalTokenCount: 106 },
++    };
++    network
++      .mockImplementationOnce(async () => Response.json({ response: firstProviderReply }))
++      .mockImplementationOnce(async () => Response.json({ response: continuationReply }));
++
++    const { response: firstResponse } = await postNative(jsonRequestBody());
++    expect(firstResponse.status).toBe(200);
++    const firstReturned = await firstResponse.json();
++    const firstParts = firstReturned.candidates[0].content.parts;
++    const normalizedSignedPart = { ...signedFencedPart, text: "{\"code\":\"4821\"}\n" };
++    expect(firstParts).toEqual([thoughtPart, normalizedSignedPart]);
++    expect(JSON.parse(firstParts.filter(part => !part.thought).map(part => part.text).join(""))).toEqual({ code: "4821" });
++    expect(firstParts.map(part => part.thoughtSignature)).toEqual([thoughtSignature, ordinarySignature]);
++    expect(Buffer.from(firstParts[1].thoughtSignature, "utf8")).toEqual(Buffer.from(ordinarySignature, "utf8"));
++    expect(firstReturned.providerEnvelopeMeta).toEqual({ trace: "signed-unary" });
++    expect(firstReturned.usageMetadata.cachedContentTokenCount).toBe(64);
++
++    const continuationBody = jsonRequestBody();
++    continuationBody.contents = [
++      ...continuationBody.contents,
++      { role: "model", parts: structuredClone(firstParts) },
++      { role: "user", parts: [{ text: "Continue from the normalized model result." }] },
++    ];
++    const continuationBefore = structuredClone(continuationBody);
++    const { response: continuationResponse } = await postNative(continuationBody);
++    expect(continuationResponse.status).toBe(200);
++    const continuationWire = JSON.parse(network.mock.calls[1][1].body);
++    expect(continuationWire.request.contents).toEqual(continuationBody.contents);
++    expect(continuationWire.request.contents[3].parts).toEqual(firstParts);
++    expect(continuationWire.request.contents[3].parts[1].thoughtSignature).toBe(ordinarySignature);
++    expect(continuationBody).toEqual(continuationBefore);
++    const continuationReturned = await continuationResponse.json();
++    const continuationText = nativeTextParts(continuationReturned).map(part => part.text).join("");
++    expect(JSON.parse(continuationText)).toEqual({ continued: true });
++    expect(continuationReturned.candidates[0].content.parts[0].thoughtSignature).toBe(ordinarySignature);
++    expect(network).toHaveBeenCalledTimes(2);
++  });
++
++  it("strips fence fragments across SSE events and retains candidate, thought, function, and late usage data in order", async () => {
++    const chunks = [
++      { response: { candidates: [{ index: 4, content: { role: "model", parts: [{ text: "```json\n{" }] } }] } },
++      { response: { candidates: [{ index: 4, content: { role: "model", parts: [
++        { text: "\"code\":\"4821\"", providerPartMeta: "middle" },
++        { text: "private thought", thought: true, thoughtSignature: "stream-thought-signature" },
++      ] } }] } },
++      { response: { candidates: [{ index: 4, content: { role: "model", parts: [{ text: "}\n```" }] }, finishReason: "STOP", providerCandidateMeta: "candidate-four" }] } },
++      { response: { candidates: [{ index: 8, content: { role: "model", parts: [{ functionCall: { id: "stream-function-16", name: "forbidden_dummy", args: { code: "4821" } }, thoughtSignature: "stream-function-signature" }] }, finishReason: "STOP" }] } },
++      { response: { usageMetadata: { promptTokenCount: 81, candidatesTokenCount: 12, totalTokenCount: 93, cachedContentTokenCount: 64 }, providerTailMeta: "late-usage" } },
++    ];
++    const upstream = chunks.map(sseFrame).join("");
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(upstream), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++
++    const { response } = await postNative(jsonRequestBody(), { stream: true, alt: "sse" });
++    expect(response.status).toBe(200);
++    const events = parseSseEvents(await response.text());
++    const candidateIndexes = [];
++    for (const event of events) {
++      for (const candidate of event.candidates || []) {
++        if (!candidateIndexes.includes(candidate.index)) candidateIndexes.push(candidate.index);
++      }
++    }
++    expect(candidateIndexes).toEqual([4, 8]);
++    const ordinaryText = nativeTextParts({ candidates: events.flatMap(event => event.candidates || []) }, 4)
++      .map(part => part.text).join("");
++    expect(JSON.parse(ordinaryText)).toEqual({ code: "4821" });
++    expect(ordinaryText).toBe('{"code":"4821"}\n');
++
++    const allParts = events.flatMap(event => event.candidates || []).flatMap(candidate => candidate.content?.parts || []);
++    expect(allParts.some(part => part.thoughtSignature === "stream-thought-signature" && part.thought === true)).toBe(true);
++    expect(allParts.find(part => part.functionCall)?.functionCall).toEqual({
++      id: "stream-function-16", name: "forbidden_dummy", args: { code: "4821" },
++    });
++    const lateUsageIndex = events.findIndex(event => event.usageMetadata?.cachedContentTokenCount === 64);
++    const lastCandidateIndex = events.reduce((last, event, index) => event.candidates?.length ? index : last, -1);
++    expect(lateUsageIndex).toBeGreaterThan(lastCandidateIndex);
++    expect(events[lateUsageIndex]).toMatchObject({
++      usageMetadata: { promptTokenCount: 81, candidatesTokenCount: 12, totalTokenCount: 93, cachedContentTokenCount: 64 },
++      providerTailMeta: "late-usage",
++    });
++    expect(network).toHaveBeenCalledOnce();
++  });
++
++  it("strips fence fragments from signed ordinary-text SSE parts without changing signature bytes or part positions", async () => {
++    const signatureValues = [
++      "eyJ0aG91Z2h0IjoiMSJ9",
++      "eyJvcmRpbmFyeSI6Im9wZW5pbmcifQ==",
++      "eyJ0aG91Z2h0IjoiMiJ9",
++      "eyJvcmRpbmFyeSI6Im1pZGRsZSJ9",
++      "eyJ0aG91Z2h0IjoiMyJ9",
++      "eyJvcmRpbmFyeSI6ImNsb3NpbmcifQ==",
++    ];
++    const thoughtParts = [
++      { text: "thought-1", thought: true, thoughtSignature: signatureValues[0], providerThoughtMeta: 1 },
++      { text: "thought-2", thought: true, thoughtSignature: signatureValues[2], providerThoughtMeta: 2 },
++      { text: "thought-3", thought: true, thoughtSignature: signatureValues[4], providerThoughtMeta: 3 },
++    ];
++    const signedTextParts = [
++      { text: "```json\n{", thoughtSignature: signatureValues[1], providerPartMeta: { fragment: "opening" } },
++      { text: "\"code\":\"4821\"", thoughtSignature: signatureValues[3], providerPartMeta: { fragment: "middle" } },
++      { text: "}\n```", thoughtSignature: signatureValues[5], providerPartMeta: { fragment: "closing" } },
++    ];
++    const chunks = [
++      { response: { candidates: [{ index: 15, content: { role: "model", parts: [thoughtParts[0], signedTextParts[0]] } }] } },
++      { response: { candidates: [{ index: 15, content: { role: "model", parts: [thoughtParts[1], signedTextParts[1]] } }] } },
++      { response: { candidates: [{ index: 15, content: { role: "model", parts: [thoughtParts[2], signedTextParts[2]] }, finishReason: "STOP" }] } },
++      { response: { usageMetadata: { promptTokenCount: 91, candidatesTokenCount: 8, totalTokenCount: 99, cachedContentTokenCount: 64 }, providerTailMeta: "late-usage" } },
++    ];
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(chunks.map(sseFrame).join("")), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++
++    const { response } = await postNative(jsonRequestBody(), { stream: true, alt: "sse" });
++    expect(response.status).toBe(200);
++    const events = parseSseEvents(await response.text());
++    const candidateEvents = events.flatMap(event => event.candidates || []).filter(candidate => candidate.index === 15);
++    expect(candidateEvents).toHaveLength(3);
++    const expectedText = ["{", "\"code\":\"4821\"", "}\n"];
++    for (let index = 0; index < candidateEvents.length; index++) {
++      expect(candidateEvents[index].content.parts).toEqual([
++        thoughtParts[index],
++        { ...signedTextParts[index], text: expectedText[index] },
++      ]);
++    }
++    const ordinaryText = candidateEvents.flatMap(candidate => candidate.content.parts)
++      .filter(part => !part.thought && typeof part.text === "string")
++      .map(part => part.text).join("");
++    expect(JSON.parse(ordinaryText)).toEqual({ code: "4821" });
++    expect(ordinaryText).toBe('{"code":"4821"}\n');
++
++    const returnedSignatures = candidateEvents.flatMap(candidate => candidate.content.parts)
++      .map(part => part.thoughtSignature);
++    expect(returnedSignatures).toEqual(signatureValues);
++    for (let index = 0; index < returnedSignatures.length; index++) {
++      expect(Buffer.from(returnedSignatures[index], "utf8")).toEqual(Buffer.from(signatureValues[index], "utf8"));
++    }
++    const lateUsageIndex = events.findIndex(event => event.usageMetadata?.cachedContentTokenCount === 64);
++    const lastCandidateIndex = events.reduce((last, event, index) => event.candidates?.length ? index : last, -1);
++    expect(lateUsageIndex).toBeGreaterThan(lastCandidateIndex);
++    expect(events[lateUsageIndex]).toMatchObject({
++      usageMetadata: { promptTokenCount: 91, candidatesTokenCount: 8, totalTokenCount: 99, cachedContentTokenCount: 64 },
++      providerTailMeta: "late-usage",
++    });
++    expect(network).toHaveBeenCalledOnce();
++  });
++
++  it.each([
++    ["JSON MIME without schema", body => { delete body.generationConfig.responseJsonSchema; }],
++    ["no JSON MIME", body => { delete body.generationConfig.responseMimeType; delete body.generationConfig.responseJsonSchema; }],
++    ["non-JSON MIME", body => { body.generationConfig.responseMimeType = "text/plain"; delete body.generationConfig.responseJsonSchema; }],
++  ])("selects JSON output only for explicit application/json MIME: %s", async (name, changeBody) => {
++    const body = jsonRequestBody();
++    changeBody(body);
++    const fenced = "```json\n{\"code\":\"4821\"}\n```";
++    network.mockImplementationOnce(async () => Response.json({ response: {
++      candidates: [{ index: 0, content: { role: "model", parts: [{ text: fenced }] }, finishReason: "STOP" }],
++    } }));
++
++    const { response } = await postNative(body);
++    expect(response.status).toBe(200);
++    const candidateText = (await response.json()).candidates[0].content.parts[0].text;
++    if (name === "JSON MIME without schema") expect(candidateText).toBe('{"code":"4821"}\n');
++    else expect(candidateText).toBe(fenced);
++  });
++
++  it.each([
++    ["malformed JSON", "```json\n{\"code\":}\n```", "STOP"],
++    ["unfinished candidate", "```json\n{\"code\":\"4821\"}\n```", undefined],
++    ["MAX_TOKENS candidate", "```json\n{\"code\":\"4821\"}\n```", "MAX_TOKENS"],
++  ])("does not sanitize %s", async (_name, fenced, finishReason) => {
++    const candidate = { index: 0, content: { role: "model", parts: [{ text: fenced }] } };
++    if (finishReason !== undefined) candidate.finishReason = finishReason;
++    network.mockImplementationOnce(async () => Response.json({ response: { candidates: [candidate] } }));
++
++    const { response } = await postNative();
++    expect(response.status).toBe(200);
++    expect((await response.json()).candidates[0].content.parts[0].text).toBe(fenced);
++  });
++
++  it("passes provider errors through without treating error text as JSON output", async () => {
++    const error = { error: { code: 400, status: "INVALID_ARGUMENT", message: "structured output rejected", details: [{ field: "generationConfig.responseJsonSchema" }] } };
++    network.mockImplementationOnce(async () => Response.json(error, { status: 400, headers: { "Retry-After": "11" } }));
++
++    const { response } = await postNative();
++    expect(response.status).toBe(400);
++    expect(response.headers.get("retry-after")).toBe("11");
++    expect(await response.json()).toEqual(error);
++  });
++
++  it("preserves an HTTP-200 Gemini error envelope", async () => {
++    const error = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "provider quota", details: [{ retryDelay: "4s" }] } };
++    network.mockImplementationOnce(async () => Response.json({ response: error }));
++
++    const { response } = await postNative();
++    expect(response.status).toBe(429);
++    expect(await response.json()).toEqual(error);
++  });
++
++  it("does not synthesize a JSON completion for an incomplete fenced SSE stream", async () => {
++    const incomplete = sseFrame({ response: {
++      candidates: [{ index: 0, content: { role: "model", parts: [{ text: "```json\n{\"code\":\"4821\"}" }] } }],
++    } });
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(incomplete), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++
++    const { response } = await postNative(jsonRequestBody(), { stream: true, alt: "sse" });
++    const output = await response.text();
++    expect(output).toContain("```json");
++    expect(output).not.toContain('"finishReason":"STOP"');
++    expect(output).toContain('"code":502');
++    expect(output).not.toContain("[DONE]");
++  });
++
++  it("cancels the upstream stream while an opening fence is still buffered", async () => {
++    let upstreamCancelled;
++    const cancelled = new Promise(resolve => { upstreamCancelled = resolve; });
++    let executorSignal;
++    const upstream = new ReadableStream({
++      start(controller) {
++        controller.enqueue(new TextEncoder().encode(sseFrame({ response: {
++          candidates: [{ index: 0, content: { role: "model", parts: [{ text: "```j" }] } }],
++        } })));
++      },
++      cancel: upstreamCancelled,
++    });
++    network.mockImplementationOnce(async (_url, options) => {
++      executorSignal = options.signal;
++      return new Response(upstream, { headers: { "Content-Type": "text/event-stream" } });
++    });
++
++    const { response } = await postNative(jsonRequestBody(), { stream: true, alt: "sse" });
++    const reader = response.body.getReader();
++    expect((await reader.read()).done).toBe(false);
++    await reader.cancel("fixture client cancelled during JSON fence");
++    await vi.waitFor(() => expect(executorSignal.aborted).toBe(true));
++    await expect(cancelled).resolves.toBeUndefined();
++  });
++});
+diff --git a/tests/unit/antigravity-native-sdk-heartbeat.test.js b/tests/unit/antigravity-native-sdk-heartbeat.test.js
+new file mode 100644
+index 00000000..e3acccd7
+--- /dev/null
++++ b/tests/unit/antigravity-native-sdk-heartbeat.test.js
+@@ -0,0 +1,38 @@
++import { describe, expect, it } from "vitest";
++import { unwrapAntigravityResponse } from "../../open-sse/utils/antigravityNative.js";
++
++// Google GenAI SDK 2.28 _api_client.py:391-421 collects data lines and
++// interprets every other nonempty line as a JSON/error response. An SSE
++// comment therefore fails the real client even though SSE permits comments.
++function sdkEvents(text) {
++  const events = [], data = [];
++  for (const line of text.split("\n")) {
++    if (!line) {
++      if (data.length) { events.push(JSON.parse(data.join("\n"))); data.length = 0; }
++    } else if (line.startsWith("data: ")) data.push(line.slice(6));
++    else throw new Error("SDK non-JSON response");
++  }
++  if (data.length) events.push(JSON.parse(data.join("\n")));
++  return events;
++}
++
++describe("Antigravity native SDK heartbeat compatibility", () => {
++  it("keeps activity visible before a complete event without a non-JSON SDK frame", async () => {
++    let source;
++    const input = new ReadableStream({ start(controller) { source = controller; } });
++    const response = await unwrapAntigravityResponse(new Response(input, { headers: { "Content-Type": "text/event-stream" } }), true, { query: [["alt", "sse"]] });
++    const reader = response.body.getReader();
++    const pending = reader.read();
++    source.enqueue(new TextEncoder().encode('data: {"response":'));
++    const early = await pending;
++    const earlyText = new TextDecoder().decode(early.value);
++    expect(earlyText).toBe("\n");
++    expect(sdkEvents(earlyText)).toEqual([]);
++    source.enqueue(new TextEncoder().encode('{"candidates":[{"content":{"parts":[{"text":"готово"}]},"finishReason":"STOP"}]}}\n\n'));
++    source.close();
++    let text = earlyText;
++    for (;;) { const next = await reader.read(); if (next.done) break; text += new TextDecoder().decode(next.value); }
++    expect(sdkEvents(text)).toEqual([{ candidates: [{ content: { parts: [{ text: "готово" }] }, finishReason: "STOP" }] }]);
++    expect(text).not.toContain(":\n");
++  });
++});

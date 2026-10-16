@@ -1,0 +1,65 @@
+From da4abc0962f1560997e02ced103b17d1a8df7bc1 Mon Sep 17 00:00:00 2001
+From: Overlay Migration <overlay-migration@example.invalid>
+Date: Fri, 16 Oct 2026 09:15:40 +0000
+Subject: [PATCH 8/8] 0008 regression-fixtures
+
+Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
+Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
+Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
+Port adaptation: retain the current upstream image mediaType and make the generated Mavis session id snapshot field deterministic.
+---
+ tests/translator/bugs-gemini-cursor-commandcode.test.js | 2 +-
+ tests/translator/golden-url-header.test.js              | 9 ++++++++-
+ tests/unit/cli-connect.test.js                          | 2 ++
+ 3 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/tests/translator/bugs-gemini-cursor-commandcode.test.js b/tests/translator/bugs-gemini-cursor-commandcode.test.js
+index 58e39274..1bb6c78a 100644
+--- a/tests/translator/bugs-gemini-cursor-commandcode.test.js
++++ b/tests/translator/bugs-gemini-cursor-commandcode.test.js
+@@ -74,7 +74,7 @@ describe("OpenAI → CommandCode", () => {
+     expect(JSON.stringify(out)).not.toContain("[image omitted]");
+     expect(out.params.messages[0].content).toEqual([
+       { type: "text", text: "look" },
+-      { type: "image", image: "data:image/png;base64,BBBB", mimeType: "image/png" },
++      { type: "image", image: "data:image/png;base64,BBBB", mimeType: "image/png", mediaType: "image/png" },
+     ]);
+   });
+ });
+diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
+index 7137903a..b93f530c 100644
+--- a/tests/translator/golden-url-header.test.js
++++ b/tests/translator/golden-url-header.test.js
+@@ -64,7 +64,14 @@ describe("GOLDEN buildHeaders (default executor providers)", () => {
+         oauth: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : OAUTH_CRED, true))),
+         nonStream: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, false))),
+       };
+-      expect(snap).toMatchSnapshot();
++      const sessionMatchers = Object.fromEntries(
++        Object.entries(snap)
++          .filter(([, headers]) => typeof headers?.["X-Mavis-Session-Id"] === "string")
++          .map(([kind]) => [kind, {
++            "X-Mavis-Session-Id": expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
++          }])
++      );
++      expect(snap).toMatchSnapshot(sessionMatchers);
+     });
+   }
+ });
+diff --git a/tests/unit/cli-connect.test.js b/tests/unit/cli-connect.test.js
+index 3695a4b6..7da8ede2 100644
+--- a/tests/unit/cli-connect.test.js
++++ b/tests/unit/cli-connect.test.js
+@@ -194,10 +194,12 @@ describe("connect run()", () => {
+   beforeEach(() => {
+     home = fs.mkdtempSync(path.join(os.tmpdir(), "9r-connect-run-"));
+     vi.spyOn(os, "homedir").mockReturnValue(home);
++    vi.stubEnv("XDG_CONFIG_HOME", "");
+     vi.spyOn(console, "log").mockImplementation(() => {});
+   });
+   afterEach(() => {
+     vi.restoreAllMocks();
++    vi.unstubAllEnvs();
+     fs.rmSync(home, { recursive: true, force: true });
+   });
+ 
