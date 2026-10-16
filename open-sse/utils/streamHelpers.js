@@ -55,8 +55,9 @@ export function hasValuableContent(chunk, format) {
     const hasText = chunk.delta?.text && chunk.delta.text !== "";
     const hasThinking = chunk.delta?.thinking && chunk.delta.thinking !== "";
     const hasInputJson = chunk.delta?.partial_json && chunk.delta.partial_json !== "";
+    const hasSignature = chunk.delta?.signature && chunk.delta.signature !== "";
     
-    if (isContentBlockDelta && !hasText && !hasThinking && !hasInputJson) {
+    if (isContentBlockDelta && !hasText && !hasThinking && !hasInputJson && !hasSignature) {
       return false;
     }
     return true;

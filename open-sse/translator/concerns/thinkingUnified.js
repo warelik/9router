@@ -255,8 +255,15 @@ function stripAll(body) {
   }
 }
 
+// Anthropic accepts {type:"adaptive",display} for its always-adaptive Claude models;
+// other claude-adaptive providers (MiniMax Code) require effort-only bodies there.
+function servesAnthropicClaude(provider, model) {
+  if (provider === "claude" || provider === "anthropic") return true;
+  return typeof provider === "string" && provider.startsWith("anthropic-compatible") && /^claude-/.test(model || "");
+}
+
 // Apply unified thinking config to body in the resolved provider-native format.
-function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
+function applyFormat(fmt, body, cfg, caps, supportedLevels, display, forwardDisplay = false) {
   const none = cfg.mode === "none";
   const canDisable = caps.thinkingCanDisable !== false;
   // Model cannot disable thinking → clamp "none" to minimal effort instead.
@@ -288,8 +295,10 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
     case "claude-adaptive": {
       if (none && canDisable) { body.thinking = { type: "disabled" }; break; }
       // Models that can disable thinking need the explicit adaptive switch.
-      // Permanently adaptive models such as Fable 5.1 accept effort directly.
+      // Permanently adaptive models such as Fable 5.1 accept effort directly; on
+      // Anthropic they still take the client's display ({type:"adaptive",display}).
       if (canDisable) body.thinking = { type: "adaptive", ...(display ? { display } : {}) };
+      else if (display && forwardDisplay) body.thinking = { type: "adaptive", display };
       else delete body.thinking;
       const level = toLevel(eff);
       // xhigh is model-gated (Opus/Sonnet 4.6 reject it) — clamp when not advertised.
@@ -424,7 +433,7 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
 // Mutates and returns body. No-op when model has no reasoning capability.
 // `intent` is a pre-captured config (from captureThinking on the original body);
 // falls back to extracting from the current body when omitted.
-export function applyThinking(targetFormat, model, body, provider = null, intent = undefined) {
+export function applyThinking(targetFormat, model, body, provider = null, intent = undefined, { preserveResponsesOptions = false } = {}) {
   if (!body || typeof body !== "object") return body;
 
   const { cleanModel, override } = parseSuffix(model);
