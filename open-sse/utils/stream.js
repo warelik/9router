@@ -1,10 +1,11 @@
 import { translateResponse, initState } from "../translator/index.js";
 import { FORMATS } from "../translator/formats.js";
 import { PROVIDERS } from "../config/providers.js";
+import { HTTP_STATUS } from "../config/runtimeConfig.js";
 import { liftReasoningAliases } from "../translator/concerns/reasoning.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
 import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
-import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, ensureStreamToolCallIds } from "./streamHelpers.js";
+import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, ensureStreamToolCallIds, buildStreamErrorBytes } from "./streamHelpers.js";
 import { restoreToolNames } from "./opencodeFingerprint.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
@@ -30,6 +31,38 @@ const STREAM_MODE = {
 // forever when the upstream stalls with no usage trailer and no [DONE].
 const PENDING_COMPLETION_FLUSH_MS = 3000;
 
+// Google response filtering uses fields/$fields or X-Goog-FieldMask. Empty
+// masks mean all fields; slash paths and parenthesized selectors are supported:
+// https://docs.cloud.google.com/apis/docs/system-parameters
+// https://developers.google.com/workspace/drive/api/guides/fields-parameter
+// Require a terminal only when every supplied projection clearly retains it.
+// Unknown selectors remain transparent instead of fabricating a failure.
+function nativeCandidateFieldIsVisible(projection, field) {
+  return (projection?.masks || []).every(value => {
+    const mask = String(value ?? "").replace(/\s/g, "");
+    if (!mask) return true;
+    const paths = [], prefixes = [];
+    let token = "";
+    const path = () => [prefixes.at(-1), token.replaceAll(".", "/")].filter(Boolean).join("/");
+    for (const character of mask) {
+      if (character === "(") {
+        if (!token) return false;
+        prefixes.push(path());
+        token = "";
+      } else if (character === "," || character === ")") {
+        if (token) paths.push(path());
+        token = "";
+        if (character === ")" && !prefixes.pop()) return false;
+      } else if (/[A-Za-z0-9_*/.]/.test(character)) token += character;
+      else return false;
+    }
+    if (prefixes.length) return false;
+    if (token) paths.push(path());
+    const aliases = field === "finishReason" ? ["finishReason", "finish_reason"] : [field];
+    return paths.some(selected => ["*", "candidates", "candidates/*", ...aliases.map(name => `candidates/${name}`)].includes(selected));
+  });
+}
+
 /**
  * Create unified SSE transform stream
  * @param {object} options
@@ -48,7 +81,7 @@ export function createSSEStream(options = {}) {
   const {
     mode = STREAM_MODE.TRANSLATE,
     targetFormat,
-    sourceFormat,
+    sourceFormat = FORMATS.OPENAI,
     provider = null,
     reqLogger = null,
     toolNameMap = null,
@@ -98,6 +131,44 @@ export function createSSEStream(options = {}) {
   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
   let finalized = false;
   let completionFlushTimer = null;
+  const nativeGeminiCandidates = new Map();
+  let nativeGeminiFailureSeen = false;
+  let nativeGeminiResponseSeen = false;
+  let nativeGeminiMultipleCandidatesSeen = false;
+  let nativeGeminiAnyFinishSeen = false;
+  let nativeGeminiData = [];
+  let nativeGeminiJson = "";
+
+  const captureNativeGeminiBody = (parsed) => {
+    nativeGeminiResponseSeen = true;
+    const extracted = extractUsage(parsed);
+    if (extracted) usage = mergeUsage(usage, extracted);
+    const response = parsed.response || parsed;
+    if (response.error || response.promptFeedback?.blockReason) nativeGeminiFailureSeen = true;
+    if ((response.candidates || []).length > 1) nativeGeminiMultipleCandidatesSeen = true;
+    for (const [position, candidate] of (response.candidates || []).entries()) {
+      const finished = !!candidate.finishReason && candidate.finishReason !== "FINISH_REASON_UNSPECIFIED";
+      if (finished) nativeGeminiAnyFinishSeen = true;
+      const index = candidate.index ?? position;
+      nativeGeminiCandidates.set(index, nativeGeminiCandidates.get(index) || finished);
+    }
+    for (const part of response.candidates?.[0]?.content?.parts || []) {
+      if (typeof part.text !== "string") continue;
+      totalContentLength += part.text.length;
+      if (part.thought === true) accumulatedThinking += part.text;
+      else accumulatedContent += part.text;
+    }
+  };
+  const captureNativeGeminiLine = (line) => {
+    if (line.startsWith("data:")) {
+      nativeGeminiData.push(line.slice(5).replace(/^ /, "").replace(/\r$/, ""));
+      return;
+    }
+    if (line.trim() || !nativeGeminiData.length) return;
+    const parsed = parseSSELine(`data: ${nativeGeminiData.join("\n")}`, sourceFormat);
+    nativeGeminiData = [];
+    if (parsed) captureNativeGeminiBody(parsed);
+  };
 
   // Lane quirk: upstream streams thinking under the OpenRouter aliases
   // (`reasoning` / `reasoning_details[]`) instead of reasoning_content — OpenCode
@@ -157,6 +228,16 @@ export function createSSEStream(options = {}) {
 
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
+
+      if (nativeGeminiPassthrough) {
+        if (nativeJson) { nativeGeminiJson += text; buffer = ""; }
+        else for (const line of lines) captureNativeGeminiLine(line);
+        // Accounting observes complete lines; the client receives original
+        // bytes, including fragmented UTF-8, tool calls and usage-only trailers.
+        reqLogger?.appendConvertedChunk?.(text);
+        controller.enqueue(chunk);
+        return;
+      }
 
       for (const line of lines) {
         const trimmed = line.trim();
@@ -477,6 +558,55 @@ export function createSSEStream(options = {}) {
         if (remaining) buffer += remaining;
 
         if (mode === STREAM_MODE.PASSTHROUGH) {
+          if (nativeGeminiPassthrough) {
+            if (nativeJson) {
+              nativeGeminiJson += remaining;
+              let nativeResponse;
+              try { nativeResponse = JSON.parse(nativeGeminiJson); }
+              catch {
+                controller.error(new Error("Upstream Gemini JSON stream ended with invalid or incomplete JSON"));
+                finalizeStream();
+                return;
+              }
+              const responses = Array.isArray(nativeResponse) ? nativeResponse : [nativeResponse];
+              if (!responses.length || responses.some(response => !response || typeof response !== "object" || Array.isArray(response))) {
+                controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
+                finalizeStream();
+                return;
+              }
+              for (const response of responses) captureNativeGeminiBody(response);
+            } else {
+              if (buffer.trim()) captureNativeGeminiLine(buffer);
+              captureNativeGeminiLine("");
+            }
+            if (!nativeGeminiResponseSeen) {
+              if (nativeJson) {
+                controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
+                finalizeStream();
+                return;
+              }
+              const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream returned no valid response", sourceFormat);
+              reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
+              controller.enqueue(failure);
+            } else if (observeNativeFinishReason && !nativeGeminiFailureSeen && (
+              // Without projected candidate IDs, separate terminal chunks can
+              // all occupy position zero. Do not assign them to fictitious IDs.
+              !observeNativeCandidateIndex && nativeGeminiMultipleCandidatesSeen
+                ? !nativeGeminiAnyFinishSeen
+                : [...nativeGeminiCandidates.values()].some(finished => !finished)
+            )) {
+              if (nativeJson) {
+                controller.error(new Error("Upstream Gemini JSON stream ended before a candidate finished"));
+                finalizeStream();
+                return;
+              }
+              const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream ended before a candidate finished", sourceFormat);
+              reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
+              controller.enqueue(failure);
+            }
+            finalizeStream();
+            return;
+          }
           if (buffer) {
             let output = buffer;
             if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
@@ -600,9 +730,12 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
   });
 }
 
-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null) {
+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
+    sourceFormat,
+    nativeJson,
+    nativeResponseProjection,
     provider,
     reqLogger,
     toolNameMap,

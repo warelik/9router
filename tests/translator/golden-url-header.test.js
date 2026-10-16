@@ -21,6 +21,8 @@ const SPECIALIZED = new Set([
   "codex", "cursor", "vertex", "vertex-partner", "opencode",
   "opencode-go", "grok-web", "perplexity-web", "ollama-local", "commandcode",
   "xiaomi-tokenplan", "mimo-free",
+  // Fork-only local bridge; its URL and header contract is locked by unit/aistudio-provider.test.js.
+  "aistudio",
 ]);
 
 // Per-process / per-request values: kimi's random device name, minimax's session UUID.

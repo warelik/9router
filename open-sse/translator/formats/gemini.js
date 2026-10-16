@@ -518,6 +518,62 @@ export function cleanJSONSchemaForAntigravity(schema) {
   return cleaned;
 }
 
+const PROTO_SCHEMA_TYPES = new Set(["OBJECT", "ARRAY", "STRING", "NUMBER", "INTEGER", "BOOLEAN", "NULL"]);
+export function lowerProtoSchemaTypes(schema) {
+  if (!schema || typeof schema !== "object") return schema;
+  if (Array.isArray(schema)) {
+    for (const item of schema) lowerProtoSchemaTypes(item);
+    return schema;
+  }
+  if (typeof schema.type === "string" && PROTO_SCHEMA_TYPES.has(schema.type)) {
+    schema.type = schema.type.toLowerCase();
+  }
+  eachChildSchema(schema, lowerProtoSchemaTypes);
+  return schema;
+}
+
+const LEGACY_PROTO_SCHEMA_KEYS = new Set(["type", "format", "description", "nullable", "enum", "items", "properties", "required", "propertyOrdering"]);
+export function isLegacyGeminiSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return false;
+  for (const key of Object.keys(schema)) {
+    if (!LEGACY_PROTO_SCHEMA_KEYS.has(key)) return false;
+  }
+  if (schema.enum !== undefined && (!Array.isArray(schema.enum) || !schema.enum.every((v) => typeof v === "string"))) return false;
+  if (schema.properties !== undefined) {
+    if (typeof schema.properties !== "object" || schema.properties === null || Array.isArray(schema.properties)) return false;
+    for (const child of Object.values(schema.properties)) {
+      if (!isLegacyGeminiSchema(child)) return false;
+    }
+  }
+  if (schema.items !== undefined && !isLegacyGeminiSchema(schema.items)) return false;
+  return true;
+}
+
+export function adaptAIStudioStructuredOutput(body) {
+  if (!body || typeof body !== "object") return body;
+  const key = body.generation_config ? "generation_config" : "generationConfig";
+  const generation = body[key];
+  const schema = generation?.responseJsonSchema ?? generation?.response_json_schema;
+  const mime = generation?.responseMimeType ?? generation?.response_mime_type;
+  const conflictingAliases = generation && (
+    (Object.hasOwn(generation, "responseJsonSchema") && Object.hasOwn(generation, "response_json_schema")) ||
+    (Object.hasOwn(generation, "responseMimeType") && Object.hasOwn(generation, "response_mime_type"))
+  );
+  // The browser-authenticated API accepts the current responseFormat wire;
+  // its deprecated responseJsonSchema alias fails. Move the opaque schema
+  // to the documented replacement without compiling or relaxing it.
+  if (!conflictingAliases && schema !== undefined && mime === "application/json"
+    && !generation.responseFormat && !generation.response_format && !generation.responseSchema && !generation.response_schema) {
+    const mapped = { ...generation, responseFormat: { text: { mimeType: "APPLICATION_JSON", schema } } };
+    delete mapped.responseJsonSchema;
+    delete mapped.response_json_schema;
+    delete mapped.responseMimeType;
+    delete mapped.response_mime_type;
+    return { ...body, [key]: mapped };
+  }
+  return body;
+}
+
 // Gemini / Cloud Code treat a `$ref` key inside functionResponse.response as a
 // pointer to functionResponse.parts and reject the request with
 // "The referenced name `#/$defs/...` in function_response.response does not match
