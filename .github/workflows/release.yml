@@ -243,6 +243,7 @@ jobs:
           PATCHSET_SHA256: ${{ needs.prepare.outputs.patchset }}
           APP_VERSION: ${{ needs.prepare.outputs.version }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release }}
+          REPAIR_HEAD: ${{ needs.prepare.outputs.repair_head }}
         run: python3 scripts/release.py publish "$GITHUB_WORKSPACE/release"
 
   land:
