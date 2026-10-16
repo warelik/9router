@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "config": "a230adadfe8e2d22bd4945fb3904e0cfd0bd64bc",
+  "upstream": "87a74e1bda3677193c6f71a7e2100c90311f0689",
+  "cycle": "06b20c799501f154170cf20ab1d7d8ab3e09247ca15c6f6158eedb8430acb617",
+  "nonblocking": true
+}
