@@ -367,10 +367,13 @@ function wrapInCloudCodeEnvelope(model, geminiCLI, credentials = null, isAntigra
   }
 
   if (geminiCLI.tools?.length > 0) {
-    envelope.request.toolConfig = {
+    envelope.request.toolConfig = geminiCLI.toolConfig || {
       functionCallingConfig: { mode: "VALIDATED" }
     };
   }
+
+  if (geminiCLI._customToolNames) envelope._customToolNames = geminiCLI._customToolNames;
+  if (geminiCLI._toolNameMap) envelope._toolNameMap = geminiCLI._toolNameMap;
 
   return envelope;
 }
@@ -504,6 +507,9 @@ function wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials = nu
     envelope.request.systemInstruction = { role: GEMINI_ROLE.USER, parts: systemParts };
   }
 
+  if (claudeRequest._customToolNames) envelope._customToolNames = claudeRequest._customToolNames;
+  if (claudeRequest._toolNameMap) envelope._toolNameMap = claudeRequest._toolNameMap;
+
   envelope.request.contents = normalizeGeminiContents(envelope.request.contents, model);
   return envelope;
 }
@@ -521,11 +527,11 @@ export function openaiToAntigravityRequest(model, body, stream, credentials = nu
     return wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials);
   }
 
-  const geminiCLI = openaiToGeminiCLIRequest(model, body, stream);
+  const geminiCLI = openaiToGeminiCLIRequest(model, body, stream, credentials);
   return wrapInCloudCodeEnvelope(model, geminiCLI, credentials, true);
 }
 
 // Register
 register(FORMATS.OPENAI, FORMATS.GEMINI, openaiToGeminiRequest, null);
-register(FORMATS.OPENAI, FORMATS.GEMINI_CLI, (model, body, stream, credentials) => wrapInCloudCodeEnvelope(model, openaiToGeminiCLIRequest(model, body, stream), credentials), null);
+register(FORMATS.OPENAI, FORMATS.GEMINI_CLI, (model, body, stream, credentials) => wrapInCloudCodeEnvelope(model, openaiToGeminiCLIRequest(model, body, stream, credentials), credentials), null);
 register(FORMATS.OPENAI, FORMATS.ANTIGRAVITY, openaiToAntigravityRequest, null);
