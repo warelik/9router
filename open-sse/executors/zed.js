@@ -17,6 +17,8 @@
 import { BaseExecutor } from "./base.js";
 import { FORMATS } from "../translator/formats.js";
 import { initState } from "../translator/index.js";
+import { ensureToolCallIds, fixMissingToolResponses } from "../translator/concerns/toolCall.js";
+import { applyThinking, captureThinking } from "../translator/concerns/thinkingUnified.js";
 import { openaiToClaudeRequest } from "../translator/request/openai-to-claude.js";
 import { openaiToGeminiRequest } from "../translator/request/openai-to-gemini.js";
 import { openaiToOpenAIResponsesRequest } from "../translator/request/openai-responses.js";
@@ -59,22 +61,32 @@ function normalizeZedProvider(value, model) {
 
 function buildProviderRequest(provider, model, body, stream, credentials) {
   if (provider === ZED_PROVIDER.anthropic) {
+    ensureToolCallIds(body);
+    fixMissingToolResponses(body);
     return openaiToClaudeRequest(model, body, true);
   }
   if (provider === ZED_PROVIDER.google) {
-    const geminiRequest = openaiToGeminiRequest(model, body, true);
+    ensureToolCallIds(body, { preserveIds: true });
+    const geminiRequest = openaiToGeminiRequest(model, body, true, credentials);
+    applyThinking("gemini", model, geminiRequest, "gemini", captureThinking(body));
     // Zed's hosted Gemini backend speaks the Vertex safety vocabulary, not the
     // public Gemini API enum the shared translator emits (`OFF`, `CIVIC_INTEGRITY`,
     // `DANGEROUS_CONTENT`). Drop client-side safetySettings for the Zed Google
     // path so Zed applies its own defaults — scoped here so native Gemini/
     // Antigravity is untouched.
     delete geminiRequest.safetySettings;
+    delete geminiRequest._customToolNames;
+    delete geminiRequest._toolNameMap;
     return geminiRequest;
   }
   if (provider === ZED_PROVIDER.openai) {
+    ensureToolCallIds(body);
+    fixMissingToolResponses(body);
     return openaiToOpenAIResponsesRequest(model, body, true, credentials);
   }
   // xAI is OpenAI-shaped — forward as-is.
+  ensureToolCallIds(body);
+  fixMissingToolResponses(body);
   return { ...(body || {}), model, stream: stream !== false };
 }
 

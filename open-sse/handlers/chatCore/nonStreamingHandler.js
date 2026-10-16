@@ -1,6 +1,7 @@
 import { FORMATS } from "../../translator/formats.js";
 import { needsTranslation } from "../../translator/index.js";
 import { openAICompletionToClaudeMessage } from "../../translator/concerns/claudeMessage.js";
+import { toOpenAIUsage } from "../../translator/concerns/usage.js";
 import { ollamaBodyToOpenAI } from "../../translator/response/ollama-to-openai.js";
 import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTracking.js";
 import { createErrorResult } from "../../utils/error.js";
@@ -13,6 +14,8 @@ import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
 import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
 import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
+import { storeGeminiTurnSignature, storeGeminiThoughtSignature, storeGeminiServerParts, storeGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
+import { toOpenAIFinish } from "../../translator/concerns/finishReason.js";
 
 function parseToolArguments(value) {
   if (!value) return {};
@@ -138,14 +141,34 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
     const usage = response.usageMetadata || responseBody.usageMetadata;
     let textContent = "", reasoningContent = "";
     const toolCalls = [];
+    const serverParts = [];
+    let turnSignature = null;
 
     if (content?.parts) {
       for (const part of content.parts) {
+        // Server-executed tool parts (googleSearch on Gemini 3) are captured verbatim
+        // for replay; they must not surface as text or set the pending signature.
+        if (part.toolCall || part.toolResponse) {
+          serverParts.push(part);
+          continue;
+        }
+        const partSig = part.thoughtSignature || part.thought_signature;
+        if (typeof partSig === "string" && partSig) turnSignature = partSig;
         if (part.thought === true && part.text) reasoningContent += part.text;
         else if (part.text !== undefined) textContent += part.text;
         if (part.functionCall) {
+          const callId = part.functionCall.id || `call_${part.functionCall.name}_${Date.now()}_${toolCalls.length}`;
+          // The call's own signature (or the one just before it) must come back with the call.
+          if (turnSignature) {
+            storeGeminiThoughtSignature(callId, turnSignature, sessionId, response.modelVersion);
+            turnSignature = null;
+          }
+          if (serverParts.length) {
+            storeGeminiServerParts(callId, serverParts, serverPartsSessionId, response.modelVersion, turnScope);
+            serverParts.length = 0;
+          }
           toolCalls.push({
-            id: `call_${part.functionCall.name}_${Date.now()}_${toolCalls.length}`,
+            id: callId,
             type: "function",
             function: { name: part.functionCall.name, arguments: JSON.stringify(part.functionCall.args || {}) }
           });
@@ -162,10 +185,25 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
     const message = { role: "assistant" };
     if (textContent) message.content = textContent;
     if (reasoningContent) message.reasoning_content = reasoningContent;
+    if (turnSignature && toolCalls.length === 0) {
+      storeGeminiTurnSignature({
+        reasoning: reasoningContent,
+        content: textContent,
+        scope: turnScope,
+      }, turnSignature, response.modelVersion);
+    }
+    if (serverParts.length) {
+      storeGeminiServerPartsForTurn({
+        reasoning: reasoningContent,
+        content: textContent,
+        scope: turnScope,
+        sessionId: serverPartsSessionId,
+      }, serverParts, response.modelVersion);
+    }
     if (toolCalls.length > 0) message.tool_calls = toolCalls;
     if (!message.content && !message.tool_calls) message.content = "";
 
-    let finishReason = (candidate.finishReason || "stop").toLowerCase();
+    let finishReason = toOpenAIFinish(candidate.finishReason || "STOP", "gemini");
     if (finishReason === "stop" && toolCalls.length > 0) finishReason = "tool_calls";
 
     const result = {
@@ -177,15 +215,12 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
     };
 
     if (usage) {
-      result.usage = {
-        prompt_tokens: (usage.promptTokenCount || 0) + (usage.thoughtsTokenCount || 0),
-        completion_tokens: usage.candidatesTokenCount || 0,
-        total_tokens: usage.totalTokenCount || 0
-      };
-      if (usage.thoughtsTokenCount > 0) {
-        result.usage.completion_tokens_details = { reasoning_tokens: usage.thoughtsTokenCount };
-      }
+      result.usage = toOpenAIUsage(usage, "gemini");
     }
+    // Same hand-off as the OpenAI-shaped branches above: Claude and Responses clients must not
+    // receive a bare chat.completion body.
+    if (sourceFormat === FORMATS.OPENAI_RESPONSES) return openAICompletionToResponses(result, customToolNames);
+    if (sourceFormat === FORMATS.CLAUDE) return openAICompletionToClaudeMessage(result);
     return result;
   }
 
@@ -329,7 +364,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
   if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: Date.now() - requestStartTime } }));
 
   const translatedResponse = needsTranslation(targetFormat, sourceFormat)
-    ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames)
+    ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames, credentials?._geminiTurnScope, credentials?._clientSessionId, credentials?._geminiServerPartsSessionId)
     : responseBody;
   const isClaudeMessageResponse = sourceFormat === FORMATS.CLAUDE && translatedResponse?.type === "message";
   // Responses-format translation produces a `object:"response"` body with no

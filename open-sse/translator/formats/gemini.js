@@ -1,7 +1,7 @@
 // Gemini helper functions for translator
 
 import { safeParseJSON } from "../concerns/json.js";
-import { OPENAI_BLOCK } from "../schema/index.js";
+import { OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
 import { isGemini4Model } from "../../providers/capabilities.js";
 
 // Unsupported JSON Schema constraints that should be removed for Antigravity
@@ -52,6 +52,43 @@ export const DEFAULT_SAFETY_SETTINGS = [
   { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "OFF" }
 ];
 
+const FILE_EXTENSION_MIME = {
+  pdf: "application/pdf", json: "application/json",
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+  mp3: "audio/mpeg", wav: "audio/wav", mp4: "video/mp4",
+  txt: "text/plain", md: "text/markdown", csv: "text/csv",
+};
+
+function fileMimeType(filename, explicit) {
+  if (typeof explicit === "string" && explicit.includes("/")) return explicit;
+  const ext = typeof filename === "string" ? filename.split(".").pop().toLowerCase() : "";
+  const mime = FILE_EXTENSION_MIME[ext];
+  return typeof mime === "string" ? mime : undefined;
+}
+
+function dataUrlToInlinePart(url) {
+  const commaIndex = url.indexOf(",");
+  if (commaIndex === -1) return null;
+  const mimeType = url.substring(5, commaIndex).split(";")[0];
+  return { inlineData: { mime_type: mimeType, data: url.substring(commaIndex + 1) } };
+}
+
+function appendFilePart(parts, file) {
+  if (!file || typeof file !== "object") return;
+  const mime = fileMimeType(file.filename, file.mime_type || file.mimeType);
+  const data = file.file_data;
+  if (typeof data === "string" && data.startsWith("data:")) {
+    const part = dataUrlToInlinePart(data);
+    if (part) parts.push(part);
+  } else if (typeof data === "string" && /^https?:\/\//.test(data)) {
+    parts.push({ fileData: { fileUri: data, ...(mime ? { mimeType: mime } : {}) } });
+  } else if (typeof data === "string" && data) {
+    parts.push({ inlineData: { mime_type: mime || "application/octet-stream", data } });
+  } else if (typeof file.file_url === "string" && /^https?:\/\//.test(file.file_url)) {
+    parts.push({ fileData: { fileUri: file.file_url, ...(mime ? { mimeType: mime } : {}) } });
+  }
+}
+
 // Convert OpenAI content to Gemini parts
 export function convertOpenAIContentToParts(content) {
   const parts = [];
@@ -95,14 +132,10 @@ export function convertOpenAIContentToParts(content) {
             inlineData: { mime_type: mimeType, data: data }
           });
         }
-      } else if (item.type === OPENAI_BLOCK.FILE && item.file?.file_data?.startsWith("data:")) {
-        const url = item.file.file_data;
-        const commaIndex = url.indexOf(",");
-        if (commaIndex !== -1) {
-          const mimeType = url.substring(5, commaIndex).split(";")[0];
-          const data = url.substring(commaIndex + 1);
-          parts.push({ inlineData: { mime_type: mimeType, data: data } });
-        }
+      } else if (item.type === OPENAI_BLOCK.FILE) {
+        appendFilePart(parts, item.file);
+      } else if (item.type === RESPONSES_ITEM.INPUT_FILE) {
+        appendFilePart(parts, item);
       }
     }
   }
@@ -143,50 +176,61 @@ export function generateProjectId() {
   return `${adj}-${noun}-${crypto.randomUUID().slice(0, 5)}`;
 }
 
-// Helper: Remove unsupported keywords recursively from object/array
-// Also strips all vendor extension fields (x- prefixed) not supported by Gemini
-function removeUnsupportedKeywords(obj, keywords) {
-  if (!obj || typeof obj !== "object") return;
+const SCHEMA_MAP_KEYS = new Set(["properties", "$defs", "definitions", "patternProperties", "dependentSchemas"]);
+const SCHEMA_ARRAY_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
+const SCHEMA_SINGLE_KEYS = new Set(["items", "additionalProperties", "contains", "not", "if", "then", "else"]);
 
-  if (Array.isArray(obj)) {
-    for (const item of obj) {
-      removeUnsupportedKeywords(item, keywords);
-    }
-    return;
-  }
-
-  for (const key of Object.keys(obj)) {
-    if (keywords.includes(key) || key.startsWith("x-")) {
-      delete obj[key];
-      continue;
-    }
-
-    const value = obj[key];
-    if (value && typeof value === "object") {
-      removeUnsupportedKeywords(value, keywords);
+function eachChildSchema(node, fn) {
+  for (const key of Object.keys(node)) {
+    if (SCHEMA_MAP_KEYS.has(key)) {
+      const map = node[key];
+      if (map && typeof map === "object" && !Array.isArray(map)) {
+        for (const child of Object.values(map)) {
+          if (child && typeof child === "object") fn(child);
+        }
+      }
+    } else if (SCHEMA_ARRAY_KEYS.has(key)) {
+      if (Array.isArray(node[key])) {
+        for (const child of node[key]) {
+          if (child && typeof child === "object") fn(child);
+        }
+      }
+    } else if (SCHEMA_SINGLE_KEYS.has(key)) {
+      const child = node[key];
+      if (child && typeof child === "object" && !Array.isArray(child)) fn(child);
     }
   }
 }
 
+// Helper: Remove unsupported keywords recursively from object/array
+// Also strips all vendor extension fields (x- prefixed) not supported by Gemini
+function removeUnsupportedKeywords(obj, keywords) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+
+  for (const key of Object.keys(obj)) {
+    if (keywords.includes(key) || key.startsWith("x-")) {
+      delete obj[key];
+    }
+  }
+
+  eachChildSchema(obj, (child) => removeUnsupportedKeywords(child, keywords));
+}
+
 // Convert const to enum
 function convertConstToEnum(obj) {
-  if (!obj || typeof obj !== "object") return;
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
 
   if (obj.const !== undefined && !obj.enum) {
     obj.enum = [obj.const];
     delete obj.const;
   }
 
-  for (const value of Object.values(obj)) {
-    if (value && typeof value === "object") {
-      convertConstToEnum(value);
-    }
-  }
+  eachChildSchema(obj, convertConstToEnum);
 }
 
 // Convert enum values to strings (Gemini requires string enum values + explicit type:"string")
 function convertEnumValuesToStrings(obj) {
-  if (!obj || typeof obj !== "object") return;
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
 
   if (obj.enum && Array.isArray(obj.enum)) {
     obj.enum = obj.enum.map(v => String(v));
@@ -196,16 +240,12 @@ function convertEnumValuesToStrings(obj) {
     }
   }
 
-  for (const value of Object.values(obj)) {
-    if (value && typeof value === "object") {
-      convertEnumValuesToStrings(value);
-    }
-  }
+  eachChildSchema(obj, convertEnumValuesToStrings);
 }
 
 // Merge allOf schemas
 function mergeAllOf(obj) {
-  if (!obj || typeof obj !== "object") return;
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
 
   if (obj.allOf && Array.isArray(obj.allOf)) {
     const merged = {};
@@ -230,11 +270,7 @@ function mergeAllOf(obj) {
     if (merged.required) obj.required = [...(obj.required || []), ...merged.required];
   }
 
-  for (const value of Object.values(obj)) {
-    if (value && typeof value === "object") {
-      mergeAllOf(value);
-    }
-  }
+  eachChildSchema(obj, mergeAllOf);
 }
 
 // Select best schema from anyOf/oneOf
@@ -266,7 +302,7 @@ function selectBest(items) {
 
 // Flatten anyOf/oneOf
 function flattenAnyOfOneOf(obj) {
-  if (!obj || typeof obj !== "object") return;
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
 
   if (obj.anyOf && Array.isArray(obj.anyOf) && obj.anyOf.length > 0) {
     const nonNullSchemas = obj.anyOf.filter(s => s && s.type !== "null");
@@ -288,47 +324,32 @@ function flattenAnyOfOneOf(obj) {
     }
   }
 
-  for (const value of Object.values(obj)) {
-    if (value && typeof value === "object") {
-      flattenAnyOfOneOf(value);
-    }
-  }
+  eachChildSchema(obj, flattenAnyOfOneOf);
 }
 
 // Flatten type arrays
 function flattenTypeArrays(obj) {
-  if (!obj || typeof obj !== "object") return;
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
 
   if (obj.type && Array.isArray(obj.type)) {
     const nonNullTypes = obj.type.filter(t => t !== "null");
     obj.type = nonNullTypes.length > 0 ? nonNullTypes[0] : "string";
   }
 
-  for (const value of Object.values(obj)) {
-    if (value && typeof value === "object") {
-      flattenTypeArrays(value);
-    }
-  }
+  eachChildSchema(obj, flattenTypeArrays);
 }
 
 // Infer missing type=object when properties exist (Gemini requires explicit type)
 function ensureObjectType(obj) {
-  if (!obj || typeof obj !== "object") return;
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
   if (obj.properties && !obj.type) obj.type = "object";
-  for (const [key, v] of Object.entries(obj)) {
-    if (!v || typeof v !== "object") continue;
-    if (key === "properties" && !Array.isArray(v)) {
-      for (const sub of Object.values(v)) ensureObjectType(sub);
-    } else {
-      ensureObjectType(v);
-    }
-  }
+  eachChildSchema(obj, ensureObjectType);
 }
 
 // Convert prefixItems (tuple validation) to items — Gemini cannot express tuples,
 // and a type:"array" schema without items is rejected with "missing field"
 function convertPrefixItems(obj) {
-  if (!obj || typeof obj !== "object") return;
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
 
   if (Array.isArray(obj.prefixItems) && obj.prefixItems.length > 0) {
     const variants = obj.prefixItems.filter(s => s && s.type !== "null");
@@ -340,20 +361,16 @@ function convertPrefixItems(obj) {
     delete obj.prefixItems;
   }
 
-  for (const value of Object.values(obj)) {
-    if (value && typeof value === "object") {
-      convertPrefixItems(value);
-    }
-  }
+  eachChildSchema(obj, convertPrefixItems);
 }
 
 // Gemini requires items on every type:"array" schema — fill a permissive placeholder
 function ensureArrayItems(obj) {
-  if (!obj || typeof obj !== "object") return;
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
   if (obj.type === "array" && !obj.items) {
     obj.items = { type: "string" };
   }
-  for (const v of Object.values(obj)) if (v && typeof v === "object") ensureArrayItems(v);
+  eachChildSchema(obj, ensureArrayItems);
 }
 
 // Clean JSON Schema for Antigravity API compatibility - removes unsupported keywords recursively
@@ -382,7 +399,7 @@ export function cleanJSONSchemaForAntigravity(schema) {
 
   // Phase 4: Cleanup required fields recursively
   function cleanupRequired(obj) {
-    if (!obj || typeof obj !== "object") return;
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
 
     if (obj.required && Array.isArray(obj.required) && obj.properties) {
       const validRequired = obj.required.filter(field =>
@@ -395,12 +412,8 @@ export function cleanJSONSchemaForAntigravity(schema) {
       }
     }
 
-    // Recurse into nested objects
-    for (const value of Object.values(obj)) {
-      if (value && typeof value === "object") {
-        cleanupRequired(value);
-      }
-    }
+    // Recurse into nested schemas
+    eachChildSchema(obj, cleanupRequired);
   }
 
   cleanupRequired(cleaned);
@@ -434,12 +447,8 @@ export function cleanJSONSchemaForAntigravity(schema) {
       }
     }
 
-    // Recurse into nested objects
-    for (const value of Object.values(obj)) {
-      if (value && typeof value === "object") {
-        addPlaceholders(value);
-      }
-    }
+    // Recurse into nested schemas
+    eachChildSchema(obj, addPlaceholders);
   }
 
   addPlaceholders(cleaned);
@@ -536,7 +545,12 @@ function moveFunctionResponsesLast(parts) {
 }
 
 // Merge adjacent same-role messages, strip empty parts, ensure initial and terminal user turns
-export function normalizeGeminiContents(contents, model = null) {
+export function normalizeGeminiContents(contents, modelOrOptions = null, extraOptions = {}) {
+  const optionsObject = modelOrOptions && typeof modelOrOptions === "object"
+    && Object.hasOwn(modelOrOptions, "synthesizeTerminalToolResponse");
+  const model = optionsObject ? null : modelOrOptions;
+  const options = optionsObject ? modelOrOptions : extraOptions;
+  const synthesizeTerminalToolResponse = options?.synthesizeTerminalToolResponse ?? true;
   const frLast = isGemini4Model(model);
   const out = [];
   for (const c of contents || []) {
@@ -555,21 +569,22 @@ export function normalizeGeminiContents(contents, model = null) {
   if (out.length > 0 && out.at(-1).role === "model") {
     const fnCalls = (out.at(-1).parts || []).filter(p => p && p.functionCall);
     if (fnCalls.length > 0) {
-      const responses = fnCalls.map(p => {
-        const call = p.functionCall || {};
-        const fr = {
-          name: call.name || "tool",
-          response: { result: "Continue." }
-        };
-        if (call.id) fr.id = call.id;
-        return { functionResponse: fr };
-      });
-      out.push({ role: "user", parts: responses });
+      if (synthesizeTerminalToolResponse) {
+        const responses = fnCalls.map(p => {
+          const call = p.functionCall || {};
+          const fr = {
+            name: call.name || "tool",
+            response: { result: "Continue." }
+          };
+          if (call.id) fr.id = call.id;
+          return { functionResponse: fr };
+        });
+        out.push({ role: "user", parts: responses });
+      }
     } else {
       out.push({ role: "user", parts: [{ text: "Continue." }] });
     }
   }
   return out;
 }
-
 

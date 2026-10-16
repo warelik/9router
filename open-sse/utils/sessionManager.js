@@ -220,6 +220,22 @@ export function resolveSessionIdentity({ headers, body, connectionId, workspaceI
     return { sessionId: deriveSessionId(connectionId), ephemeral: false };
 }
 
+// Client-declared conversation identity for plaintext caches. Unlike a transport session
+// it is never generated and never derived from the provider connection, workspace,
+// prompt_cache_key or assistant text. Account-wide fallbacks remain transport-only.
+export function captureConversationId(body, credentials) {
+    const headers = credentials?.rawHeaders;
+    const thread = headerValue(headers, "thread-id") || headerValue(headers, "x-amp-thread-id");
+    if (thread) return thread;
+    const claude = extractClaudeCodeSession(body?.metadata?.user_id) || headerValue(headers, CLAUDE_CODE_SESSION_HEADER);
+    if (claude) return `claude:${claude}`;
+    for (const key of SESSION_HEADER_KEYS) {
+        const v = headerValue(headers, key);
+        if (v) return v;
+    }
+    return normalizeSessionId(body?.conversation_id) || normalizeSessionId(body?.session_id) || null;
+}
+
 export function resolveSessionId(opts = {}) {
     return resolveSessionIdentity(opts).sessionId;
 }

@@ -89,17 +89,26 @@ export function createSSEStream(options = {}) {
     body = null,
     onStreamComplete = null,
     apiKey = null,
-    credentials = null
+    credentials = null,
+    nativeJson = false,
+    nativeResponseProjection = null
   } = options;
 
   let buffer = "";
   let usage = null;
+  // The client's wire protocol determines termination, regardless of which
+  // provider serves it. Native Gemini SSE ends at EOF and carries arbitrary
+  // Parts/metadata that must not pass through Chat normalization.
+  const nativeGeminiPassthrough = mode === STREAM_MODE.PASSTHROUGH &&
+    [FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY].includes(sourceFormat);
+  const observeNativeFinishReason = nativeCandidateFieldIsVisible(nativeResponseProjection, "finishReason");
+  const observeNativeCandidateIndex = nativeCandidateFieldIsVisible(nativeResponseProjection, "index");
 
   // Per-stream decoder with stream:true to correctly handle multi-byte chars split across chunks
   const decoder = new TextDecoder("utf-8", { fatal: false });
 
   const state = mode === STREAM_MODE.TRANSLATE
-    ? { ...initState(sourceFormat), provider, toolNameMap, customToolNames: new Set(customToolNames || []), model, sessionId: credentials?._clientSessionId || null,
+    ? { ...initState(sourceFormat), provider, toolNameMap, customToolNames: new Set(customToolNames || []), model, sessionId: credentials?._clientSessionId || null, serverPartsSessionId: credentials?._geminiServerPartsSessionId || null, turnScope: credentials?._geminiTurnScope || null,
         // Which upstream format this stream came from. A response translator can be
         // reached either directly (target === its registered source) or as the second
         // hop of a pivot, and on the terminal null chunk the pivot drops it — so a
@@ -574,9 +583,7 @@ export function createSSEStream(options = {}) {
           // Some clients (e.g. OpenClaw) expect the OpenAI-style sentinel:
           //   data: [DONE]\n\n
           // Without it they can hang until timeout and trigger failover.
-          // Gemini-family clients (Antigravity, Vertex, Gemini) reject this sentinel with 400 syntax errors.
-          const isGeminiFamily = provider === "antigravity" || provider === "gemini" || provider === "vertex";
-          if (!streamDoneSent && !isGeminiFamily) {
+          if (!streamDoneSent) {
             const doneOutput = "data: [DONE]\n\n";
             reqLogger?.appendConvertedChunk?.(doneOutput);
             controller.enqueue(sharedEncoder.encode(doneOutput));
@@ -617,6 +624,7 @@ export function createSSEStream(options = {}) {
                 const output = formatSSE(item, sourceFormat);
                 reqLogger?.appendConvertedChunk?.(output);
                 controller.enqueue(sharedEncoder.encode(output));
+                sseEmittedCount++;
               }
             }
           }
@@ -637,6 +645,7 @@ export function createSSEStream(options = {}) {
             const output = formatSSE(item, sourceFormat);
             reqLogger?.appendConvertedChunk?.(output);
             controller.enqueue(sharedEncoder.encode(output));
+            sseEmittedCount++;
           }
         }
 
@@ -654,6 +663,16 @@ export function createSSEStream(options = {}) {
           reqLogger?.appendConvertedChunk?.(doneOutput);
           controller.enqueue(sharedEncoder.encode(doneOutput));
           openAIResponsesDoneSent = true;
+          streamDoneSent = true;
+        }
+
+        // A translated stream for an OpenAI Chat client must end with the OpenAI sentinel: the
+        // upstream's own [DONE] is consumed above and Gemini/Claude streams have none. Nothing
+        // else in this mode emits it, so one is written here.
+        if (sourceFormat === FORMATS.OPENAI && sseEmittedCount > 0) {
+          const doneOutput = "data: [DONE]\n\n";
+          reqLogger?.appendConvertedChunk?.(doneOutput);
+          controller.enqueue(sharedEncoder.encode(doneOutput));
           streamDoneSent = true;
         }
 
