@@ -80,13 +80,15 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   normalizeThinkingConfig(result);
 
   // Always ensure tool_calls have id (some providers require it)
-  ensureToolCallIds(result);
-  
+  const zedDeferred = provider === "zed";
+  const geminiFamily = isGeminiFamilyTarget(targetFormat, model);
+  if (!zedDeferred) ensureToolCallIds(result, { preserveIds: geminiFamily });
+
   // Kiro performs stricter source-aware reconciliation after session replay.
   // The generic helper inserts OpenAI `role: tool` messages, which a direct
   // Claude→Kiro translator cannot consume and which cannot repair partial
   // parallel tool results.
-  if (targetFormat !== FORMATS.KIRO) {
+  if (targetFormat !== FORMATS.KIRO && !geminiFamily && !zedDeferred) {
     fixMissingToolResponses(result);
   }
 
@@ -98,6 +100,9 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   const clientSessionId = captureSessionId(result, credentials, connectionId, targetFormat);
   // Expose to downstream translators (gemini-cli/antigravity envelopes) that run after envelope is stripped
   if (credentials) credentials._clientSessionId = clientSessionId;
+  if (credentials) credentials._geminiServerPartsSessionId = captureConversationId(result, credentials);
+
+  let sourceToolNameMap = null;
 
   // If same format, skip translation steps
   if (sourceFormat !== targetFormat) {
@@ -107,6 +112,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     const directFn = requestRegistry.get(`${sourceFormat}:${targetFormat}`);
     if (directFn) {
       result = directFn(model, result, stream, credentials);
+      if (result._toolNameMap instanceof Map) sourceToolNameMap = result._toolNameMap;
     } else {
       // Step 1: source -> openai (if source is not openai)
       if (sourceFormat !== FORMATS.OPENAI) {
@@ -117,6 +123,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
           reqLogger?.logOpenAIRequest?.(result);
         }
       }
+      if (result._toolNameMap instanceof Map) sourceToolNameMap = result._toolNameMap;
 
       // Step 2: openai -> target (if target is not openai)
       if (targetFormat !== FORMATS.OPENAI) {

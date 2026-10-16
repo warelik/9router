@@ -19,6 +19,9 @@ import {
   zedLlmFetch,
 } from "open-sse/shared/zedAuth.js";
 import ZedExecutor from "open-sse/executors/zed.js";
+import "../translator/registerAll.js";
+import { translateRequest } from "../../open-sse/translator/index.js";
+import { FORMATS } from "../../open-sse/translator/formats.js";
 
 function catalogFor(entries) {
   const rawById = new Map(entries);
@@ -117,5 +120,112 @@ describe("completion payload shaping", () => {
     expect(openaiToGeminiRequest("gemini-x", { ...CHAT_BODY }, true)).toHaveProperty(
       "safetySettings",
     );
+  });
+
+  it("keeps all instruction text in systemInstruction and never leaks translator metadata into provider_request", async () => {
+    resolveZedModels.mockImplementation(async () => catalogFor([
+      ["gemini-x", { provider: "google" }],
+    ]));
+    const captured = {};
+    mockCatalogFetch(captured);
+    const executor = makeExecutor();
+
+    await executor.execute({
+      model: "gemini-x",
+      body: {
+        messages: [
+          { role: "system", content: "SYS_ONE" },
+          { role: "developer", content: "DEV_ONE" },
+          { role: "user", content: "hi" },
+        ],
+        tools: [{
+          type: "function",
+          function: {
+            name: "rich_tool",
+            parameters: {
+              type: "object",
+              properties: { count: { type: "integer", minimum: 1, maximum: 5 } },
+            },
+          },
+        }],
+        _customToolNames: ["custom_one"],
+        _toolNameMap: new Map([["cloaked", "orig"]]),
+      },
+      stream: false,
+      credentials: {},
+    });
+
+    const req = captured.body.provider_request;
+    const sysText = JSON.stringify(req.systemInstruction);
+    expect(sysText).toContain("SYS_ONE");
+    expect(sysText).toContain("DEV_ONE");
+    expect(JSON.stringify(req)).not.toContain("_customToolNames");
+    expect(JSON.stringify(req)).not.toContain("_toolNameMap");
+    expect(req).not.toHaveProperty("_customToolNames");
+    expect(req).not.toHaveProperty("_toolNameMap");
+  });
+
+  const ZED_TOOL_HISTORY = {
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "go" }] },
+      { type: "function_call", name: "alpha", call_id: "call.1", arguments: "{}" },
+      { type: "function_call", name: "beta", call_id: "call1", arguments: "{}" },
+      { type: "function_call", name: "ghost", call_id: "c-miss", arguments: "{}" },
+      { type: "function_call_output", call_id: "call1", output: "B" },
+      { type: "function_call_output", call_id: "call.1", output: "A" },
+      { type: "function_call", name: "zeta", call_id: "c-tail", arguments: "{}" },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "done" }] },
+    ],
+    reasoning: { effort: "high" },
+    max_output_tokens: 128,
+  };
+
+  it("google backend keeps client ids, chronological results, high thinking and upstream answer headroom", async () => {
+    resolveZedModels.mockImplementation(async () => catalogFor([
+      ["gemini-3.5-flash-lite", { provider: "google" }],
+    ]));
+    const captured = {};
+    mockCatalogFetch(captured);
+    const executor = makeExecutor();
+
+    const deferred = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, "gemini-3.5-flash-lite", structuredClone(ZED_TOOL_HISTORY), false, {}, "zed");
+    const assistant = deferred.messages.find((m) => m.role === "assistant" && m.tool_calls?.length);
+    expect(assistant.tool_calls.map((t) => t.id)).toEqual(["call.1", "call1", "c-miss"]);
+    expect(deferred.messages.filter((m) => m.role === "tool")).toHaveLength(2);
+    expect(deferred.reasoning_effort).toBe("high");
+
+    await executor.execute({ model: "gemini-3.5-flash-lite", body: deferred, stream: false, credentials: {} });
+
+    const req = captured.body.provider_request;
+    const calls = req.contents.flatMap((c) => c.parts.filter((p) => p.functionCall).map((p) => p.functionCall));
+    expect(calls.map((c) => c.id)).toEqual(["call.1", "call1", "c-miss", "c-tail"]);
+    const resps = req.contents.flatMap((c) => c.parts.filter((p) => p.functionResponse).map((p) => p.functionResponse));
+    expect(resps.map((r) => r.id)).toEqual(["call1", "call.1"]);
+    expect(resps.map((r) => r.name)).toEqual(["beta", "alpha"]);
+    expect(req.generationConfig.thinkingConfig).toMatchObject({ thinkingLevel: "high" });
+    expect(req.generationConfig.maxOutputTokens).toBe(65535);
+  });
+
+  it("anthropic backend retains Anthropic id sanitation and placeholder results", async () => {
+    resolveZedModels.mockImplementation(async () => catalogFor([
+      ["claude-sonnet-4.5", { provider: "anthropic" }],
+    ]));
+    const captured = {};
+    mockCatalogFetch(captured);
+    const executor = makeExecutor();
+
+    const deferred = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, "claude-sonnet-4.5", structuredClone(ZED_TOOL_HISTORY), false, {}, "zed");
+
+    await executor.execute({ model: "claude-sonnet-4.5", body: deferred, stream: false, credentials: {} });
+
+    const req = captured.body.provider_request;
+    const toolUses = req.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : []).filter((b) => b.type === "tool_use"));
+    for (const tu of toolUses) {
+      expect(tu.id).toMatch(/^[a-zA-Z0-9_-]+$/);
+    }
+    const toolResults = req.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : []).filter((b) => b.type === "tool_result"));
+    expect(toolResults.length).toBeGreaterThanOrEqual(3);
+    const uncoveredId = toolUses.at(-1).id;
+    expect(toolResults.some((tr) => tr.tool_use_id === uncoveredId)).toBe(true);
   });
 });

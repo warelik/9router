@@ -37,6 +37,17 @@ function emitFunctionCall(functionCall, state, signature = null) {
   return buildChunk(chunkMeta(state), { tool_calls: [toolCall] }, null);
 }
 
+// Emit a text part as reasoning/content and remember it for the turn signature (see finish).
+function emitText(part, isThought, state) {
+  if (isThought) state.turnReasoning = (state.turnReasoning || "") + part.text;
+  else state.turnContent = (state.turnContent || "") + part.text;
+  return buildChunk(
+    chunkMeta(state),
+    isThought ? reasoningDelta(part.text) : { content: part.text },
+    null
+  );
+}
+
 // Convert Gemini response chunk to OpenAI format
 export function geminiToOpenAIResponse(chunk, state) {
   if (!chunk) return null;
@@ -61,6 +72,13 @@ export function geminiToOpenAIResponse(chunk, state) {
   // Process parts
   if (content?.parts) {
     for (const part of content.parts) {
+      // Server-executed tool parts (googleSearch on Gemini 3) never reach the client;
+      // capture them verbatim, in order, without letting their signatures become the
+      // pending signature of the following functionCall.
+      if (part.toolCall || part.toolResponse) {
+        (state.geminiServerParts ??= []).push(part);
+        continue;
+      }
       const hasThoughtSig = part.thoughtSignature || part.thought_signature;
       if (hasThoughtSig && typeof hasThoughtSig === "string") {
         state.pendingThoughtSignature = hasThoughtSig;
@@ -78,11 +96,7 @@ export function geminiToOpenAIResponse(chunk, state) {
         }
 
         if (hasTextContent) {
-          results.push(buildChunk(
-            chunkMeta(state),
-            isThought ? reasoningDelta(part.text) : { content: part.text },
-            null
-          ));
+          results.push(emitText(part, isThought, state));
         }
 
         if (hasFunctionCall) {
@@ -97,11 +111,7 @@ export function geminiToOpenAIResponse(chunk, state) {
       // can also stream thought parts without a signature; those must not be
       // surfaced as normal assistant content in OpenAI-compatible clients.
       if (part.text !== undefined && part.text !== "") {
-        results.push(buildChunk(
-          chunkMeta(state),
-          isThought ? reasoningDelta(part.text) : { content: part.text },
-          null
-        ));
+        results.push(emitText(part, isThought, state));
       }
 
       // Function call
@@ -136,6 +146,26 @@ export function geminiToOpenAIResponse(chunk, state) {
 
   // Finish reason - include usage in final chunk
   if (candidate.finishReason) {
+    // Server parts that never preceded a functionCall belong to a turn that ended on
+    // text; anchor them to the turn key so the next request can replay them.
+    if (state.geminiServerParts?.length) {
+      storeGeminiServerPartsForTurn(
+        { reasoning: state.turnReasoning, content: state.turnContent, scope: state.turnScope, sessionId: state.serverPartsSessionId },
+        state.geminiServerParts,
+        state.model
+      );
+      state.geminiServerParts = [];
+    }
+    // A signature still pending at the end of a turn without tool calls belongs to the
+    // thinking that produced this text; keep it so the next request can replay it.
+    if (state.pendingThoughtSignature && state.geminiToolCallCount === 0) {
+      storeGeminiTurnSignature(
+        { reasoning: state.turnReasoning, content: state.turnContent, scope: state.turnScope },
+        state.pendingThoughtSignature,
+        state.model
+      );
+      state.pendingThoughtSignature = null;
+    }
     let finishReason = toOpenAIFinish(candidate.finishReason, "gemini");
     if (finishReason === OPENAI_FINISH.STOP && state.geminiToolCallCount > 0) {
       finishReason = OPENAI_FINISH.TOOL_CALLS;
