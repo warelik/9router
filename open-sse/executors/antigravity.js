@@ -8,6 +8,7 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { cleanJSONSchemaForAntigravity, normalizeGeminiContents } from "../translator/formats/gemini.js";
 import { DEFAULT_THINKING_AG_SIGNATURE } from "../config/defaultThinkingSignature.js";
 import { getGeminiThoughtSignatureSync } from "../services/thoughtSignatureStore.js";
+import { unwrapAntigravityResponse, validateAntigravityFieldMask } from "../utils/antigravityNative.js";
 
 // Sanitize function name: Gemini requires [a-zA-Z_][a-zA-Z0-9_.:\-]{0,63}
 function sanitizeFunctionName(name) {
@@ -54,6 +55,60 @@ const ANTIGRAVITY_REQUEST_BLACKLIST = [
 const stripBlacklisted = obj => {
   for (const key of ANTIGRAVITY_REQUEST_BLACKLIST) delete obj[key];
 };
+
+function rewriteSystemPrompt(request) {
+  if (!request.systemInstruction?.parts) return;
+  for (const part of request.systemInstruction.parts) {
+    if (typeof part.text !== "string") continue;
+    for (const { from, to } of ANTIGRAVITY_PROMPT_REWRITES) part.text = part.text.replaceAll(from, to);
+  }
+}
+
+function nativeGeminiRequestsJsonOutput(body) {
+  if (!body || typeof body !== "object") return false;
+  return [body.generationConfig, body.generation_config].some(config =>
+    config && typeof config === "object"
+    && (config.responseMimeType === "application/json" || config.response_mime_type === "application/json")
+  );
+}
+
+function nativeGeminiUsesResponseSchema(request) {
+  return [request.generationConfig, request.generation_config].some(config =>
+    config && typeof config === "object"
+    && (Object.prototype.hasOwnProperty.call(config, "responseSchema")
+      || Object.prototype.hasOwnProperty.call(config, "response_schema"))
+  );
+}
+
+function nativeGeminiDisablesFunctionCalling(request) {
+  return [request.toolConfig, request.tool_config].some(toolConfig => {
+    if (!toolConfig || typeof toolConfig !== "object") return false;
+    return [toolConfig.functionCallingConfig, toolConfig.function_calling_config].some(config =>
+      config && typeof config === "object" && config.mode === "NONE"
+    );
+  });
+}
+
+function removeDisabledNativeGeminiDeclarations(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request)
+    || !nativeGeminiUsesResponseSchema(request) || !nativeGeminiDisablesFunctionCalling(request)
+    || !Array.isArray(request.tools)) return;
+
+  const remainingTools = [];
+  for (const toolGroup of request.tools) {
+    if (!toolGroup || typeof toolGroup !== "object" || Array.isArray(toolGroup)) {
+      remainingTools.push(toolGroup);
+      continue;
+    }
+    const hadDeclarations = Object.prototype.hasOwnProperty.call(toolGroup, "functionDeclarations")
+      || Object.prototype.hasOwnProperty.call(toolGroup, "function_declarations");
+    delete toolGroup.functionDeclarations;
+    delete toolGroup.function_declarations;
+    if (Object.keys(toolGroup).length || !hadDeclarations) remainingTools.push(toolGroup);
+  }
+  if (remainingTools.length) request.tools = remainingTools;
+  else delete request.tools;
+}
 
 // Image generation model name patterns
 const IMAGE_MODEL_PATTERNS = [
@@ -172,6 +227,30 @@ export class AntigravityExecutor extends BaseExecutor {
   transformRequest(model, body, stream, credentials) {
     const projectId = credentials?.projectId || this.generateProjectId();
 
+    if (credentials?.nativeGeminiPassthrough) {
+      const request = structuredClone(body);
+      // Antigravity can emit a forbidden tool call when a native JSON Schema
+      // request disables calling but still carries function declarations.
+      // Preserve built-in/unknown tools and every other request field.
+      removeDisabledNativeGeminiDeclarations(request);
+      delete request.model;
+      delete request.stream;
+      const rawSessionId = request.sessionId || resolveSessionId({
+        headers: credentials.rawHeaders, body,
+        connectionId: credentials.email || credentials.connectionId, scope: "antigravity",
+      });
+      request.sessionId = toNumericSessionId(rawSessionId) || rawSessionId;
+      rewriteSystemPrompt(request);
+      this._lastSessionId = request.sessionId;
+      // Keep the provider's existing IDE/auth fingerprint. In particular, chat
+      // must omit requestType, and the client payload must not replace it.
+      return {
+        project: projectId, model, userAgent: "antigravity",
+        requestId: buildIdeRequestId({ body: {}, request, credentials, model, requestType: "agent" }),
+        request,
+      };
+    }
+
     // OpenAI clients may include stream_options even for non-streaming calls.
     // Google generateContent rejects that combination before processing the request.
     if (stream !== true) delete body.stream_options;
@@ -228,6 +307,7 @@ export class AntigravityExecutor extends BaseExecutor {
 
     // ─── Standard (non-image) request ───
     // Fix contents for Claude models via Antigravity
+    const geminiBacked = !String(body.model || model || "").toLowerCase().includes("claude");
     const rawContents = (body.request?.contents || []).map(c => {
       let role = c.role;
       // functionResponse must be role "user" for Claude models
@@ -267,7 +347,7 @@ export class AntigravityExecutor extends BaseExecutor {
         parts: modifiedParts || parts || [],
       };
     });
-    const contents = normalizeGeminiContents(rawContents, model);
+    const contents = normalizeGeminiContents(rawContents, model, { synthesizeTerminalToolResponse: !geminiBacked });
 
     // Sanitize tool schemas and function names before sending to Antigravity.
     let tools = body.request?.tools;
@@ -281,13 +361,19 @@ export class AntigravityExecutor extends BaseExecutor {
           const name = sanitizeFunctionName(fn.name);
           if (seenToolNames.has(name)) continue;
           seenToolNames.add(name);
-          allDeclarations.push({
-            ...fn,
-            name,
-            parameters: fn.parameters
-              ? cleanJSONSchemaForAntigravity(structuredClone(fn.parameters))
-              : { type: "object", properties: { reason: { type: "string", description: "Brief explanation" } }, required: ["reason"] }
-          });
+          const decl = { ...fn, name };
+          if (geminiBacked) {
+            if (decl.parametersJsonSchema !== undefined) {
+              delete decl.parameters;
+            } else if (decl.parameters !== undefined) {
+              decl.parameters = cleanJSONSchemaForAntigravity(structuredClone(decl.parameters));
+            }
+          } else {
+            decl.parameters = decl.parameters
+              ? cleanJSONSchemaForAntigravity(structuredClone(decl.parameters))
+              : { type: "object", properties: { reason: { type: "string", description: "Brief explanation" } }, required: ["reason"] };
+          }
+          allDeclarations.push(decl);
         }
       }
       tools = allDeclarations.length > 0 ? [{ functionDeclarations: allDeclarations }] : [];
@@ -299,14 +385,7 @@ export class AntigravityExecutor extends BaseExecutor {
     
     // Rewrite competing-client branding in system prompts (e.g. Zed's Claude prompt,
     // OpenCode naming) so Antigravity doesn't flag the request with a 429 Quota Exhausted.
-    if (requestWithoutTools.systemInstruction?.parts) {
-      for (const part of requestWithoutTools.systemInstruction.parts) {
-        if (typeof part.text !== "string") continue;
-        for (const { from, to } of ANTIGRAVITY_PROMPT_REWRITES) {
-          part.text = part.text.replaceAll(from, to);
-        }
-      }
-    }
+    rewriteSystemPrompt(requestWithoutTools);
 
     const generationConfig = { ...(requestWithoutTools.generationConfig || {}) };
     if (generationConfig.maxOutputTokens > MAX_ANTIGRAVITY_OUTPUT_TOKENS) {
@@ -320,7 +399,7 @@ export class AntigravityExecutor extends BaseExecutor {
       ...(tools && { tools }),
       sessionId,
       safetySettings: undefined,
-      ...(tools?.length > 0 && { toolConfig: { functionCallingConfig: { mode: "VALIDATED" } } })
+      ...(tools?.length > 0 && { toolConfig: (geminiBacked && _originalToolConfig) || { functionCallingConfig: { mode: "VALIDATED" } } })
     };
 
     // Strip blacklisted thinking fields from top-level body (set by thinkingUnified.js at root, not body.request)
@@ -344,6 +423,19 @@ export class AntigravityExecutor extends BaseExecutor {
       requestId: buildIdeRequestId({ body, request: transformedRequest, credentials, model, requestType: "agent" }),
       request: transformedRequest
     };
+  }
+
+  async execute(options) {
+    const jsonOutput = Boolean(options.credentials?.nativeGeminiPassthrough && nativeGeminiRequestsJsonOutput(options.body));
+    if (options.credentials?.nativeGeminiPassthrough) {
+      const error = validateAntigravityFieldMask(options.credentials.nativeGeminiRequest);
+      if (error) return { response: Response.json(error, { status: 400 }), headers: {}, url: null, transformedBody: null };
+    }
+    const result = await super.execute(options);
+    if (options.credentials?.nativeGeminiPassthrough) {
+      result.response = await unwrapAntigravityResponse(result.response, options.stream, options.credentials.nativeGeminiRequest, { jsonOutput });
+    }
+    return result;
   }
 
   async refreshCredentials(credentials, log, proxyOptions = null) {
