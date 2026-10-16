@@ -67,6 +67,13 @@ export const DEFAULT_MIN_TOKENS = 32000;
 
 export const TOKEN_SAVER_HEADER = "x-9router-token-saver";
 
+export const PORTABLE_COLLABORATION = {
+  header: "x-9router-portable-collaboration",
+  namespace: "collaboration",
+  messageTools: ["spawn_agent", "send_message", "followup_task"],
+  aliasPrefix: "collab_plain_",
+};
+
 // Retry config for 429 responses (legacy - kept for backward compatibility)
 export const RETRY_CONFIG = {
   maxAttempts: 2,

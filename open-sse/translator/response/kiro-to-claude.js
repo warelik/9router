@@ -15,6 +15,7 @@
  */
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
+import { resolveToolName } from "../../utils/opencodeFingerprint.js";
 
 function stopThinkingBlock(state, results) {
   if (!state.thinkingBlockStarted) return;
@@ -51,7 +52,7 @@ function convertFinishReason(reason) {
 function restoreToolName(stateOrData, name) {
   const raw = name || "";
   const map = stateOrData?.toolNameMap || stateOrData?._toolNameMap;
-  return map && typeof map.get === "function" && map.has(raw) ? map.get(raw) : raw;
+  return resolveToolName(raw, map).name;
 }
 
 export function kiroToClaudeResponse(chunk, state) {

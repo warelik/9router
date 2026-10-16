@@ -10,6 +10,7 @@ import { toOpenAIUsage } from "../concerns/usage.js";
 import { fallbackToolCallId } from "../concerns/toolCall.js";
 import { reasoningDelta } from "../concerns/reasoning.js";
 import { toOpenAIFinish } from "../concerns/finishReason.js";
+import { resolveToolName } from "../../utils/opencodeFingerprint.js";
 
 // Build chunk meta for current kiro state
 function chunkMeta(state) {
@@ -25,7 +26,7 @@ function chunkMeta(state) {
 function restoreToolName(state, name) {
   const raw = name || "";
   const map = state?.toolNameMap;
-  return map && typeof map.get === "function" && map.has(raw) ? map.get(raw) : raw;
+  return resolveToolName(raw, map).name;
 }
 
 export function kiroToOpenAIResponse(chunk, state) {

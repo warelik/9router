@@ -6,7 +6,8 @@ import { toOpenAIUsage } from "../concerns/usage.js";
 import { reasoningDelta } from "../concerns/reasoning.js";
 import { encodeDataUri } from "../concerns/image.js";
 import { toOpenAIFinish } from "../concerns/finishReason.js";
-import { storeGeminiThoughtSignature } from "../../services/thoughtSignatureStore.js";
+import { resolveToolName } from "../../utils/opencodeFingerprint.js";
+import { storeGeminiThoughtSignature, storeGeminiTurnSignature, storeGeminiServerParts, storeGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
 
 // Build chunk meta for current gemini state
 function chunkMeta(state) {
@@ -17,12 +18,18 @@ function chunkMeta(state) {
 function emitFunctionCall(functionCall, state, signature = null) {
   const rawName = functionCall.name;
   // Restore original tool name from mapping (AG cloaking)
-  const fcName = state.toolNameMap?.get(rawName) || rawName;
+  const fcName = state.toolNameMap ? resolveToolName(rawName, state.toolNameMap).name : rawName;
   const fcArgs = functionCall.args || {};
   const toolCallIndex = state.functionIndex++;
   const callId = functionCall.id || `${fcName}-${Date.now()}-${toolCallIndex}`;
   if (signature) {
     storeGeminiThoughtSignature(callId, signature, state.sessionId, state.model);
+  }
+  // Server-side parts accumulated so far in this turn belong to this call: they
+  // must be replayed verbatim ahead of its functionCall on later requests.
+  if (state.geminiServerParts?.length) {
+    storeGeminiServerParts(callId, state.geminiServerParts, state.serverPartsSessionId, state.model, state.turnScope);
+    state.geminiServerParts = [];
   }
   const toolCall = {
     id: callId,

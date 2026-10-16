@@ -207,9 +207,22 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
       const { body: cloakedBody, toolNameMap } = cloakClaudeTools(result);
       result = cloakedBody;
       if (toolNameMap?.size > 0) {
-        result._toolNameMap = toolNameMap;
+        const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
+        for (const [key, value] of toolNameMap) merged.set(key, value);
+        result._toolNameMap = merged;
       }
     }
+  }
+
+  if (sourceToolNameMap) {
+    const targetMap = result._toolNameMap instanceof Map ? result._toolNameMap : null;
+    const merged = new Map();
+    if (targetMap) for (const [key, value] of targetMap) merged.set(key, value);
+    for (const [key, value] of sourceToolNameMap) {
+      if (value !== null && typeof value === "object") merged.set(key, value);
+      else if (!merged.has(key)) merged.set(key, value);
+    }
+    if (merged.size > 0) result._toolNameMap = merged;
   }
 
   // Antigravity cloaking disabled
