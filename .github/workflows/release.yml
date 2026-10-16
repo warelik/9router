@@ -144,7 +144,7 @@ jobs:
             io.9router.patches.sha256=${{ env.PATCHSET_SHA256 }}
           outputs: type=docker,dest=${{ runner.temp }}/9router-image.tar
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=max,ignore-error=true
       - name: Load And Check Runtime Health And Version
         run: |
           set -euo pipefail
