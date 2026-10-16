@@ -105,14 +105,71 @@ class RepairBoundaryTests(unittest.TestCase):
         self.assertFalse(result["waiting"])
         copy.assert_called_once_with(HEAD, Path(directory) / "proposal")
 
-    def test_an_empty_push_cannot_wait_forever(self):
+    def test_an_empty_push_does_not_prevent_rechecking_the_original_candidate(self):
         with (patch.object(release, "repair_pull", return_value=STATE),
               patch.object(release, "repair_comments",
                            return_value=[request(age=release.REVIEW_WAIT_SECONDS + 1)]),
               patch.object(release, "repair_changes", return_value=([], False)),
-              patch.object(release, "output"),
-              self.assertRaisesRegex(ValueError, "two-hour")):
+              patch.object(release, "output")):
+            result = release.proposal(REPO, CONFIG, Path("/unused"))
+        self.assertTrue(result["deferred"])
+
+    def test_policy_minor_findings_request_followup_without_blocking_acceptance(self):
+        review = {"body": f"<!-- 9router-policy:{HEAD} -->", "created_at": request()["created_at"]}
+        with (patch.object(release, "repair_pull", return_value=STATE),
+              patch.object(release, "repair_comments", return_value=[review]),
+              patch.object(release, "repair_changes", return_value=(["scripts/release.py"], True)),
+              patch.object(release, "policy_review", return_value=(True, "Accepted")),
+              patch.object(release, "minor_findings", return_value=[{"body": "P2 fix"}]),
+              patch.object(release, "output") as output):
             release.proposal(REPO, CONFIG, Path("/unused"))
+        self.assertTrue(output.call_args.kwargs["ready"])
+        self.assertTrue(output.call_args.kwargs["followup"])
+
+    def test_recovered_candidate_closes_only_the_unchanged_blocking_repair(self):
+        with (patch.object(release, "api", side_effect=[
+                  {"sha": CONFIG}, {"state": "open", "head": {"sha": HEAD}}, {}, {}]) as api):
+            release.close_recovered_repair(REPO, CONFIG, state=STATE)
+        self.assertEqual(api.call_args.kwargs, {"method": "PATCH", "data": {"state": "closed"}})
+
+    def test_minor_or_changed_repair_is_not_closed_by_default_candidate_recovery(self):
+        for state, minor, head in (
+            ({**STATE, "nonblocking": True}, False, HEAD),
+            (STATE, True, HEAD), (STATE, False, SEED),
+        ):
+            with (self.subTest(minor=minor, head=head),
+                  patch.object(release, "api", side_effect=[
+                      {"sha": CONFIG}, {"state": "open", "head": {"sha": head}}]) as api):
+                release.close_recovered_repair(REPO, CONFIG, state=state, has_minor=minor)
+            self.assertFalse(any(c.kwargs.get("method") in {"POST", "PATCH"} for c in api.call_args_list))
+
+    def test_policy_minor_followup_targets_the_new_adopted_configuration(self):
+        adopted = "e" * 40
+        review = {"body": f"<!-- 9router-policy:{HEAD} -->", "created_at": request()["created_at"]}
+        finding = {"body": "P2 policy followup", "path": "scripts/release.py", "line": 1}
+        def api(path, **kwargs):
+            if path.endswith("/commits/downstream"):
+                return {"sha": CONFIG}
+            return {"state": "open", "head": {"sha": HEAD}}
+        def run(*args, **kwargs):
+            return adopted if args == ("git", "rev-parse", "HEAD") else ""
+        with (tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, ENV),
+              patch.object(release, "repair_pull", return_value=STATE),
+              patch.object(release, "repair_changes", return_value=(["scripts/release.py"], True)),
+              patch.object(release, "repair_comments", return_value=[review]),
+              patch.object(release, "policy_review", return_value=(True, "Accepted")),
+              patch.object(release, "minor_findings", return_value=[finding]),
+              patch.object(release, "api", side_effect=api),
+              patch.object(release, "pages", return_value=[]),
+              patch.object(release, "run", side_effect=run),
+              patch.object(release.subprocess, "check_output", return_value=b"verified diff"),
+              patch.object(release.subprocess, "run", return_value=SimpleNamespace(stdout="", returncode=1)),
+              patch.object(release, "request_repair") as followup):
+            release.land_repair(Path(directory))
+        self.assertEqual(followup.call_args.kwargs["config"], adopted)
+        self.assertEqual(followup.call_args.kwargs["upstream"], UPSTREAM)
+        self.assertTrue(followup.call_args.kwargs["nonblocking"])
+        self.assertIn("P2 policy followup", followup.call_args.kwargs["evidence"])
 
 
 class NativeTaskTests(unittest.TestCase):
@@ -310,6 +367,12 @@ class AdoptionTests(unittest.TestCase):
             self.assertFalse({"GH_TOKEN", "GITHUB_TOKEN", "CODEX_REQUEST_TOKEN",
                               "NINEROUTER_KEY", "GITHUB_ENV", "GITHUB_PATH"} & env.keys())
             self.assertEqual(env["CI"], "true")
+            self.assertEqual(args[:4], ["docker", "run", "--rm", "--read-only"])
+            self.assertIn("--network=none", args)
+            self.assertIn("--cap-drop=ALL", args)
+            self.assertIn("--security-opt=no-new-privileges", args)
+            mounts = [args[i + 1] for i, value in enumerate(args) if value == "--mount"]
+            self.assertEqual(sum(m.endswith(",readonly") for m in mounts), 2)
             for name in ("HOME", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
                          "XDG_STATE_HOME", "XDG_CACHE_HOME", "DATA_DIR"):
                 path = Path(env[name])

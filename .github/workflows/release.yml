@@ -300,4 +300,5 @@ jobs:
           CANDIDATE_PR: ${{ needs.prepare.outputs.pr }}
           CANDIDATE_SHA: ${{ needs.prepare.outputs.sha }}
           REPAIR_HEAD: ${{ needs.prepare.outputs.repair_head }}
+          NONBLOCKING_FOLLOWUP: ${{ !contains(needs.*.result, 'failure') && needs.prepare.outputs.followup == 'true' }}
         run: python3 scripts/release.py repair "$RUNNER_TEMP/9router-repair"

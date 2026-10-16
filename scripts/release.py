@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 REPAIR_STATE = re.compile(r"<!-- 9router-repair:v1 (\{[^\n]+\}) -->")
 FIX_REQUEST = re.compile(r"<!-- 9router-fix:([0-9a-f]{40}):([1-3]) -->")
 MAX_FIX_ATTEMPTS = 3
+POLICY_IMAGE = "docker.io/library/python@sha256:5560e9ab8709f459489e5b8aa696eda8a07ef821e14bb122be62d91234bfa98b"
 REVIEW_WAIT_SECONDS = 7200
 WAITING_REVIEW = "Waiting for Codex; no completed exact-SHA review"
 
@@ -362,16 +363,14 @@ def proposal(repo, config, directory):
     active = [c for c in requests
               if FIX_REQUEST.search(c["body"]).group(1) == state["head"]]
     if active or state["head"] == state["seed"]:
-        pending_review(requests[0]["created_at"] if requests else state["created_at"])
         output(ready=False, mode="waiting", reason="Codex is repairing the patch series",
                repair_pr=state["number"], repair_head=state["head"], upstream=state["upstream"])
-        return {**state, "waiting": True}
+        return {**state, "waiting": True, "deferred": True}
     changed, policy = repair_changes(state)
     if not changed:
-        pending_review(requests[0]["created_at"] if requests else state["created_at"])
         output(ready=False, mode="waiting", reason="Codex is repairing the patch series",
                repair_pr=state["number"], repair_head=state["head"], upstream=state["upstream"])
-        return {**state, "waiting": True}
+        return {**state, "waiting": True, "deferred": True}
     if policy:
         marker = f"<!-- 9router-policy:{state['head']} -->"
         review_requests = [c for c in comments if marker in (c.get("body") or "")]
@@ -386,7 +385,8 @@ def proposal(repo, config, directory):
                 token=owner_token(repo))]
         ready, reason = policy_review(repo, state, review_requests[0]["created_at"])
         output(ready=ready, mode="policy", reason=reason, repair_pr=state["number"],
-               repair_head=state["head"], upstream=state["upstream"])
+               repair_head=state["head"], upstream=state["upstream"],
+               followup=ready and bool(minor_findings(repo, state["number"], state["head"])))
         if not ready and reason != WAITING_REVIEW:
             raise ValueError(reason)
         if not ready:
@@ -419,6 +419,21 @@ def minor_findings(repo, pr, sha):
             and MINOR_FINDING.search(finding.get("body") or "")]
 
 
+def close_recovered_repair(repo, config, *, state=None, has_minor=False):
+    if has_minor or api(f"repos/{repo}/commits/downstream")["sha"] != config:
+        return
+    state = state or repair_pull(repo, config)
+    if state is None or state.get("nonblocking"):
+        return
+    pull = api(f"repos/{repo}/pulls/{state['number']}")
+    if pull["state"] != "open" or pull["head"]["sha"] != state["head"]:
+        return
+    api(f"repos/{repo}/issues/{state['number']}/comments", method="POST",
+        data={"body": "The original candidate passed normal verification without this proposal. "
+                       "No unpublished agent change was accepted; the obsolete repair is closed."})
+    api(f"repos/{repo}/pulls/{state['number']}", method="PATCH", data={"state": "closed"})
+
+
 def prepare(app):
     repo = os.environ["GITHUB_REPOSITORY"]
     config = os.environ["GITHUB_SHA"]
@@ -429,6 +444,9 @@ def prepare(app):
         output(reason="Superseded configuration; a newer cycle owns the update", mode="waiting")
         return
     state = proposal(repo, config, app.parent)
+    deferred = state if state and state.get("deferred") else None
+    if deferred:
+        state = None
     if state and state["waiting"]:
         return
     upstream = state["upstream"] if state else api(f"repos/{UPSTREAM}/commits/{UPSTREAM_BRANCH}")["sha"]
@@ -436,7 +454,8 @@ def prepare(app):
         raise ValueError("Expected a full upstream commit")
     patches, patchset = patch_identity(state["patches"] if state else ROOT / "patches")
     output(ready=False, mode="application", upstream=upstream, patchset=patchset,
-           repair_pr=state["number"] if state else "", repair_head=state["head"] if state else "")
+           repair_pr=state["number"] if state else "",
+           repair_head=state["head"] if state else deferred["head"] if deferred else "")
     if app.exists():
         raise ValueError("Source destination must be fresh")
     run("git", "init", str(app))
@@ -472,7 +491,10 @@ def prepare(app):
                 if not ready:
                     output(reason=reason, pr=pull["number"])
                     raise ValueError(reason)
-                output(followup=bool(minor_findings(repo, pull["number"], sha)), pr=pull["number"])
+                minor = bool(minor_findings(repo, pull["number"], sha))
+                output(followup=minor or bool(deferred and deferred.get("nonblocking")), pr=pull["number"])
+                if deferred:
+                    close_recovered_repair(repo, config, state=deferred, has_minor=minor)
                 reviewed = True
                 break
         if not reviewed:
@@ -522,7 +544,8 @@ def prepare(app):
     print(reason)
     output(ready=ready, reason=reason, sha=sha, upstream=upstream, patchset=patchset,
            version=version, release=release, pr=pr,
-           followup=ready and bool(minor_findings(repo, pr, sha)))
+           followup=ready and (bool(minor_findings(repo, pr, sha))
+                              or bool(deferred and deferred.get("nonblocking"))))
     if not ready:
         if reason != WAITING_REVIEW:
             raise ValueError(reason)
@@ -532,7 +555,7 @@ def prepare(app):
         pending_review(min(c["created_at"] for c in requests))
 
 
-def escalation(repo, config, upstream, reason):
+def escalation(repo, config, upstream, reason, *, nonblocking=False):
     marker = f"<!-- 9router-escalation:{config}:{upstream} -->"
     for issue in pages(f"repos/{repo}/issues?state=open"):
         if (marker in (issue.get("body") or "")
@@ -543,7 +566,7 @@ def escalation(repo, config, upstream, reason):
         "assignees": [repo.split("/")[0]],
         "body": (
             f"@{repo.split('/')[0]} The bounded machine repair did not produce a verified fix. "
-            "Publication is blocked; the last verified release is retained. "
+            f"{'The nonblocking follow-up remains unresolved; verified publication may continue. ' if nonblocking else 'Publication is blocked; the last verified release is retained. '}"
             "No server deployment or data change is performed by this workflow.\n\n"
             f"Configuration: `{config}`. Upstream: `{upstream}`.\n\n"
             f"Evidence:\n```\n{reason[-16000:].replace('```', chr(39) * 3)}\n```\n\n"
@@ -580,8 +603,9 @@ def failure_evidence(repo):
     return "\n".join(lines)[-24000:]
 
 
-def request_repair(directory):
-    repo, config = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"]
+def request_repair(directory, *, config=None, upstream=None, evidence=None, nonblocking=False):
+    repo = os.environ["GITHUB_REPOSITORY"]
+    config = config or os.environ["GITHUB_SHA"]
     if api(f"repos/{repo}/commits/downstream")["sha"] != config:
         print("Configuration superseded; do not repair an obsolete candidate")
         return
@@ -590,16 +614,19 @@ def request_repair(directory):
     if state and verified_head and state["head"] != verified_head:
         print("A newer repair was pushed; its synchronization event will verify it")
         return
-    upstream = state["upstream"] if state else os.environ.get("UPSTREAM_SHA", "")
+    nonblocking = nonblocking or os.environ.get("NONBLOCKING_FOLLOWUP") == "true" or bool(
+        state and state.get("nonblocking"))
+    upstream = state["upstream"] if state else upstream or os.environ.get("UPSTREAM_SHA", "")
     if not SHA.fullmatch(upstream):
         upstream = api(f"repos/{UPSTREAM}/commits/{UPSTREAM_BRANCH}")["sha"]
     if not SHA.fullmatch(config) or not SHA.fullmatch(upstream):
         raise ValueError("Machine repair requires exact source commits")
-    failure = failure_evidence(repo)
+    failure = evidence if evidence is not None else failure_evidence(repo)
     try:
         token = owner_token(repo)
     except (ValueError, subprocess.CalledProcessError) as error:
-        escalation(repo, config, upstream, f"Native owner authorization unavailable: {error}\n\n{failure}")
+        escalation(repo, config, upstream, f"Native owner authorization unavailable: {error}\n\n{failure}",
+                   nonblocking=nonblocking)
     if state is None:
         directory.mkdir(parents=True, exist_ok=True)
         source, work = directory / "upstream", directory / "configuration"
@@ -612,7 +639,8 @@ def request_repair(directory):
         releases = pages(f"repos/{repo}/releases")
         published = max((r["id"] for r in releases if not r["draft"] and not r["prerelease"]), default=0)
         cycle = hashlib.sha256(f"{upstream}:{patch_identity(ROOT / 'patches')[1]}:{published}".encode()).hexdigest()
-        identity = {"schema": 1, "config": config, "upstream": upstream, "cycle": cycle}
+        identity = {"schema": 1, "config": config, "upstream": upstream,
+                    "cycle": cycle, "nonblocking": nonblocking}
         (context / "context.json").write_text(json.dumps(identity, indent=2) + "\n")
         with (context / "upstream.tar.gz").open("wb") as archive:
             subprocess.run(["git", "archive", "--format=tar.gz", "HEAD"], cwd=source, stdout=archive, check=True)
@@ -654,12 +682,13 @@ def request_repair(directory):
         try:
             pending_review(requests[0]["created_at"])
         except ValueError as error:
-            escalation(repo, config, upstream, f"{error}\n\n{failure}")
+            escalation(repo, config, upstream, f"{error}\n\n{failure}", nonblocking=nonblocking)
     if any(FIX_REQUEST.search(c["body"]).group(1) == state["head"] for c in requests):
         print(f"Native Codex task is already active on PR #{state['number']}")
         return
     if len(requests) >= MAX_FIX_ATTEMPTS:
-        escalation(repo, config, upstream, f"Three attempted fixes did not pass the gates.\n\n{failure}")
+        escalation(repo, config, upstream, f"Three attempted fixes did not pass the gates.\n\n{failure}",
+                   nonblocking=nonblocking)
     api(f"repos/{repo}/issues/{state['number']}/comments", method="POST",
         data={"body": repair_text(state, len(requests) + 1, failure)}, token=token)
     print(f"Requested native Codex fix on PR #{state['number']}; no deployment")
@@ -667,24 +696,36 @@ def request_repair(directory):
 
 def check_policy(candidate):
     """Run untrusted policy only in the read-only job, against trusted and new tests."""
+    launcher = (
+        "import sys,unittest;sys.path.insert(0,sys.argv[1]);import release;"
+        "suite=unittest.defaultTestLoader.discover(sys.argv[2],pattern='test_*.py');"
+        "sys.exit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())"
+    )
+    for tests in (ROOT / "scripts", candidate / "scripts"):
+        with tempfile.TemporaryDirectory(prefix="9router-policy-tests-") as temporary:
+            root = Path(temporary)
+            env = {name: os.environ[name] for name in ("PATH", "LANG", "LC_ALL", "TZ") if name in os.environ}
+            for name, path in {"HOME": root / "home", "TMPDIR": root / "tmp",
+                               "DATA_DIR": root / "data", "XDG_CONFIG_HOME": root / "config",
+                               "XDG_DATA_HOME": root / "data", "XDG_STATE_HOME": root / "state",
+                               "XDG_CACHE_HOME": root / "cache"}.items():
+                path.mkdir(mode=0o700, exist_ok=True)
+                env[name] = str(path)
+            env.update(CI="true", PYTHONDONTWRITEBYTECODE="1")
+            command = ["docker", "run", "--rm", "--read-only", "--network=none",
+                       "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                       "--user", f"{os.getuid()}:{os.getgid()}", "--workdir", str(root)]
+            for source in dict.fromkeys((ROOT.resolve(), candidate.resolve())):
+                command += ["--mount", f"type=bind,source={source},target={source},readonly"]
+            command += ["--mount", f"type=bind,source={root},target={root}"]
+            for name, value in env.items():
+                command += ["--env", f"{name}={value}"]
+            command += [POLICY_IMAGE, "python3", "-B", "-c", launcher,
+                        str(candidate / "scripts"), str(tests)]
+            subprocess.run(command, cwd=root, env=env, check=True)
+    # The linter's directory is never writable by candidate code.
     with tempfile.TemporaryDirectory(prefix="9router-policy-") as temporary:
         root = Path(temporary)
-        env = {name: os.environ[name] for name in ("PATH", "LANG", "LC_ALL", "TZ") if name in os.environ}
-        for name, path in {"HOME": root / "home", "TMPDIR": root / "tmp",
-                           "DATA_DIR": root / "data", "XDG_CONFIG_HOME": root / "config",
-                           "XDG_DATA_HOME": root / "data", "XDG_STATE_HOME": root / "state",
-                           "XDG_CACHE_HOME": root / "cache"}.items():
-            path.mkdir(mode=0o700, exist_ok=True)
-            env[name] = str(path)
-        env.update(CI="true", PYTHONDONTWRITEBYTECODE="1")
-        launcher = (
-            "import sys,unittest;sys.path.insert(0,sys.argv[1]);import release;"
-            "suite=unittest.defaultTestLoader.discover(sys.argv[2],pattern='test_*.py');"
-            "sys.exit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())"
-        )
-        for tests in (ROOT / "scripts", candidate / "scripts"):
-            subprocess.run([sys.executable, "-c", launcher, str(candidate / "scripts"), str(tests)],
-                           cwd=root, env=env, check=True)
         url = ("https://github.com/rhysd/actionlint/releases/download/v1.7.12/"
                "actionlint_1.7.12_linux_amd64.tar.gz")
         archive = urlopen(url, timeout=60).read()
@@ -717,6 +758,7 @@ def land_repair(directory):
                                      os.environ["CANDIDATE_SHA"], state["upstream"])
     if not ready:
         raise ValueError(reason)
+    followup = minor_findings(repo, state["number"], state["head"]) if policy else []
     if api(f"repos/{repo}/commits/downstream")["sha"] != config:
         raise ValueError("Default configuration changed; do not land stale repairs")
     directory.mkdir(parents=True, exist_ok=True)
@@ -762,6 +804,12 @@ def land_repair(directory):
         if (marker in (issue.get("body") or "")
                 and issue.get("user", {}).get("login") in {"github-actions[bot]", repo.split("/")[0]}):
             api(f"repos/{repo}/issues/{issue['number']}", method="PATCH", data={"state": "closed"})
+    if followup:
+        evidence = (f"Nonblocking policy findings on https://github.com/{repo}/pull/{state['number']} "
+                    f"at reviewed commit {state['head']}; adopted as {commit}.\n\n"
+                    + "\n\n".join(f"{f.get('path')}:{f.get('line')}\n{f['body']}" for f in followup))
+        request_repair(directory / "followup", config=commit, upstream=state["upstream"],
+                       evidence=evidence, nonblocking=True)
     api(f"repos/{repo}/actions/workflows/release.yml/dispatches", method="POST", data={"ref": "downstream"})
     print(f"Adopted {commit}; requested normal exact-source verification and release")
 
@@ -1011,6 +1059,8 @@ def publish(directory):
     close_published_reviews(repo, sha, os.environ["UPSTREAM_SHA"],
                             f"review/{os.environ['UPSTREAM_SHA']}-{os.environ['PATCHSET_SHA256']}")
     print(f"Published {tag}; VPS untouched")
+    close_recovered_repair(repo, os.environ["GITHUB_SHA"],
+                           has_minor=bool(minor_findings(repo, pr, sha)))
 
 
 def main():
