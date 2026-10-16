@@ -107,14 +107,35 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // whose wire format has no supported transport (for example MiniMax-M3:
   // OpenAI clients should stay on /chat/completions; other clients can fall
   // back to its declared Claude target).
-  const targetFormat = useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
-  if (useTransport && credentials) credentials.runtimeTransport = useTransport;
+  const nativeAntigravity = sourceFormat === FORMATS.GEMINI && provider === "antigravity"
+    && supportsNativeGemini(provider, model);
+  // The executor unwraps Cloud Code responses into Gemini for this source only.
+  // Its global Antigravity format remains in use for OpenAI/Claude/IDE clients.
+  const targetFormat = nativeAntigravity ? FORMATS.GEMINI
+    : useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
+  const nativeGemini = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
+  // A response projection can intentionally hide the native completion field.
+  // Keep this metadata out of the provider body and cache prefix.
+  const nativeResponseProjection = nativeGemini ? {
+    masks: [
+      ...(clientRawRequest?.queryParams || [])
+        .filter(([name]) => name === "fields" || name === "$fields")
+        .map(([, value]) => value),
+      ...Object.entries(clientRawRequest?.headers || {})
+        .filter(([name]) => name.toLowerCase() === "x-goog-fieldmask")
+        .map(([, value]) => value),
+    ],
+  } : null;
+  // When the model guard rejects the source-matched transport, translation
+  // must dispatch to the transport matching its target wire format.
+  const effectiveTransport = useTransport || resolveTransport(provider, targetFormat);
+  if (effectiveTransport && credentials) credentials.runtimeTransport = effectiveTransport;
   const stripList = getModelStrip(alias, model);
   const upstreamModel = getModelUpstreamId(alias, model);
 
   // Inject provider-level thinking config override (only if client hasn't set)
   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
-  if (providerThinking?.mode && providerThinking.mode !== "auto") {
+  if (!nativeGemini && providerThinking?.mode && providerThinking.mode !== "auto") {
     const mode = providerThinking.mode;
     if (mode === "on" && !body.thinking) {
       console.log("Injecting provider-level thinking config override: on");
