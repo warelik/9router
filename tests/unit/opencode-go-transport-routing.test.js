@@ -10,8 +10,8 @@
 //   - deepseek × {openai, claude, openai-responses} × {bare, (max)} — the endpoint matrix
 //     under dispute in #3278/#3332. Bare and suffixed cells must resolve identically.
 //   - glm/kimi (chat-only) + (max) — regression cells: with the thinking suffix, the guard
-//     is bypassed on master (suffix isn't stripped before the registry lookup) and these get
-//     routed to /messages, which the upstream does not serve for them.
+//     must reject unsupported source endpoints, then use the translated target's supported
+//     transport rather than falling through to the provider's chat default implicitly.
 //   - minimax + (max) + claude — suffix must NOT block a genuinely declared format.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -96,14 +96,18 @@ const RESPONSE_BY_FORMAT = {
 };
 
 async function route(model, sourceFormat) {
-  executeMock.mockResolvedValueOnce({
-    response: new Response(JSON.stringify(RESPONSE_BY_FORMAT[sourceFormat === "openai" ? "openai" : sourceFormat] || RESPONSE_BY_FORMAT.openai), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    }),
-    url: ENDPOINTS[sourceFormat] || ENDPOINTS.openai,
-    headers: {},
-    transformedBody: null,
+  executeMock.mockImplementationOnce(async ({ credentials }) => {
+    const format = credentials.runtimeTransport?.format || "openai";
+    const url = credentials.runtimeTransport?.baseUrl || ENDPOINTS.openai;
+    return {
+      response: new Response(JSON.stringify(RESPONSE_BY_FORMAT[format] || RESPONSE_BY_FORMAT.openai), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      url,
+      headers: {},
+      transformedBody: null,
+    };
   });
 
   const credentials = { apiKey: "test-key", providerSpecificData: {} };
@@ -122,7 +126,12 @@ async function route(model, sourceFormat) {
   });
 
   const { credentials: creds } = executeMock.mock.calls.at(-1)[0];
-  return { result, runtimeTransport: creds.runtimeTransport ?? null };
+  const executorResult = await executeMock.mock.results.at(-1).value;
+  return {
+    result,
+    runtimeTransport: creds.runtimeTransport ?? null,
+    effectiveUrl: executorResult.url,
+  };
 }
 
 describe("opencode-go DeepSeek endpoint matrix (via real handleChatCore)", () => {
@@ -149,16 +158,21 @@ describe("opencode-go thinking-suffix guard (regression)", () => {
     vi.clearAllMocks();
   });
 
+  // Keep these original full titles stable: the differential regression gate keys cases by path and full_name.
   it("does NOT route chat-only glm-5.2(max) to /messages on a claude-format request", async () => {
-    const { result, runtimeTransport } = await route("glm-5.2(max)", "claude");
+    const { result, runtimeTransport, effectiveUrl } = await route("glm-5.2(max)", "claude");
     expect(result.success).toBe(true);
-    expect(runtimeTransport).toBeNull(); // guard must block; falls back to chat/completions
+    expect(runtimeTransport?.format).toBe("openai");
+    expect(effectiveUrl).toBe(ENDPOINTS.openai);
+    expect(effectiveUrl).not.toBe(ENDPOINTS.claude);
   });
 
   it("does NOT route chat-only kimi-k2.6(max) to /responses on a responses-format request", async () => {
-    const { result, runtimeTransport } = await route("kimi-k2.6(max)", "openai-responses");
+    const { result, runtimeTransport, effectiveUrl } = await route("kimi-k2.6(max)", "openai-responses");
     expect(result.success).toBe(true);
-    expect(runtimeTransport).toBeNull();
+    expect(runtimeTransport?.format).toBe("openai");
+    expect(effectiveUrl).toBe(ENDPOINTS.openai);
+    expect(effectiveUrl).not.toBe(ENDPOINTS["openai-responses"]);
   });
 
   it("still routes minimax-m3(max) + claude-format client to /messages", async () => {
@@ -168,9 +182,11 @@ describe("opencode-go thinking-suffix guard (regression)", () => {
   });
 
   it("does NOT route minimax-m3(max) (no responses support) to /responses", async () => {
-    const { result, runtimeTransport } = await route("minimax-m3(max)", "openai-responses");
+    const { result, runtimeTransport, effectiveUrl } = await route("minimax-m3(max)", "openai-responses");
     expect(result.success).toBe(true);
-    expect(runtimeTransport).toBeNull();
+    expect(runtimeTransport?.format).toBe("openai");
+    expect(effectiveUrl).toBe(ENDPOINTS.openai);
+    expect(effectiveUrl).not.toBe(ENDPOINTS["openai-responses"]);
   });
 });
 

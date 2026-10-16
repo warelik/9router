@@ -455,7 +455,13 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
   }
   if (body.top_p !== undefined) result.top_p = body.top_p;
   if (body.reasoning !== undefined) result.reasoning = body.reasoning;
-  if (body.reasoning_effort !== undefined) result.reasoning = { effort: body.reasoning_effort, summary: "auto" };
+  if (body.reasoning_effort !== undefined) {
+    const current = body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning)
+      ? body.reasoning
+      : {};
+    result.reasoning = { ...current, effort: body.reasoning_effort };
+    if (inferReasoningSummary && !Object.hasOwn(current, "summary")) result.reasoning.summary = "auto";
+  }
   if (body.service_tier !== undefined) result.service_tier = body.service_tier;
   if (body.prompt_cache_key !== undefined) result.prompt_cache_key = body.prompt_cache_key;
 
@@ -464,4 +470,6 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
 
 // Register both directions
 register(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, openaiResponsesToOpenAIRequest, null);
-register(FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, openaiToOpenAIResponsesRequest, null);
+// Executor construction keeps its summary default; translation preserves client options.
+register(FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, (model, body, stream, credentials) =>
+  openaiToOpenAIResponsesRequest(model, body, stream, credentials, { inferReasoningSummary: false }), null);
