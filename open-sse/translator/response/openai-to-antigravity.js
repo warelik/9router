@@ -1,6 +1,7 @@
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
 import { GEMINI_ROLE, OPENAI_FINISH, GEMINI_FINISH } from "../schema/index.js";
+import { resolveToolName } from "../../utils/opencodeFingerprint.js";
 import { extractReasoningText } from "../concerns/reasoning.js";
 
 // Convert OpenAI SSE chunk to Antigravity SSE format
@@ -66,7 +67,7 @@ export function openaiToAntigravityResponse(chunk, state) {
       let args = {};
       try { args = JSON.parse(accum.arguments); } catch { /* empty */ }
       // Restore original tool name if it was prefixed during cloaking
-      const originalName = state.toolNameMap?.get(accum.name) || accum.name;
+      const originalName = state.toolNameMap ? resolveToolName(accum.name, state.toolNameMap).name : accum.name;
       parts.push({
         functionCall: {
           name: originalName,

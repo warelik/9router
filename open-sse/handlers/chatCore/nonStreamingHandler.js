@@ -97,7 +97,10 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
   }
 
   const usage = responseBody.usage || {};
-  const status = choice.finish_reason === "tool_calls" ? "completed" : (choice.finish_reason === "stop" ? "completed" : (choice.finish_reason || "completed"));
+  // Responses has no "length"/"content_filter" status: a cut-off turn is `incomplete` with a reason.
+  const incompleteReason = choice.finish_reason === "length" ? "max_output_tokens"
+    : choice.finish_reason === "content_filter" ? "content_filter" : null;
+  const status = incompleteReason ? "incomplete" : "completed";
 
   return {
     id: `resp_${responseBody.id || ""}`.replace(/^resp_chatcmpl-/, "resp_"),
@@ -107,11 +110,14 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
     status,
     background: false,
     error: null,
+    ...(incompleteReason ? { incomplete_details: { reason: incompleteReason } } : {}),
     output,
     usage: {
       input_tokens: usage.prompt_tokens || usage.input_tokens || 0,
       output_tokens: usage.completion_tokens || usage.output_tokens || 0,
       total_tokens: usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
+      ...(usage.prompt_tokens_details ? { input_tokens_details: usage.prompt_tokens_details } : {}),
+      ...(usage.completion_tokens_details ? { output_tokens_details: usage.completion_tokens_details } : {}),
     },
   };
 }
@@ -119,7 +125,7 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
 /**
  * Translate non-streaming response body from provider format → OpenAI format.
  */
-export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames = null) {
+export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames = null, turnScope = null, sessionId = null, serverPartsSessionId = null) {
   if (targetFormat === sourceFormat) return responseBody;
   // Provider responded in OpenAI Chat Completions shape but the client speaks
   // Responses API — convert so tool_calls/text surface as Responses `output`.

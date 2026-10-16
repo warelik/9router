@@ -26,6 +26,87 @@ export function normalizeResponsesInput(input) {
 // Strict Responses upstreams reject overlong call_ids with InputValidationError (#393).
 export const MAX_RESPONSES_CALL_ID_LEN = 64;
 
+// OpenAI reasoning items carry Fernet-encrypted blobs; other providers' own
+// encrypted_content values use different ciphertexts and must be preserved.
+export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
+
+// Codex's observed plaintext task carrier (an agent_message encrypted_content part) is converted
+// here to input_text; known OpenAI Fernet ciphertext stays opaque.
+export function normalizeResponsesAgentMessage(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item) || item.type !== "agent_message") return item;
+  const content = Array.isArray(item.content)
+    ? item.content.map((part) => (part?.type === "encrypted_content"
+        && typeof part.encrypted_content === "string"
+        && !part.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX)
+      ? { type: RESPONSES_ITEM.INPUT_TEXT, text: part.encrypted_content }
+      : part))
+    : item.content;
+  return { ...item, type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content };
+}
+
+function reasoningHasReadableText(item) {
+  const blocks = [
+    ...(Array.isArray(item.summary) ? item.summary : []),
+    ...(Array.isArray(item.content) ? item.content : []),
+  ];
+  return blocks.some((b) =>
+    (typeof b === "string" && b.trim() !== "")
+    || (typeof b?.text === "string" && b.text.trim() !== ""));
+}
+
+/**
+ * Rewrite provider-specific Responses input items into portable shapes.
+ * Codex CLI histories contain multi-agent and delegation items that strict
+ * Responses upstreams (e.g. Kimi Code) reject with 400:
+ * - agent_message → user message built from its input_text parts and plaintext encrypted_content
+ *   task carriers (dropped if none); Fernet ciphertext parts are left out
+ * - function_call_output/custom_tool_call_output without call_id → user message
+ *   from its output (string as-is; array → input_text/input_image parts; dropped if empty)
+ * - reasoning whose encrypted_content is an OpenAI Fernet token and which carries
+ *   no readable summary/content text → dropped (undecryptable for other providers)
+ * Everything else is returned as the same object; the caller's array is not mutated.
+ */
+export function toPortableResponsesInput(input) {
+  if (!Array.isArray(input)) return input;
+  const out = [];
+  for (const item of input) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      out.push(item);
+      continue;
+    }
+    if (item.type === "agent_message") {
+      const message = normalizeResponsesAgentMessage(item);
+      const parts = Array.isArray(message.content)
+        ? message.content.filter((c) => c?.type === RESPONSES_ITEM.INPUT_TEXT)
+        : [];
+      if (parts.length > 0) {
+        out.push({ type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content: parts });
+      }
+      continue;
+    }
+    if ((item.type === RESPONSES_ITEM.FUNCTION_CALL_OUTPUT
+        || item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL_OUTPUT) && !item.call_id) {
+      const parts = Array.isArray(item.output)
+        ? item.output.filter((c) => c?.type === RESPONSES_ITEM.INPUT_TEXT || c?.type === RESPONSES_ITEM.INPUT_IMAGE)
+        : (typeof item.output === "string" && item.output !== ""
+            ? [{ type: RESPONSES_ITEM.INPUT_TEXT, text: item.output }]
+            : []);
+      if (parts.length > 0) {
+        out.push({ type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content: parts });
+      }
+      continue;
+    }
+    if (item.type === RESPONSES_ITEM.REASONING
+      && typeof item.encrypted_content === "string"
+      && item.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX)
+      && !reasoningHasReadableText(item)) {
+      continue;
+    }
+    out.push(item);
+  }
+  return out;
+}
+
 // Fallback ids share one Date.now() when a batch of items is sanitized in a tight
 // loop — a per-process sequence keeps same-millisecond ids unique so
 // function_call ↔ function_call_output correlation never collides.
@@ -100,7 +181,8 @@ export function convertResponsesApiFormat(body) {
   const inputItems = normalizeResponsesInput(body.input);
   if (!inputItems) return body;
 
-  for (const item of inputItems) {
+  for (const rawItem of inputItems) {
+    const item = normalizeResponsesAgentMessage(rawItem);
     // Determine item type - Droid CLI sends role-based items without 'type' field
     // Fallback: if no type but has role property, treat as message
     const itemType = item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);

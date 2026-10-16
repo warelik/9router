@@ -4,10 +4,12 @@
  * Responses API uses: { input: [...], instructions: "..." }
  * Chat API uses: { messages: [...] }
  */
+import { createHash } from "crypto";
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
 import {
   normalizeResponsesInput,
+  normalizeResponsesAgentMessage,
   clampResponsesCallId,
   coerceResponsesArguments,
   coerceResponsesOutput,
@@ -37,9 +39,46 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
   let pendingReasoningEncrypted = "";
   const additionalTools = [];
   const customToolNames = new Set();
+  const namespaceToolMap = new Map();
+  const aliasCache = new Map();
+  const reservedNames = new Set();
+
+  const reserveToolName = (tool) => {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return;
+    if (tool.type === "namespace") return;
+    const n = tool.function?.name ?? tool.name;
+    if (typeof n === "string" && n.trim()) reservedNames.add(n.trim());
+  };
+  for (const tool of Array.isArray(body.tools) ? body.tools : []) reserveToolName(tool);
+
+  const aliasFor = (namespace, name) => {
+    const identity = JSON.stringify([namespace, name]);
+    if (aliasCache.has(identity)) return aliasCache.get(identity);
+    const stem = `ns_${namespace}_${name}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40);
+    const hash = createHash("sha256").update(identity).digest("hex").slice(0, 16);
+    const base = `${stem}_${hash}`;
+    let alias = base;
+    for (let i = 1; reservedNames.has(alias); i++) {
+      const suffix = `_${i}`;
+      alias = `${base.slice(0, 64 - suffix.length)}${suffix}`;
+    }
+    reservedNames.add(alias);
+    aliasCache.set(identity, alias);
+    return alias;
+  };
 
   const inputItems = normalizeResponsesInput(body.input);
   if (!inputItems) return body;
+
+  for (const item of inputItems) {
+    if (item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS && Array.isArray(item.tools)) {
+      for (const tool of item.tools) reserveToolName(tool);
+    }
+    else if ((item?.type === RESPONSES_ITEM.FUNCTION_CALL || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL)
+      && !item?.namespace && typeof item.name === "string" && item.name.trim()) {
+      reservedNames.add(item.name.trim());
+    }
+  }
 
   // Extract reasoning text from summary[].text (encrypted_content is continuity-only)
   const extractReasoningText = (item) => {
@@ -61,7 +100,8 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
     pendingReasoningEncrypted = "";
   };
 
-  for (const item of inputItems) {
+  for (const rawItem of inputItems) {
+    const item = normalizeResponsesAgentMessage(rawItem);
     // Determine item type - Droid CLI sends role-based items without 'type' field
     // Fallback: if no type but has role property, treat as message
     const itemType = item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);
@@ -113,7 +153,12 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
       }
       // Skip items with empty/missing name — Codex/OpenAI reject nameless tool calls (#444)
       if (!item.name || typeof item.name !== "string" || item.name.trim() === "") continue;
-      if (itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL) customToolNames.add(item.name);
+      const namespace = typeof item.namespace === "string" && item.namespace.trim() ? item.namespace.trim() : null;
+      const callName = namespace ? aliasFor(namespace, item.name) : item.name;
+      if (namespace) {
+        namespaceToolMap.set(callName, { name: item.name, namespace, type: itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL ? "custom" : "function" });
+      }
+      if (itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL) customToolNames.add(callName);
       const toolInput = itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL
         ? { input: typeof item.input === "string" ? item.input : JSON.stringify(item.input ?? "") }
         : item.arguments;
@@ -121,7 +166,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
         id: item.call_id,
         type: OPENAI_BLOCK.FUNCTION,
         function: {
-          name: item.name,
+          name: callName,
           arguments: typeof toolInput === "string" ? toolInput : JSON.stringify(toolInput ?? {})
         }
       });
@@ -178,29 +223,50 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
   // explicit `name` field and cannot be represented as Chat Completions function declarations.
   // Filter them out to avoid sending nameless functionDeclarations to downstream providers
   // such as Gemini, which strictly validates function names.
-  const responseTools = [
-    ...(Array.isArray(body.tools) ? body.tools : []),
-    ...additionalTools,
-  ];
+  const responseTools = [];
+  for (const tool of [...(Array.isArray(body.tools) ? body.tools : []), ...additionalTools]) {
+    if (tool && typeof tool === "object" && !Array.isArray(tool) && tool.type === "namespace") {
+      if (typeof tool.name === "string" && tool.name.trim() && Array.isArray(tool.tools)) {
+        for (const child of tool.tools) {
+          if (child?.type === "function" || child?.type === "custom") responseTools.push({ child, ns: tool });
+        }
+      }
+      continue;
+    }
+    responseTools.push({ child: tool, ns: null });
+  }
   if (responseTools.length > 0) {
     result.tools = responseTools
-      .map(tool => {
+      .map(({ child: tool, ns }) => {
+        if (!tool || typeof tool !== "object" || Array.isArray(tool)) return null;
+        // Hosted web_search has no function declaration. Flag it for Gemini-native
+        // targets that can serve googleSearch; cached-only (external_web_access:false)
+        // and domain-restricted variants cannot be honored upstream, so they stay dropped.
+        if (tool.type === "web_search") {
+          const restricted = Array.isArray(tool.filters?.allowed_domains) && tool.filters.allowed_domains.length > 0;
+          if (tool.external_web_access !== false && !restricted) result._webSearch = true;
+          return null;
+        }
         // Already in Chat Completions format: { type: "function", function: { name, ... } }
-        if (tool.function) return tool;
+        if (tool.function && !ns) return tool;
         // Responses API function/custom tool: { type, name, description, parameters|format }.
         // Chat Completions has no freeform custom-tool declaration, so expose custom
         // tools as functions with one raw `input` string while retaining their names
         // in translator-only metadata for the response conversion.
         const name = tool.name;
         if (!name || typeof name !== "string" || name.trim() === "") return null;
+        const wireName = ns ? aliasFor(ns.name.trim(), name) : name;
+        if (ns) namespaceToolMap.set(wireName, { name, namespace: ns.name.trim(), type: tool.type === "custom" ? "custom" : "function" });
+        const label = ns ? `[${ns.name.trim()}.${name}]` : "";
+        const nsDescription = ns ? String(ns.description || "") : "";
         if (tool.type === "custom") {
-          customToolNames.add(name);
+          customToolNames.add(wireName);
           const formatHint = [tool.format?.syntax, tool.format?.definition].filter(Boolean).join("\n");
           return {
             type: OPENAI_BLOCK.FUNCTION,
             function: {
-              name,
-              description: [String(tool.description || ""), formatHint].filter(Boolean).join("\n\n"),
+              name: wireName,
+              description: [label, String(tool.description || ""), nsDescription, formatHint].filter(Boolean).join("\n\n"),
               parameters: {
                 type: "object",
                 properties: {
@@ -220,8 +286,8 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
         return {
           type: OPENAI_BLOCK.FUNCTION,
           function: {
-            name,
-            description: String(tool.description || ""),
+            name: wireName,
+            description: [label, String(tool.description || ""), nsDescription].filter(Boolean).join("\n\n"),
             parameters: normalizeToolParameters(tool.parameters),
             strict: tool.strict
           }
@@ -230,6 +296,16 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
       .filter(Boolean);
   }
   if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
+
+  if (result.tool_choice && typeof result.tool_choice === "object" && !Array.isArray(result.tool_choice)
+    && result.tool_choice.type === "function" && typeof result.tool_choice.name === "string") {
+    const choice = result.tool_choice;
+    const choiceNs = typeof choice.namespace === "string" && choice.namespace.trim() ? choice.namespace.trim() : null;
+    const choiceName = choiceNs ? aliasFor(choiceNs, choice.name) : choice.name;
+    if (choiceNs) namespaceToolMap.set(choiceName, { name: choice.name, namespace: choiceNs, type: "function" });
+    result.tool_choice = { type: "function", function: { name: choiceName } };
+  }
+  if (namespaceToolMap.size > 0) result._toolNameMap = namespaceToolMap;
 
   // Cleanup Responses API specific fields
   // Map Responses-only max_output_tokens to Chat max_tokens (avoid leaking unknown field upstream)
@@ -318,7 +394,7 @@ function buildReasoningInputItem(msg) {
 /**
  * Convert OpenAI Chat Completions to OpenAI Responses API format
  */
-export function openaiToOpenAIResponsesRequest(model, body, stream, credentials) {
+export function openaiToOpenAIResponsesRequest(model, body, stream, credentials, { inferReasoningSummary = true } = {}) {
   // Body already in Responses API format (e.g. Cursor CLI calling /chat/completions with input[])
   if (body.input) {
     const out = { ...body, model, stream: true };
