@@ -27,6 +27,9 @@ export function buildSystemoneUrl(override, cfg) {
  * Core System One (Jev) handler — native decision payload pass-through.
  * URL/headers come from the registry's systemoneConfig; body and JSON response
  * are forwarded untouched (decision models have no chat translation layer).
+ * Providers whose REST API wraps the native result in an envelope (Cloudflare
+ * /ai/run: { success, result, errors }) declare systemoneConfig.responseRoot;
+ * only that envelope is removed, the native payload itself is not changed.
  *
  * @returns {Promise<{ success: boolean, response: Response, usage?: object, status?: number, error?: string }>}
  */
@@ -111,6 +114,22 @@ export async function handleSystemoneCore({
     responseBody = await providerResponse.json();
   } catch {
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
+  }
+
+  const responseRoot = cfg.responseRoot;
+  if (responseRoot) {
+    if (responseBody?.success === false) {
+      const detail = Array.isArray(responseBody.errors) ? responseBody.errors.find((e) => e?.message)?.message : null;
+      return createErrorResult(
+        HTTP_STATUS.BAD_GATEWAY,
+        formatProviderError(new Error(detail || `${provider} reported an unsuccessful System One response`), provider, model, HTTP_STATUS.BAD_GATEWAY)
+      );
+    }
+    const native = responseBody?.[responseRoot];
+    if (!native || typeof native !== "object" || Array.isArray(native)) {
+      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid System One response from ${provider}: missing ${responseRoot}`);
+    }
+    responseBody = native;
   }
 
   if (onRequestSuccess) await onRequestSuccess();
