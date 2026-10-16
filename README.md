@@ -39,7 +39,7 @@ they lag behind the actual application version.
 2. Open one review-only application PR against that exact clean upstream snapshot.
 3. Request Codex review as the owner; wait without rebuilding while review is pending.
 4. Accept only authenticated Codex review of that exact application commit.
-5. Run the preserved regression files, build one container from immutable Git
+5. Run the preserved and newly added regression files, build one container from immutable Git
    source, and check its health, application version, platform and image labels.
 6. Recheck review and patch configuration, then publish the image archive,
    provenance and SHA-256 checksums. Close the review PR without merging.
@@ -48,7 +48,36 @@ Codex completion comments, including edits to its structured summary, resume the
 workflow immediately. The schedule is also a fallback. P0/P1 findings, incomplete
 review, a changed PR head, failing tests, patch conflicts or integrity errors stop
 publication. A reaction alone is not approval. No historical upstream commit
-queue or automatic AI repair loop is used.
+queue is used. P2/P3 findings retain their nonblocking status but request an
+automatic repair, including findings on an already published application.
+
+## Native Codex repair
+
+Ordinary failures open a repair PR and request `@codex fix ...` using the owner's
+existing authorization. Its temporary upstream archive supplies exact source
+context even when the cloud task has no internet access. Codex updates the real
+branch: task acknowledgements, reports and unpublished commits are not fixes.
+
+Application repairs change the ordered patches. The resulting application gets
+a fresh exact-SHA review and regressions before the verified patch diff is
+adopted. Policy repairs instead run against both the trusted tests and proposed
+tests in a read-only, isolated job; the proposed YAML is checked with a
+checksum-pinned official actionlint binary and Codex reviews the exact policy SHA.
+Policy and application repairs cannot be mixed.
+
+Only that verified diff is adopted into `downstream`; repair context is never
+merged. A dispatched normal cycle rechecks the new configuration and builds and
+publishes the exact reviewed application. New regression filenames are recorded
+in `patches/source.json` separately from its frozen historical `test_files`, and
+continue running if upstream absorbs the corresponding fix.
+
+The same upstream/patchset since the last publication has at most three coding
+attempts, including policy repairs across configuration commits, and a two-hour task/review
+deadline, checked on callbacks and the scheduled fallback. A blocked review or
+failed verification is a failed workflow, not a green `ready=false`. Pending
+external work is explicitly reported as pending. Exhausted or unavailable
+machine repair assigns a deduplicated issue to the owner using existing GitHub
+notifications; the last verified release remains available.
 
 Upstream omits its URL/header snapshot. When missing from reviewed source, the
 test job generates it from the exact clean upstream with the shared test harness,
@@ -62,14 +91,16 @@ client-config writers cannot use the operator's inherited configuration paths.
 - Use `downstream` as the default branch and enable its Actions workflow.
 - Allow GitHub Actions to create pull requests.
 - Enable the Codex GitHub integration for `warelik/9router`.
-- Set the repository secret `CODEX_REQUEST_TOKEN` to an owner token allowed to
-  comment on its PRs. Requests from the Actions bot are not used as owner requests.
+- Set the repository secret `CODEX_REQUEST_TOKEN` to the existing owner token
+  allowed to comment on PRs and update workflows for independently reviewed policy
+  repairs. Requests from the Actions bot are not used as owner requests.
+- Native Codex cloud tasks need permission to push to their repair PR branch.
 - Run **Upstream Plus Patches**. No VPS access or deployment secrets are needed.
 
-If upstream breaks a patch, regenerate the affected patch against the new
-snapshot, retain its regression cases and push the patch change. Do not skip
-patches, replace upstream source with old files, force-push, or weaken review.
+If upstream breaks a patch, the native task minimally refreshes that patch and
+retains its regression cases. Do not skip patches, replace upstream source with
+old files, force-push, or weaken review.
 
 Published releases are named `build-VERSION-UPSTREAM-PATCHSET`; they contain a
-`linux/amd64` Docker image, not a VPS deployment. Recipes and the running VPS
-remain unchanged.
+`linux/amd64` Docker image, `provenance.json` and `SHA256SUMS`, not a VPS deployment.
+The server recipe downloads that immutable release; GitHub has no VPS credentials.
