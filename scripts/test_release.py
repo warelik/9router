@@ -164,13 +164,16 @@ class ReviewPolicyTests(unittest.TestCase):
 class PatchBoundaryTests(unittest.TestCase):
     def test_application_and_test_paths_are_allowed(self):
         release.validate_paths([
-            "next.config.mjs", "open-sse/executors/default.js",
+            "next.config.mjs", "Dockerfile", "npm-shrinkwrap.json",
+            "open-sse/executors/default.js",
             "src/app/api/v1alpha/models/[...path]/route.js", "tests/unit/example.test.js",
         ])
 
     def test_old_controller_and_instructions_are_not_application_patches(self):
         for path in (".github/workflows/warelik-sync.yml", "warelik/automation/controller.py",
-                     ".gitignore", "README.md", "tests/translator/AGENTS.md", "open-sse/.rules"):
+                     ".gitignore", "README.md", "package.json", "package-lock.json",
+                     "docker-compose.yml",
+                     "tests/translator/AGENTS.md", "open-sse/.rules"):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 release.validate_paths([path])
 

@@ -207,7 +207,7 @@ def copy_patch_series(commit, directory):
 
 def validate_paths(paths):
     for path in paths:
-        if (path != "next.config.mjs"
+        if (path not in {"next.config.mjs", "Dockerfile", "npm-shrinkwrap.json"}
                 and not path.startswith(("open-sse/", "src/", "tests/"))):
             raise ValueError(f"Patch escapes the application/test boundary: {path}")
         if Path(path).name in {"AGENTS.md", "CLAUDE.md", ".rules"}:
