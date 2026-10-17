@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-ARG NODE_IMAGE=node:22-alpine
+ARG NODE_IMAGE=node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402
 ARG ALPINE_MIRROR=dl-cdn.alpinelinux.org
 ARG NPM_REGISTRY=https://registry.npmjs.org/
 ARG APP_VERSION=unknown
@@ -19,9 +19,9 @@ ARG NPM_REGISTRY
 
 RUN apk add --no-cache python3 make g++ linux-headers
 
-COPY package.json ./
+COPY package.json npm-shrinkwrap.json ./
 RUN --mount=type=cache,target=/root/.npm \
-    npm install \
+    npm ci \
       --registry="${NPM_REGISTRY}" \
       --fetch-retries=5 \
       --fetch-retry-factor=2 \
