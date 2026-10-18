@@ -723,12 +723,26 @@ class AdoptionTests(unittest.TestCase):
         # The same check also protects the producer and adopter: a successful
         # no-op check, an intervening checkout mutation, or an unconditional
         # adoption would otherwise invalidate the immutable oracle.
-        for job in ("prepare", "policy-check", "land"):
+        def execution_steps(steps):
+            # An exact Action revision can be refreshed without changing which
+            # Action runs, its arguments, or the surrounding execution contract.
+            result = []
+            for step in steps:
+                value = dict(step)
+                reference = value.get("uses", "")
+                if reference and not reference.startswith(("./", "docker://")):
+                    value["uses"] = reference.rsplit("@", 1)[0]
+                result.append(value)
+            return result
+
+        self.assertEqual(set(document["jobs"]), set(trusted["jobs"]), "Preserve the complete verified job graph")
+        for job in trusted["jobs"]:
             proposed_job, trusted_job = document["jobs"][job], trusted["jobs"][job]
-            for field in ("if", "needs", "continue-on-error", "defaults", "env", "permissions", "strategy", "outputs"):
+            for field in ("if", "needs", "continue-on-error", "defaults", "env", "permissions", "strategy", "outputs",
+                          "container", "services", "environment", "uses", "with", "secrets"):
                 self.assertEqual(proposed_job.get(field), trusted_job.get(field),
                                  f"Protected {job} job must retain trusted {field}")
-            self.assertEqual(proposed_job["steps"], trusted_job["steps"],
+            self.assertEqual(execution_steps(proposed_job["steps"]), execution_steps(trusted_job["steps"]),
                              f"Protected {job} step sequence must retain trusted execution")
         release.validate_action_pins(workflow)
 
@@ -797,8 +811,8 @@ class AdoptionTests(unittest.TestCase):
     def test_policy_sequence_and_adoption_gate_cannot_bypass_the_oracle(self):
         yaml = release.yaml_module()
         workflow = release.ROOT / ".github/workflows/release.yml"
-        for job in ("prepare", "policy-check", "land"):
-            for mutation in ("insert-step", "append-step", "replace-checkout", "drop-needs", "unconditional"):
+        for job in yaml.safe_load(workflow.read_text(encoding="utf-8"))["jobs"]:
+            for mutation in ("insert-step", "append-step", "replace-checkout", "drop-needs", "unconditional", "no-op"):
                 with self.subTest(job=job, mutation=mutation), tempfile.TemporaryDirectory() as directory:
                     document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
                     target = document["jobs"][job]
@@ -810,13 +824,32 @@ class AdoptionTests(unittest.TestCase):
                         target["steps"][0].setdefault("with", {})["ref"] = "${{ needs.prepare.outputs.repair_head }}"
                     elif mutation == "drop-needs":
                         target["needs"] = []
+                    elif mutation == "no-op":
+                        target["steps"] = [{"run": "true"}]
                     else:
                         target["if"] = "always()"
                     candidate = Path(directory) / "proposed.yml"
                     candidate.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
                     with patch.dict(os.environ, {"NINEROUTER_POLICY_CANDIDATE_WORKFLOW": str(candidate)}):
-                        with self.assertRaises(AssertionError):
+                        with self.assertRaises((AssertionError, KeyError, StopIteration)):
                             self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
+
+    def test_policy_workflow_allows_pinned_action_refresh_and_operational_parameters(self):
+        yaml = release.yaml_module()
+        workflow = release.ROOT / ".github/workflows/release.yml"
+        with tempfile.TemporaryDirectory() as directory:
+            document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+            for job in document["jobs"].values():
+                job["timeout-minutes"] += 1
+                job["runs-on"] = "ubuntu-26.04"
+                for step in job["steps"]:
+                    reference = step.get("uses", "")
+                    if reference and not reference.startswith(("./", "docker://")):
+                        step["uses"] = reference.rsplit("@", 1)[0] + "@" + "c" * 40
+            candidate = Path(directory) / "proposed.yml"
+            candidate.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+            with patch.dict(os.environ, {"NINEROUTER_POLICY_CANDIDATE_WORKFLOW": str(candidate)}):
+                self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
 
     def test_action_workflows_reject_unsafe_yaml_tags_without_construction(self):
         with tempfile.TemporaryDirectory() as directory:
