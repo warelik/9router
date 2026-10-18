@@ -706,7 +706,19 @@ class AdoptionTests(unittest.TestCase):
             baseline = next(item for item in trusted["jobs"][job]["steps"]
                             if item.get("name") == "Install The Pinned Policy YAML Parser")
             self.assertEqual(script, baseline["run"], "Parser bootstrap must retain the trusted executable body")
-            use_index = next(i for i, item in enumerate(steps) if item.get("name") == consumer)
+            self.assertEqual(step, baseline, "Parser bootstrap must retain trusted execution settings")
+            consumers = [(i, item) for i, item in enumerate(steps) if item.get("name") == consumer]
+            self.assertEqual(len(consumers), 1, f"Missing or duplicate policy consumer in {job}")
+            use_index, use_step = consumers[0]
+            trusted_consumer = next(item for item in trusted["jobs"][job]["steps"]
+                                    if item.get("name") == consumer)
+            self.assertEqual(use_step, trusted_consumer, "Policy consumer must retain trusted execution and gating")
+            for field in ("if", "needs", "continue-on-error", "defaults", "env", "permissions", "strategy"):
+                self.assertEqual(document["jobs"][job].get(field), trusted["jobs"][job].get(field),
+                                 f"Policy job must retain trusted {field}")
+            for field in ("defaults", "env", "permissions"):
+                self.assertEqual(document.get(field), trusted.get(field),
+                                 f"Policy workflow must retain trusted {field}")
             self.assertLess(index, use_index)
         release.validate_action_pins(workflow)
 
@@ -741,6 +753,35 @@ class AdoptionTests(unittest.TestCase):
                     candidate.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
                     with patch.dict(os.environ, {"NINEROUTER_POLICY_CANDIDATE_WORKFLOW": str(candidate)}):
                         with self.assertRaisesRegex(AssertionError, "trusted executable body"):
+                            self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
+
+    def test_policy_consumers_reject_disabled_and_replaced_checks(self):
+        yaml = release.yaml_module()
+        workflow = release.ROOT / ".github/workflows/release.yml"
+        mutations = ({"if": False}, {"continue-on-error": True}, {"run": "true"},
+                     {"shell": "bash {0} || true"}, {"working-directory": "/tmp"},
+                     {"env": {"PYTHONPATH": "/tmp/untrusted"}})
+        for job, name in (("prepare", "Test Release Policy"),
+                          ("policy-check", "Enforce The Trusted Tests And Validate Proposed YAML")):
+            for mutation in mutations:
+                with self.subTest(job=job, mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                    document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+                    step = next(item for item in document["jobs"][job]["steps"] if item.get("name") == name)
+                    step.update(mutation)
+                    candidate = Path(directory) / "proposed.yml"
+                    candidate.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+                    with patch.dict(os.environ, {"NINEROUTER_POLICY_CANDIDATE_WORKFLOW": str(candidate)}):
+                        with self.assertRaisesRegex(AssertionError, "Policy consumer must retain"):
+                            self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
+            for mutation in ({"if": False}, {"continue-on-error": True},
+                             {"defaults": {"run": {"shell": "bash {0} || true"}}}):
+                with self.subTest(job=job, scope="job", mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                    document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+                    document["jobs"][job].update(mutation)
+                    candidate = Path(directory) / "proposed.yml"
+                    candidate.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+                    with patch.dict(os.environ, {"NINEROUTER_POLICY_CANDIDATE_WORKFLOW": str(candidate)}):
+                        with self.assertRaisesRegex(AssertionError, "Policy job must retain"):
                             self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
 
     def test_action_workflows_reject_unsafe_yaml_tags_without_construction(self):
