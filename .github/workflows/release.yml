@@ -48,9 +48,8 @@ jobs:
       mode: ${{ steps.snapshot.outputs.mode }}
       repair_pr: ${{ steps.snapshot.outputs.repair_pr }}
       repair_head: ${{ steps.snapshot.outputs.repair_head }}
-      followup: ${{ steps.snapshot.outputs.followup }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Require The Trusted Default Branch
@@ -59,8 +58,22 @@ jobs:
         run: |
           test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"
           test "$DEFAULT_BRANCH" = downstream
+      - name: Install The Pinned Policy YAML Parser
+        run: |
+          parser_dir="$RUNNER_TEMP/9router-policy-parser"
+          requirements="$RUNNER_TEMP/9router-policy-requirements.txt"
+          mkdir -m 700 "$parser_dir"
+          printf '%s\n' 'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' > "$requirements"
+          python3 -m pip install --isolated --disable-pip-version-check --no-input --no-cache-dir \
+            --only-binary=:all: --no-deps --require-hashes --index-url https://pypi.org/simple \
+            --target "$parser_dir" -r "$requirements"
+          printf 'NINEROUTER_POLICY_PARSER=%s\n' "$parser_dir" >> "$GITHUB_ENV"
+          printf 'PYTHONDONTWRITEBYTECODE=1\n' >> "$GITHUB_ENV"
       - name: Test Release Policy
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver: docker
       - name: Prepare The Exact Source And Review
         id: snapshot
         env:
@@ -92,16 +105,27 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           path: trusted
           persist-credentials: false
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.prepare.outputs.repair_head }}
           path: candidate
           persist-credentials: false
+      - name: Install The Pinned Policy YAML Parser
+        run: |
+          parser_dir="$RUNNER_TEMP/9router-policy-parser"
+          requirements="$RUNNER_TEMP/9router-policy-requirements.txt"
+          mkdir -m 700 "$parser_dir"
+          printf '%s\n' 'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' > "$requirements"
+          python3 -m pip install --isolated --disable-pip-version-check --no-input --no-cache-dir \
+            --only-binary=:all: --no-deps --require-hashes --index-url https://pypi.org/simple \
+            --target "$parser_dir" -r "$requirements"
+          printf 'NINEROUTER_POLICY_PARSER=%s\n' "$parser_dir" >> "$GITHUB_ENV"
+          printf 'PYTHONDONTWRITEBYTECODE=1\n' >> "$GITHUB_ENV"
       - name: Enforce The Trusted Tests And Validate Proposed YAML
         run: python3 trusted/scripts/release.py check-policy "$GITHUB_WORKSPACE/candidate"
 
@@ -115,23 +139,23 @@ jobs:
       UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
       UPSTREAM_DIR: ${{ github.workspace }}/upstream
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           path: app
           persist-credentials: false
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           path: trusted
           persist-credentials: false
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: decolua/9router
           ref: ${{ needs.prepare.outputs.upstream }}
           path: upstream
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
       - name: Install Application And Test Dependencies
@@ -156,13 +180,13 @@ jobs:
       PATCHSET_SHA256: ${{ needs.prepare.outputs.patchset }}
       CONFIG_SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Build From The Immutable Remote Git Context
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: https://github.com/${{ github.repository }}.git#${{ needs.prepare.outputs.sha }}
           platforms: linux/amd64
@@ -210,7 +234,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/release"
           gzip -n -c "$RUNNER_TEMP/9router-image.tar" > "$RUNNER_TEMP/release/9router-image.tar.gz"
           python3 scripts/release.py provenance "$RUNNER_TEMP/release/9router-image.tar.gz"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: reviewed-${{ needs.prepare.outputs.sha }}
           path: ${{ runner.temp }}/release/
@@ -226,11 +250,11 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: reviewed-${{ needs.prepare.outputs.sha }}
           path: release
@@ -263,7 +287,7 @@ jobs:
       issues: write
       actions: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -280,7 +304,7 @@ jobs:
   repair:
     name: Request Native Codex Repair Or Escalate Explicitly
     needs: [prepare, policy-check, test, build, publish, land]
-    if: always() && (contains(needs.*.result, 'failure') || needs.prepare.outputs.followup == 'true')
+    if: always() && contains(needs.*.result, 'failure')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -289,7 +313,7 @@ jobs:
       issues: write
       actions: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -301,5 +325,4 @@ jobs:
           CANDIDATE_PR: ${{ needs.prepare.outputs.pr }}
           CANDIDATE_SHA: ${{ needs.prepare.outputs.sha }}
           REPAIR_HEAD: ${{ needs.prepare.outputs.repair_head }}
-          NONBLOCKING_FOLLOWUP: ${{ !contains(needs.*.result, 'failure') && needs.prepare.outputs.followup == 'true' }}
         run: python3 scripts/release.py repair "$RUNNER_TEMP/9router-repair"

@@ -45,39 +45,94 @@ they lag behind the actual application version.
    provenance and SHA-256 checksums. Close the review PR without merging.
 
 Codex completion comments, including edits to its structured summary, resume the
-workflow immediately. The schedule is also a fallback. P0/P1 findings, incomplete
+workflow immediately. The schedule is also a fallback. Unresolved findings of any priority, incomplete
 review, a changed PR head, failing tests, patch conflicts or integrity errors stop
 publication. A reaction alone is not approval. No historical upstream commit
-queue is used. P2/P3 findings retain their nonblocking status but request an
-automatic repair, including findings on an already published application.
+queue is used. Real P2/P3 defects require the same fix, regression and fresh
+exact-commit review before publication as other defects. Review requests exclude
+optional optimization and stylistic preferences; a false positive must be
+resolved with evidence. Findings on an already published application trigger
+repair while the last working installation is preserved.
+
+The Dockerfile pins the Node image by the registry index digest. Every preparation
+checks the current digest and `linux/amd64` availability for the base tag selected
+by that upstream snapshot, before the already-published shortcut. A moved tag or
+changed upstream base enters the existing Codex repair flow: update the small
+Dockerfile patch, review the new commit and rebuild. The patch hash changes the
+release identity even when the application's version has not changed.
 
 ## Native Codex repair
 
-Ordinary application failures are repaired on the exact upstream snapshot and
-ordered patch series. Policy repairs are checked without write credentials.
-The policy job uses only its immutable trusted test files and release module;
-the proposed release module runs as a separate process through the existing
-`prepare` and `land` commands. Disposable GitHub fixtures check readiness and
-review reads, and a local bare Git remote records the exact selectively adopted
-files. The verifier asserts actual outputs, API calls and Git changes, so an
-early `os._exit(0)` or printed success cannot meet the positive contract.
+Ordinary failures open a repair PR and request `@codex fix ...` using the owner's
+existing authorization. Its temporary upstream archive supplies exact source
+context even when the cloud task has no internet access. Codex updates the real
+branch: task acknowledgements, reports and unpublished commits are not fixes.
 
-The checker syntax-parses proposed Python without importing it, requires
-full commit SHAs for remote Actions, and runs checksum-pinned actionlint on the
-proposed workflow. Candidate-authored tests are not used as the pre-adoption
-verdict. Each policy candidate receives exact-SHA Codex review before selective
-adoption; the next default-branch run executes the adopted tests as trusted code.
-Application patches and release-policy repairs cannot be mixed.
+Application repairs change the ordered patches. The resulting application gets
+a fresh exact-SHA review and regressions before the verified patch diff is
+adopted. Before a policy repair is adopted, the read-only job runs tests and the
+release module from the trusted checkout. Proposed Python is syntax-parsed, not
+imported into that process. The trusted CLI regression launches the proposed
+`prepare` and `land` commands in separate subprocesses with disposable GitHub
+and Git fixtures; it checks readiness output, exact-review API reads, absence of
+mutating calls during prepare, and the actual commit and dispatch caused by a
+clean adoption. Exact-SHA P2 findings block adoption. Early `os._exit(0)` and
+forged success output do not satisfy those contracts. Candidate-authored tests
+are parsed but do not define the pre-adoption verdict. The proposed workflow is
+checked with a checksum-pinned official actionlint binary. Remote GitHub Actions
+references require full commit SHAs; Docker Actions remain supported only with an
+exact `docker://image[:tag]@sha256:<64 lowercase hex>` reference. Registry ports
+and optional image tags are allowed when the exact digest is present; mutable
+Docker tags without a digest are rejected. Local `./` Actions remain allowed.
+The validator reads workflow YAML with PyYAML `safe_load` and checks semantic job
+and step `uses` fields, including quoted keys, flow mappings, and reusable or
+subdirectory references. It does not construct custom YAML tags. The official
+`PyYAML==6.0.3` wheel is pinned by SHA-256
+`ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc` and installed
+with `pip --require-hashes` into an isolated runner-temp directory before the
+prepare tests and trusted policy check. The check-policy runner copies that
+trusted parser into its read-only fixture mount, imports it before trusted tests
+or candidate subprocesses, and starts Python with isolated mode so writable
+current-directory modules cannot shadow it. Candidate `prepare` and `land` CLI
+commands lazy-load the parser only if YAML validation is requested, preserving
+the immutable bootstrap oracle's stdlib-only CLI path. Codex reviews the exact
+policy SHA.
+The verified policy diff is selectively adopted; the next default-branch run
+then executes the newly trusted tests and continues through fresh review and
+build. Policy and application repairs cannot be mixed.
 
-Policy repair may include `README.md` alongside release scripts, workflow and
-tests. Application repair may change only `patches/*.patch`; mixed changes are
-rejected before checks or adoption.
+The first trusted CLI regression must already exist on the default branch for
+it to run during a policy-repair check. Adding it in the same untrusted repair
+does not make it part of that repair's trusted suite; the first adoption of
+this verifier therefore needs a separate trusted-base transition and a fresh
+default-branch run before later policy changes can rely on it.
 
-The CLI verifier is a separate trusted-base transition. Its regression file
-must already exist on the default branch to run before later policy changes are
-adopted. The first transition requires its own exact-SHA review and isolated
-native checks before the verifier is used as the baseline for subsequent
-policy repairs.
+Only that verified diff is adopted into `downstream`; repair context is never
+merged. A dispatched normal cycle rechecks the new configuration and builds and
+publishes the exact reviewed application. New regression filenames are recorded
+in `patches/source.json` separately from its frozen historical `test_files`, and
+continue running if upstream absorbs the corresponding fix.
+
+The upstream snapshot and last published release identify a repair campaign.
+Its two-hour task/review deadline starts at the first owner fix request and spans
+configuration commits, patch changes, and workflow dispatches. A later fix or
+review does not reset the current window. Request numbers are history, not a limit.
+Each repair PR records its bounded window; callbacks and the scheduled workflow
+check its deadline. On timeout the current workflow fails, records the evidence,
+and closes that window without assigning an owner-decision issue. A later callback
+does not reopen it. The next scheduled run starts a fresh bounded window, carries
+all previous attempts into the prompt, and requires evidence for a changed approach.
+Elapsed time and attempt count alone never trigger human escalation. A blocked
+review or failed verification is a failed workflow, not a green `ready=false`;
+unavailable owner authorization remains an explicit platform blocker. The last
+verified release remains available throughout repair.
+
+Upstream omits its URL/header snapshot. When missing from reviewed source, the
+test job generates it from the exact clean upstream with the shared test harness,
+then compares the patched application against it with `CI=true`. It never accepts
+snapshot values generated from the patched application itself.
+Both test phases run with disposable `HOME`, `XDG_*`, `TMPDIR` and `DATA_DIR`;
+client-config writers cannot use the operator's inherited configuration paths.
 
 ## GitHub setup
 

@@ -227,6 +227,56 @@ raise SystemExit(2)
         result, output, api_calls, git_calls = self.run_prepare_cli(candidate)
         self.assert_policy_prepare_ready(result, output, api_calls, git_calls)
 
+    def test_candidate_check_policy_cli_rejects_semantic_unpinned_yaml_before_container(self):
+        parser = os.environ.get("NINEROUTER_POLICY_PARSER")
+        self.assertTrue(parser, "trusted pinned YAML parser must be installed before CLI tests")
+        for workflow_text in (
+            'jobs:\n  check:\n    steps:\n      - "uses": actions/checkout@main\n',
+            'jobs:\n  check:\n    steps:\n      - {uses: "actions/checkout@main"}\n',
+        ):
+            with self.subTest(workflow=workflow_text), tempfile.TemporaryDirectory(
+                    prefix="9router-policy-yaml-cli-",
+                    dir=os.environ.get("TMPDIR") or "/var/tmp") as temporary:
+                root = Path(temporary).resolve()
+                scripts = root / "scripts"
+                scripts.mkdir()
+                candidate = scripts / "release.py"
+                candidate.write_bytes(self.candidate_release().read_bytes())
+                (scripts / "yaml.py").write_text(
+                    "from pathlib import Path\n"
+                    f"Path({str(root / 'candidate-yaml-shadowed')!r}).write_text('bad')\n",
+                    encoding="utf-8",
+                )
+                (root / "yaml.py").write_text(
+                    "from pathlib import Path\n"
+                    f"Path({str(root / 'cwd-yaml-shadowed')!r}).write_text('bad')\n",
+                    encoding="utf-8",
+                )
+                workflow = root / ".github/workflows/release.yml"
+                workflow.parent.mkdir(parents=True)
+                workflow.write_text(workflow_text, encoding="utf-8")
+                home, tmp = root / "home", root / "tmp"
+                home.mkdir(mode=0o700)
+                tmp.mkdir(mode=0o700)
+                env = {
+                    "PATH": os.defpath,
+                    "HOME": str(home),
+                    "TMPDIR": str(tmp),
+                    "NINEROUTER_POLICY_PARSER": parser,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "LC_ALL": "C.UTF-8",
+                    "TZ": "UTC",
+                }
+                result = subprocess.run(
+                    [sys.executable, "-B", str(candidate), "check-policy", str(root)],
+                    cwd=root, env=env, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("exact commit SHA", result.stderr)
+                self.assertFalse((root / "candidate-yaml-shadowed").exists())
+                self.assertFalse((root / "cwd-yaml-shadowed").exists())
+
     def test_prepare_cli_blocks_p2_findings_in_a_changed_candidate(self):
         candidate = self.candidate_release()
         if candidate.read_bytes() == Path(release.__file__).resolve().read_bytes():

@@ -99,8 +99,8 @@ class ReviewPolicyTests(unittest.TestCase):
         finding = {"user": BOT, "commit_id": HEAD, "body": "**[P1]** Broken request"}
         self.assertFalse(self.gate(inline=[finding], comments=[native_state(), receipt()]))
 
-    def test_p0_p1_in_structured_summary_cannot_bypass_severity_gate(self):
-        for severity in ("P0", "P1"):
+    def test_all_priorities_in_structured_summary_block_publication(self):
+        for severity in ("P0", "P1", "P2", "P3"):
             with self.subTest(severity=severity):
                 comment = native_state()
                 comment["body"] += f"\n**[{severity}]** Broken request despite clean JSON"
@@ -115,10 +115,22 @@ class ReviewPolicyTests(unittest.TestCase):
         finding = {"user": BOT, "commit_id": OTHER, "body": "[P1] Broken old request"}
         self.assertTrue(self.gate(inline=[finding], comments=[receipt()]))
 
-    def test_p2_does_not_block_a_completed_formal_review(self):
+    def test_p2_p3_and_unlabelled_findings_block_completed_formal_review(self):
         review = {"id": 12, "user": BOT, "commit_id": HEAD, "state": "COMMENTED", "submitted_at": COMPLETED}
-        finding = {"user": BOT, "commit_id": HEAD, "pull_request_review_id": 12, "body": "[P2] Detail"}
-        self.assertTrue(self.gate(reviews=[review], inline=[finding]))
+        for body in ("[P2] Bug", "[P3] Bug", "Drops the last response chunk"):
+            finding = {"user": BOT, "commit_id": HEAD, "pull_request_review_id": 12, "body": body}
+            with self.subTest(body=body):
+                self.assertFalse(self.gate(reviews=[review], inline=[finding], comments=[receipt()]))
+
+    def test_structured_findings_override_an_approval_or_clean_receipt(self):
+        review = {"id": 12, "user": BOT, "commit_id": HEAD, "state": "APPROVED", "submitted_at": COMPLETED}
+        for state in (native_state(has_any_findings=True), native_state(has_unresolved_findings=True)):
+            with self.subTest(state=state):
+                self.assertFalse(self.gate(reviews=[review], comments=[state, receipt()]))
+
+    def test_foreign_inline_comment_does_not_impersonate_a_codex_finding(self):
+        finding = {"user": {"login": "somebody", "type": "User"}, "commit_id": HEAD, "body": "[P2] Bug"}
+        self.assertTrue(self.gate(inline=[finding], comments=[receipt()]))
 
     def test_quota_comment_without_completed_review_is_not_success(self):
         review = {"user": BOT, "commit_id": HEAD, "state": "COMMENTED",
@@ -237,6 +249,66 @@ class TestEnvironmentTests(unittest.TestCase):
                     release.run_vitest(Path("/example"), ["translator/example.test.js"], update=True)
                 self.assertTrue(paths)
                 self.assertTrue(all(not path.exists() for path in paths))
+
+
+class NodeBaseTests(unittest.TestCase):
+    digest = "sha256:" + "e" * 64
+
+    def inspect(self, *, candidate=None, current=None, upstream="node:22-alpine", platforms=None):
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory)
+            (app / "Dockerfile").write_text("ARG NODE_IMAGE=" + (candidate or f"node:22-alpine@{self.digest}") + "\n")
+            metadata = {"digest": current if current is not None else self.digest,
+                        "manifests": platforms if platforms is not None else [
+                            {"platform": {"os": "linux", "architecture": "amd64"}}]}
+            with patch.object(release, "run", side_effect=["ARG NODE_IMAGE=" + upstream, json.dumps(metadata)]) as run:
+                release.check_node_base(app, OTHER)
+            self.assertEqual(run.call_args.args,
+                             ("docker", "buildx", "imagetools", "inspect", upstream,
+                              "--format", "{{json .Manifest}}"))
+
+    def test_current_index_pin_and_required_platform_are_accepted(self):
+        self.inspect()
+
+    def test_changed_base_tag_requires_reviewed_patch_and_rebuild(self):
+        with self.assertRaisesRegex(ValueError, "pin is stale"):
+            self.inspect(current="sha256:" + "f" * 64)
+
+    def test_unpinned_or_changed_upstream_base_cannot_stay_on_old_node(self):
+        with self.assertRaisesRegex(ValueError, "exact base tag"):
+            self.inspect(candidate="node:22-alpine")
+        with self.assertRaisesRegex(ValueError, "exact base tag"):
+            self.inspect(upstream="node:24-alpine")
+
+    def test_missing_digest_or_platform_is_not_a_successful_registry_check(self):
+        with self.assertRaisesRegex(ValueError, "exact Node base digest"):
+            self.inspect(current="")
+        with self.assertRaisesRegex(ValueError, "no linux/amd64"):
+            self.inspect(platforms=[{"platform": {"os": "linux", "architecture": "arm64"}}])
+
+    def test_prepare_checks_base_before_the_already_published_shortcut(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory) / "app"
+            package = '{"version":"0.5.104"}'
+            def git(*args, **kwargs):
+                if args == ("git", "init", str(app)):
+                    app.mkdir()
+                    (app / "package.json").write_text(package)
+                if args[:2] == ("git", "show"):
+                    return package
+                if args[:2] == ("git", "rev-parse"):
+                    return HEAD
+                return ""
+            with (patch.dict(os.environ, {"GITHUB_REPOSITORY": "warelik/9router", "GITHUB_SHA": HEAD}),
+                  patch.object(release, "api", side_effect=[{"sha": HEAD}, {"sha": OTHER}]),
+                  patch.object(release, "proposal", return_value=None),
+                  patch.object(release, "patch_identity", return_value=([Path("fix.patch")], "f" * 64)),
+                  patch.object(release, "output"), patch.object(release, "run", side_effect=git),
+                  patch.object(release, "check_node_base", side_effect=ValueError("pin is stale")) as check,
+                  patch.object(release, "pages", side_effect=AssertionError("stale pin precedes release lookup")),
+                  self.assertRaisesRegex(ValueError, "pin is stale")):
+                release.prepare(app)
+            check.assert_called_once_with(app, OTHER)
 
 
 class GoldenBaselineTests(unittest.TestCase):
@@ -417,7 +489,7 @@ class PublicationTests(unittest.TestCase):
                   patch.object(release, "close_recovered_repair") as close):
                 release.publish(root)
             close.assert_called_once_with(
-                "warelik/9router", env["GITHUB_SHA"], has_minor=False, expected_head=OTHER)
+                "warelik/9router", env["GITHUB_SHA"], expected_head=OTHER)
 
     def test_publish_step_wires_the_prepared_repair_head(self):
         workflow = (Path(__file__).parents[1] / ".github/workflows/release.yml").read_text()

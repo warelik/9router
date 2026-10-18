@@ -23,15 +23,25 @@ Release policy changes are separate from application repairs and require review.
 Ordinary conflicts, test failures and review findings belong to native Codex
 repair tasks, not the owner. Push the actual fix to the repair PR branch; a report
 or an unpublished commit does not count. New application SHAs need their own
-review and regressions before publication. Keep P0/P1 blocking; P2/P3 findings
-get automatic follow-up without changing the publication threshold.
+review and regressions before publication. Every real unresolved finding blocks
+publication and adoption, including P2/P3. Machines fix it, retain a regression,
+and request fresh review of the changed exact SHA. Resolve a false positive with
+evidence; optional optimization and style are not product defects.
 
 The workflow adopts only the verified patch or policy diff, never repair-context
 files. It records future regression files separately from the historical
 manifest entries, so upstream absorption cannot silently remove their coverage.
-After bounded unsuccessful attempts it assigns an issue through existing GitHub
-notifications. Escalation must explain evidence, attempts and the cost/risk of the
-remaining choices; it is not an instruction for routine manual maintenance.
+Bound each task and job by time and resources. A later scheduled run continues
+with the prior evidence and a changed diagnostic approach. Elapsed time and
+attempt count alone never justify escalation. Use existing GitHub notifications
+only when evidence shows no simple correct solution without workarounds or
+overengineering, or the owner's scope or permissions must change. Explain the
+attempts, alternatives and consequences; routine maintenance belongs to machines.
+
+When upstream fixes a defect, prove the regression passes without our product
+patch, remove the redundant change, and retain the useful test. Prefer existing
+GitHub and Codex mechanisms; do not create a separate product or a controller
+without demonstrated need.
 
 Do not force-push, rewrite existing branches, skip conflicting patches or weaken
 tests/review to make publication pass. A published build is not a deployment.

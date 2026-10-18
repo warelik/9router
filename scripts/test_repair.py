@@ -18,6 +18,7 @@ HEAD = "c" * 40
 UPSTREAM = "d" * 40
 STATE = {"schema": 1, "config": CONFIG, "upstream": UPSTREAM, "seed": SEED,
          "head": HEAD, "number": 2, "branch": "repair/example",
+         "cycle": "e" * 64, "window": "run-prior",
          "created_at": "2026-10-16T10:00:00Z"}
 ENV = {"GITHUB_REPOSITORY": REPO, "GITHUB_SHA": CONFIG, "GITHUB_RUN_ID": "42",
        "REPAIR_PR": "2", "REPAIR_HEAD": HEAD, "CANDIDATE_PR": "1", "CANDIDATE_SHA": HEAD}
@@ -34,6 +35,7 @@ class RepairBoundaryTests(unittest.TestCase):
     def test_only_patch_changes_or_policy_changes_are_eligible(self):
         for changed, policy in (
             ("patches/0009-fix.patch", False), ("scripts/release.py", True),
+            ("README.md", True),
             ("scripts/test_new_case.py", True), (".github/workflows/release.yml", True),
         ):
             with (self.subTest(changed=changed),
@@ -44,7 +46,8 @@ class RepairBoundaryTests(unittest.TestCase):
     def test_context_manifest_instructions_and_mixed_changes_cannot_land(self):
         for changed in (
             ".repair/context.json", ".repair/upstream.tar.gz", "patches/source.json",
-            "AGENTS.md", ".gitignore", "patches/0009-fix.patch\nscripts/release.py",
+            "AGENTS.md", ".gitignore", "CONTRIBUTING.md",
+            "patches/0009-fix.patch\nscripts/release.py",
         ):
             with (self.subTest(changed=changed),
                   patch.object(release, "run", side_effect=["", "", "", CONFIG, changed]),
@@ -81,6 +84,7 @@ class RepairBoundaryTests(unittest.TestCase):
         state = {**STATE, "head": SEED}
         with (patch.object(release, "repair_pull", return_value=state),
               patch.object(release, "repair_comments", return_value=[request()]),
+              patch.object(release, "repair_states", return_value=[state]),
               patch.object(release, "output") as output,
               patch.object(release, "repair_changes", side_effect=AssertionError("No new head"))):
             result = release.proposal(REPO, CONFIG, Path("/unused"))
@@ -98,6 +102,7 @@ class RepairBoundaryTests(unittest.TestCase):
         with (tempfile.TemporaryDirectory() as directory,
               patch.object(release, "repair_pull", return_value=STATE),
               patch.object(release, "repair_comments", return_value=[request()]),
+              patch.object(release, "repair_states", return_value=[STATE]),
               patch.object(release, "repair_changes", return_value=(["patches/0009-fix.patch"], False)),
               patch.object(release, "copy_patch_series", return_value=Path(directory)) as copy,
               patch.object(release, "output")):
@@ -105,26 +110,27 @@ class RepairBoundaryTests(unittest.TestCase):
         self.assertFalse(result["waiting"])
         copy.assert_called_once_with(HEAD, Path(directory) / "proposal")
 
-    def test_an_empty_push_does_not_prevent_rechecking_the_original_candidate(self):
+    def test_elapsed_repair_window_fails_even_when_the_pr_is_waiting_for_a_push(self):
         with (patch.object(release, "repair_pull", return_value=STATE),
               patch.object(release, "repair_comments",
                            return_value=[request(age=release.REVIEW_WAIT_SECONDS + 1)]),
-              patch.object(release, "repair_changes", return_value=([], False)),
-              patch.object(release, "output")):
-            result = release.proposal(REPO, CONFIG, Path("/unused"))
-        self.assertTrue(result["deferred"])
+              patch.object(release, "repair_states", return_value=[STATE]),
+              patch.object(release, "output") as output,
+              self.assertRaisesRegex(ValueError, "two-hour")):
+            release.proposal(REPO, CONFIG, Path("/unused"))
+        self.assertIn("two-hour", output.call_args.kwargs["reason"])
 
-    def test_policy_minor_findings_request_followup_without_blocking_acceptance(self):
+    def test_policy_findings_block_adoption_and_enter_normal_repair(self):
         review = {"body": f"<!-- 9router-policy:{HEAD} -->", "created_at": request()["created_at"]}
         with (patch.object(release, "repair_pull", return_value=STATE),
               patch.object(release, "repair_comments", return_value=[review]),
+              patch.object(release, "repair_states", return_value=[STATE]),
               patch.object(release, "repair_changes", return_value=(["scripts/release.py"], True)),
-              patch.object(release, "policy_review", return_value=(True, "Accepted")),
-              patch.object(release, "minor_findings", return_value=[{"body": "P2 fix"}]),
-              patch.object(release, "output") as output):
+              patch.object(release, "policy_review", return_value=(False, "Codex reported an unresolved finding on this commit")),
+              patch.object(release, "output") as output,
+              self.assertRaisesRegex(ValueError, "unresolved finding")):
             release.proposal(REPO, CONFIG, Path("/unused"))
-        self.assertTrue(output.call_args.kwargs["ready"])
-        self.assertTrue(output.call_args.kwargs["followup"])
+        self.assertFalse(output.call_args.kwargs["ready"])
 
     def test_recovered_candidate_closes_only_the_unchanged_blocking_repair(self):
         with (patch.object(release, "api", side_effect=[
@@ -151,21 +157,15 @@ class RepairBoundaryTests(unittest.TestCase):
             release.close_recovered_repair(REPO, CONFIG)
         self.assertFalse(any(c.kwargs.get("method") in {"POST", "PATCH"} for c in api.call_args_list))
 
-    def test_minor_or_changed_repair_is_not_closed_by_default_candidate_recovery(self):
-        for state, minor, head in (
-            ({**STATE, "nonblocking": True}, False, HEAD),
-            (STATE, True, HEAD), (STATE, False, SEED),
-        ):
-            with (self.subTest(minor=minor, head=head),
-                  patch.object(release, "api", side_effect=[
-                      {"sha": CONFIG}, {"state": "open", "head": {"sha": head}}]) as api):
-                release.close_recovered_repair(REPO, CONFIG, state=state, has_minor=minor)
-            self.assertFalse(any(c.kwargs.get("method") in {"POST", "PATCH"} for c in api.call_args_list))
+    def test_changed_repair_is_not_closed_by_default_candidate_recovery(self):
+        with patch.object(release, "api", side_effect=[
+                {"sha": CONFIG}, {"state": "open", "head": {"sha": SEED}}]) as api:
+            release.close_recovered_repair(REPO, CONFIG, state=STATE)
+        self.assertFalse(any(c.kwargs.get("method") in {"POST", "PATCH"} for c in api.call_args_list))
 
-    def test_policy_minor_followup_targets_the_new_adopted_configuration(self):
+    def test_clean_policy_is_adopted_and_dispatched_without_a_second_repair_queue(self):
         adopted = "e" * 40
         review = {"body": f"<!-- 9router-policy:{HEAD} -->", "created_at": request()["created_at"]}
-        finding = {"body": "P2 policy followup", "path": "scripts/release.py", "line": 1}
         def api(path, **kwargs):
             if path.endswith("/commits/downstream"):
                 return {"sha": CONFIG}
@@ -177,18 +177,16 @@ class RepairBoundaryTests(unittest.TestCase):
               patch.object(release, "repair_changes", return_value=(["scripts/release.py"], True)),
               patch.object(release, "repair_comments", return_value=[review]),
               patch.object(release, "policy_review", return_value=(True, "Accepted")),
-              patch.object(release, "minor_findings", return_value=[finding]),
-              patch.object(release, "api", side_effect=api),
+              patch.object(release, "api", side_effect=api) as calls,
               patch.object(release, "pages", return_value=[]),
               patch.object(release, "run", side_effect=run),
               patch.object(release.subprocess, "check_output", return_value=b"verified diff"),
               patch.object(release.subprocess, "run", return_value=SimpleNamespace(stdout="", returncode=1)),
               patch.object(release, "request_repair") as followup):
             release.land_repair(Path(directory))
-        self.assertEqual(followup.call_args.kwargs["config"], adopted)
-        self.assertEqual(followup.call_args.kwargs["upstream"], UPSTREAM)
-        self.assertTrue(followup.call_args.kwargs["nonblocking"])
-        self.assertIn("P2 policy followup", followup.call_args.kwargs["evidence"])
+        followup.assert_not_called()
+        self.assertEqual(calls.call_args.args, (f"repos/{REPO}/actions/workflows/release.yml/dispatches",))
+        self.assertEqual(calls.call_args.kwargs, {"method": "POST", "data": {"ref": "downstream"}})
 
 
 class NativeTaskTests(unittest.TestCase):
@@ -200,12 +198,13 @@ class NativeTaskTests(unittest.TestCase):
             patch.object(release, "failure_evidence", return_value="Actual failed assertion"),
             patch.object(release, "owner_token", return_value="test-only"),
             patch.object(release, "repair_comments", return_value=requests),
+            patch.object(release, "repair_states", return_value=[STATE]),
         )
         return context
 
     def test_first_fix_is_a_native_owner_request_not_a_review_or_a_report(self):
         contexts = self.invoke([])
-        with contexts[0], contexts[1] as api, contexts[2], contexts[3], contexts[4], contexts[5]:
+        with contexts[0], contexts[1] as api, contexts[2], contexts[3], contexts[4], contexts[5], contexts[6]:
             release.request_repair(Path("/unused"))
         sent = api.call_args
         self.assertEqual(sent.args[0], f"repos/{REPO}/issues/2/comments")
@@ -218,27 +217,168 @@ class NativeTaskTests(unittest.TestCase):
 
     def test_same_head_is_not_requested_twice(self):
         contexts = self.invoke([request(HEAD)])
-        with contexts[0], contexts[1] as api, contexts[2], contexts[3], contexts[4], contexts[5]:
+        with contexts[0], contexts[1] as api, contexts[2], contexts[3], contexts[4], contexts[5], contexts[6]:
             release.request_repair(Path("/unused"))
         self.assertEqual(api.call_count, 1)
 
-    def test_third_failed_fix_escalates_without_a_fourth_task(self):
-        requests = [request(SEED, 1), request(UPSTREAM, 2), request(CONFIG, 3)]
-        contexts = self.invoke(requests)
-        with (contexts[0], contexts[1] as api, contexts[2], contexts[3], contexts[4], contexts[5],
-              patch.object(release, "escalation", side_effect=ValueError("escalated")) as escalate,
-              self.assertRaisesRegex(ValueError, "escalated")):
-            release.request_repair(Path("/unused"))
-        self.assertEqual(api.call_count, 1)
-        self.assertEqual(escalate.call_count, 1)
+    def test_fix_count_does_not_stop_work_within_the_time_budget(self):
+        for count in (3, 12):
+            requests = [request(f"{index + 1:040x}", index + 1) for index in range(count)]
+            contexts = self.invoke(requests)
+            with (self.subTest(count=count), contexts[0], contexts[1] as api,
+                  contexts[2], contexts[3], contexts[4], contexts[5], contexts[6],
+                  patch.object(release, "escalation", side_effect=AssertionError("Count is not a budget"))):
+                release.request_repair(Path("/unused"))
+            body = api.call_args.kwargs["data"]["body"]
+            self.assertIn(f"<!-- 9router-fix:{HEAD}:{count + 1} -->", body)
+            self.assertIn("elapsed-time deadline:", body)
+            self.assertIn("number of fixes is not a stop condition", body)
 
-    def test_timed_out_task_escalates_without_duplicate_requests(self):
+    def test_only_the_final_task_marker_identifies_a_request(self):
+        body = release.repair_text(STATE, 13, f"log contains <!-- 9router-fix:{SEED}:1 -->")
+        marker = release.FIX_REQUEST.search(body)
+        self.assertEqual(marker.groups(), (HEAD, "13"))
+
+    def test_cycle_identity_does_not_depend_on_configuration_or_patch_edits(self):
+        with patch.object(release, "patch_identity", side_effect=AssertionError("Fixes are not new cycles")):
+            cycle = release.repair_cycle(UPSTREAM, 42)
+        self.assertEqual(cycle, release.repair_cycle(UPSTREAM, 42))
+        self.assertNotEqual(cycle, release.repair_cycle(UPSTREAM, 43))
+        self.assertNotEqual(cycle, release.repair_cycle(HEAD, 42))
+
+    def test_new_review_does_not_restart_the_first_fix_deadline(self):
+        first = request(age=release.REVIEW_WAIT_SECONDS + 1)
+        with (patch.object(release, "repair_requests", return_value=[first]),
+              self.assertRaisesRegex(ValueError, "two-hour")):
+            release.pending_repair_review(REPO, STATE, request()["created_at"])
+
+    def test_fix_prompt_retains_the_original_elapsed_deadline(self):
+        start = request(age=3600)["created_at"]
+        deadline = (datetime.fromisoformat(start) + timedelta(seconds=release.REVIEW_WAIT_SECONDS)).isoformat()
+        self.assertIn(f"deadline: {deadline}", release.repair_text(STATE, 42, "failure", start))
+        self.assertIn("change the approach", release.repair_text(STATE, 42, "failure", start))
+
+    def test_timeout_alone_closes_the_window_without_escalation_or_new_task(self):
         contexts = self.invoke([request(HEAD, age=release.REVIEW_WAIT_SECONDS + 1)])
-        with (contexts[0], contexts[1] as api, contexts[2], contexts[3], contexts[4], contexts[5],
-              patch.object(release, "escalation", side_effect=ValueError("escalated")),
-              self.assertRaisesRegex(ValueError, "escalated")):
+        with (contexts[0], contexts[1] as api, contexts[2], contexts[3], contexts[4], contexts[5], contexts[6],
+              patch.dict(os.environ, {**ENV, "GITHUB_EVENT_NAME": "issue_comment"}),
+              patch.object(release, "expire_repair_window") as expire,
+              patch.object(release, "escalation", side_effect=AssertionError("Elapsed time is not an owner decision")),
+              patch("builtins.print") as emit):
             release.request_repair(Path("/unused"))
         self.assertEqual(api.call_count, 1)
+        expire.assert_called_once()
+        self.assertIn("next scheduled run", emit.call_args.args[0])
+
+    def test_expiry_is_recorded_and_closes_only_the_matching_window(self):
+        pull = {"state": "open", "head": {"sha": HEAD, "repo": {"full_name": REPO},
+                                             "ref": "repair/window"},
+                "base": {"ref": "downstream"},
+                "body": "<!-- 9router-repair:v1 " + json.dumps(STATE) + " -->"}
+        with (patch.object(release, "repair_comments", return_value=[]),
+              patch.object(release, "api", side_effect=[pull, None, pull, None]) as api):
+            release.expire_repair_window(REPO, STATE, "deadline and evidence", "test-only")
+        self.assertEqual(api.call_args_list[1].args,
+                         (f"repos/{REPO}/issues/{STATE['number']}/comments",))
+        timeout = api.call_args_list[1].kwargs["data"]["body"]
+        self.assertIn("next scheduled run", timeout)
+        self.assertIn("does not request an owner decision", timeout)
+        self.assertIn("deadline and evidence", timeout)
+        self.assertEqual(api.call_args_list[0].args, (f"repos/{REPO}/pulls/{STATE['number']}",))
+        self.assertEqual(api.call_args_list[3].kwargs["data"], {"state": "closed"})
+
+        moved = {**STATE, "head": SEED}
+        advanced = {**pull, "head": {**pull["head"], "sha": SEED}}
+        with (patch.object(release, "repair_comments", return_value=[]),
+              patch.object(release, "api", side_effect=[advanced, None, advanced, None]) as api):
+            release.expire_repair_window(REPO, moved, "deadline", "test-only")
+        self.assertEqual(api.call_count, 4)
+
+        wrong_window = {**pull, "body": "<!-- 9router-repair:v1 " + json.dumps(
+            {**STATE, "window": "run-other"}) + " -->"}
+        with (patch.object(release, "repair_comments", return_value=[]),
+              patch.object(release, "api", return_value=wrong_window) as api,
+              self.assertRaisesRegex(ValueError, "identity changed")):
+            release.expire_repair_window(REPO, STATE, "deadline", "test-only")
+        self.assertEqual(api.call_count, 1)
+
+    def test_next_schedule_starts_a_fresh_window_and_keeps_old_attempt_history(self):
+        old = request(HEAD, 7, age=release.REVIEW_WAIT_SECONDS + 1)
+        new_seed = "f" * 40
+        calls = []
+
+        def api(path, *, method="GET", data=None, token=None):
+            calls.append((path, method, data, token))
+            if path.endswith("/commits/downstream"):
+                return {"sha": CONFIG}
+            if path.endswith("/pulls") and method == "POST":
+                return {"number": 3, "created_at": datetime.now(timezone.utc).isoformat()}
+            return None
+
+        def run(*args, cwd=None, **kwargs):
+            if args[:2] == ("git", "init"):
+                Path(args[2]).mkdir(parents=True, exist_ok=True)
+            if args[:3] == ("git", "worktree", "add"):
+                Path(args[4]).mkdir(parents=True, exist_ok=True)
+            if args[:3] == ("git", "rev-parse", "HEAD"):
+                return new_seed
+            return ""
+
+        def process(command, **kwargs):
+            return SimpleNamespace(returncode=1 if "--quiet" in command else 0, stdout="")
+
+        with (tempfile.TemporaryDirectory() as directory,
+              patch.dict(os.environ, {**ENV, "GITHUB_EVENT_NAME": "schedule"}),
+              patch.object(release, "api", side_effect=api),
+              patch.object(release, "repair_pull", return_value=STATE),
+              patch.object(release, "failure_evidence", return_value="deadline evidence"),
+              patch.object(release, "owner_token", return_value="test-only"),
+              patch.object(release, "repair_states", return_value=[STATE]),
+              patch.object(release, "repair_requests", side_effect=[[old], []]),
+              patch.object(release, "repair_history", side_effect=[[old], [old]]),
+              patch.object(release, "repair_comments", return_value=[]),
+              patch.object(release, "expire_repair_window") as expire,
+              patch.object(release, "run", side_effect=run),
+              patch.object(release.subprocess, "run", side_effect=process)):
+            release.request_repair(Path(directory) / "repair")
+
+        expire.assert_called_once()
+        created = next(call for call in calls if call[0].endswith("/pulls") and call[1] == "POST")
+        identity = release.REPAIR_STATE.search(created[2]["body"])
+        self.assertEqual(json.loads(identity.group(1))["window"], "run-42")
+        self.assertEqual(json.loads(identity.group(1))["cycle"], STATE["cycle"])
+        task = next(call for call in calls if call[0].endswith("/issues/3/comments"))
+        body = task[2]["body"]
+        self.assertIn(f"<!-- 9router-fix:{new_seed}:2 -->", body)
+        self.assertIn("Earlier attempts across this upstream/release campaign", body)
+        self.assertIn(old["created_at"], body)
+        self.assertIn("change the approach", body)
+
+    def test_deadline_is_scoped_to_window_but_all_campaign_attempts_remain_history(self):
+        cycle = STATE["cycle"]
+        old_state = {**STATE, "number": 1, "window": "run-old"}
+        new_state = {**STATE, "number": 3, "window": "run-new"}
+        old_pull = {
+            "number": 1, "user": {"login": "github-actions[bot]"},
+            "head": {"sha": SEED, "repo": {"full_name": REPO}, "ref": "repair/old"},
+            "state": "closed", "created_at": "2026-10-15T10:00:00Z",
+            "body": "<!-- 9router-repair:v1 " + json.dumps(old_state) + " -->",
+        }
+        new_pull = {
+            "number": 3, "user": {"login": "github-actions[bot]"},
+            "head": {"sha": HEAD, "repo": {"full_name": REPO}, "ref": "repair/new"},
+            "state": "open", "created_at": "2026-10-16T10:00:00Z",
+            "body": "<!-- 9router-repair:v1 " + json.dumps(new_state) + " -->",
+        }
+        old_request = request(SEED, 1, age=release.REVIEW_WAIT_SECONDS + 10)
+        new_request = request(HEAD, 2, age=5)
+        comments = {1: [old_request], 3: [new_request]}
+        with (patch.object(release, "pages", return_value=[old_pull, new_pull]),
+              patch.object(release, "repair_comments", side_effect=lambda _repo, number: comments[number])):
+            self.assertEqual(release.repair_requests(REPO, new_state), [new_request])
+            self.assertEqual(release.repair_history(REPO, new_state), [old_request, new_request])
+        self.assertEqual(release.repair_window(new_state), "run-new")
+        self.assertEqual(new_state["cycle"], cycle)
 
     def test_superseded_configuration_does_not_close_or_repair_newer_work(self):
         with (patch.dict(os.environ, ENV), patch.object(release, "api", return_value={"sha": HEAD}),
@@ -263,26 +403,27 @@ class NativeTaskTests(unittest.TestCase):
         self.assertIn("Actual assertion failed", evidence)
         self.assertIn("[P2] Restore custom call type", evidence)
 
-    def test_p2_remains_nonblocking_but_gets_an_automatic_followup(self):
-        finding = {"user": {"login": release.BOT, "type": "Bot"}, "commit_id": HEAD, "body": "[P2] Bug"}
-        with patch.object(release, "pages", return_value=[
-            finding, {**finding, "commit_id": CONFIG},
-            {**finding, "user": {"login": "somebody", "type": "User"}},
-        ]):
-            self.assertEqual(release.minor_findings(REPO, 1, HEAD), [finding])
-        self.assertIsNone(release.SEVERITY.search("[P2] Bug"))
+    def test_legacy_nonblocking_metadata_cannot_reenable_publication_exception(self):
+        contexts = self.invoke([])
+        with (contexts[0], contexts[1] as api, contexts[3], contexts[4], contexts[5], contexts[6],
+              patch.dict(os.environ, {"NONBLOCKING_FOLLOWUP": "true"}),
+              patch.object(release, "repair_pull", return_value={**STATE, "nonblocking": True})):
+            release.request_repair(Path("/unused"))
+        self.assertIn("push the actual fix", api.call_args.kwargs["data"]["body"])
+        self.assertNotIn("nonblocking", api.call_args.kwargs["data"]["body"])
 
     def test_policy_configuration_changes_do_not_reset_the_repair_budget(self):
         cycle = "e" * 64
-        state = {**STATE, "cycle": cycle}
+        state = {**STATE, "cycle": cycle, "window": "run-42"}
         previous = {
             "number": 1, "user": {"login": "github-actions[bot]", "type": "Bot"},
-            "head": {"repo": {"full_name": REPO}, "ref": "repair/previous"},
+            "head": {"sha": SEED, "repo": {"full_name": REPO}, "ref": "repair/previous"},
+            "state": "closed", "created_at": "2026-10-15T10:00:00Z",
             "body": "<!-- 9router-repair:v1 " + json.dumps({**state, "config": SEED}) + " -->",
         }
         first, second = request(SEED, 1, age=2), request(UPSTREAM, 2, age=1)
         with (patch.object(release, "pages", return_value=[previous]),
-              patch.object(release, "repair_comments", side_effect=[[], [first, second]])):
+              patch.object(release, "repair_comments", side_effect=[[first, second], []])):
             self.assertEqual(release.repair_requests(REPO, state), [first, second])
 
 
@@ -403,8 +544,17 @@ class AdoptionTests(unittest.TestCase):
             self.assertIn("--network=none", args)
             self.assertIn("--cap-drop=ALL", args)
             self.assertIn("--security-opt=no-new-privileges", args)
+            self.assertEqual(args[args.index(release.POLICY_IMAGE) + 1:
+                                  args.index(release.POLICY_IMAGE) + 4],
+                             ["python3", "-I", "-B"])
+            launcher = args[-4]
+            self.assertLess(launcher.index("import yaml"), launcher.index("import release"))
+            self.assertIn("NINEROUTER_POLICY_PARSER", env)
+            self.assertEqual(Path(env["NINEROUTER_POLICY_PARSER"]), Path(args[-1]))
             mounts = [args[i + 1] for i, value in enumerate(args) if value == "--mount"]
             self.assertEqual(sum(m.endswith(",readonly") for m in mounts), 1)
+            self.assertTrue(any(str(Path(args[-1]).parents[1]) in mount and mount.endswith(",readonly")
+                                for mount in mounts))
             self.assertNotIn(str(candidate_root), " ".join(args))
             proposed = Path(env["NINEROUTER_POLICY_CANDIDATE_RELEASE"])
             self.assertTrue(proposed.is_file())
@@ -412,7 +562,7 @@ class AdoptionTests(unittest.TestCase):
             self.assertEqual(proposed.stat().st_mode & 0o777, 0o444)
             self.assertTrue(any(str(proposed.parents[2]) in mount for mount in mounts))
             candidate_copies.append(proposed)
-            suite = Path(args[-1])
+            suite = Path(args[-2])
             trusted_test_files.append(sorted(path.name for path in suite.glob("test_*.py")))
             self.assertIn("test_policy_cli.py", trusted_test_files[-1])
             self.assertNotIn("test_candidate.py", trusted_test_files[-1])
@@ -423,7 +573,7 @@ class AdoptionTests(unittest.TestCase):
                 self.assertTrue(path.is_dir())
                 self.assertEqual(path.stat().st_mode & 0o777, 0o700)
                 paths.append(path)
-            suites.append(args[-1])
+            suites.append(args[-2])
             return SimpleNamespace(returncode=0)
 
         with (tempfile.TemporaryDirectory() as directory,
@@ -502,3 +652,72 @@ class AdoptionTests(unittest.TestCase):
             workflow.write_text(
                 "jobs:\n  test:\n    steps:\n      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n")
             release.validate_action_pins(workflow)
+            workflow.write_text("jobs:\n  test:\n    steps:\n      - uses: actions/checkout@main\n")
+            with self.assertRaisesRegex(ValueError, "exact commit SHA"):
+                release.validate_action_pins(workflow)
+            workflow.write_text(
+                'jobs:\n  test:\n    steps:\n      - "uses": "actions/checkout@main"\n')
+            with self.assertRaisesRegex(ValueError, "exact commit SHA"):
+                release.validate_action_pins(workflow)
+            workflow.write_text(
+                'jobs:\n  test:\n    steps:\n      - {uses: "actions/checkout@main"}\n')
+            with self.assertRaisesRegex(ValueError, "exact commit SHA"):
+                release.validate_action_pins(workflow)
+            workflow.write_text(
+                "jobs:\n  test:\n    steps:\n      - uses: >-\n          actions/checkout@main\n")
+            with self.assertRaisesRegex(ValueError, "exact commit SHA"):
+                release.validate_action_pins(workflow)
+
+    def test_action_workflows_keep_reusable_and_subdirectory_commit_refs(self):
+        commit = "c" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = Path(directory) / "release.yml"
+            workflow.write_text(
+                "jobs:\n"
+                "  reusable:\n"
+                f"    uses: owner/repository/.github/workflows/child.yml@{commit}\n"
+                "  steps:\n"
+                "    steps:\n"
+                f"      - uses: owner/repository/actions/check/action.yml@{commit}\n"
+                f"      - &pinned {{uses: owner/repository/shared@{commit}}}\n"
+                "      - *pinned\n"
+                "      - uses: ./local-action\n"
+                "      - run: |\n"
+                "          echo 'uses: actions/checkout@main'\n")
+            release.validate_action_pins(workflow)
+
+    def test_policy_workflows_install_the_exact_parser_in_both_jobs(self):
+        workflow = release.ROOT / ".github/workflows/release.yml"
+        contents = workflow.read_text(encoding="utf-8")
+        self.assertEqual(contents.count(release.POLICY_YAML_REQUIREMENT), 2)
+        self.assertEqual(contents.count("Install The Pinned Policy YAML Parser"), 2)
+        release.validate_action_pins(workflow)
+
+    def test_action_workflows_reject_unsafe_yaml_tags_without_construction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = Path(directory) / "release.yml"
+            marker = Path(directory) / "yaml-tag-executed"
+            workflow.write_text(
+                "jobs:\n  check:\n    steps:\n"
+                f"      - !!python/object/apply:os.system [\"touch {marker}\"]\n")
+            with self.assertRaisesRegex(ValueError, "invalid or unsafe"):
+                release.validate_action_pins(workflow)
+            self.assertFalse(marker.exists())
+
+    def test_action_workflows_allow_docker_actions_only_by_exact_image_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = Path(directory) / "release.yml"
+            workflow.write_text(
+                "jobs:\n  test:\n    steps:\n"
+                f"      - uses: docker://registry.example:5000/acme/action:v1@sha256:{'a' * 64}\n")
+            release.validate_action_pins(workflow)
+            workflow.write_text(
+                "jobs:\n  test:\n    steps:\n"
+                "      - uses: docker://ghcr.io/acme/action:stable\n")
+            with self.assertRaisesRegex(ValueError, "Docker Action must use an exact image@sha256 digest"):
+                release.validate_action_pins(workflow)
+            workflow.write_text(
+                "jobs:\n  test:\n    steps:\n"
+                f"      - uses: docker://ghcr.io/acme/action@sha256:{'a' * 63}\n")
+            with self.assertRaisesRegex(ValueError, "Docker Action must use an exact image@sha256 digest"):
+                release.validate_action_pins(workflow)
