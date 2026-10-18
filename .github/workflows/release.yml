@@ -50,7 +50,7 @@ jobs:
       repair_head: ${{ steps.snapshot.outputs.repair_head }}
       followup: ${{ steps.snapshot.outputs.followup }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
       - name: Require The Trusted Default Branch
@@ -92,12 +92,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           path: trusted
           persist-credentials: false
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ needs.prepare.outputs.repair_head }}
           path: candidate
@@ -115,23 +115,23 @@ jobs:
       UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
       UPSTREAM_DIR: ${{ github.workspace }}/upstream
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           path: app
           persist-credentials: false
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           path: trusted
           persist-credentials: false
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: decolua/9router
           ref: ${{ needs.prepare.outputs.upstream }}
           path: upstream
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "22"
       - name: Install Application And Test Dependencies
@@ -156,13 +156,13 @@ jobs:
       PATCHSET_SHA256: ${{ needs.prepare.outputs.patchset }}
       CONFIG_SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - name: Build From The Immutable Remote Git Context
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: https://github.com/${{ github.repository }}.git#${{ needs.prepare.outputs.sha }}
           platforms: linux/amd64
@@ -210,7 +210,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/release"
           gzip -n -c "$RUNNER_TEMP/9router-image.tar" > "$RUNNER_TEMP/release/9router-image.tar.gz"
           python3 scripts/release.py provenance "$RUNNER_TEMP/release/9router-image.tar.gz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: reviewed-${{ needs.prepare.outputs.sha }}
           path: ${{ runner.temp }}/release/
@@ -226,11 +226,11 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: reviewed-${{ needs.prepare.outputs.sha }}
           path: release
@@ -263,7 +263,7 @@ jobs:
       issues: write
       actions: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -289,7 +289,7 @@ jobs:
       issues: write
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false

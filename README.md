@@ -53,38 +53,31 @@ automatic repair, including findings on an already published application.
 
 ## Native Codex repair
 
-Ordinary failures open a repair PR and request `@codex fix ...` using the owner's
-existing authorization. Its temporary upstream archive supplies exact source
-context even when the cloud task has no internet access. Codex updates the real
-branch: task acknowledgements, reports and unpublished commits are not fixes.
+Ordinary application failures are repaired on the exact upstream snapshot and
+ordered patch series. Policy repairs are checked without write credentials.
+The policy job uses only its immutable trusted test files and release module;
+the proposed release module runs as a separate process through the existing
+`prepare` and `land` commands. Disposable GitHub fixtures check readiness and
+review reads, and a local bare Git remote records the exact selectively adopted
+files. The verifier asserts actual outputs, API calls and Git changes, so an
+early `os._exit(0)` or printed success cannot meet the positive contract.
 
-Application repairs change the ordered patches. The resulting application gets
-a fresh exact-SHA review and regressions before the verified patch diff is
-adopted. Policy repairs instead run against both the trusted tests and proposed
-tests in a read-only, isolated job; the proposed YAML is checked with a
-checksum-pinned official actionlint binary and Codex reviews the exact policy SHA.
-Policy and application repairs cannot be mixed.
+The checker syntax-parses proposed Python without importing it, requires
+full commit SHAs for remote Actions, and runs checksum-pinned actionlint on the
+proposed workflow. Candidate-authored tests are not used as the pre-adoption
+verdict. Each policy candidate receives exact-SHA Codex review before selective
+adoption; the next default-branch run executes the adopted tests as trusted code.
+Application patches and release-policy repairs cannot be mixed.
 
-Only that verified diff is adopted into `downstream`; repair context is never
-merged. A dispatched normal cycle rechecks the new configuration and builds and
-publishes the exact reviewed application. New regression filenames are recorded
-in `patches/source.json` separately from its frozen historical `test_files`, and
-continue running if upstream absorbs the corresponding fix.
+Policy repair may include `README.md` alongside release scripts, workflow and
+tests. Application repair may change only `patches/*.patch`; mixed changes are
+rejected before checks or adoption.
 
-The same upstream/patchset since the last publication has at most three coding
-attempts, including policy repairs across configuration commits, and a two-hour task/review
-deadline, checked on callbacks and the scheduled fallback. A blocked review or
-failed verification is a failed workflow, not a green `ready=false`. Pending
-external work is explicitly reported as pending. Exhausted or unavailable
-machine repair assigns a deduplicated issue to the owner using existing GitHub
-notifications; the last verified release remains available.
-
-Upstream omits its URL/header snapshot. When missing from reviewed source, the
-test job generates it from the exact clean upstream with the shared test harness,
-then compares the patched application against it with `CI=true`. It never accepts
-snapshot values generated from the patched application itself.
-Both test phases run with disposable `HOME`, `XDG_*`, `TMPDIR` and `DATA_DIR`;
-client-config writers cannot use the operator's inherited configuration paths.
+The CLI verifier is a separate trusted-base transition. Its regression file
+must already exist on the default branch to run before later policy changes are
+adopted. The first transition requires its own exact-SHA review and isolated
+native checks before the verifier is used as the baseline for subsequent
+policy repairs.
 
 ## GitHub setup
 

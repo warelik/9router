@@ -1,6 +1,7 @@
 """Build one upstream snapshot plus the patch series; GitHub PRs hold reviews."""
 
 import argparse
+import ast
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -264,7 +265,7 @@ def repair_changes(state):
         raise ValueError("Repair seed is not based on the trusted configuration")
     changed = run("git", "diff", "--no-renames", "--name-only", state["seed"], state["head"], cwd=ROOT).splitlines()
     patches = [p for p in changed if re.fullmatch(r"patches/[A-Za-z0-9_.-]+\.patch", p)]
-    policy = [p for p in changed if p in {"scripts/release.py", ".github/workflows/release.yml"}
+    policy = [p for p in changed if p in {"scripts/release.py", ".github/workflows/release.yml", "README.md"}
               or re.fullmatch(r"scripts/test_[A-Za-z0-9_]+\.py", p)]
     if set(changed) != set(patches + policy) or (patches and policy):
         raise ValueError("Repair must change either application patches or release policy, without mixing them")
@@ -699,37 +700,135 @@ def request_repair(directory, *, config=None, upstream=None, evidence=None, nonb
     print(f"Requested native Codex fix on PR #{state['number']}; no deployment")
 
 
+def policy_container_engine():
+    """Select a working rootless Podman or Docker runner for isolated policy tests."""
+    attempts = []
+    host_exec = shutil.which("distrobox-host-exec")
+    if host_exec:
+        result = subprocess.run([host_exec, "podman", "info"], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, check=False, timeout=15)
+        if result.returncode == 0:
+            return [host_exec, "podman"], "podman"
+        attempts.append("host Podman through distrobox-host-exec is unavailable")
+    podman = shutil.which("podman")
+    if podman:
+        result = subprocess.run([podman, "info"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                check=False, timeout=15)
+        if result.returncode == 0:
+            return [podman], "podman"
+        attempts.append("Podman CLI is installed but its service is unavailable")
+    docker = shutil.which("docker")
+    if docker:
+        result = subprocess.run([docker, "info"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                check=False, timeout=15)
+        if result.returncode == 0:
+            return [docker], "docker"
+        attempts.append("Docker CLI is installed but its daemon is unavailable")
+    detail = "; ".join(attempts) if attempts else "no Docker or Podman CLI is installed"
+    raise ValueError(f"Policy checks require a working Docker or Podman runtime: {detail}")
+
+def validate_action_pins(workflow):
+    for reference in re.findall(r"(?m)^[ \t]*(?:-[ \t]*)?uses:[ \t]*(\S+)",
+                                Path(workflow).read_text(encoding="utf-8")):
+        if reference.startswith(("./", "docker://")):
+            continue
+        action, separator, commit = reference.rpartition("@")
+        if (not separator or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", action)
+                or not SHA.fullmatch(commit)):
+            raise ValueError(f"Workflow action must use an exact commit SHA: {reference}")
+
 def check_policy(candidate):
-    """Run untrusted policy only in the read-only job, against trusted and new tests."""
+    """Test the immutable baseline and exercise proposed policy only through its CLI."""
+    candidate_path = Path(candidate)
+    if candidate_path.is_symlink() or not candidate_path.is_dir():
+        raise ValueError("Proposed policy checkout must be a real directory")
+    candidate = candidate_path.resolve()
+    candidate_scripts = candidate / "scripts"
+    candidate_release = candidate_scripts / "release.py"
+    candidate_workflow = candidate / ".github/workflows/release.yml"
+    if (candidate_scripts.is_symlink() or not candidate_scripts.is_dir()
+            or candidate_release.is_symlink() or not candidate_release.is_file()
+            or candidate_workflow.is_symlink() or not candidate_workflow.is_file()):
+        raise ValueError("Proposed policy is missing regular scripts/release.py or release workflow files")
+    proposed_python = [candidate_release, *sorted(candidate_scripts.glob("test_*.py"))]
+    for path in proposed_python:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"Proposed policy Python must be a regular file: {path.name}")
+        try:
+            ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
+        except (SyntaxError, UnicodeError) as error:
+            raise ValueError(f"Proposed policy Python has invalid syntax in {path.name}: {error}") from error
+    validate_action_pins(candidate_workflow)
+
+    trusted_scripts = ROOT / "scripts"
+    trusted_tests = sorted(trusted_scripts.glob("test_*.py"))
+    trusted_release = trusted_scripts / "release.py"
+    trusted_manifest = ROOT / "patches/source.json"
+    trusted_workflow = ROOT / ".github/workflows/release.yml"
+    if (not trusted_release.is_file() or not trusted_tests or not trusted_manifest.is_file()
+            or trusted_workflow.is_symlink() or not trusted_workflow.is_file()
+            or any(test.is_symlink() or not test.is_file() for test in trusted_tests)):
+        raise ValueError("Trusted release-policy baseline is incomplete")
+
     launcher = (
         "import sys,unittest;sys.path.insert(0,sys.argv[1]);import release;"
         "suite=unittest.defaultTestLoader.discover(sys.argv[2],pattern='test_*.py');"
         "sys.exit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())"
     )
-    for tests in (ROOT / "scripts", candidate / "scripts"):
-        with tempfile.TemporaryDirectory(prefix="9router-policy-tests-") as temporary:
-            root = Path(temporary)
-            env = {name: os.environ[name] for name in ("PATH", "LANG", "LC_ALL", "TZ") if name in os.environ}
-            for name, path in {"HOME": root / "home", "TMPDIR": root / "tmp",
-                               "DATA_DIR": root / "data", "XDG_CONFIG_HOME": root / "config",
-                               "XDG_DATA_HOME": root / "data", "XDG_STATE_HOME": root / "state",
-                               "XDG_CACHE_HOME": root / "cache"}.items():
-                path.mkdir(mode=0o700, exist_ok=True)
-                env[name] = str(path)
-            env.update(CI="true", PYTHONDONTWRITEBYTECODE="1")
-            command = ["docker", "run", "--rm", "--read-only", "--network=none",
-                       "--cap-drop=ALL", "--security-opt=no-new-privileges",
-                       "--user", f"{os.getuid()}:{os.getgid()}", "--workdir", str(root)]
-            for source in dict.fromkeys((ROOT.resolve(), candidate.resolve())):
-                command += ["--mount", f"type=bind,source={source},target={source},readonly"]
-            command += ["--mount", f"type=bind,source={root},target={root}"]
-            for name, value in env.items():
-                command += ["--env", f"{name}={value}"]
-            command += [POLICY_IMAGE, "python3", "-B", "-c", launcher,
-                        str(candidate / "scripts"), str(tests)]
-            subprocess.run(command, cwd=root, env=env, check=True)
-    # The linter's directory is never writable by candidate code.
-    with tempfile.TemporaryDirectory(prefix="9router-policy-") as temporary:
+    temp_root = os.environ.get("TMPDIR") or "/var/tmp"
+    container_engine, engine_kind = policy_container_engine()
+    with tempfile.TemporaryDirectory(prefix="9router-policy-tests-", dir=temp_root) as temporary:
+        root = Path(temporary).resolve()
+        trusted_root = root / "trusted"
+        trusted_scripts = trusted_root / "scripts"
+        trusted_scripts.mkdir(parents=True, mode=0o700)
+        (trusted_root / "patches").mkdir(mode=0o700)
+        trusted_workflow_path = trusted_root / ".github/workflows/release.yml"
+        trusted_workflow_path.parent.mkdir(parents=True, mode=0o700)
+        shutil.copy2(trusted_release, trusted_scripts / "release.py")
+        for test in trusted_tests:
+            shutil.copy2(test, trusted_scripts / test.name)
+        shutil.copy2(trusted_manifest, trusted_root / "patches/source.json")
+        shutil.copy2(trusted_workflow, trusted_workflow_path)
+        candidate_module = root / "candidate/scripts/release.py"
+        candidate_module.parent.mkdir(parents=True, mode=0o700)
+        shutil.copy2(candidate_release, candidate_module)
+        os.chmod(candidate_module, 0o444)
+        writable = root / "writable"
+        writable.mkdir(mode=0o700)
+        env = {name: os.environ[name] for name in ("PATH", "LANG", "LC_ALL", "TZ") if name in os.environ}
+        for name, relative in {
+            "HOME": "home", "TMPDIR": "tmp", "DATA_DIR": "data",
+            "XDG_CONFIG_HOME": "config", "XDG_DATA_HOME": "share",
+            "XDG_STATE_HOME": "state", "XDG_CACHE_HOME": "cache",
+            "XDG_RUNTIME_DIR": "run", "XDG_CONFIG_DIRS": "config-dirs",
+            "XDG_DATA_DIRS": "data-dirs",
+        }.items():
+            path = writable / relative
+            path.mkdir(mode=0o700)
+            env[name] = str(path)
+        env.update(CI="true", PYTHONDONTWRITEBYTECODE="1",
+                   NINEROUTER_POLICY_CANDIDATE_RELEASE=str(candidate_module))
+        command = [*container_engine, "run", "--rm", "--read-only", "--network=none",
+                   "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                   "--memory=1g", "--cpus=2", "--pids-limit=256"]
+        if engine_kind == "podman":
+            command.append("--userns=keep-id")
+        command += ["--user", f"{os.getuid()}:{os.getgid()}", "--workdir", str(writable)]
+        relabel = ",relabel=shared" if engine_kind == "podman" else ""
+        command += ["--mount", f"type=bind,source={root},target={root},readonly{relabel}"]
+        command += ["--mount", f"type=bind,source={writable},target={writable}{relabel}"]
+        for name, value in env.items():
+            command += ["--env", f"{name}={value}"]
+        command += [POLICY_IMAGE, "python3", "-B", "-c", launcher,
+                    str(trusted_scripts), str(trusted_scripts)]
+        result = subprocess.run(command, cwd=writable, env=env, check=False,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+        if result.returncode != 0:
+            detail = (result.stdout + "\n" + result.stderr)[-4000:]
+            raise ValueError(f"Isolated trusted policy tests failed with status {result.returncode}: {detail}")
+
+    with tempfile.TemporaryDirectory(prefix="9router-policy-lint-", dir=temp_root) as temporary:
         root = Path(temporary)
         url = ("https://github.com/rhysd/actionlint/releases/download/v1.7.12/"
                "actionlint_1.7.12_linux_amd64.tar.gz")
@@ -740,7 +839,7 @@ def check_policy(candidate):
             binary = root / "actionlint"
             binary.write_bytes(package.extractfile("actionlint").read())
             binary.chmod(0o700)
-        run(str(binary), "-shellcheck=", "-pyflakes=", str(candidate / ".github/workflows/release.yml"))
+        run(str(binary), "-shellcheck=", "-pyflakes=", str(candidate_workflow))
 
 
 def land_repair(directory):

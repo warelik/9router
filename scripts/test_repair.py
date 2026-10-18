@@ -330,6 +330,17 @@ class RegressionSelectionTests(unittest.TestCase):
 
 
 class AdoptionTests(unittest.TestCase):
+    def test_readme_is_the_only_documentation_path_in_a_policy_repair(self):
+        with patch.object(release, "run", side_effect=["", "", "", CONFIG, "README.md",
+                              "100644 blob " + HEAD + "\tREADME.md"]):
+            self.assertEqual(release.repair_changes(STATE), (["README.md"], True))
+        for changed in ("CONTRIBUTING.md", "docs/release.md",
+                        "README.md\npatches/0009-fix.patch"):
+            with (self.subTest(changed=changed),
+                  patch.object(release, "run", side_effect=["", "", "", CONFIG, changed]),
+                  self.assertRaises(ValueError)):
+                release.repair_changes(STATE)
+
     def test_changed_proposal_head_cannot_land(self):
         with (patch.dict(os.environ, ENV),
               patch.object(release, "repair_pull", return_value={**STATE, "head": SEED}),
@@ -380,6 +391,8 @@ class AdoptionTests(unittest.TestCase):
     def test_policy_checks_use_only_disposable_paths_and_no_inherited_credentials(self):
         paths = []
         suites = []
+        candidate_copies = []
+        trusted_test_files = []
 
         def execute(args, **kwargs):
             env = kwargs["env"]
@@ -391,7 +404,19 @@ class AdoptionTests(unittest.TestCase):
             self.assertIn("--cap-drop=ALL", args)
             self.assertIn("--security-opt=no-new-privileges", args)
             mounts = [args[i + 1] for i, value in enumerate(args) if value == "--mount"]
-            self.assertEqual(sum(m.endswith(",readonly") for m in mounts), 2)
+            self.assertEqual(sum(m.endswith(",readonly") for m in mounts), 1)
+            self.assertNotIn(str(candidate_root), " ".join(args))
+            proposed = Path(env["NINEROUTER_POLICY_CANDIDATE_RELEASE"])
+            self.assertTrue(proposed.is_file())
+            self.assertEqual(proposed.read_text(), candidate_release.read_text())
+            self.assertEqual(proposed.stat().st_mode & 0o777, 0o444)
+            self.assertTrue(any(str(proposed.parents[2]) in mount for mount in mounts))
+            candidate_copies.append(proposed)
+            suite = Path(args[-1])
+            trusted_test_files.append(sorted(path.name for path in suite.glob("test_*.py")))
+            self.assertIn("test_policy_cli.py", trusted_test_files[-1])
+            self.assertNotIn("test_candidate.py", trusted_test_files[-1])
+            self.assertTrue((suite.parent / ".github/workflows/release.yml").is_file())
             for name in ("HOME", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
                          "XDG_STATE_HOME", "XDG_CACHE_HOME", "DATA_DIR"):
                 path = Path(env[name])
@@ -407,15 +432,73 @@ class AdoptionTests(unittest.TestCase):
               patch.object(release.subprocess, "run", side_effect=execute),
               patch.object(release, "urlopen") as fetch,
               self.assertRaisesRegex(ValueError, "actionlint archive integrity")):
+            candidate_root = Path(directory).resolve()
+            candidate_scripts = candidate_root / "scripts"
+            candidate_scripts.mkdir()
+            candidate_release = candidate_scripts / "release.py"
+            marker = candidate_root / "candidate-python-executed"
+            candidate_release.write_text(
+                "from pathlib import Path\nPath(" + repr(str(marker)) + ").write_text('executed')\n")
+            (candidate_scripts / "test_candidate.py").write_text("assert True\n")
+            workflow = candidate_root / ".github/workflows/release.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text(
+                "name: policy fixture\non: workflow_dispatch\njobs:\n"
+                "  check:\n    runs-on: ubuntu-latest\n    steps:\n"
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n")
             fetch.return_value.read.return_value = b"not an authenticated release"
-            release.check_policy(Path(directory))
-        self.assertEqual(suites[0], str(release.ROOT / "scripts"))
-        self.assertEqual(suites[1], str(Path(directory) / "scripts"))
+            with patch.object(release, "policy_container_engine", return_value=(["docker"], "docker")):
+                release.check_policy(candidate_root)
+        trusted_suite = Path(suites[0])
+        self.assertEqual(trusted_suite.name, "scripts")
+        self.assertEqual(trusted_suite.parent.name, "trusted")
+        self.assertIn("test_policy_cli.py", trusted_test_files[0])
+        self.assertNotEqual(trusted_suite, release.ROOT / "scripts")
+        self.assertEqual(len(suites), 1)
+        self.assertFalse(marker.exists(), "candidate Python must not execute before trusted adoption")
+        self.assertEqual(len(candidate_copies), 1)
         self.assertTrue(all(not path.exists() for path in paths))
 
+    def test_invalid_candidate_python_is_rejected_before_tests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate_scripts = Path(directory) / "scripts"
+            candidate_scripts.mkdir()
+            (candidate_scripts / "release.py").write_text("def invalid(:\n")
+            workflow = Path(directory) / ".github/workflows/release.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text(
+                "name: policy fixture\non: workflow_dispatch\njobs:\n"
+                "  check:\n    runs-on: ubuntu-latest\n    steps:\n"
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n")
+            with (patch.object(release.subprocess, "run") as run,
+                  self.assertRaisesRegex(ValueError, "invalid syntax in release.py")):
+                release.check_policy(Path(directory))
+            run.assert_not_called()
+
     def test_failed_policy_tests_cannot_reach_linting_or_write_credentials(self):
-        with (patch.object(release.subprocess, "run",
-                          side_effect=subprocess.CalledProcessError(1, "unittest")),
-              patch.object(release, "urlopen", side_effect=AssertionError("Stop at failed tests")),
-              self.assertRaises(subprocess.CalledProcessError)):
-            release.check_policy(Path("/unused"))
+        with tempfile.TemporaryDirectory() as directory:
+            candidate_scripts = Path(directory) / "scripts"
+            candidate_scripts.mkdir()
+            (candidate_scripts / "release.py").write_text("pass\n")
+            workflow = Path(directory) / ".github/workflows/release.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text(
+                "name: policy fixture\non: workflow_dispatch\njobs:\n"
+                "  check:\n    runs-on: ubuntu-latest\n    steps:\n"
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n")
+            with (patch.object(release, "policy_container_engine", return_value=(["docker"], "docker")),
+                  patch.object(release.subprocess, "run",
+                              side_effect=subprocess.CalledProcessError(1, "trusted policy tests")),
+                  patch.object(release, "urlopen", side_effect=AssertionError("Stop at failed tests")),
+                  self.assertRaises(subprocess.CalledProcessError)):
+                release.check_policy(Path(directory))
+
+    def test_action_workflows_require_officially_pinned_commit_refs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = Path(directory) / "release.yml"
+            workflow.write_text("jobs:\n  test:\n    steps:\n      - uses: actions/checkout@v4\n")
+            with self.assertRaisesRegex(ValueError, "exact commit SHA"):
+                release.validate_action_pins(workflow)
+            workflow.write_text(
+                "jobs:\n  test:\n    steps:\n      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n")
+            release.validate_action_pins(workflow)
