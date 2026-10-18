@@ -97,6 +97,11 @@ current-directory modules cannot shadow it. Candidate `prepare` and `land` CLI
 commands lazy-load the parser only if YAML validation is requested, preserving
 the immutable bootstrap oracle's stdlib-only CLI path. Codex reviews the exact
 policy SHA.
+The immutable suite receives a read-only copy of the proposed workflow and
+checks its parser bootstrap in both jobs before the corresponding parser use.
+Inline findings are attributed to their original reviewed commit: GitHub may
+relocate an old comment to a new head. A relocated old finding cannot replace
+the required fresh clean review, and a current-commit finding still blocks it.
 The verified policy diff is selectively adopted; the next default-branch run
 then executes the newly trusted tests and continues through fresh review and
 build. Policy and application repairs cannot be mixed.

@@ -687,11 +687,41 @@ class AdoptionTests(unittest.TestCase):
             release.validate_action_pins(workflow)
 
     def test_policy_workflows_install_the_exact_parser_in_both_jobs(self):
-        workflow = release.ROOT / ".github/workflows/release.yml"
+        workflow = Path(os.environ.get("NINEROUTER_POLICY_CANDIDATE_WORKFLOW") or
+                        release.ROOT / ".github/workflows/release.yml")
         contents = workflow.read_text(encoding="utf-8")
-        self.assertEqual(contents.count(release.POLICY_YAML_REQUIREMENT), 2)
-        self.assertEqual(contents.count("Install The Pinned Policy YAML Parser"), 2)
+        document = release.yaml_module().safe_load(contents)
+        for job, consumer in (("prepare", "Test Release Policy"),
+                              ("policy-check", "Enforce The Trusted Tests And Validate Proposed YAML")):
+            steps = document["jobs"][job]["steps"]
+            installers = [(index, step) for index, step in enumerate(steps)
+                          if step.get("name") == "Install The Pinned Policy YAML Parser"]
+            self.assertEqual(len(installers), 1, f"Missing parser bootstrap in {job}")
+            index, step = installers[0]
+            self.assertNotIn("if", step)
+            self.assertNotIn("continue-on-error", step)
+            script = step.get("run", "")
+            for required in (release.POLICY_YAML_REQUIREMENT, "python3 -m pip install", "--require-hashes",
+                             "--no-deps", "--only-binary=:all:", "NINEROUTER_POLICY_PARSER", "$GITHUB_ENV"):
+                self.assertIn(required, script)
+            use_index = next(i for i, item in enumerate(steps) if item.get("name") == consumer)
+            self.assertLess(index, use_index)
         release.validate_action_pins(workflow)
+
+    def test_parser_bootstrap_assertions_read_the_proposed_workflow(self):
+        workflow = Path(os.environ.get("NINEROUTER_POLICY_CANDIDATE_WORKFLOW") or
+                        release.ROOT / ".github/workflows/release.yml")
+        yaml = release.yaml_module()
+        for job in ("prepare", "policy-check"):
+            with self.subTest(job=job), tempfile.TemporaryDirectory() as directory:
+                document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+                document["jobs"][job]["steps"] = [step for step in document["jobs"][job]["steps"]
+                    if step.get("name") != "Install The Pinned Policy YAML Parser"]
+                candidate = Path(directory) / "proposed.yml"
+                candidate.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+                with patch.dict(os.environ, {"NINEROUTER_POLICY_CANDIDATE_WORKFLOW": str(candidate)}):
+                    with self.assertRaisesRegex(AssertionError, "Missing parser bootstrap"):
+                        self.test_policy_workflows_install_the_exact_parser_in_both_jobs()
 
     def test_action_workflows_reject_unsafe_yaml_tags_without_construction(self):
         with tempfile.TemporaryDirectory() as directory:

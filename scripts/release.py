@@ -76,7 +76,7 @@ def review_gate(sha, requested_at, reviews, inline, comments, resolve):
     if not SHA.fullmatch(sha) or not requested_at:
         return False, "No exact-SHA review request"
     exact = [r for r in reviews if actor(r) and r.get("commit_id") == sha]
-    findings = [r for r in inline if actor(r) and r.get("commit_id") == sha
+    findings = [r for r in inline if actor(r) and (r.get("original_commit_id") or r.get("commit_id")) == sha
                 and (r.get("body") or "").strip()]
     if findings:
         return False, "Codex reported an unresolved finding on this commit"
@@ -751,7 +751,7 @@ def failure_evidence(repo):
     pr, sha = os.environ.get("CANDIDATE_PR", ""), os.environ.get("CANDIDATE_SHA", "")
     if pr.isdigit() and SHA.fullmatch(sha):
         for finding in pages(f"repos/{repo}/pulls/{pr}/comments"):
-            if actor(finding) and finding.get("commit_id") == sha:
+            if actor(finding) and (finding.get("original_commit_id") or finding.get("commit_id")) == sha:
                 lines.append(f"\n{finding.get('path')}:{finding.get('line')}\n{finding.get('body')}")
     return "\n".join(lines)[-24000:]
 
@@ -1054,6 +1054,9 @@ def check_policy(candidate):
         candidate_module.parent.mkdir(parents=True, mode=0o700)
         shutil.copy2(candidate_release, candidate_module)
         os.chmod(candidate_module, 0o444)
+        proposed_workflow = root / "candidate/.github/workflows/release.yml"
+        proposed_workflow.parent.mkdir(parents=True, mode=0o700)
+        shutil.copy2(candidate_workflow, proposed_workflow)
         writable = root / "writable"
         writable.mkdir(mode=0o700)
         env = {name: os.environ[name] for name in ("PATH", "LANG", "LC_ALL", "TZ") if name in os.environ}
@@ -1069,7 +1072,8 @@ def check_policy(candidate):
             env[name] = str(path)
         env.update(CI="true", PYTHONDONTWRITEBYTECODE="1",
                    NINEROUTER_POLICY_PARSER=str(trusted_parser),
-                   NINEROUTER_POLICY_CANDIDATE_RELEASE=str(candidate_module))
+                   NINEROUTER_POLICY_CANDIDATE_RELEASE=str(candidate_module),
+                   NINEROUTER_POLICY_CANDIDATE_WORKFLOW=str(proposed_workflow))
         command = [*container_engine, "run", "--rm", "--read-only", "--network=none",
                    "--cap-drop=ALL", "--security-opt=no-new-privileges",
                    "--memory=1g", "--cpus=2", "--pids-limit=256"]

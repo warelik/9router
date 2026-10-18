@@ -115,6 +115,17 @@ class ReviewPolicyTests(unittest.TestCase):
         finding = {"user": BOT, "commit_id": OTHER, "body": "[P1] Broken old request"}
         self.assertTrue(self.gate(inline=[finding], comments=[receipt()]))
 
+    def test_relocated_old_inline_finding_requires_a_fresh_clean_review(self):
+        finding = {"user": BOT, "commit_id": HEAD, "original_commit_id": OTHER,
+                   "body": "[P1] Broken old request"}
+        self.assertFalse(self.gate(inline=[finding]))
+        self.assertTrue(self.gate(inline=[finding], comments=[receipt()]))
+
+    def test_original_current_inline_finding_still_blocks_when_relocated(self):
+        finding = {"user": BOT, "commit_id": OTHER, "original_commit_id": HEAD,
+                   "body": "[P2] Defect on the requested commit"}
+        self.assertFalse(self.gate(inline=[finding], comments=[receipt()]))
+
     def test_p2_p3_and_unlabelled_findings_block_completed_formal_review(self):
         review = {"id": 12, "user": BOT, "commit_id": HEAD, "state": "COMMENTED", "submitted_at": COMPLETED}
         for body in ("[P2] Bug", "[P3] Bug", "Drops the last response chunk"):
