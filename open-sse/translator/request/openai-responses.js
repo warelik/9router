@@ -295,16 +295,35 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
       })
       .filter(Boolean);
   }
-  if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
 
   if (result.tool_choice && typeof result.tool_choice === "object" && !Array.isArray(result.tool_choice)
-    && result.tool_choice.type === "function" && typeof result.tool_choice.name === "string") {
+    && (result.tool_choice.type === "function" || result.tool_choice.type === "custom")
+    && typeof result.tool_choice.name === "string") {
     const choice = result.tool_choice;
     const choiceNs = typeof choice.namespace === "string" && choice.namespace.trim() ? choice.namespace.trim() : null;
     const choiceName = choiceNs ? aliasFor(choiceNs, choice.name) : choice.name;
-    if (choiceNs) namespaceToolMap.set(choiceName, { name: choice.name, namespace: choiceNs, type: "function" });
+    if (choiceNs) {
+      const existing = namespaceToolMap.get(choiceName);
+      if (choice.type === "custom") {
+        const declaration = responseTools.find(({ child, ns }) =>
+          child?.type === "custom" && ns?.name?.trim() === choiceNs && child.name === choice.name);
+        const descriptor = existing?.type === "custom"
+          ? existing
+          : { name: choice.name, namespace: choiceNs, type: "custom" };
+        const format = declaration?.child.format ?? choice.format;
+        if (format !== undefined) {
+          namespaceToolMap.set(choiceName, { ...descriptor, format });
+        } else if (!existing) {
+          namespaceToolMap.set(choiceName, descriptor);
+        }
+      } else if (!existing) {
+        namespaceToolMap.set(choiceName, { name: choice.name, namespace: choiceNs, type: "function" });
+      }
+    }
+    if (choice.type === "custom") customToolNames.add(choiceName);
     result.tool_choice = { type: "function", function: { name: choiceName } };
   }
+  if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
   if (namespaceToolMap.size > 0) result._toolNameMap = namespaceToolMap;
 
   // Cleanup Responses API specific fields
