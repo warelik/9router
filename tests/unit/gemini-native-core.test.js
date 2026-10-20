@@ -48,13 +48,13 @@ function body(generation = { maxOutputTokens: 2048, thinkingConfig: { thinkingLe
   };
 }
 const quiet = Object.fromEntries(["debug", "info", "warn", "error", "line", "errorLine"].map(name => [name, vi.fn()]));
-async function run(provider, requestBody = body(), { suffix = "", stream = false, mode = "high", signal, ua = "Some arbitrary Gemini client", queryParams = [], clientHeaders = {}, onRequestSuccess, apiVersion = "v1beta", rawRequest } = {}) {
+async function run(provider, requestBody = body(), { suffix = "", stream = false, mode = "high", signal, ua = "Some arbitrary Gemini client", queryParams = [], clientHeaders = {}, onRequestSuccess, apiVersion = "v1beta", rawRequest, credentials: suppliedCredentials } = {}) {
   return handleChatCore({
     body: { ...structuredClone(requestBody), model: `${provider}/${model}${suffix}`, stream },
     modelInfo: { provider, model: model + suffix }, sourceFormatOverride: FORMATS.GEMINI,
     userAgent: ua, log: quiet, clientSignal: signal,
     onRequestSuccess,
-    credentials: { apiKey: "offline-provider-key", connectionId: "offline-native-test", providerSpecificData: { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy.invalid:18080", strictProxy: true } },
+    credentials: suppliedCredentials || { apiKey: "offline-provider-key", connectionId: "offline-native-test", providerSpecificData: { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy.invalid:18080", strictProxy: true } },
     connectionId: "offline-native-test", providerThinking: { mode },
     rtkEnabled: false, headroomEnabled: false, cavemanEnabled: false, ponytailEnabled: false, pxpipeEnabled: false,
     clientRawRequest: rawRequest || { endpoint: `/${apiVersion}/models/${provider}/${model}${suffix}:${stream ? "streamGenerateContent" : "generateContent"}`, apiVersion, body: structuredClone(requestBody), queryParams, headers: { "user-agent": ua, ...clientHeaders } },
@@ -72,6 +72,19 @@ describe("native Gemini requests through real chat core and executor", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   for (const provider of ["gemini", "aistudio"]) {
+    it(`${provider}: does not reuse a stale server-parts tenant scope in native passthrough`, async () => {
+      const credentials = {
+        apiKey: "offline-provider-key",
+        connectionId: "offline-native-test",
+        providerSpecificData: { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy.invalid:18080", strictProxy: true },
+        _geminiServerPartsSessionId: JSON.stringify(["previous-tenant", "previous-conversation"]),
+      };
+      const result = await run(provider, body(), { credentials });
+      expect(result.success).toBe(true);
+      expect(credentials._geminiServerPartsSessionId).toBeNull();
+      await result.response.text();
+    });
+
     it(`${provider}: arbitrary client retains all history/tools/settings and strict proxy on the provider wire`, async () => {
       const original = body();
       const result = await run(provider, original);
