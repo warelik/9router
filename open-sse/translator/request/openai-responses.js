@@ -101,7 +101,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
   };
 
   for (const rawItem of inputItems) {
-    const item = normalizeResponsesAgentMessage(rawItem);
+    const item = normalizeResponsesAgentMessage(rawItem, { dropOpaqueContent: true });
     // Determine item type - Droid CLI sends role-based items without 'type' field
     // Fallback: if no type but has role property, treat as message
     const itemType = item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);
