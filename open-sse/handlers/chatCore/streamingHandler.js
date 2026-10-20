@@ -24,7 +24,7 @@ const CODEX_SOURCE_TO_TARGET = {
 /**
  * Determine which SSE transform stream to use based on provider/format.
  */
-function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials, nativeJson, nativeResponseProjection }) {
+function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, onNativeResponseSuccess, apiKey, credentials, nativeJson, nativeResponseProjection }) {
   const isDroidCLI = userAgent?.toLowerCase().includes("droid") || userAgent?.toLowerCase().includes("codex-cli");
   // Responses-API providers (e.g. codex) emit Responses SSE → translate into client format
   const isResponsesProvider = PROVIDERS[provider]?.format === FORMATS.OPENAI_RESPONSES;
@@ -42,7 +42,7 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
   // The passthrough path has no format translation, so the fingerprint's tool
   // rename map (read -> read_client) has to be handed over explicitly —
   // otherwise the client receives a call to a tool it never declared (#4986).
-  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, toolNameMap, sourceFormat, nativeJson, nativeResponseProjection);
+  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, toolNameMap, sourceFormat, nativeJson, nativeResponseProjection, onNativeResponseSuccess);
 }
 
 /**
@@ -85,17 +85,23 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
     };
   }
 
-  if (onRequestSuccess) {
+  const deferNativeGeminiSuccess = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
+    && !needsTranslation(targetFormat, sourceFormat) && !toolNameMap?.size;
+  const reportRequestSuccess = () => {
+    if (!onRequestSuccess) return;
     Promise.resolve()
       .then(onRequestSuccess)
       .catch(err => {
         console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
       });
+  };
+  if (onRequestSuccess && !deferNativeGeminiSuccess) {
+    reportRequestSuccess();
   }
 
   const nativeGeminiJson = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
     && upstreamContentType.includes("application/json");
-  const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
+  const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, onNativeResponseSuccess: deferNativeGeminiSuccess ? reportRequestSuccess : null, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
 
   // Terminal bytes when the stream aborts after HTTP 200 was already sent, so the
   // client sees a real error instead of a silently truncated stream.
