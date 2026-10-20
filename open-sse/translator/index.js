@@ -66,7 +66,7 @@ function detectClientLastRole(body) {
 }
 
 // Translate request: source -> openai -> target
-export function translateRequest(sourceFormat, targetFormat, model, body, stream = true, credentials = null, provider = null, reqLogger = null, stripList = [], connectionId = null, clientTool = null) {
+export function translateRequest(sourceFormat, targetFormat, model, body, stream = true, credentials = null, provider = null, reqLogger = null, stripList = [], connectionId = null, clientTool = null, serverPartsTenant = null) {
   ensureInitialized();
   let result = body;
   // Role the client actually ended on, before any translator drops an emptied turn.
@@ -99,7 +99,12 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   const clientSessionId = captureSessionId(result, credentials, connectionId, targetFormat);
   // Expose to downstream translators (gemini-cli/antigravity envelopes) that run after envelope is stripped
   if (credentials) credentials._clientSessionId = clientSessionId;
-  if (credentials) credentials._geminiServerPartsSessionId = captureConversationId(result, credentials);
+  const conversationId = captureConversationId(result, credentials);
+  if (credentials) {
+    credentials._geminiServerPartsSessionId = serverPartsTenant && conversationId
+      ? JSON.stringify([serverPartsTenant, conversationId])
+      : null;
+  }
 
   let sourceToolNameMap = null;
 
