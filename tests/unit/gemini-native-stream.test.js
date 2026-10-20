@@ -30,7 +30,7 @@ const chunk = {
 };
 const lateUsage = { usageMetadata: { promptTokenCount: 4096, candidatesTokenCount: 7, thoughtsTokenCount: 20, cachedContentTokenCount: 2048, totalTokenCount: 4123 } };
 const inputStream = chunks => new ReadableStream({ start(controller) { for (const value of chunks) controller.enqueue(value); controller.close(); } });
-const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nativeJson = false, projection = null) => createPassthroughStreamWithLogger(provider, null, "gemini-native-test", null, null, complete, null, source, nativeJson, projection);
+const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nativeJson = false, projection = null, onNativeResponseSuccess = null) => createPassthroughStreamWithLogger(provider, null, "gemini-native-test", null, null, complete, null, source, nativeJson, projection, onNativeResponseSuccess);
 const readText = stream => new Response(stream).text();
 
 describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
@@ -233,6 +233,19 @@ describe("native response projections preserve requested data without inventing 
       .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, false, { masks: ["modelStatus"] })))).toBe(original);
   });
 
+  it.each([
+    ["empty object", "{}"],
+    ["empty array", "[]"],
+    ["number", "17"],
+    ["null", "null"],
+    ["empty wrapped object", '{"response":{}}'],
+  ])("rejects a native SSE %s frame instead of accepting it as a response", async (_name, payload) => {
+    const original = `data: ${payload}\n\n`;
+    const output = await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("aistudio")));
+    expect(output.startsWith(original)).toBe(true);
+    expect(output.slice(original.length)).toContain('"code":502');
+  });
+
   it("retains provider errors and details when finishReason is excluded", async () => {
     const failure = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota", details: [{ retryDelay: "2s" }] } };
     for (const nativeJson of [false, true]) {
@@ -276,17 +289,76 @@ describe("native stream integration and failure cleanup", () => {
     expect(succeeded).not.toHaveBeenCalled();
   });
 
-  it("passes the native client format through the real streaming handler", async () => {
+  it("reports native request success only after consuming a validated terminal response", async () => {
     const original = frame(chunk) + frame(lateUsage);
+    const succeeded = vi.fn();
     const controller = createStreamController({ provider: "aistudio", model: "gemini-native-test" });
     const result = await handleStreamingResponse({
       providerResponse: new Response(inputStream([encode(original)]), { headers: { "content-type": "text/event-stream" } }),
       provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
       body: { contents: [{ role: "user", parts: [{ text: "task" }] }] }, stream: true, requestStartTime: Date.now(),
-      streamController: controller,
+      streamController: controller, onRequestSuccess: succeeded,
     });
     expect(result.success).toBe(true);
+    expect(succeeded).not.toHaveBeenCalled();
     expect(await result.response.text()).toBe(original);
+    await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+  });
+
+  it.each([
+    ["finishReason is masked", frame({ candidates: [{ content: { parts: [{ text: "projected answer" }] } }] }), { masks: ["candidates/content/parts/text"] }],
+    ["the selected empty object is masked", frame({}), { masks: ["modelStatus"] }],
+    ["a null response wrapper falls back to its nonempty outer object", frame({ response: null }), null],
+  ])("reports native success at accepted EOF when %s", async (_name, raw, nativeResponseProjection) => {
+    const succeeded = vi.fn();
+    const result = await handleStreamingResponse({
+      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "text/event-stream" } }),
+      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+      body: {}, stream: true, requestStartTime: Date.now(), nativeResponseProjection,
+      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+      onRequestSuccess: succeeded,
+    });
+    expect(succeeded).not.toHaveBeenCalled();
+    expect(await result.response.text()).toBe(raw);
+    await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+  });
+
+  it.each([
+    ["HTTP 200 native error", frame(chunk) + frame({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" } }), "quota"],
+    ["malformed data after a terminal", frame(chunk) + "data: {not-json}\n\n", '"code":502'],
+    ["candidate without a terminal", frame({ candidates: [{ index: 0, content: { parts: [{ text: "partial" }] } }] }), "before a candidate finished"],
+  ])("does not report native request success for %s", async (_name, raw, expectedFailure) => {
+    const succeeded = vi.fn();
+    const result = await handleStreamingResponse({
+      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "text/event-stream" } }),
+      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+      body: {}, stream: true, requestStartTime: Date.now(),
+      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+      onRequestSuccess: succeeded,
+    });
+    const output = await result.response.text();
+    expect(output).toContain(expectedFailure);
+    expect(succeeded).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["empty object", "{}"],
+    ["empty array", "[]"],
+    ["scalar", "17"],
+    ["array with empty object", "[{}]"],
+    ["array with scalar", "[17]"],
+    ["empty wrapped object", '{"response":{}}'],
+  ])("does not report native request success for JSON %s", async (_name, raw) => {
+    const succeeded = vi.fn();
+    const result = await handleStreamingResponse({
+      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "application/json" } }),
+      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+      body: {}, stream: true, requestStartTime: Date.now(),
+      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+      onRequestSuccess: succeeded,
+    });
+    await expect(result.response.text()).rejects.toThrow("Upstream Gemini JSON stream returned no valid response");
+    expect(succeeded).not.toHaveBeenCalled();
   });
 
   it.each([FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY])("builds a native numeric abort error without DONE for %s", source => {
@@ -345,6 +417,10 @@ describe("native stream integration and failure cleanup", () => {
   it.each([
     ["empty transport", ""],
     ["empty response array", "[]"],
+    ["empty response object", "{}"],
+    ["scalar response", "17"],
+    ["array containing an empty object", "[{}]"],
+    ["array containing a scalar", "[17]"],
     ["incomplete JSON", '[{"candidates":['],
     ["unfinished candidate in syntactically valid JSON", JSON.stringify([{ candidates: [{ index: 0, content: { parts: [{ text: "partial" }] } }] }])],
   ])("rejects %s at clean native JSON EOF", async (_name, raw) => {
