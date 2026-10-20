@@ -61,6 +61,23 @@ function nativeCandidateFieldIsVisible(projection, field) {
   });
 }
 
+function nativeResponseProjectionAllowsEmpty(projection) {
+  return projection?.masks?.some(value => {
+    const mask = String(value ?? "").trim();
+    return mask.length > 0 && mask !== "*";
+  }) || false;
+}
+
+function isValidNativeGeminiResponse(response, projection) {
+  if (!response || typeof response !== "object" || Array.isArray(response)) return false;
+  if (!nativeResponseProjectionAllowsEmpty(projection) && Object.keys(response).length === 0) return false;
+
+  const nativeResponse = response.response || response;
+  if (!nativeResponse || typeof nativeResponse !== "object" || Array.isArray(nativeResponse)) return false;
+  if (!nativeResponseProjectionAllowsEmpty(projection) && Object.keys(nativeResponse).length === 0) return false;
+  return true;
+}
+
 /**
  * Create unified SSE transform stream
  * @param {object} options
@@ -91,7 +108,8 @@ export function createSSEStream(options = {}) {
     apiKey = null,
     credentials = null,
     nativeJson = false,
-    nativeResponseProjection = null
+    nativeResponseProjection = null,
+    onNativeResponseSuccess = null
   } = options;
 
   let buffer = "";
@@ -134,31 +152,49 @@ export function createSSEStream(options = {}) {
   let completionFlushTimer = null;
   const nativeGeminiCandidates = new Map();
   let nativeGeminiFailureSeen = false;
+  let nativeGeminiErrorSeen = false;
+  let nativeGeminiInvalidResponseSeen = false;
   let nativeGeminiResponseSeen = false;
   let nativeGeminiMultipleCandidatesSeen = false;
   let nativeGeminiAnyFinishSeen = false;
+  let nativeGeminiSuccessReported = false;
   let nativeGeminiData = [];
   let nativeGeminiJson = "";
 
   const captureNativeGeminiBody = (parsed) => {
+    if (!isValidNativeGeminiResponse(parsed, nativeResponseProjection)) return false;
     nativeGeminiResponseSeen = true;
     const extracted = extractUsage(parsed);
     if (extracted) usage = mergeUsage(usage, extracted);
     const response = parsed.response || parsed;
-    if (response.error || response.promptFeedback?.blockReason) nativeGeminiFailureSeen = true;
-    if ((response.candidates || []).length > 1) nativeGeminiMultipleCandidatesSeen = true;
-    for (const [position, candidate] of (response.candidates || []).entries()) {
-      const finished = !!candidate.finishReason && candidate.finishReason !== "FINISH_REASON_UNSPECIFIED";
-      if (finished) nativeGeminiAnyFinishSeen = true;
+    if (response.error) {
+      nativeGeminiFailureSeen = true;
+      nativeGeminiErrorSeen = true;
+    }
+    if (response.promptFeedback?.blockReason) {
+      nativeGeminiFailureSeen = true;
+    }
+    const candidates = Array.isArray(response.candidates) ? response.candidates : [];
+    if (candidates.length > 1) nativeGeminiMultipleCandidatesSeen = true;
+    for (const [position, candidate] of candidates.entries()) {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+      const finished = typeof candidate.finishReason === "string"
+        && candidate.finishReason.length > 0 && candidate.finishReason !== "FINISH_REASON_UNSPECIFIED";
+      if (finished) {
+        nativeGeminiAnyFinishSeen = true;
+      }
       const index = candidate.index ?? position;
       nativeGeminiCandidates.set(index, nativeGeminiCandidates.get(index) || finished);
     }
-    for (const part of response.candidates?.[0]?.content?.parts || []) {
+    const parts = candidates[0]?.content?.parts;
+    for (const part of Array.isArray(parts) ? parts : []) {
+      if (!part || typeof part !== "object" || Array.isArray(part)) continue;
       if (typeof part.text !== "string") continue;
       totalContentLength += part.text.length;
       if (part.thought === true) accumulatedThinking += part.text;
       else accumulatedContent += part.text;
     }
+    return true;
   };
   const captureNativeGeminiLine = (line) => {
     if (line.startsWith("data:")) {
@@ -166,9 +202,23 @@ export function createSSEStream(options = {}) {
       return;
     }
     if (line.trim() || !nativeGeminiData.length) return;
-    const parsed = parseSSELine(`data: ${nativeGeminiData.join("\n")}`, sourceFormat);
+    const payload = nativeGeminiData.join("\n");
     nativeGeminiData = [];
-    if (parsed) captureNativeGeminiBody(parsed);
+    let parsed;
+    try { parsed = JSON.parse(payload); }
+    catch {
+      nativeGeminiInvalidResponseSeen = true;
+      return;
+    }
+    if (!captureNativeGeminiBody(parsed)) nativeGeminiInvalidResponseSeen = true;
+  };
+
+  const reportNativeGeminiSuccess = () => {
+    if (!onNativeResponseSuccess || nativeGeminiSuccessReported) return;
+    nativeGeminiSuccessReported = true;
+    Promise.resolve().then(onNativeResponseSuccess).catch(err => {
+      console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
+    });
   };
 
   // Usage/logging tail, callable from transform() as well as flush(): a client that
@@ -532,23 +582,24 @@ export function createSSEStream(options = {}) {
                 return;
               }
               const responses = Array.isArray(nativeResponse) ? nativeResponse : [nativeResponse];
-              if (!responses.length || responses.some(response => !response || typeof response !== "object" || Array.isArray(response))) {
-                controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
-                finalizeStream();
-                return;
+              if (!responses.length) nativeGeminiInvalidResponseSeen = true;
+              else for (const response of responses) {
+                if (!captureNativeGeminiBody(response)) nativeGeminiInvalidResponseSeen = true;
               }
-              for (const response of responses) captureNativeGeminiBody(response);
             } else {
               if (buffer.trim()) captureNativeGeminiLine(buffer);
               captureNativeGeminiLine("");
             }
-            if (!nativeGeminiResponseSeen) {
+            if (nativeGeminiInvalidResponseSeen || !nativeGeminiResponseSeen) {
               if (nativeJson) {
                 controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
                 finalizeStream();
                 return;
               }
-              const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream returned no valid response", sourceFormat);
+              const message = nativeGeminiInvalidResponseSeen
+                ? "Upstream Gemini stream contained invalid response data"
+                : "Upstream Gemini stream returned no valid response";
+              const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, message, sourceFormat);
               reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
               controller.enqueue(failure);
             } else if (observeNativeFinishReason && !nativeGeminiFailureSeen && (
@@ -566,6 +617,8 @@ export function createSSEStream(options = {}) {
               const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream ended before a candidate finished", sourceFormat);
               reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
               controller.enqueue(failure);
+            } else if (!nativeGeminiErrorSeen) {
+              reportNativeGeminiSuccess();
             }
             finalizeStream();
             return;
@@ -703,13 +756,14 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
   });
 }
 
-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null) {
+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null, onNativeResponseSuccess = null) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
     provider,
     sourceFormat,
     nativeJson,
     nativeResponseProjection,
+    onNativeResponseSuccess,
     reqLogger,
     model,
     connectionId,
