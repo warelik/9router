@@ -65,6 +65,24 @@ describe("native Gemini alpha generation contract", () => {
     expect(routes).toEqual(["[...path]"]);
   });
 
+  it.each([["v1alpha", alpha], ["v1beta", beta]])(
+    "%s rejects unsupported model actions before generation", async (version, route) => {
+      const request = new Request(
+        `https://router.test/${version}/models/gemini/${model}:countTokens`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) },
+      );
+      const response = await route.POST(request, {
+        params: Promise.resolve({ path: ["gemini", `${model}:countTokens`] }),
+      });
+
+      expect(response.status).toBe(405);
+      expect(response.headers.get("Allow")).toBe("POST, OPTIONS");
+      expect(await response.text()).toBe("");
+      expect(mocks.handleChat).not.toHaveBeenCalled();
+      expect(mocks.network).not.toHaveBeenCalled();
+    },
+  );
+
   it("keeps the live browser-auth v1 404 regression protected from inherited test overlays", async () => {
     const savedError = { error: { code: 404, status: "INTERNAL", message: 'Proxy browser error: Google API returned error: 404 NOT_FOUND {"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}' } };
     mocks.network.mockImplementation(async url => new URL(url).pathname.startsWith("/v1/models/")
