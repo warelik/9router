@@ -36,7 +36,11 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
   }
 
   if (needsTranslation(targetFormat, sourceFormat)) {
-    return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
+    return createSSETransformStreamWithLogger(
+      targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId,
+      body, onStreamComplete, apiKey, customToolNames, credentials,
+      nativeResponseProjection, onNativeResponseSuccess, nativeJson,
+    );
   }
 
   // The passthrough path has no format translation, so the fingerprint's tool
@@ -85,8 +89,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
     };
   }
 
-  const deferNativeGeminiSuccess = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
-    && !needsTranslation(targetFormat, sourceFormat) && !toolNameMap?.size;
+  const deferNativeGeminiSuccess = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
   const reportRequestSuccess = () => {
     if (!onRequestSuccess) return;
     Promise.resolve()

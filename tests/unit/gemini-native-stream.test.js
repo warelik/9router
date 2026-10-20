@@ -305,6 +305,113 @@ describe("native stream integration and failure cleanup", () => {
     await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
   });
 
+  it("defers native request success through the same-format tool-name transform", async () => {
+    const toolNameMap = new Map([["wire_tool", "original_tool"]]);
+    const response = { candidates: [{ index: 0, content: { role: "model", parts: [
+      { functionCall: { id: "call-1", name: "wire_tool", args: { value: 1 } } },
+    ] }, finishReason: "STOP" }] };
+    const succeeded = vi.fn();
+    const result = await handleStreamingResponse({
+      providerResponse: new Response(inputStream([encode(frame(response))]), { headers: { "content-type": "text/event-stream" } }),
+      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+      body: {}, stream: true, requestStartTime: Date.now(), toolNameMap,
+      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+      onRequestSuccess: succeeded,
+    });
+
+    expect(succeeded).not.toHaveBeenCalled();
+    const output = await result.response.text();
+    expect(output).toContain('"functionCall":{"id":"call-1","name":"original_tool"');
+    await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+  });
+
+  it.each([
+    ["native error envelope", frame({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" } })],
+    ["malformed native data", "data: {not-json}\n\n"],
+    ["unfinished native candidate", frame({ candidates: [{ index: 0, content: { parts: [{ text: "partial" }] } }] })],
+  ])("does not report native request success through the tool-name transform for %s", async (_name, raw) => {
+    const succeeded = vi.fn();
+    const result = await handleStreamingResponse({
+      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "text/event-stream" } }),
+      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+      body: {}, stream: true, requestStartTime: Date.now(), toolNameMap: new Map([["wire_tool", "original_tool"]]),
+      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+      onRequestSuccess: succeeded,
+    });
+
+    await result.response.text();
+    expect(succeeded).not.toHaveBeenCalled();
+  });
+
+  it("validates native JSON at EOF and restores tool names through the same-format transform", async () => {
+    const toolNameMap = new Map([["wire_tool", "original_tool"]]);
+    const native = {
+      candidates: [{ index: 0, content: { role: "model", parts: [
+        { text: "valid answer" },
+        { functionCall: { name: "wire_tool", args: { value: 1 } } },
+      ] }, finishReason: "STOP" }],
+      futureNativeField: { retained: true },
+    };
+    const succeeded = vi.fn();
+    const result = await handleStreamingResponse({
+      providerResponse: new Response(inputStream([encode(JSON.stringify(native))]), { headers: { "content-type": "application/json" } }),
+      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+      body: {}, stream: true, requestStartTime: Date.now(), toolNameMap,
+      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+      onRequestSuccess: succeeded,
+    });
+
+    expect(succeeded).not.toHaveBeenCalled();
+    const output = JSON.parse(await result.response.text());
+    expect(output.candidates[0].content.parts).toEqual([
+      { text: "valid answer" },
+      { functionCall: { name: "original_tool", args: { value: 1 } } },
+    ]);
+    expect(output.futureNativeField).toEqual(native.futureNativeField);
+    await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+  });
+
+  it("reports a valid native JSON refusal only after the tool-name transform reaches EOF", async () => {
+    const native = { promptFeedback: { blockReason: "SAFETY" }, futureNativeField: true };
+    const succeeded = vi.fn();
+    const result = await handleStreamingResponse({
+      providerResponse: new Response(inputStream([encode(JSON.stringify(native))]), { headers: { "content-type": "application/json" } }),
+      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+      body: {}, stream: true, requestStartTime: Date.now(), toolNameMap: new Map([["wire_tool", "original_tool"]]),
+      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+      onRequestSuccess: succeeded,
+    });
+
+    expect(succeeded).not.toHaveBeenCalled();
+    expect(JSON.parse(await result.response.text())).toEqual(native);
+    await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+  });
+
+  it.each([
+    ["native error envelope", JSON.stringify({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" } }), false],
+    ["malformed JSON", "{not-json", true],
+    ["malformed candidate list", JSON.stringify({ candidates: {} }), true],
+    ["unfinished candidate", JSON.stringify({ candidates: [{ index: 0, content: { parts: [{ text: "partial" }] } }] }), true],
+  ])("does not report native JSON request success through the tool-name transform for %s", async (_name, raw, rejects) => {
+    const succeeded = vi.fn();
+    const result = await handleStreamingResponse({
+      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "application/json" } }),
+      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+      body: {}, stream: true, requestStartTime: Date.now(), toolNameMap: new Map([["wire_tool", "original_tool"]]),
+      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+      onRequestSuccess: succeeded,
+    });
+
+    if (rejects) {
+      await expect(result.response.text()).rejects.toThrow("Upstream Gemini JSON stream");
+    } else {
+      expect(JSON.parse(await result.response.text())).toEqual({
+        error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" },
+      });
+    }
+    expect(succeeded).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["JSON terminal candidate", "application/json", JSON.stringify(chunk)],
     ["JSON safety refusal", "application/json", JSON.stringify({ promptFeedback: { blockReason: "SAFETY" } })],
