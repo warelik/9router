@@ -12,6 +12,7 @@ vi.mock("@/lib/db/helpers/kvStore.js", () => ({
 
 const { normalizeResponsesAgentMessage, convertResponsesApiFormat } = await import("../../open-sse/translator/formats/responsesApi.js");
 const { openaiResponsesToOpenAIRequest } = await import("../../open-sse/translator/request/openai-responses.js");
+const { restoreToolNames } = await import("../../open-sse/utils/opencodeFingerprint.js");
 const { hasUndeliverableAgentMessage } = await import("../../open-sse/translator/concerns/portableCollaboration.js");
 const { openaiToGeminiRequest } = await import("../../open-sse/translator/request/openai-to-gemini.js");
 const { storeGeminiTurnSignature, storeGeminiServerPartsForTurn } = await import("../../open-sse/services/thoughtSignatureStore.js");
@@ -99,5 +100,54 @@ describe("Gemini historical turns retain their own instruction prefix", () => {
     const isolatedParts = isolated.contents.filter((entry) => entry.role === "model").flatMap((entry) => entry.parts);
     expect(isolatedParts.some((part) => part.thoughtSignature === signature)).toBe(false);
     expect(isolatedParts).not.toContainEqual(searchPart);
+  });
+});
+
+describe("forced Responses custom tool choices preserve custom identity", () => {
+  const format = { type: "grammar", syntax: "lark", definition: "start: TEXT" };
+
+  it("uses the declaration alias and keeps its custom descriptor for successful calls", () => {
+    const body = {
+      model: "m",
+      tools: [{ type: "namespace", name: "automation", tools: [
+        { type: "custom", name: "patch", description: "Apply raw input.", format },
+      ] }],
+      input: [],
+      tool_choice: { type: "custom", name: "patch", namespace: "automation" },
+    };
+    const out = openaiResponsesToOpenAIRequest(body.model, body, true, {});
+    const [wireName, descriptor] = [...out._toolNameMap].find(([, value]) =>
+      value?.name === "patch" && value.namespace === "automation");
+
+    expect(wireName).toBeTruthy();
+    expect(descriptor).toEqual({
+      name: "patch", namespace: "automation", type: "custom", format,
+    });
+    expect(out.tool_choice).toEqual({ type: "function", function: { name: wireName } });
+    expect(out._customToolNames).toContain(wireName);
+    expect(restoreToolNames({
+      type: "function_call", name: wireName, call_id: "call_patch", arguments: "RAW_PATCH",
+    }, out._toolNameMap)).toEqual({
+      type: "custom_tool_call", name: "patch", namespace: "automation",
+      call_id: "call_patch", input: "RAW_PATCH",
+    });
+    const refusal = {
+      output: [{ type: "message", role: "assistant", content: [
+        { type: "refusal", refusal: "I can't help with that request." },
+      ] }],
+    };
+    expect(restoreToolNames(refusal, out._toolNameMap)).toEqual(refusal);
+  });
+
+  it("normalizes a root custom choice and leaves refusal output untouched", () => {
+    const body = {
+      model: "m",
+      tools: [{ type: "custom", name: "apply_patch", format }],
+      input: [],
+      tool_choice: { type: "custom", name: "apply_patch" },
+    };
+    const out = openaiResponsesToOpenAIRequest(body.model, body, true, {});
+    expect(out.tool_choice).toEqual({ type: "function", function: { name: "apply_patch" } });
+    expect(out._customToolNames).toContain("apply_patch");
   });
 });
