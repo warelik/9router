@@ -59,6 +59,10 @@ export async function POST(request, { params }) {
 
   try {
     const { path } = await params;
+    const actionPath = Array.isArray(path) ? path.at(-1) : "";
+    if (!/:(?:generateContent|streamGenerateContent)$/.test(actionPath || "")) {
+      return new Response(null, { status: 405, headers: { Allow: "POST, OPTIONS" } });
+    }
     // path = ["provider", "model:action"] or ["model:action"]
 
     let model;

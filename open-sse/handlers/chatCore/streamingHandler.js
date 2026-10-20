@@ -36,7 +36,11 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
   }
 
   if (needsTranslation(targetFormat, sourceFormat) || toolNameMap?.size) {
-    return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
+    return createSSETransformStreamWithLogger(
+      targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId,
+      body, onStreamComplete, apiKey, customToolNames, credentials,
+      nativeResponseProjection, onNativeResponseSuccess, nativeJson,
+    );
   }
 
   return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, sourceFormat, nativeJson, nativeResponseProjection, onNativeResponseSuccess);
@@ -82,8 +86,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
     };
   }
 
-  const deferNativeGeminiSuccess = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
-    && !needsTranslation(targetFormat, sourceFormat) && !toolNameMap?.size;
+  const deferNativeGeminiSuccess = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
   const reportRequestSuccess = () => {
     if (!onRequestSuccess) return;
     Promise.resolve()

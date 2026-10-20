@@ -374,6 +374,27 @@ export function restoreToolNames(payload, map) {
     }));
   }
 
+  // Gemini GenerateContent responses carry tool names in candidate Parts.
+  if (Array.isArray(payload.candidates)) {
+    const candidates = payload.candidates.map((candidate) => {
+      const parts = candidate?.content?.parts;
+      if (!Array.isArray(parts)) return candidate;
+      let changed = false;
+      const nextParts = parts.map((part) => {
+        const call = part?.functionCall;
+        if (typeof call?.name !== "string" || !map.has(call.name)) return part;
+        const name = resolveToolName(call.name, map).name;
+        if (name === call.name) return part;
+        changed = true;
+        return { ...part, functionCall: { ...call, name } };
+      });
+      return changed ? { ...candidate, content: { ...candidate.content, parts: nextParts } } : candidate;
+    });
+    if (candidates.some((candidate, index) => candidate !== payload.candidates[index])) {
+      put("candidates", candidates);
+    }
+  }
+
   // OpenAI Responses final JSON body.
   if (Array.isArray(payload.output)) {
     put("output", payload.output.map((item) =>

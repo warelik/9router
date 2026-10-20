@@ -105,6 +105,11 @@ export function createSSEStream(options = {}) {
   // Parts/metadata that must not pass through Chat normalization.
   const nativeGeminiPassthrough = mode === STREAM_MODE.PASSTHROUGH &&
     [FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY].includes(sourceFormat);
+  const observeNativeGeminiTransform = mode === STREAM_MODE.TRANSLATE
+    && sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
+    && typeof onNativeResponseSuccess === "function";
+  const transformNativeGeminiJson = mode === STREAM_MODE.TRANSLATE
+    && sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI && nativeJson;
   const observeNativeFinishReason = nativeCandidateFieldIsVisible(nativeResponseProjection, "finishReason");
   const observeNativeCandidateIndex = nativeCandidateFieldIsVisible(nativeResponseProjection, "index");
 
@@ -147,11 +152,21 @@ export function createSSEStream(options = {}) {
   let nativeGeminiData = [];
   let nativeGeminiJson = "";
 
+  const nativeGeminiHasIncompleteCandidate = () =>
+    observeNativeFinishReason && !nativeGeminiFailureSeen && (
+      !observeNativeCandidateIndex && nativeGeminiMultipleCandidatesSeen
+        ? !nativeGeminiAnyFinishSeen
+        : [...nativeGeminiCandidates.values()].some(finished => !finished)
+    );
+
   const captureNativeGeminiBody = (parsed) => {
     if (!isValidNativeGeminiResponse(parsed, nativeResponseProjection)) return false;
     nativeGeminiResponseSeen = true;
     const extracted = extractUsage(parsed);
-    if (extracted) usage = mergeUsage(usage, extracted);
+    if (extracted) {
+      usage = mergeUsage(usage, extracted);
+      if (state) state.usage = mergeUsage(state.usage, extracted);
+    }
     const response = parsed.response || parsed;
     if (parsed.error || response.error) {
       nativeGeminiFailureSeen = true;
@@ -254,8 +269,12 @@ export function createSSEStream(options = {}) {
     transform(chunk, controller) {
       if (!ttftAt) ttftAt = Date.now();
       const text = decoder.decode(chunk, { stream: true });
-      buffer += text;
       reqLogger?.appendProviderChunk?.(text);
+      if (transformNativeGeminiJson) {
+        nativeGeminiJson += text;
+        return;
+      }
+      buffer += text;
 
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
@@ -271,6 +290,7 @@ export function createSSEStream(options = {}) {
       }
 
       for (const line of lines) {
+        if (observeNativeGeminiTransform) captureNativeGeminiLine(line);
         const trimmed = line.trim();
         if (isDebugEnabled && trimmed) {
           sseLineCount++;
@@ -554,7 +574,50 @@ export function createSSEStream(options = {}) {
       trackPendingRequest(model, provider, connectionId, false);
       try {
         const remaining = decoder.decode();
+        if (transformNativeGeminiJson) {
+          nativeGeminiJson += remaining;
+          let nativeResponse;
+          try { nativeResponse = JSON.parse(nativeGeminiJson); }
+          catch {
+            controller.error(new Error("Upstream Gemini JSON stream ended with invalid or incomplete JSON"));
+            finalizeStream();
+            return;
+          }
+          const responses = Array.isArray(nativeResponse) ? nativeResponse : [nativeResponse];
+          if (!responses.length) nativeGeminiInvalidResponseSeen = true;
+          else for (const response of responses) {
+            if (!captureNativeGeminiBody(response)) nativeGeminiInvalidResponseSeen = true;
+          }
+          if (nativeGeminiInvalidResponseSeen || !nativeGeminiResponseSeen) {
+            controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
+            finalizeStream();
+            return;
+          }
+          if (nativeGeminiHasIncompleteCandidate()) {
+            controller.error(new Error("Upstream Gemini JSON stream ended before a candidate finished"));
+            finalizeStream();
+            return;
+          }
+          const translated = translateResponse(targetFormat, sourceFormat, nativeResponse, state);
+          if (!Array.isArray(translated) || translated.length !== 1 || translated[0] == null) {
+            controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
+            finalizeStream();
+            return;
+          }
+          const output = JSON.stringify(translated[0]);
+          reqLogger?.appendConvertedChunk?.(output);
+          controller.enqueue(sharedEncoder.encode(output));
+          sseEmittedCount++;
+          if (!nativeGeminiErrorSeen) reportNativeGeminiSuccess();
+          finalizeStream();
+          return;
+        }
         if (remaining) buffer += remaining;
+
+        if (observeNativeGeminiTransform) {
+          if (buffer.trim()) captureNativeGeminiLine(buffer);
+          captureNativeGeminiLine("");
+        }
 
         if (mode === STREAM_MODE.PASSTHROUGH) {
           if (nativeGeminiPassthrough) {
@@ -588,13 +651,7 @@ export function createSSEStream(options = {}) {
               const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, message, sourceFormat);
               reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
               controller.enqueue(failure);
-            } else if (observeNativeFinishReason && !nativeGeminiFailureSeen && (
-              // Without projected candidate IDs, separate terminal chunks can
-              // all occupy position zero. Do not assign them to fictitious IDs.
-              !observeNativeCandidateIndex && nativeGeminiMultipleCandidatesSeen
-                ? !nativeGeminiAnyFinishSeen
-                : [...nativeGeminiCandidates.values()].some(finished => !finished)
-            )) {
+            } else if (nativeGeminiHasIncompleteCandidate()) {
               if (nativeJson) {
                 controller.error(new Error("Upstream Gemini JSON stream ended before a candidate finished"));
                 finalizeStream();
@@ -715,6 +772,10 @@ export function createSSEStream(options = {}) {
           streamDoneSent = true;
         }
 
+        if (observeNativeGeminiTransform && !nativeGeminiInvalidResponseSeen
+            && nativeGeminiResponseSeen && !nativeGeminiErrorSeen
+            && !nativeGeminiHasIncompleteCandidate()) reportNativeGeminiSuccess();
+
         finalizeStream();
       } catch (error) {
         console.log("Error in flush:", error);
@@ -724,7 +785,7 @@ export function createSSEStream(options = {}) {
   });
 }
 
-export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null, credentials = null) {
+export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null, credentials = null, nativeResponseProjection = null, onNativeResponseSuccess = null, nativeJson = false) {
   return createSSEStream({
     mode: STREAM_MODE.TRANSLATE,
     targetFormat,
@@ -738,7 +799,10 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
     body,
     onStreamComplete,
     apiKey,
-    credentials
+    credentials,
+    nativeResponseProjection,
+    onNativeResponseSuccess,
+    nativeJson,
   });
 }
 
