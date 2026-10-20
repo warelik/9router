@@ -12,7 +12,7 @@ import { initTranslators } from "open-sse/translator/index.js";
 import { getTargetFormat, supportsNativeGemini } from "open-sse/services/provider.js";
 import { getModelInfo } from "@/sse/services/model.js";
 import { proxyAwareFetch } from "open-sse/utils/proxyFetch.js";
-import { getKeyAccessContext, enforceKeyAccessResolved } from "@/sse/services/keyAccess.js";
+import { extractClientApiKey, getKeyAccessContext, enforceKeyAccessResolved } from "@/sse/services/keyAccess.js";
 
 let initialized = false;
 const GEMINI_NATIVE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -151,14 +151,7 @@ export async function POST(request, { params }) {
 }
 
 function extractGeminiClientApiKey(request) {
-  const authHeader = request.headers.get("Authorization");
-  if (authHeader?.startsWith("Bearer ")) return authHeader.slice(7);
-
-  const googleApiKey = request.headers.get("x-goog-api-key");
-  if (googleApiKey) return googleApiKey;
-
-  const url = new URL(request.url);
-  return url.searchParams.get("key") || url.searchParams.get("$key");
+  return extractClientApiKey(request);
 }
 
 function normalizeGeminiNativeModel(model) {

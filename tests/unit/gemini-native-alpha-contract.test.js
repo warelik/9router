@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, readdirSync } from "node:fs";
 
-const mocks = vi.hoisted(() => ({ network: vi.fn(), handleChat: vi.fn() }));
+const mocks = vi.hoisted(() => ({ network: vi.fn(), handleChat: vi.fn(), validateApiKey: vi.fn(), apiKeys: {} }));
 vi.mock("../../src/app/api/v1/models/route.js", () => ({ buildModelsList: async () => [] }));
 vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: mocks.network }));
 vi.mock("@/sse/handlers/chat.js", () => ({ handleChat: mocks.handleChat }));
@@ -13,9 +13,13 @@ vi.mock("@/sse/services/model.js", () => ({ getModelInfo: async value => {
 } }));
 vi.mock("@/sse/services/auth.js", () => ({
   getProviderCredentials: async () => ({ apiKey: "fixture-provider-key", connectionId: "fixture", providerSpecificData: {} }),
-  isValidApiKey: async () => true, markAccountUnavailable: async () => ({ shouldFallback: false }), clearAccountError: async () => {},
+  isValidApiKey: key => mocks.validateApiKey(key), markAccountUnavailable: async () => ({ shouldFallback: false }), clearAccountError: async () => {},
 }));
 vi.mock("@/lib/localDb", () => ({ getSettings: async () => ({ requireApiKey: true }) }));
+vi.mock("@/lib/db/repos/apiKeysRepo.js", () => ({
+  getApiKeyByKey: async key => mocks.apiKeys[key] || null,
+}));
+vi.mock("@/lib/db/repos/combosRepo.js", () => ({ getCombos: async () => [] }));
 vi.mock("../../open-sse/executors/index.js", async () => {
   const { DefaultExecutor } = await import("../../open-sse/executors/default.js");
   return { getExecutor: provider => new DefaultExecutor(provider) };
@@ -37,6 +41,20 @@ let credentials;
 describe("native Gemini alpha generation contract", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.apiKeys = {
+      "restricted-tts": {
+        id: "restricted-tts-id",
+        name: "restricted-tts",
+        access: { restricted: true, allow: [`gemini/${model}`] },
+      },
+      "restricted-other": {
+        id: "restricted-other-id",
+        name: "restricted-other",
+        access: { restricted: true, allow: ["gemini/gemini-2.5-pro"] },
+      },
+    };
+    mocks.validateApiKey.mockReset().mockImplementation(async key =>
+      key === "fixture-client-key" || Object.hasOwn(mocks.apiKeys, key));
     vi.stubGlobal("fetch", vi.fn(() => { throw new Error("DIRECT_NETWORK_FORBIDDEN"); }));
     mocks.network.mockImplementation(async (_url, options) => new Response(JSON.stringify(options.headers.Accept ? [reply] : reply), { headers: { "Content-Type": "application/json" } }));
     mocks.handleChat.mockImplementation(async (request, raw, options) => {
@@ -97,6 +115,77 @@ describe("native Gemini alpha generation contract", () => {
     expect(JSON.parse(mocks.network.mock.calls[0][1].body)).toEqual(input);
     expect(mocks.network).toHaveBeenCalledOnce();
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("applies restricted API-key allow-lists to $key on the direct Gemini TTS path", async () => {
+    const requestFor = key => new Request(
+      `https://router.test/v1beta/models/${model}:generateContent?$key=${key}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: "Speak" }] }],
+          generationConfig: { responseModalities: ["AUDIO"] },
+        }),
+      },
+    );
+    const params = { params: Promise.resolve({ path: [`${model}:generateContent`] }) };
+
+    mocks.validateApiKey.mockClear();
+    const allowed = await beta.POST(requestFor("restricted-tts"), params);
+    expect(allowed.status).toBe(200);
+    expect(mocks.validateApiKey).toHaveBeenCalledWith("restricted-tts");
+    expect(mocks.network).toHaveBeenCalledOnce();
+
+    mocks.network.mockClear();
+    mocks.validateApiKey.mockClear();
+    const denied = await beta.POST(requestFor("restricted-other"), params);
+    expect(denied.status).toBe(403);
+    expect(mocks.validateApiKey).toHaveBeenCalledWith("restricted-other");
+    expect(mocks.network).not.toHaveBeenCalled();
+  });
+
+  it("uses the shared x-api-key and Bearer precedence for direct Gemini TTS authorization and access", async () => {
+    const body = JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: "Speak" }] }],
+      generationConfig: { responseModalities: ["AUDIO"] },
+    });
+    const params = { params: Promise.resolve({ path: [`${model}:generateContent`] }) };
+    const xApiKey = new Request(
+      `https://router.test/v1beta/models/${model}:generateContent?key=restricted-other&$key=restricted-other`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": "restricted-tts",
+          "x-goog-api-key": "restricted-other",
+        },
+        body,
+      },
+    );
+    const allowed = await beta.POST(xApiKey, params);
+    expect(allowed.status).toBe(200);
+    expect(mocks.validateApiKey).toHaveBeenCalledWith("restricted-tts");
+    expect(mocks.network).toHaveBeenCalledOnce();
+
+    mocks.network.mockClear();
+    mocks.validateApiKey.mockClear();
+    const bearer = new Request(
+      `https://router.test/v1beta/models/${model}:generateContent?key=restricted-tts&$key=restricted-tts`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer restricted-other",
+          "x-api-key": "restricted-tts",
+        },
+        body,
+      },
+    );
+    const denied = await beta.POST(bearer, params);
+    expect(denied.status).toBe(403);
+    expect(mocks.validateApiKey).toHaveBeenCalledWith("restricted-other");
+    expect(mocks.network).not.toHaveBeenCalled();
   });
 
   for (const provider of ["gemini", "aistudio"]) {
