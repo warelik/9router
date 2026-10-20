@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import "open-sse/index.js";
+import { hasValidCliToken, isLocalRequest } from "@/dashboardGuard.js";
 
 import {
   getProviderCredentials,
@@ -25,7 +27,7 @@ import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
-import { getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
+import { extractClientApiKey, getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
 
 /**
  * Handle chat completion request
@@ -70,6 +72,8 @@ export async function handleChat(request, clientRawRequest = null, options = {})
 
   // Enforce API key if enabled in settings
   const settings = await getSettings();
+  let authenticatedApiKey = false;
+  let serverPartsApiKey = null;
   if (settings.requireApiKey) {
     if (!apiKey) {
       log.warn("AUTH", "Missing API key (requireApiKey=true)");
@@ -80,7 +84,37 @@ export async function handleChat(request, clientRawRequest = null, options = {})
       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
     }
+    authenticatedApiKey = true;
+    serverPartsApiKey = apiKey;
+  } else {
+    // Optional API keys do not gate the request, but a valid one still provides
+    // a trustworthy tenant boundary for plaintext Gemini server parts.
+    const optionalApiKey = extractClientApiKey(request);
+    if (optionalApiKey) {
+      try {
+        authenticatedApiKey = await isValidApiKey(optionalApiKey);
+        if (authenticatedApiKey) serverPartsApiKey = optionalApiKey;
+      } catch {
+        // Cache identity must not change the acceptance of optional-key requests.
+      }
+    }
   }
+
+  // Gemini server-side tool parts are plaintext history. Bind their cache to
+  // an authenticated API-key tenant or the existing trusted local/CLI caller.
+  // A client-declared conversation id alone is not a caller identity.
+  let serverPartsTenant = authenticatedApiKey
+    ? createHash("sha256").update("gemini-server-parts-tenant\0").update(serverPartsApiKey).digest("hex")
+    : null;
+  if (!serverPartsTenant) {
+    try {
+      if (isLocalRequest(request)) serverPartsTenant = "trusted-local";
+      else if (await hasValidCliToken(request)) serverPartsTenant = "trusted-cli";
+    } catch {
+      // Failure to resolve a trusted principal disables caching only.
+    }
+  }
+  options = { ...options, serverPartsTenant };
 
   if (!modelStr) {
     log.warn("CHAT", "Missing model");
@@ -311,6 +345,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       clientSignal: request?.signal,
       // Detect source format by endpoint + body
       sourceFormatOverride: options.sourceFormatOverride || (request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null),
+      serverPartsTenant: options.serverPartsTenant,
       onCredentialsRefreshed: async (newCreds) => {
         await updateProviderCredentials(credentials.connectionId, {
           ...newCreds,

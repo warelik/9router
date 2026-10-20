@@ -7,6 +7,13 @@ import { translateNonStreamingResponse } from "../../open-sse/handlers/chatCore/
 import { getGeminiThoughtSignatureSync } from "../../open-sse/services/thoughtSignatureStore.js";
 
 const MODEL = "gemini-3.8-flash";
+const TENANT_A = "authenticated-api-key-tenant-a";
+const TENANT_B = "authenticated-api-key-tenant-b";
+const TRUSTED_LOCAL = "trusted-local";
+const TRUSTED_CLI = "trusted-cli";
+
+const translateForTenant = (source, target, model, body, credentials, provider, tenant = TENANT_A, connectionId = null) =>
+  translateRequest(source, target, model, body, true, credentials, provider, null, [], connectionId, null, tenant);
 
 const recordVersion = () => ({
   type: "function",
@@ -113,7 +120,7 @@ describe("Responses web_search request translation", () => {
 describe("server-executed tool parts in responses", () => {
   const session = (sessionId = "web-search-conversation-fixture") => {
     const credentials = { rawHeaders: { session_id: sessionId } };
-    translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([recordVersion(), webSearch]), true, credentials, "aistudio");
+    translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([recordVersion(), webSearch]), credentials, "aistudio");
     return credentials;
   };
 
@@ -159,7 +166,7 @@ describe("server-executed tool parts in responses", () => {
         { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
       ],
     };
-    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, true, credentials, "aistudio");
+    const translated = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, credentials, "aistudio");
     const modelTurn = translated.contents.find(c => c.role === "model");
     const fcIndex = modelTurn.parts.findIndex(p => p.functionCall);
     expect(fcIndex).toBeGreaterThan(0);
@@ -191,7 +198,7 @@ describe("server-executed tool parts in responses", () => {
         { type: "message", role: "user", content: [{ type: "input_text", text: "Thanks." }] },
       ],
     };
-    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, true, credentials, "aistudio");
+    const translated = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, credentials, "aistudio");
     const modelTurn = translated.contents.find(c => c.role === "model");
     const textIndex = modelTurn.parts.findIndex(p => p.text === "The LTS version is 24.21.0.");
     const stored = textParts.filter(p => p.toolCall || p.toolResponse);
@@ -212,14 +219,80 @@ describe("server-executed tool parts in responses", () => {
         { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
       ],
     };
-    const replayed = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), true, { rawHeaders: { session_id: "web-search-session-a" } }, "aistudio");
+    const replayed = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), { rawHeaders: { session_id: "web-search-session-a" } }, "aistudio");
     const turnA = replayed.contents.find(c => c.role === "model");
     expect(turnA.parts.slice(0, turnA.parts.findIndex(p => p.functionCall))).toEqual(serverParts);
-    const other = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), true, { rawHeaders: { session_id: "web-search-session-b" } }, "aistudio");
+    const other = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), { rawHeaders: { session_id: "web-search-session-b" } }, "aistudio");
     const parts = other.contents.flatMap(c => c.parts);
     expect(parts.some(p => p.toolCall || p.toolResponse)).toBe(false);
     expect(JSON.stringify(other)).not.toContain("GOOGLE_SEARCH_WEB");
     expect(parts.find(p => p.functionCall).functionCall.id).toBe("call_393372");
+  });
+
+  it("does not replay server parts across authenticated API-key tenants sharing one session", async () => {
+    const sessionId = "shared-client-declared-session";
+    const tenantA = session(sessionId);
+    await runStream([nativeResponse(probeParts)], tenantA);
+    const history = {
+      model: MODEL,
+      instructions: "You are a precise assistant.",
+      tools: [recordVersion(), webSearch],
+      input: [
+        userMessage(),
+        { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
+        { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
+      ],
+    };
+    const sameTenant = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), { rawHeaders: { session_id: sessionId } }, "aistudio", TENANT_A);
+    const replayedParts = sameTenant.contents.flatMap(entry => entry.parts || []);
+    expect(replayedParts.some(part => part.toolCall || part.toolResponse)).toBe(true);
+
+    const otherTenant = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), { rawHeaders: { session_id: sessionId } }, "aistudio", TENANT_B);
+    const isolatedParts = otherTenant.contents.flatMap(entry => entry.parts || []);
+    expect(isolatedParts.some(part => part.toolCall || part.toolResponse)).toBe(false);
+    expect(isolatedParts.find(part => part.functionCall).functionCall.id).toBe("call_393372");
+  });
+
+  it("replays for the trusted local principal without sharing with a distinct authenticated caller", async () => {
+    const sessionId = "trusted-local-session";
+    const localCredentials = { rawHeaders: { session_id: sessionId } };
+    translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([recordVersion(), webSearch]), localCredentials, "aistudio", TRUSTED_LOCAL);
+    await runStream([nativeResponse(probeParts)], localCredentials);
+    const history = {
+      model: MODEL,
+      instructions: "You are a precise assistant.",
+      tools: [recordVersion(), webSearch],
+      input: [
+        userMessage(),
+        { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
+        { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
+      ],
+    };
+    const localReplay = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), { rawHeaders: { session_id: sessionId } }, "aistudio", TRUSTED_LOCAL);
+    expect(localReplay.contents.flatMap(entry => entry.parts || []).some(part => part.toolCall || part.toolResponse)).toBe(true);
+
+    const cliReplay = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, structuredClone(history), { rawHeaders: { session_id: sessionId } }, "aistudio", TRUSTED_CLI);
+    expect(cliReplay.contents.flatMap(entry => entry.parts || []).some(part => part.toolCall || part.toolResponse)).toBe(false);
+  });
+
+  it("does not cache server parts from a client session without an authenticated tenant", async () => {
+    const credentials = { rawHeaders: { session_id: "untrusted-shared-session" } };
+    translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([recordVersion(), webSearch]), true, credentials, "aistudio");
+    expect(credentials._geminiServerPartsSessionId).toBeNull();
+    await runStream([nativeResponse(probeParts)], credentials);
+
+    const next = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, {
+      ...requestBody([recordVersion(), webSearch]),
+      input: [
+        userMessage(),
+        { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
+        { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
+      ],
+    }, true, credentials, "aistudio");
+    expect(next.contents.flatMap(entry => entry.parts || []).some(part => part.toolCall || part.toolResponse)).toBe(false);
   });
 
   it("never shares plaintext server parts between headerless conversations on one provider credential", async () => {
@@ -237,7 +310,7 @@ describe("server-executed tool parts in responses", () => {
     });
     const open = (body) => {
       const credentials = {};
-      const out = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, body, true, credentials, "aistudio", null, [], CONNECTION);
+      const out = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, body, credentials, "aistudio", TENANT_A, CONNECTION);
       return { credentials, out };
     };
     const first = open(requestBody([recordVersion(), webSearch]));
@@ -266,7 +339,7 @@ describe("server-executed tool parts in responses", () => {
   it("strips replayed server parts when the target cannot serve web search", async () => {
     const credentials = session();
     await runStream([nativeResponse(probeParts)], credentials);
-    const ag = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.ANTIGRAVITY, "gemini-3.8-flash-high", historyWithCall([recordVersion(), webSearch]), true, credentials, "antigravity");
+    const ag = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.ANTIGRAVITY, "gemini-3.8-flash-high", historyWithCall([recordVersion(), webSearch]), credentials, "antigravity");
     const agParts = ag.request.contents.flatMap(c => c.parts);
     expect(agParts.some(p => p.toolCall || p.toolResponse)).toBe(false);
     const fc = agParts.find(p => p.functionCall);
@@ -274,12 +347,12 @@ describe("server-executed tool parts in responses", () => {
     expect(fc.thoughtSignature).toBe(CALL_SIG);
     expect(JSON.stringify(ag)).not.toContain("googleSearch");
     expect(JSON.stringify(ag)).not.toContain("includeServerSideToolInvocations");
-    const noSearch = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, historyWithCall([recordVersion()]), true, credentials, "gemini");
+    const noSearch = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, historyWithCall([recordVersion()]), credentials, "gemini");
     const geminiParts = noSearch.contents.flatMap(c => c.parts);
     expect(geminiParts.some(p => p.toolCall || p.toolResponse)).toBe(false);
     expect(JSON.stringify(noSearch)).not.toContain("googleSearch");
     expect(JSON.stringify(noSearch)).not.toContain("includeServerSideToolInvocations");
-    const enabled = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, historyWithCall([recordVersion(), webSearch]), true, credentials, "gemini");
+    const enabled = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, historyWithCall([recordVersion(), webSearch]), credentials, "gemini");
     const modelTurn = enabled.contents.find(c => c.role === "model");
     const fcIndex = modelTurn.parts.findIndex(p => p.functionCall);
     expect(modelTurn.parts.slice(0, fcIndex)).toEqual(serverParts);
@@ -302,7 +375,7 @@ describe("server-executed tool parts in responses", () => {
         { type: "message", role: "user", content: [{ type: "input_text", text: "Done?" }] },
       ],
     };
-    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, true, credentials, "aistudio");
+    const translated = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, credentials, "aistudio");
     const modelTurn = translated.contents.find(c => c.role === "model");
     const fcIndex = modelTurn.parts.findIndex(p => p.functionCall);
     expect(modelTurn.parts.slice(0, fcIndex)).toEqual(serverParts);
