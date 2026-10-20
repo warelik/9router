@@ -5,7 +5,10 @@ import { HTTP_STATUS } from "../config/runtimeConfig.js";
 import { liftReasoningAliases } from "../translator/concerns/reasoning.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
 import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
-import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, ensureStreamToolCallIds, buildStreamErrorBytes } from "./streamHelpers.js";
+import {
+  parseSSELine, hasValuableContent, fixInvalidId, formatSSE, ensureStreamToolCallIds, buildStreamErrorBytes,
+  isValidNativeGeminiResponse,
+} from "./streamHelpers.js";
 import { restoreToolNames } from "./opencodeFingerprint.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
@@ -61,23 +64,6 @@ function nativeCandidateFieldIsVisible(projection, field) {
     const aliases = field === "finishReason" ? ["finishReason", "finish_reason"] : [field];
     return paths.some(selected => ["*", "candidates", "candidates/*", ...aliases.map(name => `candidates/${name}`)].includes(selected));
   });
-}
-
-function nativeResponseProjectionAllowsEmpty(projection) {
-  return projection?.masks?.some(value => {
-    const mask = String(value ?? "").trim();
-    return mask.length > 0 && mask !== "*";
-  }) || false;
-}
-
-function isValidNativeGeminiResponse(response, projection) {
-  if (!response || typeof response !== "object" || Array.isArray(response)) return false;
-  if (!nativeResponseProjectionAllowsEmpty(projection) && Object.keys(response).length === 0) return false;
-
-  const nativeResponse = response.response || response;
-  if (!nativeResponse || typeof nativeResponse !== "object" || Array.isArray(nativeResponse)) return false;
-  if (!nativeResponseProjectionAllowsEmpty(projection) && Object.keys(nativeResponse).length === 0) return false;
-  return true;
 }
 
 /**
@@ -175,7 +161,7 @@ export function createSSEStream(options = {}) {
     const extracted = extractUsage(parsed);
     if (extracted) usage = mergeUsage(usage, extracted);
     const response = parsed.response || parsed;
-    if (response.error) {
+    if (parsed.error || response.error) {
       nativeGeminiFailureSeen = true;
       nativeGeminiErrorSeen = true;
     }

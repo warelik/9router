@@ -256,6 +256,17 @@ describe("native Gemini requests through real chat core and executor", () => {
       expect(await result.response.json()).toEqual(error);
     });
 
+    it(`${provider}: native errors retain their status when malformed candidate fields are also present`, async () => {
+      const error = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" }, candidates: {} };
+      const succeeded = vi.fn();
+      network.mockImplementationOnce(async () => Response.json(error));
+      const result = await run(provider, body(), { onRequestSuccess: succeeded });
+      expect(result.success).toBe(false);
+      expect(result.response.status).toBe(429);
+      expect(await result.response.json()).toEqual(error);
+      expect(succeeded).not.toHaveBeenCalled();
+    });
+
     it.each([
       ["null", null],
       ["empty array", []],
@@ -263,6 +274,8 @@ describe("native Gemini requests through real chat core and executor", () => {
       ["string", "unexpected response"],
       ["scalar", 17],
       ["empty object", {}],
+      ["non-array candidates", { candidates: {} }],
+      ["null candidate entry", { candidates: [null] }],
     ])(`${provider}: rejects invalid native JSON response shape %s rather than a successful empty SDK result`, async (_shape, response) => {
       const succeeded = vi.fn();
       network.mockImplementationOnce(async () => Response.json(response));
@@ -290,10 +303,12 @@ describe("native Gemini requests through real chat core and executor", () => {
       { candidates: [{ index: 0, finishReason: "MAX_TOKENS", content: { role: "model", parts: [] } }] },
       { futureNativeResult: { task: { type: "customer", value: 9 } } },
     ])(`${provider}: preserves native blocked, finished zero-content and nonempty future responses`, async response => {
+      const succeeded = vi.fn();
       network.mockImplementationOnce(async () => Response.json(response));
-      const result = await run(provider);
+      const result = await run(provider, body(), { onRequestSuccess: succeeded });
       expect(result.success).toBe(true);
       expect(await result.response.json()).toEqual(response);
+      await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
     });
 
     it(`${provider}: unknown native root fields never enter Chat finish, reasoning or usage mutators`, async () => {
