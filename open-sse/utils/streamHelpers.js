@@ -4,6 +4,30 @@ import { SSE_DONE } from "./sseConstants.js";
 
 const sharedEncoder = new TextEncoder();
 
+function nativeResponseProjectionAllowsEmpty(projection) {
+  return projection?.masks?.some(value => {
+    const mask = String(value ?? "").trim();
+    return mask.length > 0 && mask !== "*";
+  }) || false;
+}
+
+export function isValidNativeGeminiResponse(response, projection = null) {
+  if (!response || typeof response !== "object" || Array.isArray(response)) return false;
+  const allowsEmpty = nativeResponseProjectionAllowsEmpty(projection);
+  if (!allowsEmpty && Object.keys(response).length === 0) return false;
+  if (response.error) return true;
+
+  const nativeResponse = response.response || response;
+  if (!nativeResponse || typeof nativeResponse !== "object" || Array.isArray(nativeResponse)) return false;
+  if (!allowsEmpty && Object.keys(nativeResponse).length === 0) return false;
+  if (nativeResponse.error) return true;
+  if (nativeResponse.candidates !== undefined && (
+    !Array.isArray(nativeResponse.candidates)
+    || nativeResponse.candidates.some(candidate => !candidate || typeof candidate !== "object" || Array.isArray(candidate))
+  )) return false;
+  return true;
+}
+
 // Parse SSE data line
 export function parseSSELine(line, format = null) {
   if (!line) return null;
