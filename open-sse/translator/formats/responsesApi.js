@@ -32,7 +32,7 @@ export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
 
 // Codex's observed plaintext task carrier (an agent_message encrypted_content part) is converted
 // here to input_text; known OpenAI Fernet ciphertext stays opaque.
-export function normalizeResponsesAgentMessage(item) {
+export function normalizeResponsesAgentMessage(item, { dropOpaqueContent = false } = {}) {
   if (!item || typeof item !== "object" || Array.isArray(item) || item.type !== "agent_message") return item;
   const content = Array.isArray(item.content)
     ? item.content.map((part) => (part?.type === "encrypted_content"
@@ -41,7 +41,12 @@ export function normalizeResponsesAgentMessage(item) {
       ? { type: RESPONSES_ITEM.INPUT_TEXT, text: part.encrypted_content }
       : part))
     : item.content;
-  return { ...item, type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content };
+  const normalizedContent = dropOpaqueContent && Array.isArray(content)
+    ? content.filter((part) => !(part?.type === "encrypted_content"
+        && typeof part.encrypted_content === "string"
+        && part.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX)))
+    : content;
+  return { ...item, type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content: normalizedContent };
 }
 
 function reasoningHasReadableText(item) {
@@ -182,7 +187,7 @@ export function convertResponsesApiFormat(body) {
   if (!inputItems) return body;
 
   for (const rawItem of inputItems) {
-    const item = normalizeResponsesAgentMessage(rawItem);
+    const item = normalizeResponsesAgentMessage(rawItem, { dropOpaqueContent: true });
     // Determine item type - Droid CLI sends role-based items without 'type' field
     // Fallback: if no type but has role property, treat as message
     const itemType = item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);
