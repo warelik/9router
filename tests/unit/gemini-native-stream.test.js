@@ -306,6 +306,24 @@ describe("native stream integration and failure cleanup", () => {
   });
 
   it.each([
+    ["JSON terminal candidate", "application/json", JSON.stringify(chunk)],
+    ["JSON safety refusal", "application/json", JSON.stringify({ promptFeedback: { blockReason: "SAFETY" } })],
+    ["SSE safety refusal", "text/event-stream", frame({ promptFeedback: { blockReason: "SAFETY" } })],
+  ])("reports native request success at accepted EOF for a valid %s", async (_name, contentType, raw) => {
+    const succeeded = vi.fn();
+    const result = await handleStreamingResponse({
+      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": contentType } }),
+      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+      body: {}, stream: true, requestStartTime: Date.now(),
+      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+      onRequestSuccess: succeeded,
+    });
+    expect(succeeded).not.toHaveBeenCalled();
+    expect(await result.response.text()).toBe(raw);
+    await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+  });
+
+  it.each([
     ["finishReason is masked", frame({ candidates: [{ content: { parts: [{ text: "projected answer" }] } }] }), { masks: ["candidates/content/parts/text"] }],
     ["the selected empty object is masked", frame({}), { masks: ["modelStatus"] }],
     ["a null response wrapper falls back to its nonempty outer object", frame({ response: null }), null],
@@ -325,7 +343,10 @@ describe("native stream integration and failure cleanup", () => {
 
   it.each([
     ["HTTP 200 native error", frame(chunk) + frame({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" } }), "quota"],
+    ["native error with malformed candidate field", frame({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" }, candidates: {} }), "quota"],
     ["malformed data after a terminal", frame(chunk) + "data: {not-json}\n\n", '"code":502'],
+    ["non-array candidate list", frame({ candidates: {} }), '"code":502'],
+    ["null candidate entry", frame({ candidates: [null] }), '"code":502'],
     ["candidate without a terminal", frame({ candidates: [{ index: 0, content: { parts: [{ text: "partial" }] } }] }), "before a candidate finished"],
   ])("does not report native request success for %s", async (_name, raw, expectedFailure) => {
     const succeeded = vi.fn();
@@ -348,6 +369,8 @@ describe("native stream integration and failure cleanup", () => {
     ["array with empty object", "[{}]"],
     ["array with scalar", "[17]"],
     ["empty wrapped object", '{"response":{}}'],
+    ["non-array candidate list", '{"candidates":{}}'],
+    ["null candidate entry", '{"candidates":[null]}'],
   ])("does not report native request success for JSON %s", async (_name, raw) => {
     const succeeded = vi.fn();
     const result = await handleStreamingResponse({
@@ -358,6 +381,23 @@ describe("native stream integration and failure cleanup", () => {
       onRequestSuccess: succeeded,
     });
     await expect(result.response.text()).rejects.toThrow("Upstream Gemini JSON stream returned no valid response");
+    expect(succeeded).not.toHaveBeenCalled();
+  });
+
+  it("preserves a native JSON error with malformed candidate fields without reporting success", async () => {
+    const raw = JSON.stringify({
+      error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" },
+      candidates: {},
+    });
+    const succeeded = vi.fn();
+    const result = await handleStreamingResponse({
+      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "application/json" } }),
+      provider: "aistudio", model: "gemini-native-test", sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+      body: {}, stream: true, requestStartTime: Date.now(),
+      streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+      onRequestSuccess: succeeded,
+    });
+    expect(await result.response.text()).toBe(raw);
     expect(succeeded).not.toHaveBeenCalled();
   });
 

@@ -6,6 +6,7 @@ import { ollamaBodyToOpenAI } from "../../translator/response/ollama-to-openai.j
 import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTracking.js";
 import { createErrorResult } from "../../utils/error.js";
 import { upstreamResponseHeaders } from "../../utils/upstreamHeaders.js";
+import { isValidNativeGeminiResponse } from "../../utils/streamHelpers.js";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
 import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
 import { unwrapClineEnvelope } from "../../shared/clineEnvelope.js";
@@ -335,9 +336,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
 
   reqLogger.logProviderResponse(providerResponse.status, providerResponse.statusText, providerResponse.headers, responseBody);
   if (isNativeGeminiResponse) {
-    const projected = nativeResponseProjection?.masks?.some(value => String(value ?? "").trim() && String(value).trim() !== "*");
-    const validObject = responseBody !== null && typeof responseBody === "object" && !Array.isArray(responseBody);
-    if (!validObject || (!projected && Object.keys(responseBody).length === 0)) {
+    if (!isValidNativeGeminiResponse(responseBody, nativeResponseProjection)) {
       const message = `Invalid native Gemini response from ${provider}`;
       appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
       return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, message);
