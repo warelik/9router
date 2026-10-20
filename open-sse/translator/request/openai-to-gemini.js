@@ -93,6 +93,18 @@ function createToolCallIdUniquifier() {
   };
 }
 
+function appendInstructionParts(parts, content) {
+  if (typeof content === "string") {
+    if (content) parts.push({ text: content });
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block?.type === OPENAI_BLOCK.TEXT && typeof block.text === "string") {
+        parts.push({ text: block.text });
+      }
+    }
+  }
+}
+
 // Core: Convert OpenAI request to Gemini format (base for all variants)
 function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG_SIGNATURE, sessionId = null, serverPartsSessionId = null) {
   const result = {
@@ -153,20 +165,11 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
   if (Array.isArray(body.messages)) {
     for (const m of body.messages) {
       if (m.role !== ROLE.SYSTEM && m.role !== ROLE.DEVELOPER) continue;
-      if (typeof m.content === "string") {
-        if (m.content) instructionParts.push({ text: m.content });
-      } else if (Array.isArray(m.content)) {
-        for (const block of m.content) {
-          if (block?.type === OPENAI_BLOCK.TEXT && typeof block.text === "string") {
-            instructionParts.push({ text: block.text });
-          }
-        }
-      }
+      appendInstructionParts(instructionParts, m.content);
     }
   }
-  // The system instruction the finished request will carry (all system/developer blocks aggregate in order); the
-  // turn scope of every earlier assistant message must see the same value as the request that
-  // produced that turn did.
+  // The outgoing request carries all instructions. Earlier cached turns use only
+  // the instruction prefix that existed when their responses were produced.
   const finalSystem = instructionParts.length > 0
     ? { role: GEMINI_ROLE.USER, parts: instructionParts }
     : null;
@@ -181,6 +184,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
   const pendingToolCalls = new Map();
   // Emitted functionCall ids must be unique across the whole history.
   const toolCallIdUniquifier = createToolCallIdUniquifier();
+  const turnInstructionParts = [];
 
   // Convert messages
   if (body.messages && Array.isArray(body.messages)) {
@@ -190,6 +194,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
       const content = msg.content;
 
       if (role === ROLE.SYSTEM || role === ROLE.DEVELOPER) {
+        appendInstructionParts(turnInstructionParts, content);
         continue;
       } else if (role === ROLE.USER) {
         const parts = convertOpenAIContentToParts(content);
@@ -200,7 +205,10 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
         const parts = [];
 
         const text = content ? (typeof content === "string" ? content : extractTextContent(content)) : "";
-        const turnScope = geminiTurnScope(result.contents, finalSystem);
+        const turnSystem = turnInstructionParts.length > 0
+          ? { role: GEMINI_ROLE.USER, parts: turnInstructionParts }
+          : null;
+        const turnScope = geminiTurnScope(result.contents, turnSystem);
         // Signature the provider issued for this tool-free turn (Gemini only accepts its own).
         const turnSig = msg.tool_calls?.length
           ? null
