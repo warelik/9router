@@ -117,9 +117,14 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
   }, { id: streamDetailId })).catch(err => {
     console.error("[RequestDetail] Failed to save streaming request:", err.message);
   });
-  const completeStream = async (...args) => {
-    await initialDetailWrite;
-    return onStreamComplete?.(...args);
+  const completeStream = (...args) => {
+    const persist = () => onStreamComplete?.(...args);
+    if (deferNativeGeminiSuccess || args[0]?.error) {
+      return initialDetailWrite.then(persist);
+    }
+    initialDetailWrite.then(persist).catch(err => {
+      console.error("[RequestDetail] Failed to complete streaming request:", err?.message || err);
+    });
   };
   const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete: completeStream, onNativeResponseSuccess: deferNativeGeminiSuccess ? reportRequestSuccess : null, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
 
