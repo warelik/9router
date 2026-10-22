@@ -19,10 +19,12 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
   const abortController = new AbortController();
   const startTime = Date.now();
   let disconnected = false;
+  let clientDisconnected = false;
   let abortTimeout = null;
   const detachClientAbort = () => clientSignal?.removeEventListener("abort", onClientAbort);
   const onClientAbort = () => {
     if (disconnected) return;
+    clientDisconnected = true;
     disconnected = true;
     detachClientAbort();
     abortController.abort(clientSignal.reason);
@@ -45,10 +47,12 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
     startTime,
 
     isConnected: () => !disconnected,
+    isClientDisconnected: () => clientDisconnected,
 
     // Call when client disconnects
     handleDisconnect: (reason = "client_closed") => {
       if (disconnected) return;
+      clientDisconnected = true;
       disconnected = true;
       detachClientAbort();
 
@@ -114,10 +118,13 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
  * @param {boolean} [propagateAbortErrors] - Reject interrupted JSON streams
  * instead of treating transport closure as successful EOF.
  */
-export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, propagateAbortErrors = false) {
+export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, propagateAbortErrors = false, onStreamInterrupted = null) {
   const reader = transformStream.readable.getReader();
   const writer = transformStream.writable.getWriter();
   let terminalEmitted = false;
+  const interrupted = async (error, clientCancelled = false) => {
+    if (onStreamInterrupted) await onStreamInterrupted(error, clientCancelled);
+  };
 
   // Emit a synthesized terminal payload (e.g. Responses response.failed + [DONE]) once
   const emitTerminal = (controller) => {
@@ -132,6 +139,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
   return new ReadableStream({
     async pull(controller) {
       if (!streamController.isConnected()) {
+        await interrupted(new Error("Upstream stream interrupted"), streamController.isClientDisconnected?.() === true);
         if (propagateAbortErrors) {
           const error = new Error("Upstream stream interrupted");
           streamController.handleError(error);
@@ -162,6 +170,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
         if (!isControllerClosed) streamController.handleError(error);
         reader.cancel().catch(() => {});
         writer.abort().catch(() => {});
+        await interrupted(error, streamController.isClientDisconnected?.() === true);
 
         // Treat network resets / socket hang up / abort as graceful close
         const msg = error?.message || "";
@@ -196,10 +205,10 @@ export function createDisconnectAwareStream(transformStream, streamController, o
       }
     },
 
-    cancel(reason) {
+    async cancel(reason) {
       streamController.handleDisconnect(reason || "cancelled");
-      reader.cancel();
-      writer.abort();
+      await Promise.allSettled([reader.cancel(reason), writer.abort(reason)]);
+      await interrupted(new Error(String(reason || "Client cancelled the stream")), streamController.isClientDisconnected?.() !== false);
     }
   });
 }
@@ -222,7 +231,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
  * @param {boolean} [propagateAbortErrors] - Preserve transport failures for
  * native JSON framing, which cannot accept an SSE error trailer.
  */
-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, propagateAbortErrors = false) {
+export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, propagateAbortErrors = false, onStreamInterrupted = null) {
   let stallTimer = null;
   let chunkCount = 0;
   let totalBytes = 0;
@@ -251,6 +260,7 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
     signal: streamController.signal,
     startTime: streamController.startTime,
     isConnected: () => streamController.isConnected(),
+    isClientDisconnected: () => streamController.isClientDisconnected?.() === true,
     handleComplete: () => { dbg(tag, `complete | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleComplete(); },
     handleError: (e) => { dbg(tag, `error: ${e?.message} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleError(e); },
     handleDisconnect: (r) => { dbg(tag, `disconnect: ${r} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleDisconnect(r); },
@@ -285,6 +295,8 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
     { readable: transformedBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
     wrappedController,
     onAbortTerminal ? () => onAbortTerminal(abortMessage) : null,
-    propagateAbortErrors
+    propagateAbortErrors,
+    onStreamInterrupted ? (error, clientCancelled) => onStreamInterrupted(
+      new Error(abortMessage === "stream stall timeout" ? abortMessage : error?.message || abortMessage), clientCancelled) : null,
   );
 }

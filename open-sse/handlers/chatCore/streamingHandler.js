@@ -92,7 +92,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
   const deferNativeGeminiSuccess = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
   const reportRequestSuccess = () => {
     if (!onRequestSuccess) return;
-    Promise.resolve()
+    return Promise.resolve()
       .then(onRequestSuccess)
       .catch(err => {
         console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
@@ -104,7 +104,24 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
 
   const nativeGeminiJson = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
     && upstreamContentType.includes("application/json");
-  const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, onNativeResponseSuccess: deferNativeGeminiSuccess ? reportRequestSuccess : null, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
+  const initialDetailWrite = saveRequestDetail(buildRequestDetail({
+    provider, model, connectionId,
+    latency: { ttft: 0, total: Date.now() - requestStartTime },
+    tokens: { prompt_tokens: 0, completion_tokens: 0 },
+    request: extractRequestConfig(body, stream),
+    providerRequest: finalBody || translatedBody || null,
+    providerResponse: "[Streaming - raw response not captured]",
+    response: { content: "[Streaming in progress...]", thinking: null, type: "streaming" },
+    pxpipe,
+    status: deferNativeGeminiSuccess ? "pending" : "success",
+  }, { id: streamDetailId })).catch(err => {
+    console.error("[RequestDetail] Failed to save streaming request:", err.message);
+  });
+  const completeStream = async (...args) => {
+    await initialDetailWrite;
+    return onStreamComplete?.(...args);
+  };
+  const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete: completeStream, onNativeResponseSuccess: deferNativeGeminiSuccess ? reportRequestSuccess : null, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
 
   // Terminal bytes when the stream aborts after HTTP 200 was already sent, so the
   // client sees a real error instead of a silently truncated stream.
@@ -115,21 +132,12 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
     ? buildAbortedResponsesTerminalBytes
     : (message) => buildStreamErrorBytes(HTTP_STATUS.GATEWAY_TIMEOUT, message, sourceFormat);
   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
-  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, nativeGeminiJson);
-
-  saveRequestDetail(buildRequestDetail({
-    provider, model, connectionId,
-    latency: { ttft: 0, total: Date.now() - requestStartTime },
-    tokens: { prompt_tokens: 0, completion_tokens: 0 },
-    request: extractRequestConfig(body, stream),
-    providerRequest: finalBody || translatedBody || null,
-    providerResponse: "[Streaming - raw response not captured]",
-    response: { content: "[Streaming in progress...]", thinking: null, type: "streaming" },
-    pxpipe,
-    status: "success"
-  }, { id: streamDetailId })).catch(err => {
-    console.error("[RequestDetail] Failed to save streaming request:", err.message);
-  });
+  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, nativeGeminiJson,
+    typeof transformStream.finalizeNativeResponse === "function" ? (error, clientCancelled) => transformStream.finalizeNativeResponse({
+      status: clientCancelled ? 499 : HTTP_STATUS.GATEWAY_TIMEOUT,
+      error: error.message,
+      clientCancelled,
+    }) : null);
 
   return {
     success: true,
@@ -148,10 +156,16 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
 /**
  * Build onStreamComplete callback for streaming usage tracking.
  */
-export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest, pxpipe, reqTag, log }) {
+export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest, pxpipe, reqTag, log, onRequestFailure }) {
   const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
-  const onStreamComplete = (contentObj, usage, ttftAt) => {
+  const onStreamComplete = async (contentObj, usage, ttftAt) => {
+    const failure = contentObj?.error;
+    if (failure && !failure.clientCancelled && onRequestFailure) {
+      await Promise.resolve().then(() => onRequestFailure(failure)).catch(err => {
+        console.error("[ChatCore] onRequestFailure failed:", err?.message || err);
+      });
+    }
     const latency = {
       ttft: ttftAt ? ttftAt - requestStartTime : Date.now() - requestStartTime,
       total: Date.now() - requestStartTime
@@ -159,7 +173,7 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
     const safeContent = contentObj?.content || "[Empty streaming response]";
     const safeThinking = contentObj?.thinking || null;
 
-    saveRequestDetail(buildRequestDetail({
+    await saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
       latency,
       tokens: usage || { prompt_tokens: 0, completion_tokens: 0 },
@@ -168,14 +182,15 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
       providerResponse: safeContent,
       response: { content: safeContent, thinking: safeThinking, type: "streaming" },
       pxpipe,
-      status: "success"
+      status: failure ? "error" : "success",
     }, { id: streamDetailId })).catch(err => {
       console.error("[RequestDetail] Failed to update streaming content:", err.message);
     });
 
     // Persist stream usage to DB (no console line; the "📊 done" line below is authoritative)
     saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, label: "STREAM USAGE", silent: true });
-    if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency }));
+    if (log?.line) log.line(reqTag, failure ? "✗" : "📊",
+      failure ? `FAILED ${failure.status} · ${failure.error}` : formatDoneLine({ usage, latency }));
   };
 
   return { onStreamComplete, streamDetailId };
