@@ -98,8 +98,84 @@ async function call(provider, action, body, options) {
   return response;
 }
 
+function audioRequest(action = "streamGenerateContent") {
+  return {
+    req: new Request(`https://router.test/v1beta/models/gemini/tts-model:${action}`, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer router-key" },
+      body: JSON.stringify({ contents: [{ parts: [{ text: "Speak" }] }], generationConfig: { responseModalities: ["AUDIO"] } }),
+    }),
+    params: { params: Promise.resolve({ path: ["gemini", `tts-model:${action}`] }) },
+  };
+}
+
 describe("native Gemini endpoint entry contract", () => {
   beforeEach(load);
+
+  it.each(["generateContent", "streamGenerateContent"])("TTS %s waits for EOF and its account update", async action => {
+    let releaseAccount;
+    const accountUpdated = new Promise(resolve => { releaseAccount = resolve; });
+    services.clearAccountError.mockImplementationOnce(() => accountUpdated);
+    context.setTimeout = vi.fn(() => 77);
+    context.clearTimeout = vi.fn();
+    const payload = { candidates: [{ content: { parts: [{ inlineData: { mimeType: "audio/pcm", data: "AA==" } }] }, finishReason: "STOP" }] };
+    const raw = JSON.stringify(action === "streamGenerateContent" ? [payload] : payload);
+    services.fetch.mockResolvedValueOnce(new Response(raw, { headers: { "Content-Type": "application/json" } }));
+    const { req, params } = audioRequest(action);
+    const response = await context.POST(req, params);
+    expect(services.clearAccountError).not.toHaveBeenCalled();
+    let finished = false;
+    const reading = response.text().then(text => { finished = true; return text; });
+    await vi.waitFor(() => expect(services.clearAccountError).toHaveBeenCalledOnce());
+    expect(context.clearTimeout).toHaveBeenCalledWith(77);
+    expect(finished).toBe(false);
+    releaseAccount();
+    expect(await reading).toBe(raw);
+    expect(services.markAccountUnavailable).not.toHaveBeenCalled();
+  });
+
+  it("TTS retains its deadline after headers and marks a stalled response unavailable", async () => {
+    let expire;
+    context.setTimeout = vi.fn(callback => { expire = callback; return 77; });
+    context.clearTimeout = vi.fn();
+    services.fetch.mockImplementationOnce(async (_url, options) => new Response(new ReadableStream({
+      start(controller) {
+        options.signal.addEventListener("abort", () => controller.error(Object.assign(new Error("body timed out"), { name: "AbortError" })), { once: true });
+      },
+    }), { headers: { "Content-Type": "text/event-stream" } }));
+    const { req, params } = audioRequest();
+    const response = await context.POST(req, params);
+    expect(context.clearTimeout).not.toHaveBeenCalled();
+    const reading = response.text().catch(error => error);
+    expire();
+    expect(await reading).toBeInstanceOf(Error);
+    expect(services.fetch).toHaveBeenCalledOnce();
+    expect(services.markAccountUnavailable.mock.calls[0].slice(0, 2)).toEqual(["fixture-connection", 504]);
+    expect(services.clearAccountError).not.toHaveBeenCalled();
+    expect(context.clearTimeout).toHaveBeenCalledWith(77);
+  });
+
+  it("TTS awaits the post-header failure update before rejecting the body", async () => {
+    let releaseAccount;
+    const accountUpdated = new Promise(resolve => { releaseAccount = resolve; });
+    services.markAccountUnavailable.mockImplementationOnce(() => accountUpdated);
+    context.setTimeout = vi.fn(() => 77);
+    context.clearTimeout = vi.fn();
+    let upstream;
+    services.fetch.mockResolvedValueOnce(new Response(new ReadableStream({ start(controller) { upstream = controller; } }), {
+      headers: { "Content-Type": "text/event-stream" },
+    }));
+    const { req, params } = audioRequest();
+    const response = await context.POST(req, params);
+    let failed = false;
+    const reading = response.text().catch(error => { failed = true; return error; });
+    upstream.error(new Error("socket hang up"));
+    await vi.waitFor(() => expect(services.markAccountUnavailable).toHaveBeenCalledOnce());
+    expect(failed).toBe(false);
+    expect(services.markAccountUnavailable.mock.calls[0].slice(0, 2)).toEqual(["fixture-connection", 502]);
+    releaseAccount({ shouldFallback: false });
+    expect(await reading).toBeInstanceOf(Error);
+    expect(services.clearAccountError).not.toHaveBeenCalled();
+  });
 
   for (const provider of ["gemini", "aistudio"]) {
     it(`${provider}: preserves native tool history, settings and arbitrary opaque extensions`, async () => {
@@ -245,6 +321,8 @@ describe("native Gemini endpoint entry contract", () => {
     abort.abort();
     expect(signal.aborted).toBe(true);
     await response.body.cancel();
+    expect(services.clearAccountError).not.toHaveBeenCalled();
+    expect(services.markAccountUnavailable).not.toHaveBeenCalled();
   });
 
   it("a foreign-provider request keeps the existing translated route", async () => {
