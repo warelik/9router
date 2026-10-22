@@ -40,7 +40,7 @@ vi.mock("open-sse/utils/proxyFetch.js", () => ({
 }));
 
 const { GET } = await import("../../src/app/api/v1beta/models/route.js");
-const { POST: nativePOST } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
+const { POST: nativePOST, OPTIONS } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
 const responses = [];
 async function POST(...args) {
   const response = await nativePOST(...args);
@@ -111,6 +111,25 @@ describe("Gemini native v1beta endpoint", () => {
     await Promise.allSettled(responses.splice(0).filter(response => response.body && !response.bodyUsed)
       .map(response => response.body.cancel()));
     vi.unstubAllGlobals();
+  });
+
+  it.each(["missing", "invalid"])("exposes %s native TTS authentication errors to cross-origin clients", async kind => {
+    mocks.isValidApiKey.mockResolvedValue(false);
+    const request = makeGeminiRequest("gemini-3.1-flash-tts-preview:generateContent", audioBody());
+    if (kind === "missing") request.headers.delete("Authorization");
+    const response = await POST(request, { params: Promise.resolve({ path: ["gemini-3.1-flash-tts-preview:generateContent"] }) });
+    expect(response.status).toBe(401);
+    expect(response.headers.get("access-control-allow-origin")).toBe("*");
+    expect((await response.json()).error.message).toEqual(expect.any(String));
+    expect(mocks.getProviderCredentials).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("allows Authorization explicitly in native preflight while preserving wildcard headers", async () => {
+    const response = await OPTIONS();
+    const headers = response.headers.get("access-control-allow-headers").toLowerCase().split(/,\s*/);
+    expect(headers).toContain("authorization");
+    expect(headers).toContain("*");
   });
 
   it("lists Gemini TTS models using standard Google model names", async () => {

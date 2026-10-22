@@ -42,6 +42,7 @@ describe("Gemini native stable and beta API versions", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("access-control-allow-methods")).toContain("POST");
     expect(response.headers.get("access-control-allow-methods")).toContain("GET");
+    expect(response.headers.get("access-control-allow-headers").toLowerCase()).toContain("authorization");
   });
 
   // The earlier isolated alias tests missed the existing [...model] directory:
