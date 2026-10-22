@@ -1,0 +1,298 @@
+From 20205134775a75c4aae47c49779f72697ccabc94 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 22:40:41 +0000
+Subject: [PATCH] Keep native TTS deadlines and account health through body
+ completion
+
+---
+ src/app/api/v1beta/models/[...path]/route.js  | 57 +++++++++++---
+ .../unit/gemini-native-alpha-contract.test.js |  2 +
+ tests/unit/gemini-native-api-version.test.js  |  5 +-
+ tests/unit/gemini-native-endpoint.test.js     | 16 +++-
+ .../unit/gemini-native-entry-contract.test.js | 78 +++++++++++++++++++
+ 5 files changed, 143 insertions(+), 15 deletions(-)
+
+diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
+index bf9b54c4..392aac00 100644
+--- a/src/app/api/v1beta/models/[...path]/route.js
++++ b/src/app/api/v1beta/models/[...path]/route.js
+@@ -283,8 +283,13 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
+       attemptController.abort();
+     }, GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS);
+     const abortAttempt = () => attemptController.abort();
++    const cleanup = () => {
++      clearTimeout(timeout);
++      request.signal?.removeEventListener("abort", abortAttempt);
++    };
+ 
+     if (request.signal?.aborted) {
++      cleanup();
+       console.log(`[GEMINI_NATIVE] client aborted model=${modelId} ms=0 conn=${safeConnection}`);
+       return Response.json({ error: { message: "Client closed request" } }, { status: 499 });
+     }
+@@ -337,28 +342,49 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
+ 
+       return Response.json({ error: { message: errorText } }, { status });
+     } finally {
+-      clearTimeout(timeout);
+-      if (!upstreamResponse?.ok || !upstreamResponse.body) {
+-        request.signal?.removeEventListener("abort", abortAttempt);
+-      }
++      if (!upstreamResponse) cleanup();
+     }
+ 
+     console.log(`[GEMINI_NATIVE] upstream model=${modelId} status=${upstreamResponse.status} ms=${Date.now() - startedAt} conn=${safeConnection} ct=${upstreamResponse.headers.get("content-type") || "?"} cl=${upstreamResponse.headers.get("content-length") || "?"}`);
+ 
+     if (upstreamResponse.ok) {
+-      await clearAccountError(credentials.connectionId, credentials, modelId);
++      const reportSuccess = () => Promise.resolve()
++        .then(() => clearAccountError(credentials.connectionId, credentials, modelId))
++        .catch(err => console.error("[GEMINI_NATIVE] account success update failed:", err?.message || err));
+       const reader = upstreamResponse.body?.getReader();
+-      const cleanup = () => request.signal?.removeEventListener("abort", abortAttempt);
++      let cancelled = false;
+       const responseBody = reader ? new ReadableStream({
+         async pull(controller) {
++          let chunk;
+           try {
+-            const { value, done } = await reader.read();
+-            if (done) { cleanup(); controller.close(); }
+-            else controller.enqueue(value);
+-          } catch (error) { cleanup(); controller.error(error); }
++            chunk = await reader.read();
++          } catch (error) {
++            cleanup();
++            if (timedOut || (!cancelled && !request.signal?.aborted)) {
++              const status = isGeminiNativeTimeoutError(error, timedOut) ? 504 : 502;
++              await Promise.resolve().then(() => markAccountUnavailable(credentials.connectionId, status,
++                getSafeGeminiNativeErrorText(error), "gemini", modelId)).catch(err => {
++                console.error("[GEMINI_NATIVE] account failure update failed:", err?.message || err);
++              });
++            }
++            if (!cancelled) controller.error(error);
++            return;
++          }
++          if (cancelled) return;
++          if (chunk.done) {
++            cleanup();
++            if (!cancelled && !request.signal?.aborted) {
++              await reportSuccess();
++            }
++            if (!cancelled) controller.close();
++          } else controller.enqueue(chunk.value);
+         },
+-        cancel(reason) { cleanup(); attemptController.abort(); return reader.cancel(reason); },
++        cancel(reason) { cancelled = true; cleanup(); attemptController.abort(); return reader.cancel(reason); },
+       }) : null;
++      if (!reader) {
++        cleanup();
++        await reportSuccess();
++      }
+       return new Response(responseBody, {
+         status: upstreamResponse.status,
+         statusText: upstreamResponse.statusText,
+@@ -366,7 +392,14 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
+       });
+     }
+ 
+-    const errorText = await upstreamResponse.text();
++    let errorText;
++    try {
++      errorText = await upstreamResponse.text();
++    } catch (error) {
++      errorText = JSON.stringify({ error: { message: getSafeGeminiNativeErrorText(error) } });
++    } finally {
++      cleanup();
++    }
+     const { shouldFallback } = await markAccountUnavailable(
+       credentials.connectionId,
+       upstreamResponse.status,
+diff --git a/tests/unit/gemini-native-alpha-contract.test.js b/tests/unit/gemini-native-alpha-contract.test.js
+index 6db63a9e..5904adc6 100644
+--- a/tests/unit/gemini-native-alpha-contract.test.js
++++ b/tests/unit/gemini-native-alpha-contract.test.js
+@@ -134,6 +134,7 @@ describe("native Gemini alpha generation contract", () => {
+     mocks.validateApiKey.mockClear();
+     const allowed = await beta.POST(requestFor("restricted-tts"), params);
+     expect(allowed.status).toBe(200);
++    await allowed.arrayBuffer();
+     expect(mocks.validateApiKey).toHaveBeenCalledWith("restricted-tts");
+     expect(mocks.network).toHaveBeenCalledOnce();
+ 
+@@ -165,6 +166,7 @@ describe("native Gemini alpha generation contract", () => {
+     );
+     const allowed = await beta.POST(xApiKey, params);
+     expect(allowed.status).toBe(200);
++    await allowed.arrayBuffer();
+     expect(mocks.validateApiKey).toHaveBeenCalledWith("restricted-tts");
+     expect(mocks.network).toHaveBeenCalledOnce();
+ 
+diff --git a/tests/unit/gemini-native-api-version.test.js b/tests/unit/gemini-native-api-version.test.js
+index 4054492f..9c79c900 100644
+--- a/tests/unit/gemini-native-api-version.test.js
++++ b/tests/unit/gemini-native-api-version.test.js
+@@ -153,6 +153,7 @@ describe("Gemini native stable and beta API versions", () => {
+     expect(new URL(url).pathname).toBe("/v1/models/tts-model:generateContent");
+     expect(new URL(url).searchParams.has("key")).toBe(false);
+     expect(JSON.parse(options.body)).toEqual(input);
++    await response.arrayBuffer();
+   });
+ 
+   for (const version of ["v1", "v1beta"]) {
+@@ -177,12 +178,14 @@ describe("Gemini native stable and beta API versions", () => {
+   it("accepts the $key alias on the native AUDIO path without leaking it to Google", async () => {
+     const input = { contents: [{ parts: [{ text: "Speak" }] }], generationConfig: { responseModalities: ["AUDIO"] } };
+     const request = new Request("https://router.test/v1beta/models/tts-model:generateContent?$key=fixture-client-key&fields=candidates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
+-    expect((await beta.POST(request, { params: Promise.resolve({ path: ["tts-model:generateContent"] }) })).status).toBe(200);
++    const response = await beta.POST(request, { params: Promise.resolve({ path: ["tts-model:generateContent"] }) });
++    expect(response.status).toBe(200);
+     const [url, options] = mocks.proxyAwareFetch.mock.calls[0];
+     expect(new URL(url).searchParams.has("$key")).toBe(false);
+     expect(new URL(url).searchParams.has("key")).toBe(false);
+     expect(options.headers["x-goog-api-key"]).toBe("fixture-provider-key");
+     expect(JSON.parse(options.body)).toEqual(input);
++    await response.arrayBuffer();
+   });
+ 
+   it("does not change a translated client's configured provider API version", () => {
+diff --git a/tests/unit/gemini-native-endpoint.test.js b/tests/unit/gemini-native-endpoint.test.js
+index 27ec128b..e45cc666 100644
+--- a/tests/unit/gemini-native-endpoint.test.js
++++ b/tests/unit/gemini-native-endpoint.test.js
+@@ -40,7 +40,13 @@ vi.mock("open-sse/utils/proxyFetch.js", () => ({
+ }));
+ 
+ const { GET } = await import("../../src/app/api/v1beta/models/route.js");
+-const { POST } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
++const { POST: nativePOST } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
++const responses = [];
++async function POST(...args) {
++  const response = await nativePOST(...args);
++  responses.push(response);
++  return response;
++}
+ 
+ function makeGeminiRequest(path, body, headers = {}, signal) {
+   return new Request(`https://router.test/v1beta/models/${path}`, {
+@@ -101,7 +107,11 @@ describe("Gemini native v1beta endpoint", () => {
+     );
+   });
+ 
+-  afterEach(() => vi.unstubAllGlobals());
++  afterEach(async () => {
++    await Promise.allSettled(responses.splice(0).filter(response => response.body && !response.bodyUsed)
++      .map(response => response.body.cancel()));
++    vi.unstubAllGlobals();
++  });
+ 
+   it("lists Gemini TTS models using standard Google model names", async () => {
+     const response = await GET();
+@@ -214,6 +224,8 @@ describe("Gemini native v1beta endpoint", () => {
+       "gemini",
+       "gemini-3.1-flash-tts-preview"
+     );
++    expect(mocks.clearAccountError).not.toHaveBeenCalled();
++    await response.arrayBuffer();
+     expect(mocks.clearAccountError).toHaveBeenCalledWith(
+       "second-conn",
+       expect.objectContaining({ apiKey: "second-gemini-key" }),
+diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
+index 84c907bf..c0a20165 100644
+--- a/tests/unit/gemini-native-entry-contract.test.js
++++ b/tests/unit/gemini-native-entry-contract.test.js
+@@ -98,9 +98,85 @@ async function call(provider, action, body, options) {
+   return response;
+ }
+ 
++function audioRequest(action = "streamGenerateContent") {
++  return {
++    req: new Request(`https://router.test/v1beta/models/gemini/tts-model:${action}`, {
++      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer router-key" },
++      body: JSON.stringify({ contents: [{ parts: [{ text: "Speak" }] }], generationConfig: { responseModalities: ["AUDIO"] } }),
++    }),
++    params: { params: Promise.resolve({ path: ["gemini", `tts-model:${action}`] }) },
++  };
++}
++
+ describe("native Gemini endpoint entry contract", () => {
+   beforeEach(load);
+ 
++  it.each(["generateContent", "streamGenerateContent"])("TTS %s waits for EOF and its account update", async action => {
++    let releaseAccount;
++    const accountUpdated = new Promise(resolve => { releaseAccount = resolve; });
++    services.clearAccountError.mockImplementationOnce(() => accountUpdated);
++    context.setTimeout = vi.fn(() => 77);
++    context.clearTimeout = vi.fn();
++    const payload = { candidates: [{ content: { parts: [{ inlineData: { mimeType: "audio/pcm", data: "AA==" } }] }, finishReason: "STOP" }] };
++    const raw = JSON.stringify(action === "streamGenerateContent" ? [payload] : payload);
++    services.fetch.mockResolvedValueOnce(new Response(raw, { headers: { "Content-Type": "application/json" } }));
++    const { req, params } = audioRequest(action);
++    const response = await context.POST(req, params);
++    expect(services.clearAccountError).not.toHaveBeenCalled();
++    let finished = false;
++    const reading = response.text().then(text => { finished = true; return text; });
++    await vi.waitFor(() => expect(services.clearAccountError).toHaveBeenCalledOnce());
++    expect(context.clearTimeout).toHaveBeenCalledWith(77);
++    expect(finished).toBe(false);
++    releaseAccount();
++    expect(await reading).toBe(raw);
++    expect(services.markAccountUnavailable).not.toHaveBeenCalled();
++  });
++
++  it("TTS retains its deadline after headers and marks a stalled response unavailable", async () => {
++    let expire;
++    context.setTimeout = vi.fn(callback => { expire = callback; return 77; });
++    context.clearTimeout = vi.fn();
++    services.fetch.mockImplementationOnce(async (_url, options) => new Response(new ReadableStream({
++      start(controller) {
++        options.signal.addEventListener("abort", () => controller.error(Object.assign(new Error("body timed out"), { name: "AbortError" })), { once: true });
++      },
++    }), { headers: { "Content-Type": "text/event-stream" } }));
++    const { req, params } = audioRequest();
++    const response = await context.POST(req, params);
++    expect(context.clearTimeout).not.toHaveBeenCalled();
++    const reading = response.text().catch(error => error);
++    expire();
++    expect(await reading).toBeInstanceOf(Error);
++    expect(services.fetch).toHaveBeenCalledOnce();
++    expect(services.markAccountUnavailable.mock.calls[0].slice(0, 2)).toEqual(["fixture-connection", 504]);
++    expect(services.clearAccountError).not.toHaveBeenCalled();
++    expect(context.clearTimeout).toHaveBeenCalledWith(77);
++  });
++
++  it("TTS awaits the post-header failure update before rejecting the body", async () => {
++    let releaseAccount;
++    const accountUpdated = new Promise(resolve => { releaseAccount = resolve; });
++    services.markAccountUnavailable.mockImplementationOnce(() => accountUpdated);
++    context.setTimeout = vi.fn(() => 77);
++    context.clearTimeout = vi.fn();
++    let upstream;
++    services.fetch.mockResolvedValueOnce(new Response(new ReadableStream({ start(controller) { upstream = controller; } }), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++    const { req, params } = audioRequest();
++    const response = await context.POST(req, params);
++    let failed = false;
++    const reading = response.text().catch(error => { failed = true; return error; });
++    upstream.error(new Error("socket hang up"));
++    await vi.waitFor(() => expect(services.markAccountUnavailable).toHaveBeenCalledOnce());
++    expect(failed).toBe(false);
++    expect(services.markAccountUnavailable.mock.calls[0].slice(0, 2)).toEqual(["fixture-connection", 502]);
++    releaseAccount({ shouldFallback: false });
++    expect(await reading).toBeInstanceOf(Error);
++    expect(services.clearAccountError).not.toHaveBeenCalled();
++  });
++
+   for (const provider of ["gemini", "aistudio"]) {
+     it(`${provider}: preserves native tool history, settings and arbitrary opaque extensions`, async () => {
+       const original = nativeBody();
+@@ -245,6 +321,8 @@ describe("native Gemini endpoint entry contract", () => {
+     abort.abort();
+     expect(signal.aborted).toBe(true);
+     await response.body.cancel();
++    expect(services.clearAccountError).not.toHaveBeenCalled();
++    expect(services.markAccountUnavailable).not.toHaveBeenCalled();
+   });
+ 
+   it("a foreign-provider request keeps the existing translated route", async () => {
