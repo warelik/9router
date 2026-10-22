@@ -119,6 +119,29 @@ describe("Gemini native stable and beta API versions", () => {
     }
   }
 
+  for (const version of ["v1", "v1beta"]) {
+    for (const action of ["generateContent", "streamGenerateContent"]) {
+      it(`${version} ${action} preserves nested provider model IDs`, async () => {
+        const model = "kilocode/google/gemini-2.5-pro";
+        const input = body();
+        const request = new Request(`https://router.test/${version}/models/${model}:${action}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(input),
+        });
+        const segments = ["kilocode", "google", `gemini-2.5-pro:${action}`];
+        const route = version === "v1" ? stable : beta;
+        const params = version === "v1" ? { model: segments } : { path: segments };
+        const response = await route.POST(request, { params: Promise.resolve(params) });
+        expect(response.status).toBe(200);
+        expect(mocks.handleChat).toHaveBeenCalledTimes(1);
+        const [forwarded, raw] = mocks.handleChat.mock.calls[0];
+        expect(await forwarded.json()).toMatchObject({ model, stream: action === "streamGenerateContent" });
+        expect(raw.apiVersion).toBe(version);
+        expect(mocks.proxyAwareFetch).not.toHaveBeenCalled();
+      });
+    }
+  }
+
   it("the native AUDIO path forwards stable v1 to Google", async () => {
     const input = { contents: [{ parts: [{ text: "Speak" }] }], generationConfig: { responseModalities: ["AUDIO"] } };
     const request = new Request("https://router.test/v1/models/tts-model:generateContent?key=fixture-client-key&fields=candidates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });

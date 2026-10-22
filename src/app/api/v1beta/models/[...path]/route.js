@@ -63,32 +63,12 @@ export async function POST(request, { params }) {
     if (!/:(?:generateContent|streamGenerateContent)$/.test(actionPath || "")) {
       return new Response(null, { status: 405, headers: { Allow: "POST, OPTIONS" } });
     }
-    // path = ["provider", "model:action"] or ["model:action"]
-
-    let model;
-    let action; // ":generateContent" | ":streamGenerateContent"
-
-    if (path.length >= 2) {
-      // Format: /v1beta/models/provider/model:generateContent
-      const provider = path[0];
-      const modelAction = path[1];
-      action = modelAction.includes(":streamGenerateContent")
-        ? ":streamGenerateContent"
-        : ":generateContent";
-      const modelName = modelAction
-        .replace(":streamGenerateContent", "")
-        .replace(":generateContent", "");
-      model = provider + "/" + modelName;
-    } else {
-      // Format: /v1beta/models/model:generateContent
-      const modelAction = path[0];
-      action = modelAction.includes(":streamGenerateContent")
-        ? ":streamGenerateContent"
-        : ":generateContent";
-      model = modelAction
-        .replace(":streamGenerateContent", "")
-        .replace(":generateContent", "");
-    }
+    // Provider model IDs can themselves contain slashes. Only the final
+    // segment carries the validated action suffix; retain every model segment.
+    const action = actionPath.endsWith(":streamGenerateContent")
+      ? ":streamGenerateContent"
+      : ":generateContent";
+    const model = path.join("/").slice(0, -action.length);
 
     let body;
     try {
