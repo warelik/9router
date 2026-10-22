@@ -5,6 +5,7 @@ import { FORMATS } from "../../open-sse/translator/formats.js";
 import { createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.js";
 import { translateNonStreamingResponse } from "../../open-sse/handlers/chatCore/nonStreamingHandler.js";
 import { getGeminiThoughtSignatureSync } from "../../open-sse/services/thoughtSignatureStore.js";
+import { MODEL_CAPABILITIES } from "../../open-sse/providers/capabilities.js";
 
 const MODEL = "gemini-3.8-flash";
 const TENANT_A = "authenticated-api-key-tenant-a";
@@ -66,6 +67,33 @@ async function runStream(chunks, credentials) {
 }
 
 describe("Responses web_search request translation", () => {
+  it.each(["gemini", "aistudio"])("keeps hosted search available on configured Gemini 4 through %s", provider => {
+    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI,
+      "gemini/gemini-4-argon", requestBody([recordVersion(), webSearch]), true, {}, provider);
+    expect(translated.tools).toContainEqual({ googleSearch: {} });
+    expect(translated.toolConfig.includeServerSideToolInvocations).toBe(true);
+    expect("_webSearch" in translated).toBe(false);
+  });
+
+  it("uses the declared model capability rather than a model-name pattern", () => {
+    const model = "configured-hosted-search-fixture";
+    const previous = MODEL_CAPABILITIES[model];
+    try {
+      MODEL_CAPABILITIES[model] = { search: true, serverSideToolInvocations: true };
+      const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI,
+        model, requestBody([webSearch]), true, {}, "gemini");
+      expect(translated.tools).toContainEqual({ googleSearch: {} });
+      expect(translated.toolConfig.includeServerSideToolInvocations).toBe(true);
+      MODEL_CAPABILITIES[model] = { search: true, serverSideToolInvocations: false };
+      const unsupported = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI,
+        model, requestBody([webSearch]), true, {}, "gemini");
+      expect(unsupported.tools || []).not.toContainEqual({ googleSearch: {} });
+    } finally {
+      if (previous === undefined) delete MODEL_CAPABILITIES[model];
+      else MODEL_CAPABILITIES[model] = previous;
+    }
+  });
+
   for (const provider of ["gemini", "aistudio"]) {
     it(`enables googleSearch with server-side invocations for ${provider}`, () => {
       const credentials = {};
