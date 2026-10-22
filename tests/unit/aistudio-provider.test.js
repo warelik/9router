@@ -36,6 +36,34 @@ describe("aistudio provider (Gemini wire to the local bridge)", () => {
     expect(sse).toEqual(EXPECT_SSE_HEADERS);
   });
 
+  it.each([
+    ["../../admin?x=", "../../admin?x="],
+    ["..\\..\\admin", "..\\..\\admin"],
+    ["%2e%2e%2fadmin", "%2e%2e%2fadmin"],
+    ["model?key=other#fragment", "model?key=other#fragment"],
+    [".", "."], ["..", ".."],
+    ["модель/模型", "модель/模型"],
+    ["\ud800", "\ufffd"],
+  ])("keeps model %j inside the authenticated generation resource", (model, normalized) => {
+    for (const provider of ["aistudio", "gemini"]) {
+      const executor = new DefaultExecutor(provider);
+      const base = new URL(PROVIDERS[provider].baseUrl);
+      for (const stream of [false, true]) {
+        const url = new URL(executor.buildUrl(model, stream, 0, {}));
+        const action = stream ? ":streamGenerateContent" : ":generateContent";
+        const prefix = base.pathname + "/";
+        expect(url.origin).toBe(base.origin);
+        expect(url.pathname.startsWith(prefix)).toBe(true);
+        expect(url.pathname.endsWith(action)).toBe(true);
+        const segment = url.pathname.slice(prefix.length, -action.length);
+        expect(segment).not.toContain("/");
+        expect(decodeURIComponent(segment)).toBe(normalized);
+        expect([...url.searchParams]).toEqual(stream ? [["alt", "sse"]] : []);
+        expect(url.hash).toBe("");
+      }
+    }
+  });
+
   it("forwards any model id the bridge serves without a registry list", async () => {
     expect(cfg.passthroughModels ?? true).toBeTruthy();
     const info = await getModelInfoCore(`aistudio/${MODEL}`, {});
