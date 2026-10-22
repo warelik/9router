@@ -34,6 +34,28 @@ const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nat
 const readText = stream => new Response(stream).text();
 
 describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
+  it.each([null, "invalid", [], { parts: "invalid" }, { parts: [null] }, { parts: [[]] }, { parts: ["invalid"] }].map(content => [content]))(
+    "rejects malformed candidate content %j before recording streaming success", async content => {
+      const payload = { candidates: [{ index: 0, finishReason: "STOP", content }] };
+      for (const nativeJson of [false, true]) {
+        const succeeded = vi.fn();
+        const raw = nativeJson ? JSON.stringify(payload) : frame(payload);
+        const result = await handleStreamingResponse({
+          providerResponse: new Response(inputStream([encode(raw)]), {
+            headers: { "content-type": nativeJson ? "application/json" : "text/event-stream" },
+          }),
+          provider: "aistudio", model: "gemini-native-test",
+          sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+          body: {}, stream: true, requestStartTime: Date.now(),
+          streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+          onRequestSuccess: succeeded,
+        });
+        if (nativeJson) await expect(result.response.text()).rejects.toThrow("Upstream Gemini JSON stream");
+        else expect(await result.response.text()).toContain('"code":502');
+        expect(succeeded).not.toHaveBeenCalled();
+      }
+    });
+
   it.each(["gemini", "aistudio", "future-native-provider"])("does not append Chat DONE or mutate Parts/usage through %s", async provider => {
     const original = frame(chunk) + frame(lateUsage);
     const bytes = encode(original);
