@@ -14,7 +14,7 @@ import {
   coerceResponsesArguments,
   coerceResponsesOutput,
 } from "../formats/responsesApi.js";
-import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
+import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, RESPONSES_TOOL } from "../schema/index.js";
 
 const MAX_TOOL_NAME_LEN = 128;
 
@@ -45,14 +45,14 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
 
   const reserveToolName = (tool) => {
     if (!tool || typeof tool !== "object" || Array.isArray(tool)) return;
-    if (tool.type === "namespace") return;
+    if (tool.type === RESPONSES_TOOL.NAMESPACE) return;
     const n = tool.function?.name ?? tool.name;
     if (typeof n === "string" && n.trim()) reservedNames.add(n.trim());
   };
   for (const tool of Array.isArray(body.tools) ? body.tools : []) reserveToolName(tool);
 
-  const aliasFor = (namespace, name) => {
-    const identity = JSON.stringify([namespace, name]);
+  const aliasFor = (namespace, name, type) => {
+    const identity = JSON.stringify([namespace, name, type]);
     if (aliasCache.has(identity)) return aliasCache.get(identity);
     const stem = `ns_${namespace}_${name}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40);
     const hash = createHash("sha256").update(identity).digest("hex").slice(0, 16);
@@ -154,11 +154,12 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
       // Skip items with empty/missing name — Codex/OpenAI reject nameless tool calls (#444)
       if (!item.name || typeof item.name !== "string" || item.name.trim() === "") continue;
       const namespace = typeof item.namespace === "string" && item.namespace.trim() ? item.namespace.trim() : null;
-      const callName = namespace ? aliasFor(namespace, item.name) : item.name;
+      const type = itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION;
+      const callName = namespace ? aliasFor(namespace, item.name, type) : item.name;
       if (namespace) {
-        namespaceToolMap.set(callName, { name: item.name, namespace, type: itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL ? "custom" : "function" });
+        namespaceToolMap.set(callName, { name: item.name, namespace, type });
       }
-      if (itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL) customToolNames.add(callName);
+      if (type === RESPONSES_TOOL.CUSTOM) customToolNames.add(callName);
       const toolInput = itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL
         ? { input: typeof item.input === "string" ? item.input : JSON.stringify(item.input ?? "") }
         : item.arguments;
@@ -225,10 +226,10 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
   // such as Gemini, which strictly validates function names.
   const responseTools = [];
   for (const tool of [...(Array.isArray(body.tools) ? body.tools : []), ...additionalTools]) {
-    if (tool && typeof tool === "object" && !Array.isArray(tool) && tool.type === "namespace") {
+    if (tool && typeof tool === "object" && !Array.isArray(tool) && tool.type === RESPONSES_TOOL.NAMESPACE) {
       if (typeof tool.name === "string" && tool.name.trim() && Array.isArray(tool.tools)) {
         for (const child of tool.tools) {
-          if (child?.type === "function" || child?.type === "custom") responseTools.push({ child, ns: tool });
+          if (child?.type === RESPONSES_TOOL.FUNCTION || child?.type === RESPONSES_TOOL.CUSTOM) responseTools.push({ child, ns: tool });
         }
       }
       continue;
@@ -255,11 +256,12 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
         // in translator-only metadata for the response conversion.
         const name = tool.name;
         if (!name || typeof name !== "string" || name.trim() === "") return null;
-        const wireName = ns ? aliasFor(ns.name.trim(), name) : name;
-        if (ns) namespaceToolMap.set(wireName, { name, namespace: ns.name.trim(), type: tool.type === "custom" ? "custom" : "function" });
+        const type = tool.type === RESPONSES_TOOL.CUSTOM ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION;
+        const wireName = ns ? aliasFor(ns.name.trim(), name, type) : name;
+        if (ns) namespaceToolMap.set(wireName, { name, namespace: ns.name.trim(), type });
         const label = ns ? `[${ns.name.trim()}.${name}]` : "";
         const nsDescription = ns ? String(ns.description || "") : "";
-        if (tool.type === "custom") {
+        if (type === RESPONSES_TOOL.CUSTOM) {
           customToolNames.add(wireName);
           const formatHint = [tool.format?.syntax, tool.format?.definition].filter(Boolean).join("\n");
           return {
@@ -297,19 +299,20 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
   }
 
   if (result.tool_choice && typeof result.tool_choice === "object" && !Array.isArray(result.tool_choice)
-    && (result.tool_choice.type === "function" || result.tool_choice.type === "custom")
+    && (result.tool_choice.type === RESPONSES_TOOL.FUNCTION || result.tool_choice.type === RESPONSES_TOOL.CUSTOM)
     && typeof result.tool_choice.name === "string") {
     const choice = result.tool_choice;
     const choiceNs = typeof choice.namespace === "string" && choice.namespace.trim() ? choice.namespace.trim() : null;
-    const choiceName = choiceNs ? aliasFor(choiceNs, choice.name) : choice.name;
+    const choiceType = choice.type === RESPONSES_TOOL.CUSTOM ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION;
+    const choiceName = choiceNs ? aliasFor(choiceNs, choice.name, choiceType) : choice.name;
     if (choiceNs) {
       const existing = namespaceToolMap.get(choiceName);
-      if (choice.type === "custom") {
+      if (choiceType === RESPONSES_TOOL.CUSTOM) {
         const declaration = responseTools.find(({ child, ns }) =>
-          child?.type === "custom" && ns?.name?.trim() === choiceNs && child.name === choice.name);
-        const descriptor = existing?.type === "custom"
+          child?.type === RESPONSES_TOOL.CUSTOM && ns?.name?.trim() === choiceNs && child.name === choice.name);
+        const descriptor = existing?.type === RESPONSES_TOOL.CUSTOM
           ? existing
-          : { name: choice.name, namespace: choiceNs, type: "custom" };
+          : { name: choice.name, namespace: choiceNs, type: RESPONSES_TOOL.CUSTOM };
         const format = declaration?.child.format ?? choice.format;
         if (format !== undefined) {
           namespaceToolMap.set(choiceName, { ...descriptor, format });
@@ -317,10 +320,10 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
           namespaceToolMap.set(choiceName, descriptor);
         }
       } else if (!existing) {
-        namespaceToolMap.set(choiceName, { name: choice.name, namespace: choiceNs, type: "function" });
+        namespaceToolMap.set(choiceName, { name: choice.name, namespace: choiceNs, type: RESPONSES_TOOL.FUNCTION });
       }
     }
-    if (choice.type === "custom") customToolNames.add(choiceName);
+    if (choiceType === RESPONSES_TOOL.CUSTOM) customToolNames.add(choiceName);
     result.tool_choice = { type: "function", function: { name: choiceName } };
   }
   if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
