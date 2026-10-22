@@ -264,6 +264,19 @@ describe("native Gemini through Antigravity", () => {
   });
   afterEach(() => vi.unstubAllGlobals());
 
+  it.each([null, "invalid", [], { parts: "invalid" }, { parts: [null] }, { parts: [[]] }, { parts: ["invalid"] }].map(content => [content]))(
+    "rejects malformed candidate content %j before non-streaming account success", async content => {
+      const succeeded = vi.fn();
+      network.mockResolvedValueOnce(Response.json({ response: {
+        candidates: [{ index: 0, finishReason: "STOP", content }],
+      } }));
+      const { result } = await runNativeGemini(nativeBody(), { onRequestSuccess: succeeded });
+      expect(result.success).toBe(false);
+      expect(result.response.status).toBe(502);
+      expect((await result.response.json()).error.code).toBe(502);
+      expect(succeeded).not.toHaveBeenCalled();
+    });
+
   it("wraps the native body for Antigravity while preserving continuation, controls and media meaning", async () => {
     const original = nativeBody();
     const before = structuredClone(original);
