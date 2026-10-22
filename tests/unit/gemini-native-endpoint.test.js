@@ -40,7 +40,13 @@ vi.mock("open-sse/utils/proxyFetch.js", () => ({
 }));
 
 const { GET } = await import("../../src/app/api/v1beta/models/route.js");
-const { POST } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
+const { POST: nativePOST } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
+const responses = [];
+async function POST(...args) {
+  const response = await nativePOST(...args);
+  responses.push(response);
+  return response;
+}
 
 function makeGeminiRequest(path, body, headers = {}, signal) {
   return new Request(`https://router.test/v1beta/models/${path}`, {
@@ -101,7 +107,11 @@ describe("Gemini native v1beta endpoint", () => {
     );
   });
 
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(async () => {
+    await Promise.allSettled(responses.splice(0).filter(response => response.body && !response.bodyUsed)
+      .map(response => response.body.cancel()));
+    vi.unstubAllGlobals();
+  });
 
   it("lists Gemini TTS models using standard Google model names", async () => {
     const response = await GET();
@@ -214,6 +224,8 @@ describe("Gemini native v1beta endpoint", () => {
       "gemini",
       "gemini-3.1-flash-tts-preview"
     );
+    expect(mocks.clearAccountError).not.toHaveBeenCalled();
+    await response.arrayBuffer();
     expect(mocks.clearAccountError).toHaveBeenCalledWith(
       "second-conn",
       expect.objectContaining({ apiKey: "second-gemini-key" }),
