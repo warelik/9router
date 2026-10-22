@@ -171,7 +171,7 @@ describe("native Gemini endpoint entry contract", () => {
       const error = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "fixture quota", details: [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "17s" }] } };
       services.getProviderCredentials.mockResolvedValueOnce({ apiKey: "provider-key", connectionId: "fixture-connection", providerSpecificData: {} }).mockResolvedValueOnce(null);
       services.markAccountUnavailable.mockResolvedValueOnce({ shouldFallback: true });
-      services.handleChatCore.mockResolvedValueOnce({ success: false, status: 429, error: "fixture quota", response: Response.json(error, { status: 429, headers: { "Retry-After": "17" } }) });
+      services.handleChatCore.mockResolvedValueOnce({ success: false, status: 429, error: "fixture quota", nativeResponse: true, response: Response.json(error, { status: 429, headers: { "Retry-After": "17" } }) });
       const response = await call(provider, "generateContent");
       expect(response.status).toBe(429);
       expect(response.headers.get("retry-after")).toBe("17");
