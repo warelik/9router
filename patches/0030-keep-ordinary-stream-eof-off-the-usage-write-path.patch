@@ -1,0 +1,74 @@
+From 9481ba4711892b43e7653ce5870b1a33c16d63a7 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:33:28 +0000
+Subject: [PATCH] Keep ordinary stream EOF independent of usage persistence
+
+---
+ .../handlers/chatCore/streamingHandler.js     | 11 +++++--
+ tests/unit/gemini-native-stream.test.js       | 30 +++++++++++++++++++
+ 2 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
+index d947420..39cff3e 100644
+--- a/open-sse/handlers/chatCore/streamingHandler.js
++++ b/open-sse/handlers/chatCore/streamingHandler.js
+@@ -114,9 +114,14 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+   }, { id: streamDetailId })).catch(err => {
+     console.error("[RequestDetail] Failed to save streaming request:", err.message);
+   });
+-  const completeStream = async (...args) => {
+-    await initialDetailWrite;
+-    return onStreamComplete?.(...args);
++  const completeStream = (...args) => {
++    const persist = () => onStreamComplete?.(...args);
++    if (deferNativeGeminiSuccess || args[0]?.error) {
++      return initialDetailWrite.then(persist);
++    }
++    initialDetailWrite.then(persist).catch(err => {
++      console.error("[RequestDetail] Failed to complete streaming request:", err?.message || err);
++    });
+   };
+   const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete: completeStream, onNativeResponseSuccess: deferNativeGeminiSuccess ? reportRequestSuccess : null, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
+ 
+diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
+index 0f1f1c3..2321dfe 100644
+--- a/tests/unit/gemini-native-stream.test.js
++++ b/tests/unit/gemini-native-stream.test.js
+@@ -38,6 +38,36 @@ const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nat
+ const readText = stream => new Response(stream).text();
+ 
+ describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
++  it.each([
++    ["openai", FORMATS.OPENAI, 'data: {"choices":[{"delta":{"content":"fixture"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'],
++    ["claude", FORMATS.CLAUDE, 'event: message_stop\ndata: {"type":"message_stop"}\n\n'],
++    ["codex", FORMATS.OPENAI_RESPONSES, 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"fixture","status":"completed","output":[]}}\n\n'],
++  ])("keeps %s EOF independent of pending usage detail writes", async (provider, format, raw) => {
++    vi.clearAllMocks();
++    let releaseDetails;
++    const detailsWritten = new Promise(resolve => { releaseDetails = resolve; });
++    saveRequestDetail.mockImplementationOnce(() => detailsWritten);
++    const shared = { provider, model: "ordinary-test", connectionId: "ordinary-account",
++      body: {}, stream: true, requestStartTime: Date.now() };
++    const callbacks = buildOnStreamComplete(shared);
++    const result = await handleStreamingResponse({
++      ...shared, ...callbacks, userAgent: "codex-cli",
++      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "text/event-stream" } }),
++      sourceFormat: format, targetFormat: format,
++      streamController: createStreamController({ provider, model: "ordinary-test" }),
++    });
++    let finished = false;
++    const reading = result.response.text().then(text => { finished = true; return text; });
++    try {
++      await vi.waitFor(() => expect(finished).toBe(true));
++      await reading;
++      expect(saveRequestDetail).toHaveBeenCalledOnce();
++    } finally {
++      releaseDetails();
++    }
++    await vi.waitFor(() => expect(saveRequestDetail).toHaveBeenCalledTimes(2));
++  });
++
+   it("waits for the failed account update before exposing native EOF", async () => {
+     for (const nativeJson of [false, true]) {
+       let releaseAccount;
