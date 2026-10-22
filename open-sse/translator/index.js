@@ -11,6 +11,7 @@ import { captureSessionId, captureConversationId } from "../utils/sessionManager
 import { ensureStreamToolCallIds } from "../utils/streamHelpers.js";
 import { AntigravityExecutor } from "../executors/antigravity.js";
 import { PROVIDERS } from "../providers/index.js";
+import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { ROLE, GEMINI_ROLE } from "./schema/roles.js";
 
 // Registry for translators. Lazy-init guards against circular-import order:
@@ -155,8 +156,9 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     result = adaptAIStudioStructuredOutput(result);
   }
 
-  // Hosted web_search (Codex Responses tools): only Gemini-3 models on the
-  // generateContent API can serve it — as a googleSearch tool entry plus
+  // Hosted web_search (Codex Responses tools): supported models on the
+  // generateContent API declare server-side invocations in model capabilities.
+  // Send a googleSearch tool entry plus
   // toolConfig.includeServerSideToolInvocations. Antigravity/Gemini-CLI share the
   // Cloud Code internal API which rejects that combination, and Vertex is
   // unverified, so the flag is consumed without effect for them. The internal
@@ -165,7 +167,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     const wantsWebSearch = result._webSearch === true;
     delete result._webSearch;
     const webSearchEnabled = wantsWebSearch && targetFormat === FORMATS.GEMINI && (provider === "gemini" || provider === "aistudio")
-      && /^gemini-3/.test(stripThinkingSuffix(String(model ?? "").split("/").pop() || "") || "");
+      && getCapabilitiesForModel(provider, stripThinkingSuffix(String(model ?? ""))).serverSideToolInvocations === true;
     if (webSearchEnabled) {
       result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
       result.toolConfig = {
