@@ -1,0 +1,109 @@
+From 51e51716c4f1ca7dbd3201449ed4ffbf1f2482b4 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:14:15 +0000
+Subject: [PATCH] Expose native Gemini error responses with the established
+ CORS policy
+
+---
+ src/app/api/v1/models/[...model]/route.js    |  2 +-
+ src/app/api/v1beta/models/[...path]/route.js | 13 ++++++++++--
+ tests/unit/gemini-native-api-version.test.js |  1 +
+ tests/unit/gemini-native-endpoint.test.js    | 21 +++++++++++++++++++-
+ 4 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/src/app/api/v1/models/[...model]/route.js b/src/app/api/v1/models/[...model]/route.js
+index 6a17ea5e..8ffcecc0 100644
+--- a/src/app/api/v1/models/[...model]/route.js
++++ b/src/app/api/v1/models/[...model]/route.js
+@@ -18,7 +18,7 @@ export async function OPTIONS() {
+     headers: {
+       "Access-Control-Allow-Origin": "*",
+       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+-      "Access-Control-Allow-Headers": "*",
++      "Access-Control-Allow-Headers": "Authorization, Content-Type, X-API-Key, X-Goog-API-Key, *",
+     },
+   });
+ }
+diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
+index 392aac00..203cac04 100644
+--- a/src/app/api/v1beta/models/[...path]/route.js
++++ b/src/app/api/v1beta/models/[...path]/route.js
+@@ -37,7 +37,7 @@ export async function OPTIONS() {
+     headers: {
+       "Access-Control-Allow-Origin": "*",
+       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+-      "Access-Control-Allow-Headers": "*"
++      "Access-Control-Allow-Headers": "Authorization, Content-Type, X-API-Key, X-Goog-API-Key, *"
+     }
+   });
+ }
+@@ -54,7 +54,16 @@ export async function OPTIONS() {
+  * Gemini providers use the shared native passthrough. Other provider formats
+  * keep the existing Chat conversion and Gemini response adapter.
+  */
+-export async function POST(request, { params }) {
++export async function POST(request, context) {
++  const response = await postGeminiRequest(request, context);
++  return new Response(response.body, {
++    status: response.status,
++    statusText: response.statusText,
++    headers: corsHeadersFrom(response),
++  });
++}
++
++async function postGeminiRequest(request, { params }) {
+   await ensureInitialized();
+ 
+   try {
+diff --git a/tests/unit/gemini-native-api-version.test.js b/tests/unit/gemini-native-api-version.test.js
+index 9c79c900..732837d7 100644
+--- a/tests/unit/gemini-native-api-version.test.js
++++ b/tests/unit/gemini-native-api-version.test.js
+@@ -42,6 +42,7 @@ describe("Gemini native stable and beta API versions", () => {
+     expect(response.status).toBe(200);
+     expect(response.headers.get("access-control-allow-methods")).toContain("POST");
+     expect(response.headers.get("access-control-allow-methods")).toContain("GET");
++    expect(response.headers.get("access-control-allow-headers").toLowerCase()).toContain("authorization");
+   });
+ 
+   // The earlier isolated alias tests missed the existing [...model] directory:
+diff --git a/tests/unit/gemini-native-endpoint.test.js b/tests/unit/gemini-native-endpoint.test.js
+index e45cc666..bde0927f 100644
+--- a/tests/unit/gemini-native-endpoint.test.js
++++ b/tests/unit/gemini-native-endpoint.test.js
+@@ -40,7 +40,7 @@ vi.mock("open-sse/utils/proxyFetch.js", () => ({
+ }));
+ 
+ const { GET } = await import("../../src/app/api/v1beta/models/route.js");
+-const { POST: nativePOST } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
++const { POST: nativePOST, OPTIONS } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
+ const responses = [];
+ async function POST(...args) {
+   const response = await nativePOST(...args);
+@@ -113,6 +113,25 @@ describe("Gemini native v1beta endpoint", () => {
+     vi.unstubAllGlobals();
+   });
+ 
++  it.each(["missing", "invalid"])("exposes %s native TTS authentication errors to cross-origin clients", async kind => {
++    mocks.isValidApiKey.mockResolvedValue(false);
++    const request = makeGeminiRequest("gemini-3.1-flash-tts-preview:generateContent", audioBody());
++    if (kind === "missing") request.headers.delete("Authorization");
++    const response = await POST(request, { params: Promise.resolve({ path: ["gemini-3.1-flash-tts-preview:generateContent"] }) });
++    expect(response.status).toBe(401);
++    expect(response.headers.get("access-control-allow-origin")).toBe("*");
++    expect((await response.json()).error.message).toEqual(expect.any(String));
++    expect(mocks.getProviderCredentials).not.toHaveBeenCalled();
++    expect(global.fetch).not.toHaveBeenCalled();
++  });
++
++  it("allows Authorization explicitly in native preflight while preserving wildcard headers", async () => {
++    const response = await OPTIONS();
++    const headers = response.headers.get("access-control-allow-headers").toLowerCase().split(/,\s*/);
++    expect(headers).toContain("authorization");
++    expect(headers).toContain("*");
++  });
++
+   it("lists Gemini TTS models using standard Google model names", async () => {
+     const response = await GET();
+     const body = await response.json();
