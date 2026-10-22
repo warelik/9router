@@ -37,7 +37,7 @@ export async function OPTIONS() {
     headers: {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "*"
+      "Access-Control-Allow-Headers": "Authorization, Content-Type, X-API-Key, X-Goog-API-Key, *"
     }
   });
 }
@@ -54,7 +54,16 @@ export async function OPTIONS() {
  * Gemini providers use the shared native passthrough. Other provider formats
  * keep the existing Chat conversion and Gemini response adapter.
  */
-export async function POST(request, { params }) {
+export async function POST(request, context) {
+  const response = await postGeminiRequest(request, context);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: corsHeadersFrom(response),
+  });
+}
+
+async function postGeminiRequest(request, { params }) {
   await ensureInitialized();
 
   try {
