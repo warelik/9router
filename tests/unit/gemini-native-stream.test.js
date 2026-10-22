@@ -58,6 +58,25 @@ describe("native Gemini SSE preserves provider payload and follows the client pr
     expect(completed.mock.calls[0][1].cached_tokens).toBe(2048);
   });
 
+  it("accepts upstream DONE after a complete Antigravity-native response", async () => {
+    const original = frame({ response: chunk }) + frame({ response: lateUsage }) + "data: [DONE]\r\n\r\n";
+    const output = await readText(inputStream(Array.from(encode(original), byte => Uint8Array.of(byte)))
+      .pipeThrough(nativeTransform("antigravity", FORMATS.ANTIGRAVITY)));
+    expect(output).toBe(original);
+    expect(output).not.toContain('"code":502');
+  });
+
+  it("does not let upstream DONE complete an unfinished native candidate", async () => {
+    const original = frame({ response: { candidates: [{ index: 0,
+      content: { role: "model", parts: [{ text: "unfinished" }] },
+    }] } }) + "data: [DONE]\r\n\r\n";
+    const output = await readText(inputStream([encode(original)])
+      .pipeThrough(nativeTransform("antigravity", FORMATS.ANTIGRAVITY)));
+    expect(output.startsWith(original)).toBe(true);
+    expect(output.slice(original.length)).toContain('"code":502');
+    expect(output.slice(original.length)).toContain("before a candidate finished");
+  });
+
   it("preserves unknown fields, SSE comments and multiline JSON exactly", async () => {
     const partial = frame({ candidates: [{ index: 0, content: { parts: [{ text: "prefix" }] } }] });
     const original = partial + ': heartbeat\n\ndata: {"candidates":[\ndata: {"index":0,"finishReason":"STOP","futureField":true}]}\n\n';

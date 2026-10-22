@@ -11,7 +11,7 @@ import { restoreToolNames } from "./opencodeFingerprint.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
-import { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER } from "./sseConstants.js";
+import { SSE_DONE, SSE_DONE_PAYLOAD, SSE_HEADERS, SSE_HEADERS_NO_BUFFER } from "./sseConstants.js";
 
 export { COLORS, formatSSE };
 export { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER };
@@ -205,6 +205,7 @@ export function createSSEStream(options = {}) {
     if (line.trim() || !nativeGeminiData.length) return;
     const payload = nativeGeminiData.join("\n");
     nativeGeminiData = [];
+    if (payload.trim() === SSE_DONE_PAYLOAD) return;
     let parsed;
     try { parsed = JSON.parse(payload); }
     catch {
