@@ -191,7 +191,9 @@ export class DefaultExecutor extends BaseExecutor {
         ? credentials.nativeGeminiRequest.apiVersion : null;
       const baseUrl = nativeVersion
         ? this.config.baseUrl.replace("/v1beta/", `/${nativeVersion}/`) : this.config.baseUrl;
-      const url = new URL(`${baseUrl}/${model}:${stream ? "streamGenerateContent" : "generateContent"}`);
+      // A model ID is one resource component, never a URL path or query.
+      const modelSegment = encodeURIComponent(String(model).toWellFormed());
+      const url = new URL(`${baseUrl}/${modelSegment}:${stream ? "streamGenerateContent" : "generateContent"}`);
       const nativeQuery = credentials?.nativeGeminiRequest?.query;
       if (credentials?.nativeGeminiPassthrough && Array.isArray(nativeQuery)) {
         for (const [key, value] of nativeQuery) {
