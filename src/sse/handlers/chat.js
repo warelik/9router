@@ -450,6 +450,18 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         await clearAccountError(credentials.connectionId, credentials, model);
         // "Consecutive" strikes: a success clears the breaker for this pair.
         clearAntigravityStrikes(credentials.connectionId, model);
+      },
+      onRequestFailure: async ({ status, error, resetsAtMs }) => {
+        // Headers may already be sent. Retain the failed stream and make the
+        // account/model unavailable to subsequent requests through the usual path.
+        if (provider === "antigravity" && (status === 409 || status === 429)) {
+          const quotaResetMs = await handleAntigravityQuotaError(
+            credentials.connectionId, status, model,
+            refreshedCredentials.accessToken, credentials.providerSpecificData
+          );
+          if (quotaResetMs) return;
+        }
+        await markAccountUnavailable(credentials.connectionId, status, error, provider, model, resetsAtMs);
       }
     });
 
