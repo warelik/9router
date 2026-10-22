@@ -7,12 +7,16 @@ vi.mock("@/lib/usageDb.js", () => ({
   trackPendingRequest: vi.fn(),
   appendRequestLog: vi.fn(async () => {}),
   saveRequestDetail: vi.fn(async () => {}),
+  saveRequestUsage: vi.fn(async () => {}),
 }));
 
 const { createPassthroughStreamWithLogger } = await import("../../open-sse/utils/stream.js");
 const { buildStreamErrorBytes } = await import("../../open-sse/utils/streamHelpers.js");
 const { createStreamController, pipeWithDisconnect } = await import("../../open-sse/utils/streamHandler.js");
-const { handleStreamingResponse } = await import("../../open-sse/handlers/chatCore/streamingHandler.js");
+const { handleStreamingResponse, buildOnStreamComplete } = await import("../../open-sse/handlers/chatCore/streamingHandler.js");
+const { saveRequestDetail, appendRequestLog, trackPendingRequest } = await import("@/lib/usageDb.js");
+const { STREAM_STALL_TIMEOUT_MS } = await import("../../open-sse/config/runtimeConfig.js");
+const { PROVIDERS } = await import("../../open-sse/config/providers.js");
 const { FORMATS } = await import("../../open-sse/translator/formats.js");
 
 const encode = text => new TextEncoder().encode(text);
@@ -34,6 +38,137 @@ const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nat
 const readText = stream => new Response(stream).text();
 
 describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
+  it("waits for the failed account update before exposing native EOF", async () => {
+    for (const nativeJson of [false, true]) {
+      let releaseAccount;
+      const accountUpdated = new Promise(resolve => { releaseAccount = resolve; });
+      const failed = vi.fn(() => accountUpdated);
+      const shared = { provider: "aistudio", model: "gemini-native-test", connectionId: "account",
+        body: {}, stream: true, requestStartTime: Date.now(), onRequestFailure: failed };
+      const payload = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" } };
+      const raw = nativeJson ? JSON.stringify(payload) : frame(payload);
+      const result = await handleStreamingResponse({
+        ...shared, ...buildOnStreamComplete(shared),
+        providerResponse: new Response(inputStream([encode(raw)]), {
+          headers: { "content-type": nativeJson ? "application/json" : "text/event-stream" },
+        }),
+        sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+        streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test" }),
+      });
+      let finished = false;
+      const reading = result.response.text().then(value => { finished = true; return value; });
+      await vi.waitFor(() => expect(failed).toHaveBeenCalledOnce());
+      expect(finished).toBe(false);
+      releaseAccount();
+      await reading;
+      expect(finished).toBe(true);
+    }
+  });
+
+  it.each(["socket error", "stall"])("finalizes account state and history after native %s", async termination => {
+    for (const nativeJson of [false, true]) {
+      vi.clearAllMocks();
+      if (termination === "stall") vi.useFakeTimers();
+      try {
+        const failed = vi.fn();
+        const controller = createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } });
+        let upstream;
+        const body = new ReadableStream({ start(value) {
+          upstream = value;
+          controller.signal.addEventListener("abort", () => value.error(Object.assign(new Error("upstream aborted"), { name: "AbortError" })), { once: true });
+        } });
+        const shared = { provider: "aistudio", model: "gemini-native-test", connectionId: "failed-account",
+          body: {}, stream: true, requestStartTime: Date.now(), onRequestFailure: failed };
+        const callbacks = buildOnStreamComplete(shared);
+        const result = await handleStreamingResponse({
+          ...shared, ...callbacks,
+          providerResponse: new Response(body, { headers: { "content-type": nativeJson ? "application/json" : "text/event-stream" } }),
+          sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI, streamController: controller,
+        });
+        const reading = result.response.text().then(text => ({ text }), error => ({ error }));
+        if (termination === "stall") await vi.advanceTimersByTimeAsync((PROVIDERS.aistudio?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS) + 1);
+        else upstream.error(new Error("socket hang up"));
+        const output = await reading;
+        if (nativeJson) expect(output.error).toBeDefined();
+        else expect(output.text).toContain('"code":504');
+        expect(failed).toHaveBeenCalledOnce();
+        expect(failed.mock.calls[0][0]).toMatchObject({ status: 504, clientCancelled: false });
+        const details = saveRequestDetail.mock.calls.map(([detail]) => detail)
+          .filter(detail => detail.id === callbacks.streamDetailId);
+        expect(details.map(detail => detail.status)).toEqual(["pending", "error"]);
+        expect(trackPendingRequest).toHaveBeenCalledOnce();
+      } finally {
+        if (termination === "stall") vi.useRealTimers();
+      }
+    }
+  });
+
+  it("retains cancelled native requests without penalizing the provider account", async () => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    try {
+      const failed = vi.fn();
+      const shared = { provider: "aistudio", model: "gemini-native-test", connectionId: "account",
+        body: {}, stream: true, requestStartTime: Date.now(), onRequestFailure: failed };
+      const callbacks = buildOnStreamComplete(shared);
+      const controller = createStreamController({ provider: "aistudio", model: "gemini-native-test" });
+      const result = await handleStreamingResponse({
+        ...shared, ...callbacks,
+        providerResponse: new Response(new ReadableStream(), { headers: { "content-type": "text/event-stream" } }),
+        sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI, streamController: controller,
+      });
+      await result.response.body.cancel("client finished");
+      expect(failed).not.toHaveBeenCalled();
+      expect(controller.isClientDisconnected()).toBe(true);
+      const details = saveRequestDetail.mock.calls.map(([detail]) => detail)
+        .filter(detail => detail.id === callbacks.streamDetailId);
+      expect(details.map(detail => detail.status)).toEqual(["pending", "error"]);
+      expect(appendRequestLog).toHaveBeenCalledWith(expect.objectContaining({ status: "499 ERROR" }));
+      expect(trackPendingRequest).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(501);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["quota", { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "fixture quota" } }, 429],
+    ["malformed content", { candidates: [{ finishReason: "STOP", content: { parts: "invalid" } }] }, 502],
+    ["unfinished candidate", { candidates: [{ content: { parts: [{ text: "partial" }] } }] }, 502],
+  ])("reports %s to account handling and records failed stream completion", async (_name, payload, status) => {
+    for (const nativeJson of [false, true]) {
+      for (const toolNameMap of [null, new Map([["wire_tool", "original_tool"]])]) {
+        vi.clearAllMocks();
+        const failed = vi.fn();
+        const succeeded = vi.fn();
+        const shared = {
+          provider: "aistudio", model: "gemini-native-test", connectionId: "failed-account",
+          body: {}, stream: true, requestStartTime: Date.now(), onRequestFailure: failed,
+        };
+        const callbacks = buildOnStreamComplete(shared);
+        const raw = nativeJson ? JSON.stringify(payload) : frame(payload);
+        const result = await handleStreamingResponse({
+          ...shared, ...callbacks, sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+          providerResponse: new Response(inputStream([encode(raw)]), {
+            headers: { "content-type": nativeJson ? "application/json" : "text/event-stream" },
+          }),
+          streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+          toolNameMap, onRequestSuccess: succeeded,
+        });
+        if (nativeJson && status === 502) await expect(result.response.text()).rejects.toThrow("Upstream Gemini JSON stream");
+        else await result.response.text();
+        await vi.waitFor(() => expect(failed).toHaveBeenCalledOnce());
+        expect(failed.mock.calls[0][0]).toMatchObject({ status, error: expect.any(String) });
+        expect(succeeded).not.toHaveBeenCalled();
+        const details = saveRequestDetail.mock.calls.filter(([detail]) => detail.id === callbacks.streamDetailId);
+        expect(details).toHaveLength(2);
+        expect(details[0][0].status).toBe("pending");
+        expect(details[1][0]).toMatchObject({ status: "error", connectionId: "failed-account" });
+        expect(appendRequestLog).toHaveBeenCalledWith(expect.objectContaining({ status: `${status} ERROR` }));
+      }
+    }
+  });
+
   it.each([null, "invalid", [], { parts: "invalid" }, { parts: [null] }, { parts: [[]] }, { parts: ["invalid"] }].map(content => [content]))(
     "rejects malformed candidate content %j before recording streaming success", async content => {
       const payload = { candidates: [{ index: 0, finishReason: "STOP", content }] };
