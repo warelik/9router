@@ -1,5 +1,6 @@
 // Shared SSE primitives (no imports → safe for executors + stream.js)
-export const SSE_DONE = "data: [DONE]\n\n";
+export const SSE_DONE_PAYLOAD = "[DONE]";
+export const SSE_DONE = `data: ${SSE_DONE_PAYLOAD}\n\n`;
 
 export const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
