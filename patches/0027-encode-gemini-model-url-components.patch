@@ -1,0 +1,66 @@
+From b20f0725ed2acb0fac8bc7407f2a53ca55f577c1 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 22:14:37 +0000
+Subject: [PATCH] Keep Gemini model identifiers inside their authenticated URL
+ resource
+
+---
+ open-sse/executors/default.js        |  4 +++-
+ tests/unit/aistudio-provider.test.js | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
+index bc135e75..0a2124af 100644
+--- a/open-sse/executors/default.js
++++ b/open-sse/executors/default.js
+@@ -191,7 +191,9 @@ export class DefaultExecutor extends BaseExecutor {
+         ? credentials.nativeGeminiRequest.apiVersion : null;
+       const baseUrl = nativeVersion
+         ? this.config.baseUrl.replace("/v1beta/", `/${nativeVersion}/`) : this.config.baseUrl;
+-      const url = new URL(`${baseUrl}/${model}:${stream ? "streamGenerateContent" : "generateContent"}`);
++      // A model ID is one resource component, never a URL path or query.
++      const modelSegment = encodeURIComponent(String(model).toWellFormed());
++      const url = new URL(`${baseUrl}/${modelSegment}:${stream ? "streamGenerateContent" : "generateContent"}`);
+       const nativeQuery = credentials?.nativeGeminiRequest?.query;
+       if (credentials?.nativeGeminiPassthrough && Array.isArray(nativeQuery)) {
+         for (const [key, value] of nativeQuery) {
+diff --git a/tests/unit/aistudio-provider.test.js b/tests/unit/aistudio-provider.test.js
+index 7c42dbcb..a443db61 100644
+--- a/tests/unit/aistudio-provider.test.js
++++ b/tests/unit/aistudio-provider.test.js
+@@ -36,6 +36,34 @@ describe("aistudio provider (Gemini wire to the local bridge)", () => {
+     expect(sse).toEqual(EXPECT_SSE_HEADERS);
+   });
+ 
++  it.each([
++    ["../../admin?x=", "../../admin?x="],
++    ["..\\..\\admin", "..\\..\\admin"],
++    ["%2e%2e%2fadmin", "%2e%2e%2fadmin"],
++    ["model?key=other#fragment", "model?key=other#fragment"],
++    [".", "."], ["..", ".."],
++    ["модель/模型", "модель/模型"],
++    ["\ud800", "\ufffd"],
++  ])("keeps model %j inside the authenticated generation resource", (model, normalized) => {
++    for (const provider of ["aistudio", "gemini"]) {
++      const executor = new DefaultExecutor(provider);
++      const base = new URL(PROVIDERS[provider].baseUrl);
++      for (const stream of [false, true]) {
++        const url = new URL(executor.buildUrl(model, stream, 0, {}));
++        const action = stream ? ":streamGenerateContent" : ":generateContent";
++        const prefix = base.pathname + "/";
++        expect(url.origin).toBe(base.origin);
++        expect(url.pathname.startsWith(prefix)).toBe(true);
++        expect(url.pathname.endsWith(action)).toBe(true);
++        const segment = url.pathname.slice(prefix.length, -action.length);
++        expect(segment).not.toContain("/");
++        expect(decodeURIComponent(segment)).toBe(normalized);
++        expect([...url.searchParams]).toEqual(stream ? [["alt", "sse"]] : []);
++        expect(url.hash).toBe("");
++      }
++    }
++  });
++
+   it("forwards any model id the bridge serves without a registry list", async () => {
+     expect(cfg.passthroughModels ?? true).toBeTruthy();
+     const info = await getModelInfoCore(`aistudio/${MODEL}`, {});
