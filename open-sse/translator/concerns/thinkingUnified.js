@@ -255,8 +255,15 @@ function stripAll(body) {
   }
 }
 
+// Anthropic accepts {type:"adaptive",display} for its always-adaptive Claude models;
+// other claude-adaptive providers (MiniMax Code) require effort-only bodies there.
+function servesAnthropicClaude(provider, model) {
+  if (provider === "claude" || provider === "anthropic") return true;
+  return typeof provider === "string" && provider.startsWith("anthropic-compatible") && /^claude-/.test(model || "");
+}
+
 // Apply unified thinking config to body in the resolved provider-native format.
-function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
+function applyFormat(fmt, body, cfg, caps, supportedLevels, display, forwardDisplay = false) {
   const none = cfg.mode === "none";
   const canDisable = caps.thinkingCanDisable !== false;
   // Model cannot disable thinking → clamp "none" to minimal effort instead.
@@ -288,8 +295,10 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
     case "claude-adaptive": {
       if (none && canDisable) { body.thinking = { type: "disabled" }; break; }
       // Models that can disable thinking need the explicit adaptive switch.
-      // Permanently adaptive models such as Fable 5.1 accept effort directly.
+      // Permanently adaptive models such as Fable 5.1 accept effort directly; on
+      // Anthropic they still take the client's display ({type:"adaptive",display}).
       if (canDisable) body.thinking = { type: "adaptive", ...(display ? { display } : {}) };
+      else if (display && forwardDisplay) body.thinking = { type: "adaptive", display };
       else delete body.thinking;
       const level = toLevel(eff);
       // xhigh is model-gated (Opus/Sonnet 4.6 reject it) — clamp when not advertised.
@@ -424,7 +433,7 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
 // Mutates and returns body. No-op when model has no reasoning capability.
 // `intent` is a pre-captured config (from captureThinking on the original body);
 // falls back to extracting from the current body when omitted.
-export function applyThinking(targetFormat, model, body, provider = null, intent = undefined) {
+export function applyThinking(targetFormat, model, body, provider = null, intent = undefined, { preserveResponsesOptions = false } = {}) {
   if (!body || typeof body !== "object") return body;
 
   const { cleanModel, override } = parseSuffix(model);
@@ -440,11 +449,53 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
 
   const fmt = resolveFormat(targetFormat, cleanModel, provider);
   const supportedLevels = getThinkingLevels(provider, cleanModel);
+  // A translated/native Responses request already owns its wire options; preserve explicit effort and opaque reasoning fields without inventing a summary.
+  if (preserveResponsesOptions && targetFormat === "openai-responses") {
+    const current = body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning) ? body.reasoning : {};
+    const rawEffort = body.reasoning_effort ?? current.effort;
+    const inferred = cfg.mode === "none" ? "none" : toLevel(cfg);
+    const effort = !override && rawEffort !== undefined ? rawEffort : normalizeOpenAILevel(inferred, supportedLevels);
+    if (effort !== null && effort !== undefined) body.reasoning = { ...current, effort };
+    delete body.reasoning_effort;
+    return body;
+  }
   // Anthropic's `display` (summarized | omitted) decides whether thinking text
   // comes back at all; keep what the client asked for instead of resetting it.
   // An OpenAI-shaped client's ask arrives via the captured intent instead.
   const display = typeof body.thinking?.display === "string" ? body.thinking.display : intent?.display;
   stripAll(body);
-  applyFormat(fmt, body, cfg, caps, supportedLevels, display);
+  applyFormat(fmt, body, cfg, caps, supportedLevels, display, servesAnthropicClaude(provider, cleanModel));
   return body;
+}
+
+// A native Gemini client already chose provider-native settings. Preserve them;
+// only a model suffix or an absent client setting permits a router default.
+export function applyNativeGeminiThinking(model, body, provider, providerThinking = null) {
+  const { override } = parseSuffix(model);
+  const generationKey = body.generation_config ? "generation_config" : "generationConfig";
+  const generation = body[generationKey] || {};
+  const thinkingKey = generation.thinking_config ? "thinking_config" : "thinkingConfig";
+  const clientThinking = generation[thinkingKey] || {};
+  const explicit = ["thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"]
+    .some(key => Object.hasOwn(clientThinking, key));
+  if (!override && explicit) return body;
+  const mode = providerThinking?.mode;
+  const intent = override || (!mode || mode === "auto" ? null
+    : mode === "on" ? { mode: "budget", budget: 10000 }
+    : mode === "off" || mode === "none" ? { mode: "none" }
+    : { mode: "level", level: mode });
+  if (!intent) return body;
+
+  // Reuse the capability-aware mapping, without its translated-request output
+  // floor or its replacement of client-native options such as includeThoughts.
+  const mapped = applyThinking("gemini", model, {}, provider, intent).generationConfig?.thinkingConfig;
+  if (!mapped) return body;
+  const thinking = { ...clientThinking };
+  for (const key of ["thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"]) delete thinking[key];
+  if (mapped.thinkingLevel !== undefined) thinking.thinkingLevel = String(mapped.thinkingLevel).toUpperCase();
+  if (mapped.thinkingBudget !== undefined) thinking.thinkingBudget = mapped.thinkingBudget;
+  if (!Object.hasOwn(thinking, "includeThoughts") && !Object.hasOwn(thinking, "include_thoughts") && mapped.includeThoughts !== undefined) {
+    thinking.includeThoughts = mapped.includeThoughts;
+  }
+  return { ...body, [generationKey]: { ...generation, [thinkingKey]: thinking } };
 }

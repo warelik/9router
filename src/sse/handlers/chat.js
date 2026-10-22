@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import "open-sse/index.js";
+import { hasValidCliToken, isLocalRequest } from "@/dashboardGuard.js";
 
 import {
   getProviderCredentials,
@@ -25,20 +27,77 @@ import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
-import { getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
+import { extractClientApiKey, getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
+
+const GEMINI_ERROR_STATUS = Object.freeze({
+  400: "INVALID_ARGUMENT",
+  401: "UNAUTHENTICATED",
+  403: "PERMISSION_DENIED",
+  404: "NOT_FOUND",
+  408: "DEADLINE_EXCEEDED",
+  409: "ABORTED",
+  410: "FAILED_PRECONDITION",
+  412: "FAILED_PRECONDITION",
+  416: "OUT_OF_RANGE",
+  429: "RESOURCE_EXHAUSTED",
+  499: "CANCELLED",
+  500: "INTERNAL",
+  501: "UNIMPLEMENTED",
+  502: "UNAVAILABLE",
+  503: "UNAVAILABLE",
+  504: "DEADLINE_EXCEEDED",
+});
+
+function isNativeGeminiRequest(options) {
+  return options?.sourceFormatOverride === "gemini";
+}
+
+function nativeGeminiErrorResponse(status, message, extraHeaders = null) {
+  const statusCode = Number.isInteger(status) && status >= 400 ? status : HTTP_STATUS.SERVER_ERROR;
+  const headers = new Headers(extraHeaders || undefined);
+  for (const name of ["content-encoding", "content-length", "transfer-encoding"]) headers.delete(name);
+  headers.set("Content-Type", "application/json");
+  headers.set("Access-Control-Allow-Origin", "*");
+  return new Response(JSON.stringify({ error: {
+    code: statusCode,
+    status: GEMINI_ERROR_STATUS[statusCode] || (statusCode >= 500 ? "INTERNAL" : "INVALID_ARGUMENT"),
+    message: typeof message === "string" && message ? message : `Request failed with HTTP ${statusCode}`,
+  } }), { status: statusCode, headers });
+}
+
+function errorResponseForClient(status, message, options, extraHeaders = null) {
+  return isNativeGeminiRequest(options)
+    ? nativeGeminiErrorResponse(status, message, extraHeaders)
+    : errorResponse(status, message, extraHeaders);
+}
+
+async function responseErrorForClient(response, options, fallbackMessage = "Request failed") {
+  if (!isNativeGeminiRequest(options) || !response || response.status < 400) return response;
+  let message = fallbackMessage;
+  try {
+    const body = await response.clone().json();
+    if (typeof body?.error?.message === "string" && body.error.message) message = body.error.message;
+  } catch { /* Keep the caller's bounded fallback message. */ }
+  return nativeGeminiErrorResponse(response.status, message, response.headers);
+}
+
+function chatCoreErrorResponse(result, options) {
+  if (!isNativeGeminiRequest(options) || result.nativeResponse === true) return result.response;
+  return nativeGeminiErrorResponse(result.status, result.error, result.response?.headers);
+}
 
 /**
  * Handle chat completion request
  * Supports: OpenAI, Claude, Gemini, OpenAI Responses API formats
  * Format detection and translation handled by translator
  */
-export async function handleChat(request, clientRawRequest = null) {
+export async function handleChat(request, clientRawRequest = null, options = {}) {
   let body;
   try {
     body = await request.json();
   } catch {
     log.warn("CHAT", "Invalid JSON body");
-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid JSON body");
+    return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Invalid JSON body", options);
   }
 
   // Build clientRawRequest for logging (if not provided)
@@ -70,21 +129,53 @@ export async function handleChat(request, clientRawRequest = null) {
 
   // Enforce API key if enabled in settings
   const settings = await getSettings();
+  let authenticatedApiKey = false;
+  let serverPartsApiKey = null;
   if (settings.requireApiKey) {
     if (!apiKey) {
       log.warn("AUTH", "Missing API key (requireApiKey=true)");
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
+      return errorResponseForClient(HTTP_STATUS.UNAUTHORIZED, "Missing API key", options);
     }
     const valid = await isValidApiKey(apiKey);
     if (!valid) {
       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
+      return errorResponseForClient(HTTP_STATUS.UNAUTHORIZED, "Invalid API key", options);
+    }
+    authenticatedApiKey = true;
+    serverPartsApiKey = apiKey;
+  } else {
+    // Optional API keys do not gate the request, but a valid one still provides
+    // a trustworthy tenant boundary for plaintext Gemini server parts.
+    const optionalApiKey = extractClientApiKey(request);
+    if (optionalApiKey) {
+      try {
+        authenticatedApiKey = await isValidApiKey(optionalApiKey);
+        if (authenticatedApiKey) serverPartsApiKey = optionalApiKey;
+      } catch {
+        // Cache identity must not change the acceptance of optional-key requests.
+      }
     }
   }
 
+  // Gemini server-side tool parts are plaintext history. Bind their cache to
+  // an authenticated API-key tenant or the existing trusted local/CLI caller.
+  // A client-declared conversation id alone is not a caller identity.
+  let serverPartsTenant = authenticatedApiKey
+    ? createHash("sha256").update("gemini-server-parts-tenant\0").update(serverPartsApiKey).digest("hex")
+    : null;
+  if (!serverPartsTenant) {
+    try {
+      if (isLocalRequest(request)) serverPartsTenant = "trusted-local";
+      else if (await hasValidCliToken(request)) serverPartsTenant = "trusted-cli";
+    } catch {
+      // Failure to resolve a trusted principal disables caching only.
+    }
+  }
+  options = { ...options, serverPartsTenant };
+
   if (!modelStr) {
     log.warn("CHAT", "Missing model");
-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
+    return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Missing model", options);
   }
 
   // Per-key access control: a restricted key may call only its listed combos and
@@ -92,12 +183,12 @@ export async function handleChat(request, clientRawRequest = null) {
   // and any credential lookup; an allowed combo grants the members it routes to.
   const keyAccess = await getKeyAccessContext(request);
   const keyAccessDenied = await enforceKeyAccess(keyAccess, modelStr);
-  if (keyAccessDenied) return keyAccessDenied;
+  if (keyAccessDenied) return responseErrorForClient(keyAccessDenied, options, "Request not allowed");
 
   // Bypass naming/warmup requests before combo rotation to avoid wasting rotation slots
   const userAgent = request?.headers?.get("user-agent") || "";
   const bypassResponse = handleBypassRequest(body, modelStr, userAgent, !!settings.ccFilterNaming);
-  if (bypassResponse) return bypassResponse.response || bypassResponse;
+  if (bypassResponse) return responseErrorForClient(bypassResponse.response || bypassResponse, options);
 
   const requiredCapabilities = detectRequiredCapabilities(body);
 
@@ -122,7 +213,7 @@ export async function handleChat(request, clientRawRequest = null) {
             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
             cleanRawReq = { ...clientRawRequest, body: cleanBody };
           }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options);
         },
         log,
         comboName: modelStr,
@@ -137,7 +228,7 @@ export async function handleChat(request, clientRawRequest = null) {
       body,
       models: augmentedModels,
       handleSingleModel: withCapacityAdapterStripping(
-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
         adapterAdded
       ),
       log,
@@ -157,7 +248,7 @@ export async function handleChat(request, clientRawRequest = null) {
       body,
       models: soloAugmented,
       handleSingleModel: withCapacityAdapterStripping(
-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
         adapterAdded
       ),
       log,
@@ -166,13 +257,13 @@ export async function handleChat(request, clientRawRequest = null) {
     });
   }
 
-  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null);
+  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null, options);
 }
 
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, options = {}) {
   const modelInfo = await getModelInfo(modelStr);
 
   // If provider is null, this might be a combo name - check and handle
@@ -202,7 +293,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
               cleanRawReq = { ...clientRawRequest, body: cleanBody };
             }
-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options);
           },
           log,
           comboName: modelStr,
@@ -217,7 +308,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         body,
         models: augmentedModels,
         handleSingleModel: withCapacityAdapterStripping(
-          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
           adapterAdded
         ),
         log,
@@ -227,7 +318,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       });
     }
     log.warn("CHAT", "Invalid model format", { model: modelStr });
-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
+    return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Invalid model format", options);
   }
 
   const { provider, model } = modelInfo;
@@ -242,24 +333,27 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   let lastError = null;
   let lastStatus = null;
   let lastHeaders = null;
+  let lastNativeResponse = null;
 
   while (true) {
     const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { requestedModel: requestedModel || model });
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
+      if (lastNativeResponse) return lastNativeResponse;
       if (credentials?.allRateLimited) {
         const errorMsg = lastError || credentials.lastError || "Unavailable";
         const status = HTTP_STATUS.SERVICE_UNAVAILABLE;
         log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
-        return unavailableResponse(status, `[${provider}/${model}] ${errorMsg}`, credentials.retryAfter, credentials.retryAfterHuman, lastHeaders);
+        const response = unavailableResponse(status, `[${provider}/${model}] ${errorMsg}`, credentials.retryAfter, credentials.retryAfterHuman, lastHeaders);
+        return responseErrorForClient(response, options);
       }
       if (excludeConnectionIds.size === 0) {
         log.warn("AUTH", `No active credentials for provider: ${provider}`);
-        return errorResponse(HTTP_STATUS.NOT_FOUND, `No active credentials for provider: ${provider}`);
+        return errorResponseForClient(HTTP_STATUS.NOT_FOUND, `No active credentials for provider: ${provider}`, options);
       }
       log.warn("CHAT", "No more accounts available", { provider });
-      return errorResponse(lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE, lastError || "All accounts unavailable", lastHeaders);
+      return errorResponseForClient(lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE, lastError || "All accounts unavailable", options, lastHeaders);
     }
 
     // Account selection shown in the unified "▶" line (acc:...)
@@ -306,8 +400,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       providerThinking,
       // Per-provider user overrides (custom headers / connect timeout) from settings
       providerOverrides: (chatSettings.providerOverrides || {})[provider] || null,
+      clientSignal: request?.signal,
       // Detect source format by endpoint + body
-      sourceFormatOverride: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null,
+      sourceFormatOverride: options.sourceFormatOverride || (request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null),
+      serverPartsTenant: options.serverPartsTenant,
       onCredentialsRefreshed: async (newCreds) => {
         await updateProviderCredentials(credentials.connectionId, {
           ...newCreds,
@@ -319,10 +415,23 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         await clearAccountError(credentials.connectionId, credentials, model);
         // "Consecutive" strikes: a success clears the breaker for this pair.
         clearAntigravityStrikes(credentials.connectionId, model);
+      },
+      onRequestFailure: async ({ status, error, resetsAtMs }) => {
+        // Headers may already be sent. Retain the failed stream and make the
+        // account/model unavailable to subsequent requests through the usual path.
+        if (provider === "antigravity" && (status === 409 || status === 429)) {
+          const quotaResetMs = await handleAntigravityQuotaError(
+            credentials.connectionId, status, model,
+            refreshedCredentials.accessToken, credentials.providerSpecificData
+          );
+          if (quotaResetMs) return;
+        }
+        await markAccountUnavailable(credentials.connectionId, status, error, provider, model, resetsAtMs);
       }
     });
 
     if (result.success) return result.response;
+    if (result.status === 499 || request?.signal?.aborted) return chatCoreErrorResponse(result, options);
 
     // Antigravity 409/429: refresh live quota to get exact resetAt before locking
     let quotaResetMs = null;
@@ -347,9 +456,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       lastError = result.error;
       lastStatus = result.status;
       lastHeaders = upstreamResponseHeaders(result.response?.headers);
+      lastNativeResponse = result.nativeResponse === true ? result.response : null;
       continue;
     }
 
-    return result.response;
+    return chatCoreErrorResponse(result, options);
   }
 }

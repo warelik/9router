@@ -9,7 +9,10 @@ import { getSettings } from "@/lib/localDb";
 import { PROVIDER_MODELS } from "@/shared/constants/models";
 import { GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS } from "open-sse/config/runtimeConfig.js";
 import { initTranslators } from "open-sse/translator/index.js";
-import { getKeyAccessContext, enforceKeyAccessResolved } from "@/sse/services/keyAccess.js";
+import { getTargetFormat, supportsNativeGemini } from "open-sse/services/provider.js";
+import { getModelInfo } from "@/sse/services/model.js";
+import { proxyAwareFetch } from "open-sse/utils/proxyFetch.js";
+import { extractClientApiKey, getKeyAccessContext, enforceKeyAccessResolved } from "@/sse/services/keyAccess.js";
 
 let initialized = false;
 const GEMINI_NATIVE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -48,42 +51,34 @@ export async function OPTIONS() {
  * Gemini API field and Gemini CLI never sets it.
  *
  * The @google/genai SDK always uses :streamGenerateContent?alt=sse for chat.
- * The upstream handleChat returns OpenAI SSE format; we transform it to
- * Gemini SSE format on the fly via transformOpenAISSEToGeminiSSE().
+ * Gemini providers use the shared native passthrough. Other provider formats
+ * keep the existing Chat conversion and Gemini response adapter.
  */
 export async function POST(request, { params }) {
   await ensureInitialized();
 
   try {
     const { path } = await params;
-    // path = ["provider", "model:action"] or ["model:action"]
-
-    let model;
-    let action; // ":generateContent" | ":streamGenerateContent"
-
-    if (path.length >= 2) {
-      // Format: /v1beta/models/provider/model:generateContent
-      const provider = path[0];
-      const modelAction = path[1];
-      action = modelAction.includes(":streamGenerateContent")
-        ? ":streamGenerateContent"
-        : ":generateContent";
-      const modelName = modelAction
-        .replace(":streamGenerateContent", "")
-        .replace(":generateContent", "");
-      model = provider + "/" + modelName;
-    } else {
-      // Format: /v1beta/models/model:generateContent
-      const modelAction = path[0];
-      action = modelAction.includes(":streamGenerateContent")
-        ? ":streamGenerateContent"
-        : ":generateContent";
-      model = modelAction
-        .replace(":streamGenerateContent", "")
-        .replace(":generateContent", "");
+    const actionPath = Array.isArray(path) ? path.at(-1) : "";
+    if (!/:(?:generateContent|streamGenerateContent)$/.test(actionPath || "")) {
+      return new Response(null, { status: 405, headers: { Allow: "POST, OPTIONS" } });
     }
+    // Provider model IDs can themselves contain slashes. Only the final
+    // segment carries the validated action suffix; retain every model segment.
+    const action = actionPath.endsWith(":streamGenerateContent")
+      ? ":streamGenerateContent"
+      : ":generateContent";
+    const model = path.join("/").slice(0, -action.length);
 
-    const body = await request.json();
+    let body;
+    try {
+      body = await request.json();
+    } catch (error) {
+      if (error?.name !== "SyntaxError") throw error;
+      return Response.json({ error: {
+        code: 400, status: "INVALID_ARGUMENT", message: "Request body is not valid JSON",
+      } }, { status: 400, headers: { "Access-Control-Allow-Origin": "*" } });
+    }
 
     if (isGeminiNativeTtsRequest(model, body)) {
       return await forwardGeminiNativeRequest(request, body, model, action);
@@ -94,45 +89,49 @@ export async function POST(request, { params }) {
     //   :generateContent       => stream: false (plain JSON)
     const stream = action === ":streamGenerateContent";
 
-    // Convert Gemini request format to OpenAI/internal format
-    const convertedBody = convertGeminiToInternal(body, model, stream);
+    const modelInfo = await getModelInfo(model);
+    const native = modelInfo.provider && (getTargetFormat(modelInfo.provider) === "gemini"
+      || (modelInfo.provider === "antigravity" && supportsNativeGemini(modelInfo.provider, modelInfo.model)));
+
+    // Keep the native request intact. The shared handler selects translation
+    // only when the chosen provider speaks a different wire format.
+    const convertedBody = native
+      ? { ...body, model, stream }
+      : convertGeminiToInternal(body, model, stream);
+    const headers = new Headers(request.headers);
+    const clientKey = extractGeminiClientApiKey(request);
+    if (clientKey) headers.set("Authorization", `Bearer ${clientKey}`);
 
     // Create new request with converted body
     const newRequest = new Request(request.url, {
       method: "POST",
-      headers: request.headers,
+      headers,
       body: JSON.stringify(convertedBody),
+      signal: request.signal,
     });
 
-    const response = await handleChat(newRequest);
-
-    if (stream) {
-      // Transform OpenAI SSE => Gemini SSE on the fly.
-      // The @google/genai SDK always uses :streamGenerateContent?alt=sse and
-      // expects Gemini SSE chunks (no [DONE] sentinel — stream just closes).
-      return transformOpenAISSEToGeminiSSE(response, model);
-    } else {
-      // Convert OpenAI JSON response => Gemini GenerateContentResponse
-      return await convertOpenAIResponseToGemini(response, model);
-    }
+    const response = await handleChat(newRequest, {
+      endpoint: new URL(request.url).pathname,
+      body,
+      headers: Object.fromEntries(request.headers.entries()),
+      queryParams: [...new URL(request.url).searchParams.entries()].filter(([key]) => key !== "key" && key !== "$key"),
+      apiVersion: new URL(request.url).pathname.match(/\/(v1alpha|v1beta|v1)\/models\//)?.[1] || "v1beta",
+    }, native ? { sourceFormatOverride: "gemini", stream } : {});
+    if (native) return response;
+    return stream
+      ? transformOpenAISSEToGeminiSSE(response, model)
+      : await convertOpenAIResponseToGemini(response, model);
   } catch (error) {
     console.log("Error handling Gemini request:", error);
     return Response.json(
-      { error: { message: error.message, code: 500 } },
+      { error: { code: 500, status: "INTERNAL", message: error?.message || "Internal server error" } },
       { status: 500 }
     );
   }
 }
 
 function extractGeminiClientApiKey(request) {
-  const authHeader = request.headers.get("Authorization");
-  if (authHeader?.startsWith("Bearer ")) return authHeader.slice(7);
-
-  const googleApiKey = request.headers.get("x-goog-api-key");
-  if (googleApiKey) return googleApiKey;
-
-  const url = new URL(request.url);
-  return url.searchParams.get("key");
+  return extractClientApiKey(request);
 }
 
 function normalizeGeminiNativeModel(model) {
@@ -168,10 +167,12 @@ function isGeminiNativeTtsRequest(model, body) {
 
 function buildGeminiNativeUrl(requestUrl, model, action) {
   const sourceUrl = new URL(requestUrl);
-  const upstreamUrl = new URL(`${GEMINI_NATIVE_BASE_URL}/${normalizeGeminiNativeModel(model)}${action}`);
+  const version = sourceUrl.pathname.match(/\/(v1alpha|v1beta|v1)\/models\//)?.[1] || "v1beta";
+  const baseUrl = GEMINI_NATIVE_BASE_URL.replace("/v1beta/", `/${version}/`);
+  const upstreamUrl = new URL(`${baseUrl}/${normalizeGeminiNativeModel(model)}${action}`);
 
   for (const [key, value] of sourceUrl.searchParams.entries()) {
-    if (key === "key") continue;
+    if (key === "key" || key === "$key") continue;
     upstreamUrl.searchParams.append(key, value);
   }
 
@@ -282,8 +283,13 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
       attemptController.abort();
     }, GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS);
     const abortAttempt = () => attemptController.abort();
+    const cleanup = () => {
+      clearTimeout(timeout);
+      request.signal?.removeEventListener("abort", abortAttempt);
+    };
 
     if (request.signal?.aborted) {
+      cleanup();
       console.log(`[GEMINI_NATIVE] client aborted model=${modelId} ms=0 conn=${safeConnection}`);
       return Response.json({ error: { message: "Client closed request" } }, { status: 499 });
     }
@@ -293,7 +299,7 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
 
     let upstreamResponse;
     try {
-      upstreamResponse = await fetch(upstreamUrl, {
+      upstreamResponse = await proxyAwareFetch(upstreamUrl, {
         method: "POST",
         headers: {
           "Content-Type": request.headers.get("Content-Type") || "application/json",
@@ -301,6 +307,11 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
         },
         body: bodyText,
         signal: attemptController.signal,
+      }, {
+        connectionProxyEnabled: credentials?.providerSpecificData?.connectionProxyEnabled === true,
+        connectionProxyUrl: credentials?.providerSpecificData?.connectionProxyUrl || "",
+        connectionNoProxy: credentials?.providerSpecificData?.connectionNoProxy || "",
+        strictProxy: credentials?.providerSpecificData?.strictProxy === true,
       });
     } catch (error) {
       const durationMs = Date.now() - startedAt;
@@ -331,22 +342,64 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
 
       return Response.json({ error: { message: errorText } }, { status });
     } finally {
-      clearTimeout(timeout);
-      request.signal?.removeEventListener("abort", abortAttempt);
+      if (!upstreamResponse) cleanup();
     }
 
     console.log(`[GEMINI_NATIVE] upstream model=${modelId} status=${upstreamResponse.status} ms=${Date.now() - startedAt} conn=${safeConnection} ct=${upstreamResponse.headers.get("content-type") || "?"} cl=${upstreamResponse.headers.get("content-length") || "?"}`);
 
     if (upstreamResponse.ok) {
-      await clearAccountError(credentials.connectionId, credentials, modelId);
-      return new Response(upstreamResponse.body, {
+      const reportSuccess = () => Promise.resolve()
+        .then(() => clearAccountError(credentials.connectionId, credentials, modelId))
+        .catch(err => console.error("[GEMINI_NATIVE] account success update failed:", err?.message || err));
+      const reader = upstreamResponse.body?.getReader();
+      let cancelled = false;
+      const responseBody = reader ? new ReadableStream({
+        async pull(controller) {
+          let chunk;
+          try {
+            chunk = await reader.read();
+          } catch (error) {
+            cleanup();
+            if (timedOut || (!cancelled && !request.signal?.aborted)) {
+              const status = isGeminiNativeTimeoutError(error, timedOut) ? 504 : 502;
+              await Promise.resolve().then(() => markAccountUnavailable(credentials.connectionId, status,
+                getSafeGeminiNativeErrorText(error), "gemini", modelId)).catch(err => {
+                console.error("[GEMINI_NATIVE] account failure update failed:", err?.message || err);
+              });
+            }
+            if (!cancelled) controller.error(error);
+            return;
+          }
+          if (cancelled) return;
+          if (chunk.done) {
+            cleanup();
+            if (!cancelled && !request.signal?.aborted) {
+              await reportSuccess();
+            }
+            if (!cancelled) controller.close();
+          } else controller.enqueue(chunk.value);
+        },
+        cancel(reason) { cancelled = true; cleanup(); attemptController.abort(); return reader.cancel(reason); },
+      }) : null;
+      if (!reader) {
+        cleanup();
+        await reportSuccess();
+      }
+      return new Response(responseBody, {
         status: upstreamResponse.status,
         statusText: upstreamResponse.statusText,
         headers: corsHeadersFrom(upstreamResponse),
       });
     }
 
-    const errorText = await upstreamResponse.text();
+    let errorText;
+    try {
+      errorText = await upstreamResponse.text();
+    } catch (error) {
+      errorText = JSON.stringify({ error: { message: getSafeGeminiNativeErrorText(error) } });
+    } finally {
+      cleanup();
+    }
     const { shouldFallback } = await markAccountUnavailable(
       credentials.connectionId,
       upstreamResponse.status,

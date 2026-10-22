@@ -17,9 +17,23 @@ export async function OPTIONS() {
   return new Response(null, {
     headers: {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     },
+  });
+}
+
+// Stable Gemini generation shares this catch-all with OpenAI model metadata.
+// Keep metadata GET unchanged and translate only the route parameter's name.
+export async function POST(request, context) {
+  const params = await context.params;
+  const path = Array.isArray(params.model) ? params.model : [params.model];
+  if (!/:(?:generateContent|streamGenerateContent)$/.test(path.at(-1) || "")) {
+    return new Response(null, { status: 405, headers: { Allow: "GET, OPTIONS" } });
+  }
+  const { POST: handleGeminiGeneration } = await import("../../../v1beta/models/[...path]/route.js");
+  return handleGeminiGeneration(request, {
+    ...context, params: Promise.resolve({ ...params, path }),
   });
 }
 

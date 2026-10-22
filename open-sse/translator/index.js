@@ -1,14 +1,16 @@
 import { FORMATS } from "./formats.js";
-import { ensureToolCallIds, fixMissingToolResponses } from "./concerns/toolCall.js";
+import { ensureToolCallIds, fixMissingToolResponses, isGeminiFamilyTarget } from "./concerns/toolCall.js";
 import { prepareClaudeRequest, ensureTrailingUserTurn } from "./formats/claude.js";
 import { cloakClaudeTools, decloakStreamChunk } from "../utils/claudeCloaking.js";
 import { restoreToolNames } from "../utils/opencodeFingerprint.js";
 import { filterToOpenAIFormat } from "./formats/openai.js";
+import { adaptAIStudioStructuredOutput } from "./formats/gemini.js";
 import { normalizeThinkingConfig } from "../services/provider.js";
-import { applyThinking, captureThinking } from "./concerns/thinkingUnified.js";
-import { captureSessionId } from "../utils/sessionManager.js";
+import { applyThinking, captureThinking, stripThinkingSuffix } from "./concerns/thinkingUnified.js";
+import { captureSessionId, captureConversationId } from "../utils/sessionManager.js";
 import { AntigravityExecutor } from "../executors/antigravity.js";
 import { PROVIDERS } from "../providers/index.js";
+import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { ROLE, GEMINI_ROLE } from "./schema/roles.js";
 
 // Registry for translators. Lazy-init guards against circular-import order:
@@ -65,7 +67,7 @@ function detectClientLastRole(body) {
 }
 
 // Translate request: source -> openai -> target
-export function translateRequest(sourceFormat, targetFormat, model, body, stream = true, credentials = null, provider = null, reqLogger = null, stripList = [], connectionId = null, clientTool = null) {
+export function translateRequest(sourceFormat, targetFormat, model, body, stream = true, credentials = null, provider = null, reqLogger = null, stripList = [], connectionId = null, clientTool = null, serverPartsTenant = null) {
   ensureInitialized();
   let result = body;
   // Role the client actually ended on, before any translator drops an emptied turn.
@@ -78,13 +80,15 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   normalizeThinkingConfig(result);
 
   // Always ensure tool_calls have id (some providers require it)
-  ensureToolCallIds(result);
-  
+  const zedDeferred = provider === "zed";
+  const geminiFamily = isGeminiFamilyTarget(targetFormat, model);
+  if (!zedDeferred) ensureToolCallIds(result, { preserveIds: geminiFamily });
+
   // Kiro performs stricter source-aware reconciliation after session replay.
   // The generic helper inserts OpenAI `role: tool` messages, which a direct
   // Claude→Kiro translator cannot consume and which cannot repair partial
   // parallel tool results.
-  if (targetFormat !== FORMATS.KIRO) {
+  if (targetFormat !== FORMATS.KIRO && !geminiFamily && !zedDeferred) {
     fixMissingToolResponses(result);
   }
 
@@ -96,6 +100,14 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   const clientSessionId = captureSessionId(result, credentials, connectionId, targetFormat);
   // Expose to downstream translators (gemini-cli/antigravity envelopes) that run after envelope is stripped
   if (credentials) credentials._clientSessionId = clientSessionId;
+  const conversationId = captureConversationId(result, credentials);
+  if (credentials) {
+    credentials._geminiServerPartsSessionId = serverPartsTenant && conversationId
+      ? JSON.stringify([serverPartsTenant, conversationId])
+      : null;
+  }
+
+  let sourceToolNameMap = null;
 
   // If same format, skip translation steps
   if (sourceFormat !== targetFormat) {
@@ -105,6 +117,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     const directFn = requestRegistry.get(`${sourceFormat}:${targetFormat}`);
     if (directFn) {
       result = directFn(model, result, stream, credentials);
+      if (result._toolNameMap instanceof Map) sourceToolNameMap = result._toolNameMap;
     } else {
       // Step 1: source -> openai (if source is not openai)
       if (sourceFormat !== FORMATS.OPENAI) {
@@ -115,6 +128,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
           reqLogger?.logOpenAIRequest?.(result);
         }
       }
+      if (result._toolNameMap instanceof Map) sourceToolNameMap = result._toolNameMap;
 
       // Step 2: openai -> target (if target is not openai)
       if (targetFormat !== FORMATS.OPENAI) {
@@ -134,7 +148,47 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     targetFormat === FORMATS.KIRO &&
     (sourceFormat === FORMATS.OPENAI || sourceFormat === FORMATS.CLAUDE);
   if (!kiroThinkingMappedByTranslator) {
-    applyThinking(targetFormat, model, result, provider, thinkingIntent);
+    applyThinking(targetFormat, model, result, provider, thinkingIntent, { preserveResponsesOptions: targetFormat === FORMATS.OPENAI_RESPONSES });
+  }
+
+  if (sourceFormat !== targetFormat && targetFormat === FORMATS.GEMINI && provider === "aistudio") {
+    result = adaptAIStudioStructuredOutput(result);
+  }
+
+  // Hosted web_search (Codex Responses tools): supported models on the
+  // generateContent API declare server-side invocations in model capabilities.
+  // Send a googleSearch tool entry plus
+  // toolConfig.includeServerSideToolInvocations. Antigravity/Gemini-CLI share the
+  // Cloud Code internal API which rejects that combination, and Vertex is
+  // unverified, so the flag is consumed without effect for them. The internal
+  // marker must never reach a provider body.
+  if (sourceFormat !== targetFormat && result && typeof result === "object") {
+    const wantsWebSearch = result._webSearch === true;
+    delete result._webSearch;
+    const webSearchEnabled = wantsWebSearch && targetFormat === FORMATS.GEMINI && (provider === "gemini" || provider === "aistudio")
+      && getCapabilitiesForModel(provider, stripThinkingSuffix(String(model ?? ""))).serverSideToolInvocations === true;
+    if (webSearchEnabled) {
+      result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
+      result.toolConfig = {
+        ...(result.toolConfig && typeof result.toolConfig === "object" && !Array.isArray(result.toolConfig) ? result.toolConfig : {}),
+        includeServerSideToolInvocations: true,
+      };
+    } else if (isGeminiFamilyTarget(targetFormat, model)) {
+      // The replay helper inserts stored server-side parts for any Gemini-family
+      // history, but only a web-search-enabled upstream can accept them. A fallback
+      // target (or a request without the web_search tool) must not receive them.
+      for (const contents of [result.contents, result.request?.contents]) {
+        if (!Array.isArray(contents)) continue;
+        for (const entry of contents) {
+          if (Array.isArray(entry?.parts)) {
+            entry.parts = entry.parts.filter(part => !(part && (part.toolCall || part.toolResponse)));
+          }
+        }
+        for (let i = contents.length - 1; i >= 0; i--) {
+          if (Array.isArray(contents[i]?.parts) && contents[i].parts.length === 0) contents.splice(i, 1);
+        }
+      }
+    }
   }
 
   // Always normalize to clean OpenAI format when target is OpenAI
@@ -160,9 +214,22 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
       const { body: cloakedBody, toolNameMap } = cloakClaudeTools(result);
       result = cloakedBody;
       if (toolNameMap?.size > 0) {
-        result._toolNameMap = toolNameMap;
+        const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
+        for (const [key, value] of toolNameMap) merged.set(key, value);
+        result._toolNameMap = merged;
       }
     }
+  }
+
+  if (sourceToolNameMap) {
+    const targetMap = result._toolNameMap instanceof Map ? result._toolNameMap : null;
+    const merged = new Map();
+    if (targetMap) for (const [key, value] of targetMap) merged.set(key, value);
+    for (const [key, value] of sourceToolNameMap) {
+      if (value !== null && typeof value === "object") merged.set(key, value);
+      else if (!merged.has(key)) merged.set(key, value);
+    }
+    if (merged.size > 0) result._toolNameMap = merged;
   }
 
   // Antigravity cloaking disabled

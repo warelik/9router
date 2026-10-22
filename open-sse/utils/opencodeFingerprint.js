@@ -270,6 +270,22 @@ export function takeRenamedToolNames(body) {
 
 // Response side -------------------------------------------------------------
 
+export function resolveToolName(name, map) {
+  if (typeof name !== "string" || !map) return { name, descriptor: null };
+  const seen = new Set();
+  let current = name;
+  while (!seen.has(current) && map.has(current)) {
+    seen.add(current);
+    const value = map.get(current);
+    if (typeof value === "string") {
+      current = value;
+      continue;
+    }
+    return { name: current, descriptor: value && typeof value === "object" ? value : null };
+  }
+  return { name: current, descriptor: null };
+}
+
 /** Restore caller tool spellings in supported response/event shapes. */
 export function restoreToolNames(payload, map) {
   if (!map?.size || !payload) return payload;
@@ -282,11 +298,49 @@ export function restoreToolNames(payload, map) {
     out[key] = value;
   };
 
+  const restoreResponsesItem = (item) => {
+    if (typeof item.namespace === "string" && item.namespace) return item;
+    const resolved = resolveToolName(item.name, map);
+    if (resolved.descriptor) {
+      const restored = { ...item, name: resolved.descriptor.name, namespace: resolved.descriptor.namespace };
+      if (resolved.descriptor.type === "custom") {
+        restored.type = "custom_tool_call";
+        if (Object.hasOwn(restored, "arguments")) {
+          restored.input = restored.arguments;
+          delete restored.arguments;
+        }
+      }
+      return restored;
+    }
+    return resolved.name === item.name ? item : { ...item, name: resolved.name };
+  };
+
+  if ((payload.type === "function_call" || payload.type === "custom_tool_call") && typeof payload.name === "string") {
+    if (typeof payload.namespace === "string" && payload.namespace) return out;
+    if (map.has(payload.name)) {
+      const resolved = resolveToolName(payload.name, map);
+      if (resolved.descriptor) {
+        put("name", resolved.descriptor.name);
+        put("namespace", resolved.descriptor.namespace);
+        if (resolved.descriptor.type === "custom") {
+          put("type", "custom_tool_call");
+          if (Object.hasOwn(payload, "arguments")) {
+            put("input", payload.arguments);
+            if (out === payload) out = { ...payload };
+            delete out.arguments;
+          }
+        }
+      } else if (resolved.name !== payload.name) {
+        put("name", resolved.name);
+      }
+    }
+  }
+
   // Claude streaming content_block_start event.
   if (payload.type === "content_block_start") {
     const block = payload.content_block;
     if (block?.type === "tool_use" && typeof block.name === "string" && map.has(block.name)) {
-      put("content_block", { ...block, name: map.get(block.name) });
+      put("content_block", { ...block, name: resolveToolName(block.name, map).name });
     }
   }
 
@@ -294,7 +348,7 @@ export function restoreToolNames(payload, map) {
   if (Array.isArray(payload.content)) {
     put("content", payload.content.map((block) =>
       block?.type === "tool_use" && typeof block.name === "string" && map.has(block.name)
-        ? { ...block, name: map.get(block.name) }
+        ? { ...block, name: resolveToolName(block.name, map).name }
         : block));
   }
 
@@ -310,7 +364,7 @@ export function restoreToolNames(payload, map) {
           const name = call?.function?.name;
           if (typeof name === "string" && map.has(name)) {
             changed = true;
-            return { ...call, function: { ...call.function, name: map.get(name) } };
+            return { ...call, function: { ...call.function, name: resolveToolName(name, map).name } };
           }
           return call;
         });
@@ -320,18 +374,49 @@ export function restoreToolNames(payload, map) {
     }));
   }
 
+  // Gemini GenerateContent responses carry tool names in candidate Parts.
+  if (Array.isArray(payload.candidates)) {
+    const candidates = payload.candidates.map((candidate) => {
+      const parts = candidate?.content?.parts;
+      if (!Array.isArray(parts)) return candidate;
+      let changed = false;
+      const nextParts = parts.map((part) => {
+        const call = part?.functionCall;
+        if (typeof call?.name !== "string" || !map.has(call.name)) return part;
+        const name = resolveToolName(call.name, map).name;
+        if (name === call.name) return part;
+        changed = true;
+        return { ...part, functionCall: { ...call, name } };
+      });
+      return changed ? { ...candidate, content: { ...candidate.content, parts: nextParts } } : candidate;
+    });
+    if (candidates.some((candidate, index) => candidate !== payload.candidates[index])) {
+      put("candidates", candidates);
+    }
+  }
+
   // OpenAI Responses final JSON body.
   if (Array.isArray(payload.output)) {
     put("output", payload.output.map((item) =>
-      item?.type === "function_call" && typeof item.name === "string" && map.has(item.name)
-        ? { ...item, name: map.get(item.name) }
+      (item?.type === "function_call" || item?.type === "custom_tool_call") && typeof item.name === "string"
+        ? restoreResponsesItem(item)
         : item));
   }
 
   // OpenAI Responses SSE events such as response.output_item.added/done.
   const item = payload.item;
-  if (item?.type === "function_call" && typeof item.name === "string" && map.has(item.name)) {
-    put("item", { ...item, name: map.get(item.name) });
+  if ((item?.type === "function_call" || item?.type === "custom_tool_call") && typeof item.name === "string") {
+    const restored = restoreResponsesItem(item);
+    if (restored !== item) put("item", restored);
+  }
+
+  if (payload.data && typeof payload.data === "object") {
+    const restored = restoreToolNames(payload.data, map);
+    if (restored !== payload.data) put("data", restored);
+  }
+  if (payload.response && typeof payload.response === "object") {
+    const restored = restoreToolNames(payload.response, map);
+    if (restored !== payload.response) put("response", restored);
   }
 
   return out;

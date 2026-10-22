@@ -2,7 +2,8 @@ import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
 import { DEFAULT_THINKING_AG_SIGNATURE, DEFAULT_THINKING_GEMINI_CLI_SIGNATURE } from "../../config/defaultThinkingSignature.js";
 import { openaiToClaudeRequestForAntigravity } from "./openai-to-claude.js";
-import { getGeminiThoughtSignatureSync } from "../../services/thoughtSignatureStore.js";
+import { safeParseJSON } from "../concerns/json.js";
+import { getGeminiThoughtSignatureSync, findGeminiTurnSignature, geminiTurnScope, getGeminiServerPartsSync, findGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
 function generateUUID() {
   return crypto.randomUUID();
 }
@@ -16,7 +17,10 @@ import {
   generateSessionId,
   generateProjectId,
   cleanJSONSchemaForAntigravity,
-  normalizeGeminiContents
+  lowerProtoSchemaTypes,
+  isLegacyGeminiSchema,
+  normalizeGeminiContents,
+  GEMINI_RESERVED_RESPONSE_KEYS
 } from "../formats/gemini.js";
 import { deriveSessionId, toNumericSessionId } from "../../utils/sessionManager.js";
 import { ROLE, GEMINI_ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
@@ -35,6 +39,22 @@ function sanitizeGeminiFunctionName(name) {
   }
   // Truncate to 64 chars
   return sanitized.substring(0, 64);
+}
+
+function buildFunctionDeclaration(name, description, schema) {
+  const decl = { name: sanitizeGeminiFunctionName(name), description: description || "" };
+  if (schema === undefined || schema === null) return decl;
+  if (typeof schema !== "object") {
+    decl.parametersJsonSchema = schema;
+    return decl;
+  }
+  const cleaned = isLegacyGeminiSchema(schema) ? cleanJSONSchemaForAntigravity(structuredClone(schema)) : null;
+  if (cleaned !== null && JSON.stringify(cleaned) === JSON.stringify(schema)) {
+    decl.parameters = cleaned;
+  } else {
+    decl.parametersJsonSchema = lowerProtoSchemaTypes(structuredClone(schema));
+  }
+  return decl;
 }
 
 /**
@@ -73,8 +93,20 @@ function createToolCallIdUniquifier() {
   };
 }
 
+function appendInstructionParts(parts, content) {
+  if (typeof content === "string") {
+    if (content) parts.push({ text: content });
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block?.type === OPENAI_BLOCK.TEXT && typeof block.text === "string") {
+        parts.push({ text: block.text });
+      }
+    }
+  }
+}
+
 // Core: Convert OpenAI request to Gemini format (base for all variants)
-function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG_SIGNATURE, sessionId = null) {
+function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG_SIGNATURE, sessionId = null, serverPartsSessionId = null) {
   const result = {
     model: model,
     contents: [],
@@ -93,50 +125,66 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
   if (allowSampling && body.top_k !== undefined) {
     result.generationConfig.topK = body.top_k;
   }
-  if (body.max_tokens !== undefined) {
-    result.generationConfig.maxOutputTokens = body.max_tokens;
+  const maxOutput = body.max_completion_tokens !== undefined ? body.max_completion_tokens : body.max_tokens;
+  if (maxOutput !== undefined) {
+    result.generationConfig.maxOutputTokens = maxOutput;
   }
+  if (typeof body.stop === "string") {
+    result.generationConfig.stopSequences = [body.stop];
+  } else if (Array.isArray(body.stop)) {
+    result.generationConfig.stopSequences = [...body.stop];
+  }
+  if (body.seed !== undefined) {
+    result.generationConfig.seed = body.seed;
+  }
+  if (body.presence_penalty !== undefined) {
+    result.generationConfig.presencePenalty = body.presence_penalty;
+  }
+  if (body.frequency_penalty !== undefined) {
+    result.generationConfig.frequencyPenalty = body.frequency_penalty;
+  }
+
+  const applyJsonOutput = (schema) => {
+    result.generationConfig.responseMimeType = "application/json";
+    if (schema !== undefined) result.generationConfig.responseJsonSchema = schema;
+  };
+  const textFormat = body.text?.format;
+  if (textFormat?.type === "json_object") {
+    applyJsonOutput();
+  } else if (textFormat?.type === "json_schema") {
+    applyJsonOutput(textFormat.schema);
+  }
+  const responseFormat = body.response_format;
+  if (responseFormat?.type === "json_object") {
+    applyJsonOutput();
+  } else if (responseFormat?.type === "json_schema") {
+    applyJsonOutput(responseFormat.json_schema?.schema ?? responseFormat.json_schema);
+  }
+
+  const instructionParts = [];
+  if (Array.isArray(body.messages)) {
+    for (const m of body.messages) {
+      if (m.role !== ROLE.SYSTEM && m.role !== ROLE.DEVELOPER) continue;
+      appendInstructionParts(instructionParts, m.content);
+    }
+  }
+  // The outgoing request carries all instructions. Earlier cached turns use only
+  // the instruction prefix that existed when their responses were produced.
+  const finalSystem = instructionParts.length > 0
+    ? { role: GEMINI_ROLE.USER, parts: instructionParts }
+    : null;
+  if (finalSystem) result.systemInstruction = finalSystem;
 
   // Build tool_call_id -> name map
-  const tcID2Name = {};
-  if (body.messages && Array.isArray(body.messages)) {
-    for (const msg of body.messages) {
-      if (msg.role === ROLE.ASSISTANT && msg.tool_calls) {
-        for (const tc of msg.tool_calls) {
-          if (tc.type === OPENAI_BLOCK.FUNCTION && tc.id && tc.function?.name) {
-            tcID2Name[tc.id] = tc.function.name;
-          }
-        }
-      }
-    }
-  }
+  const tcID2Name = new Map();
 
-  // Build tool responses cache.
-  //
-  // Queued per id rather than a single value: an OpenAI tool_call_id is only
-  // unique within its own assistant turn, so a long agent session can reuse one
-  // id for two different tool results. A plain id->content map keeps only the
-  // LAST one, and the earlier turn would then be answered with the later
-  // turn's output. Each functionCall consumes the oldest unconsumed result for
-  // its id instead. #4273
-  const toolResponses = {};
-  if (body.messages && Array.isArray(body.messages)) {
-    for (const msg of body.messages) {
-      if (msg.role === ROLE.TOOL && msg.tool_call_id) {
-        (toolResponses[msg.tool_call_id] ||= []).push(msg.content);
-      }
-    }
-  }
-  const toolResponseCursor = {};
-
-  // Gemini validates that functionCall ids are unique across the WHOLE history,
-  // and rejects the entire request with 400 INVALID_ARGUMENT when one repeats.
-  // tool_call_id is only unique within a single assistant turn, so a long agent
-  // session can legitimately emit call_51859 at turn 14 and again at turn 22.
-  //
-  // Each functionCall takes the next free id here and passes it down to its
-  // matching functionResponse, so the pair always agrees. #4532
+  // Calls awaiting their results, keyed by ORIGINAL tool_call_id. The same id may
+  // be reused by several calls (a later turn, or sibling calls in one turn), so each
+  // id has a FIFO queue and every real tool message consumes the oldest queued call.
+  const pendingToolCalls = new Map();
+  // Emitted functionCall ids must be unique across the whole history.
   const toolCallIdUniquifier = createToolCallIdUniquifier();
+  const turnInstructionParts = [];
 
   // Convert messages
   if (body.messages && Array.isArray(body.messages)) {
@@ -145,12 +193,10 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
       const role = msg.role;
       const content = msg.content;
 
-      if (role === ROLE.SYSTEM && body.messages.length > 1) {
-        result.systemInstruction = {
-          role: GEMINI_ROLE.USER,
-          parts: [{ text: typeof content === "string" ? content : extractTextContent(content) }]
-        };
-      } else if (role === ROLE.USER || (role === ROLE.SYSTEM && body.messages.length === 1)) {
+      if (role === ROLE.SYSTEM || role === ROLE.DEVELOPER) {
+        appendInstructionParts(turnInstructionParts, content);
+        continue;
+      } else if (role === ROLE.USER) {
         const parts = convertOpenAIContentToParts(content);
         if (parts.length > 0) {
           result.contents.push({ role: GEMINI_ROLE.USER, parts });
@@ -158,30 +204,50 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
       } else if (role === ROLE.ASSISTANT) {
         const parts = [];
 
+        const text = content ? (typeof content === "string" ? content : extractTextContent(content)) : "";
+        const turnSystem = turnInstructionParts.length > 0
+          ? { role: GEMINI_ROLE.USER, parts: turnInstructionParts }
+          : null;
+        const turnScope = geminiTurnScope(result.contents, turnSystem);
+        // Signature the provider issued for this tool-free turn (Gemini only accepts its own).
+        const turnSig = msg.tool_calls?.length
+          ? null
+          : findGeminiTurnSignature({ reasoning: msg.reasoning_content, content: text, scope: turnScope }, model);
+        // Server-side tool parts (googleSearch toolCall/toolResponse) that preceded the
+        // text of this turn must go back verbatim or Gemini 3 rejects the request.
+        const serverTurnParts = findGeminiServerPartsForTurn({ reasoning: msg.reasoning_content, content: text, scope: turnScope, sessionId: serverPartsSessionId }, model);
+
         // Thinking/reasoning → thought part with signature
         if (msg.reasoning_content) {
           parts.push({
             thought: true,
             text: msg.reasoning_content
           });
-          parts.push({
-            thoughtSignature: signature,
-            text: ""
-          });
-        }
-
-        if (content) {
-          const text = typeof content === "string" ? content : extractTextContent(content);
-          if (text) {
-            parts.push({ text });
+          if (!turnSig) {
+            parts.push({
+              thoughtSignature: signature,
+              text: ""
+            });
           }
         }
 
+        const contentParts = typeof content === "string"
+          ? (content ? [{ text: content }] : [])
+          : convertOpenAIContentToParts(content);
+        if (serverTurnParts) parts.push(...serverTurnParts);
+        if (contentParts.length > 0) {
+          const [first, ...rest] = contentParts;
+          parts.push(turnSig ? { ...first, thoughtSignature: turnSig } : first);
+          parts.push(...rest);
+        } else if (turnSig) {
+          parts.push({ thoughtSignature: turnSig, text: "" });
+        }
+
         if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-          const toolCallIds = [];
           let firstFunctionCallSeen = false;
           for (const tc of msg.tool_calls) {
             if (tc.type !== OPENAI_BLOCK.FUNCTION) continue;
+            if (tc.id && tc.function?.name) tcID2Name.set(tc.id, tc.function.name);
 
             const args = tryParseJSON(tc.function?.arguments || "{}");
             const cachedSig = tc.id ? getGeminiThoughtSignatureSync(tc.id, sessionId, model) : null;
@@ -189,8 +255,10 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
             const callSig = cachedSig || (!firstFunctionCallSeen ? signature : undefined);
             firstFunctionCallSeen = true;
 
-            // Emitted id is uniquified; the thought-signature lookup above stays
-            // on the ORIGINAL id so a cached signature is still found. #4532
+            const serverParts = tc.id ? getGeminiServerPartsSync(tc.id, serverPartsSessionId, model, turnScope) : null;
+            if (serverParts) parts.push(...serverParts);
+            // Emitted id is uniquified; signature and server-part lookups stay on
+            // the ORIGINAL id so cached entries are still found.
             const emitId = toolCallIdUniquifier.next(tc.id);
 
             const part = {
@@ -204,76 +272,49 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
               part.thoughtSignature = callSig;
             }
             parts.push(part);
-            // The NAME travels with the pair for the same reason the id does:
-            // tcID2Name is a conversation-wide id->name map, so a later call
-            // reusing the id would otherwise rename this turn's response.
-            // #4273
-            toolCallIds.push({ origId: tc.id, emitId, name: tc.function?.name });
+            if (tc.id) {
+              if (!pendingToolCalls.has(tc.id)) pendingToolCalls.set(tc.id, []);
+              pendingToolCalls.get(tc.id).push({ name: tc.function?.name, emitId });
+            }
           }
 
           if (parts.length > 0) {
             result.contents.push({ role: GEMINI_ROLE.MODEL, parts });
           }
-
-          // Check if there are actual tool responses in the next messages
-          const isIntermediate = i < body.messages.length - 1;
-          const hasActualResponses = toolCallIds.some(
-            ({ origId }) => (toolResponseCursor[origId] || 0) < (toolResponses[origId]?.length ?? 0)
-          );
-
-          if (hasActualResponses || isIntermediate) {
-            const toolParts = [];
-            for (const { origId, emitId, name: callName } of toolCallIds) {
-              // Content resolves on the ORIGINAL id, consuming the oldest
-              // unconsumed result; only the emitted id is uniquified. #4273 #4532
-              const queue = toolResponses[origId];
-              const cursor = toolResponseCursor[origId] || 0;
-              let resp;
-              if (queue && cursor < queue.length) {
-                resp = queue[cursor];
-                toolResponseCursor[origId] = cursor + 1;
-              } else {
-                resp = "";
-              }
-
-              // Name comes from THIS call, not from the conversation-wide id->name map,
-              // which a later duplicate of the same id would have overwritten.
-              let name = callName || tcID2Name[origId];
-              if (!name) {
-                const idParts = String(origId).split("-");
-                if (idParts.length > 2) {
-                  name = idParts.slice(0, -2).join("-");
-                } else {
-                  name = origId;
-                }
-              }
-
-              let parsedResp = tryParseJSON(resp);
-              if (parsedResp === null) {
-                parsedResp = { result: resp };
-              } else if (typeof parsedResp !== "object") {
-                parsedResp = { result: parsedResp };
-              }
-
-              toolParts.push({
-                functionResponse: {
-                  // Matches the functionCall id emitted above, so a response
-                  // never points at an id the call does not carry. #4532
-                  id: emitId,
-                  name: sanitizeGeminiFunctionName(name),
-                  response: { result: parsedResp }
-                }
-              });
-            }
-            if (toolParts.length > 0) {
-              result.contents.push({ role: GEMINI_ROLE.USER, parts: toolParts });
-            }
-          }
         } else if (parts.length > 0) {
           result.contents.push({ role: GEMINI_ROLE.MODEL, parts });
         }
+      } else if (role === ROLE.TOOL) {
+        // Tool results come from their own role:tool messages
+        const fid = msg.tool_call_id;
+        // The oldest preceding call that used this id answers this result.
+        const pendingCall = fid ? pendingToolCalls.get(fid)?.shift() : undefined;
+        // Resolve the function name from preceding calls
+        let name = pendingCall?.name || (fid ? tcID2Name.get(fid) : undefined);
+        if (!name && fid) {
+          const idParts = fid.split("-");
+          name = idParts.length > 2 ? idParts.slice(0, -2).join("-") : fid;
+        }
+
+        const parsed = safeParseJSON(msg.content, msg.content);
+        let response = (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed))
+          ? parsed
+          : { result: parsed ?? null };
+        const serialized = JSON.stringify(response);
+        if (Object.keys(GEMINI_RESERVED_RESPONSE_KEYS).some(key => serialized.includes(`${JSON.stringify(key)}:`))) {
+          response = { result: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content) };
+        }
+
+        const functionResponse = { name: sanitizeGeminiFunctionName(name || "tool"), response };
+        const responseId = pendingCall ? pendingCall.emitId : fid;
+        if (responseId) functionResponse.id = responseId;
+        result.contents.push({ role: GEMINI_ROLE.USER, parts: [{ functionResponse }] });
       }
     }
+  }
+
+  if (result.contents.length === 0 && result.systemInstruction) {
+    result.contents.push({ role: GEMINI_ROLE.USER, parts: [{ text: "..." }] });
   }
 
   // Convert tools
@@ -282,59 +323,68 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
     for (const t of body.tools) {
       // Check if already in Anthropic/Claude format (no type field, direct name/description/input_schema)
       if (t.name && t.input_schema) {
-        const cleanedSchema = cleanJSONSchemaForAntigravity(structuredClone(t.input_schema || { type: "object", properties: {} }));
-        functionDeclarations.push({
-          name: sanitizeGeminiFunctionName(t.name),
-          description: t.description || "",
-          parameters: cleanedSchema
-        });
+        functionDeclarations.push(buildFunctionDeclaration(t.name, t.description, t.input_schema));
       }
       // OpenAI format
       else if (t.type === OPENAI_BLOCK.FUNCTION && t.function) {
         const fn = t.function;
-        const cleanedSchema = cleanJSONSchemaForAntigravity(structuredClone(fn.parameters || { type: "object", properties: {} }));
-        functionDeclarations.push({
-          name: sanitizeGeminiFunctionName(fn.name),
-          description: fn.description || "",
-          parameters: cleanedSchema
-        });
+        functionDeclarations.push(buildFunctionDeclaration(fn.name, fn.description, fn.parameters));
       }
     }
 
     if (functionDeclarations.length > 0) {
       result.tools = [{ functionDeclarations }];
+
+      const choice = body.tool_choice;
+      if (choice === "auto") {
+        result.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
+      } else if (choice === "none") {
+        result.toolConfig = { functionCallingConfig: { mode: "NONE" } };
+      } else if (choice === "required") {
+        result.toolConfig = { functionCallingConfig: { mode: "ANY" } };
+      } else if (choice && typeof choice === "object") {
+        const named = choice.function?.name ?? choice.name;
+        if (typeof named === "string" && named) {
+          result.toolConfig = {
+            functionCallingConfig: {
+              mode: "ANY",
+              allowedFunctionNames: [sanitizeGeminiFunctionName(named)]
+            }
+          };
+        }
+      }
     }
   }
 
-  result.contents = normalizeGeminiContents(result.contents, model);
+  if (body._customToolNames) result._customToolNames = body._customToolNames;
+  if (body._toolNameMap) result._toolNameMap = body._toolNameMap;
+  if (body._webSearch) result._webSearch = body._webSearch;
+
+  result.contents = normalizeGeminiContents(result.contents, model, { synthesizeTerminalToolResponse: false });
   return result;
 }
 
 // OpenAI -> Gemini (standard API)
 export function openaiToGeminiRequest(model, body, stream, credentials = null) {
-  return openaiToGeminiBase(model, body, stream, DEFAULT_THINKING_AG_SIGNATURE, credentials?._clientSessionId);
+  const result = openaiToGeminiBase(model, body, stream, DEFAULT_THINKING_AG_SIGNATURE, credentials?._clientSessionId, credentials?._geminiServerPartsSessionId || null);
+  // The response of this request is a new turn of this exact history (see geminiTurnScope).
+  if (credentials) credentials._geminiTurnScope = geminiTurnScope(result.contents, result.systemInstruction);
+  return result;
 }
 
 // OpenAI -> Gemini CLI (Cloud Code Assist)
 export function openaiToGeminiCLIRequest(model, body, stream, credentials = null) {
-  const gemini = openaiToGeminiBase(model, body, stream, DEFAULT_THINKING_GEMINI_CLI_SIGNATURE, credentials?._clientSessionId);
+  const gemini = openaiToGeminiBase(model, body, stream, DEFAULT_THINKING_GEMINI_CLI_SIGNATURE, credentials?._clientSessionId, credentials?._geminiServerPartsSessionId || null);
+  if (credentials) credentials._geminiTurnScope = geminiTurnScope(gemini.contents, gemini.systemInstruction);
   // Thinking is normalized centrally by applyThinking (thinkingUnified.js) after translation.
 
-  // Clean schema for tools
-  if (gemini.tools?.[0]?.functionDeclarations) {
-    for (const fn of gemini.tools[0].functionDeclarations) {
-      if (fn.parameters) {
-        const cleanedSchema = cleanJSONSchemaForAntigravity(fn.parameters);
-        fn.parameters = cleanedSchema;
-        // if (isClaude) {
-        //   fn.parameters = cleanedSchema;
-        // } else {
-        //   fn.parametersJsonSchema = cleanedSchema;
-        //   delete fn.parameters;
-        // }
-      }
-    }
-  }
+  // Schema compatibility is handled once in the base converter
+  // if (isClaude) {
+  //   fn.parameters = cleanedSchema;
+  // } else {
+  //   fn.parametersJsonSchema = cleanedSchema;
+  //   delete fn.parameters;
+  // }
 
   return gemini;
 }
@@ -367,10 +417,13 @@ function wrapInCloudCodeEnvelope(model, geminiCLI, credentials = null, isAntigra
   }
 
   if (geminiCLI.tools?.length > 0) {
-    envelope.request.toolConfig = {
+    envelope.request.toolConfig = geminiCLI.toolConfig || {
       functionCallingConfig: { mode: "VALIDATED" }
     };
   }
+
+  if (geminiCLI._customToolNames) envelope._customToolNames = geminiCLI._customToolNames;
+  if (geminiCLI._toolNameMap) envelope._toolNameMap = geminiCLI._toolNameMap;
 
   return envelope;
 }
@@ -504,6 +557,9 @@ function wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials = nu
     envelope.request.systemInstruction = { role: GEMINI_ROLE.USER, parts: systemParts };
   }
 
+  if (claudeRequest._customToolNames) envelope._customToolNames = claudeRequest._customToolNames;
+  if (claudeRequest._toolNameMap) envelope._toolNameMap = claudeRequest._toolNameMap;
+
   envelope.request.contents = normalizeGeminiContents(envelope.request.contents, model);
   return envelope;
 }
@@ -521,11 +577,11 @@ export function openaiToAntigravityRequest(model, body, stream, credentials = nu
     return wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials);
   }
 
-  const geminiCLI = openaiToGeminiCLIRequest(model, body, stream);
+  const geminiCLI = openaiToGeminiCLIRequest(model, body, stream, credentials);
   return wrapInCloudCodeEnvelope(model, geminiCLI, credentials, true);
 }
 
 // Register
 register(FORMATS.OPENAI, FORMATS.GEMINI, openaiToGeminiRequest, null);
-register(FORMATS.OPENAI, FORMATS.GEMINI_CLI, (model, body, stream, credentials) => wrapInCloudCodeEnvelope(model, openaiToGeminiCLIRequest(model, body, stream), credentials), null);
+register(FORMATS.OPENAI, FORMATS.GEMINI_CLI, (model, body, stream, credentials) => wrapInCloudCodeEnvelope(model, openaiToGeminiCLIRequest(model, body, stream, credentials), credentials), null);
 register(FORMATS.OPENAI, FORMATS.ANTIGRAVITY, openaiToAntigravityRequest, null);

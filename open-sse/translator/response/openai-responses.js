@@ -9,6 +9,7 @@ import { buildUsage } from "../concerns/usage.js";
 import { fallbackToolCallId } from "../concerns/toolCall.js";
 import { reasoningDelta, extractReasoningText } from "../concerns/reasoning.js";
 import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, OPENAI_FINISH, MODEL_FALLBACK } from "../schema/index.js";
+import { resolveToolName } from "../../utils/opencodeFingerprint.js";
 
 /**
  * Translate OpenAI chunk to Responses API events
@@ -153,6 +154,7 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
 
   // Handle finish_reason
   if (choice.finish_reason) {
+    state.responsesFinishReason = choice.finish_reason;
     for (const i in state.msgItemAdded) closeMessage(state, emit, i);
     closeReasoning(state, emit);
     for (const i in state.funcCallIds) closeToolCall(state, emit, i);
@@ -176,21 +178,36 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
 }
 
 // Helper functions
+// Every output item needs its own output_index within the response. Chat chunks only carry
+// per-kind indices (choice index for text, tool_calls index for calls), and reasoning has none,
+// so using them directly made reasoning, the message and the first tool call all claim 0: clients
+// saw repeated output_item.done indices and response.completed.output kept only the last item.
+// Slots are handed out in the order the items first appear.
+function outputSlot(state, kind, key) {
+  state.outputSlots ??= new Map();
+  const id = `${kind}:${key}`;
+  if (!state.outputSlots.has(id)) {
+    state.outputSlots.set(id, state.nextOutputIndex ?? 0);
+    state.nextOutputIndex = (state.nextOutputIndex ?? 0) + 1;
+  }
+  return state.outputSlots.get(id);
+}
+
 function startReasoning(state, emit, idx) {
   if (!state.reasoningId) {
     state.reasoningId = `rs_${state.responseId}_${idx}`;
-    state.reasoningIndex = idx;
+    state.reasoningIndex = outputSlot(state, "reasoning", 0);
     
     emit("response.output_item.added", {
       type: "response.output_item.added",
-      output_index: idx,
+      output_index: state.reasoningIndex,
       item: { id: state.reasoningId, type: RESPONSES_ITEM.REASONING, summary: [] }
     });
 
     emit("response.reasoning_summary_part.added", {
       type: "response.reasoning_summary_part.added",
       item_id: state.reasoningId,
-      output_index: idx,
+      output_index: state.reasoningIndex,
       summary_index: 0,
       part: { type: RESPONSES_ITEM.SUMMARY_TEXT, text: "" }
     });
@@ -253,7 +270,7 @@ function emitTextContent(state, emit, idx, content) {
     
     emit("response.output_item.added", {
       type: "response.output_item.added",
-      output_index: idx,
+      output_index: outputSlot(state, "message", idx),
       item: { id: msgId, type: RESPONSES_ITEM.MESSAGE, content: [], role: ROLE.ASSISTANT }
     });
   }
@@ -264,7 +281,7 @@ function emitTextContent(state, emit, idx, content) {
     emit("response.content_part.added", {
       type: "response.content_part.added",
       item_id: `msg_${state.responseId}_${idx}`,
-      output_index: idx,
+      output_index: outputSlot(state, "message", idx),
       content_index: 0,
       part: { type: RESPONSES_ITEM.OUTPUT_TEXT, annotations: [], logprobs: [], text: "" }
     });
@@ -273,7 +290,7 @@ function emitTextContent(state, emit, idx, content) {
   emit("response.output_text.delta", {
     type: "response.output_text.delta",
     item_id: `msg_${state.responseId}_${idx}`,
-    output_index: idx,
+    output_index: outputSlot(state, "message", idx),
     content_index: 0,
     delta: content,
     logprobs: []
@@ -292,7 +309,7 @@ function closeMessage(state, emit, idx) {
     emit("response.output_text.done", {
       type: "response.output_text.done",
       item_id: msgId,
-      output_index: parseInt(idx),
+      output_index: outputSlot(state, "message", idx),
       content_index: 0,
       text: fullText,
       logprobs: []
@@ -301,7 +318,7 @@ function closeMessage(state, emit, idx) {
     emit("response.content_part.done", {
       type: "response.content_part.done",
       item_id: msgId,
-      output_index: parseInt(idx),
+      output_index: outputSlot(state, "message", idx),
       content_index: 0,
       part: { type: RESPONSES_ITEM.OUTPUT_TEXT, annotations: [], logprobs: [], text: fullText }
     });
@@ -315,16 +332,20 @@ function closeMessage(state, emit, idx) {
 
     emit("response.output_item.done", {
       type: "response.output_item.done",
-      output_index: parseInt(idx),
+      output_index: outputSlot(state, "message", idx),
       item
     });
 
-    recordCompletedOutputItem(state, parseInt(idx), item);
+    recordCompletedOutputItem(state, outputSlot(state, "message", idx), item);
   }
 }
 
 function isCustomTool(state, name) {
-  return !!name && state.customToolNames?.has(name);
+  if (!name) return false;
+  if (state.customToolNames?.has(name)) return true;
+  const resolved = resolveToolName(name, state.toolNameMap);
+  if (resolved.descriptor) return resolved.descriptor.type === "custom";
+  return !!resolved.name && state.customToolNames?.has(resolved.name) === true;
 }
 
 function extractCustomToolInput(argumentsText) {
@@ -354,7 +375,7 @@ function emitToolCall(state, emit, tc) {
 
     emit("response.output_item.added", {
       type: "response.output_item.added",
-      output_index: tcIdx,
+      output_index: outputSlot(state, "call", tcIdx),
       item: {
         id: `${custom ? "ctc" : "fc"}_${callId}`,
         type: custom ? RESPONSES_ITEM.CUSTOM_TOOL_CALL : RESPONSES_ITEM.FUNCTION_CALL,
@@ -373,7 +394,7 @@ function emitToolCall(state, emit, tc) {
       emit("response.function_call_arguments.delta", {
         type: "response.function_call_arguments.delta",
         item_id: `fc_${refCallId}`,
-        output_index: tcIdx,
+        output_index: outputSlot(state, "call", tcIdx),
         delta: tc.function.arguments
       });
     }
@@ -395,20 +416,20 @@ function closeToolCall(state, emit, idx) {
       emit("response.custom_tool_call_input.delta", {
         type: "response.custom_tool_call_input.delta",
         item_id: `ctc_${callId}`,
-        output_index: parseInt(idx),
+        output_index: outputSlot(state, "call", idx),
         delta: input
       });
       emit("response.custom_tool_call_input.done", {
         type: "response.custom_tool_call_input.done",
         item_id: `ctc_${callId}`,
-        output_index: parseInt(idx),
+        output_index: outputSlot(state, "call", idx),
         input
       });
     } else {
       emit("response.function_call_arguments.done", {
         type: "response.function_call_arguments.done",
         item_id: `fc_${callId}`,
-        output_index: parseInt(idx),
+        output_index: outputSlot(state, "call", idx),
         arguments: args
       });
     }
@@ -423,11 +444,11 @@ function closeToolCall(state, emit, idx) {
 
     emit("response.output_item.done", {
       type: "response.output_item.done",
-      output_index: parseInt(idx),
+      output_index: outputSlot(state, "call", idx),
       item
     });
 
-    recordCompletedOutputItem(state, parseInt(idx), item);
+    recordCompletedOutputItem(state, outputSlot(state, "call", idx), item);
 
     state.funcItemDone[idx] = true;
     state.funcArgsDone[idx] = true;
@@ -461,16 +482,19 @@ function collectCompletedOutputItems(state) {
 function sendCompleted(state, emit) {
   if (!state.completedSent) {
     state.completedSent = true;
-    emit("response.completed", {
-      type: "response.completed",
+    const incompleteReason = state.responsesFinishReason === OPENAI_FINISH.LENGTH ? "max_output_tokens"
+      : state.responsesFinishReason === OPENAI_FINISH.CONTENT_FILTER ? "content_filter" : null;
+    emit(incompleteReason ? "response.incomplete" : "response.completed", {
+      type: incompleteReason ? "response.incomplete" : "response.completed",
       response: {
         id: state.responseId,
         object: "response",
         created_at: state.created,
-        status: "completed",
+        status: incompleteReason ? "incomplete" : "completed",
         background: false,
         error: null,
         output: collectCompletedOutputItems(state),
+        ...(incompleteReason ? { incomplete_details: { reason: incompleteReason } } : {}),
         ...(state.responsesUsage ? { usage: state.responsesUsage } : {})
       }
     });

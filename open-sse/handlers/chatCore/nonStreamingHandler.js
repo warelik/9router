@@ -1,10 +1,12 @@
 import { FORMATS } from "../../translator/formats.js";
 import { needsTranslation } from "../../translator/index.js";
 import { openAICompletionToClaudeMessage } from "../../translator/concerns/claudeMessage.js";
+import { toOpenAIUsage } from "../../translator/concerns/usage.js";
 import { ollamaBodyToOpenAI } from "../../translator/response/ollama-to-openai.js";
 import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTracking.js";
 import { createErrorResult } from "../../utils/error.js";
 import { upstreamResponseHeaders } from "../../utils/upstreamHeaders.js";
+import { isValidNativeGeminiResponse } from "../../utils/streamHelpers.js";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
 import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
 import { unwrapClineEnvelope } from "../../shared/clineEnvelope.js";
@@ -13,7 +15,31 @@ import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
 import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
 import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
+import { storeGeminiTurnSignature, storeGeminiThoughtSignature, storeGeminiServerParts, storeGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
+import { toOpenAIFinish } from "../../translator/concerns/finishReason.js";
 
+function parseToolArguments(value) {
+  if (!value) return {};
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
+}
+
+function nativeGeminiErrorResult(providerResponse, status, message, responseBody = null) {
+  const headers = new Headers(providerResponse.headers);
+  for (const name of ["content-encoding", "content-length", "transfer-encoding"]) headers.delete(name);
+  headers.set("Content-Type", "application/json");
+  headers.set("Access-Control-Allow-Origin", "*");
+  const result = createErrorResult(status, message);
+  return {
+    ...result,
+    nativeResponse: true,
+    response: Response.json(responseBody || { error: { code: status, status: "INTERNAL", message } }, { status, headers }),
+  };
+}
 /**
  * Convert an OpenAI Chat Completions non-streaming response body into the
  * OpenAI Responses API shape. Used when a Responses-format client (e.g. Codex)
@@ -72,7 +98,10 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
   }
 
   const usage = responseBody.usage || {};
-  const status = choice.finish_reason === "tool_calls" ? "completed" : (choice.finish_reason === "stop" ? "completed" : (choice.finish_reason || "completed"));
+  // Responses has no "length"/"content_filter" status: a cut-off turn is `incomplete` with a reason.
+  const incompleteReason = choice.finish_reason === "length" ? "max_output_tokens"
+    : choice.finish_reason === "content_filter" ? "content_filter" : null;
+  const status = incompleteReason ? "incomplete" : "completed";
 
   return {
     id: `resp_${responseBody.id || ""}`.replace(/^resp_chatcmpl-/, "resp_"),
@@ -82,11 +111,14 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
     status,
     background: false,
     error: null,
+    ...(incompleteReason ? { incomplete_details: { reason: incompleteReason } } : {}),
     output,
     usage: {
       input_tokens: usage.prompt_tokens || usage.input_tokens || 0,
       output_tokens: usage.completion_tokens || usage.output_tokens || 0,
       total_tokens: usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
+      ...(usage.prompt_tokens_details ? { input_tokens_details: usage.prompt_tokens_details } : {}),
+      ...(usage.completion_tokens_details ? { output_tokens_details: usage.completion_tokens_details } : {}),
     },
   };
 }
@@ -94,7 +126,7 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
 /**
  * Translate non-streaming response body from provider format → OpenAI format.
  */
-export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames = null) {
+export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames = null, turnScope = null, sessionId = null, serverPartsSessionId = null) {
   if (targetFormat === sourceFormat) return responseBody;
   // Provider responded in OpenAI Chat Completions shape but the client speaks
   // Responses API — convert so tool_calls/text surface as Responses `output`.
@@ -116,14 +148,34 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
     const usage = response.usageMetadata || responseBody.usageMetadata;
     let textContent = "", reasoningContent = "";
     const toolCalls = [];
+    const serverParts = [];
+    let turnSignature = null;
 
     if (content?.parts) {
       for (const part of content.parts) {
+        // Server-executed tool parts (googleSearch on Gemini 3) are captured verbatim
+        // for replay; they must not surface as text or set the pending signature.
+        if (part.toolCall || part.toolResponse) {
+          serverParts.push(part);
+          continue;
+        }
+        const partSig = part.thoughtSignature || part.thought_signature;
+        if (typeof partSig === "string" && partSig) turnSignature = partSig;
         if (part.thought === true && part.text) reasoningContent += part.text;
         else if (part.text !== undefined) textContent += part.text;
         if (part.functionCall) {
+          const callId = part.functionCall.id || `call_${part.functionCall.name}_${Date.now()}_${toolCalls.length}`;
+          // The call's own signature (or the one just before it) must come back with the call.
+          if (turnSignature) {
+            storeGeminiThoughtSignature(callId, turnSignature, sessionId, response.modelVersion);
+            turnSignature = null;
+          }
+          if (serverParts.length) {
+            storeGeminiServerParts(callId, serverParts, serverPartsSessionId, response.modelVersion, turnScope);
+            serverParts.length = 0;
+          }
           toolCalls.push({
-            id: `call_${part.functionCall.name}_${Date.now()}_${toolCalls.length}`,
+            id: callId,
             type: "function",
             function: { name: part.functionCall.name, arguments: JSON.stringify(part.functionCall.args || {}) }
           });
@@ -140,10 +192,25 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
     const message = { role: "assistant" };
     if (textContent) message.content = textContent;
     if (reasoningContent) message.reasoning_content = reasoningContent;
+    if (turnSignature && toolCalls.length === 0) {
+      storeGeminiTurnSignature({
+        reasoning: reasoningContent,
+        content: textContent,
+        scope: turnScope,
+      }, turnSignature, response.modelVersion);
+    }
+    if (serverParts.length) {
+      storeGeminiServerPartsForTurn({
+        reasoning: reasoningContent,
+        content: textContent,
+        scope: turnScope,
+        sessionId: serverPartsSessionId,
+      }, serverParts, response.modelVersion);
+    }
     if (toolCalls.length > 0) message.tool_calls = toolCalls;
     if (!message.content && !message.tool_calls) message.content = "";
 
-    let finishReason = (candidate.finishReason || "stop").toLowerCase();
+    let finishReason = toOpenAIFinish(candidate.finishReason || "STOP", "gemini");
     if (finishReason === "stop" && toolCalls.length > 0) finishReason = "tool_calls";
 
     const result = {
@@ -155,15 +222,12 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
     };
 
     if (usage) {
-      result.usage = {
-        prompt_tokens: (usage.promptTokenCount || 0) + (usage.thoughtsTokenCount || 0),
-        completion_tokens: usage.candidatesTokenCount || 0,
-        total_tokens: usage.totalTokenCount || 0
-      };
-      if (usage.thoughtsTokenCount > 0) {
-        result.usage.completion_tokens_details = { reasoning_tokens: usage.thoughtsTokenCount };
-      }
+      result.usage = toOpenAIUsage(usage, "gemini");
     }
+    // Same hand-off as the OpenAI-shaped branches above: Claude and Responses clients must not
+    // receive a bare chat.completion body.
+    if (sourceFormat === FORMATS.OPENAI_RESPONSES) return openAICompletionToResponses(result, customToolNames);
+    if (sourceFormat === FORMATS.CLAUDE) return openAICompletionToClaudeMessage(result);
     return result;
   }
 
@@ -234,12 +298,19 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
 /**
  * Handle non-streaming response from provider.
  */
-export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log }) {
+export async function handleNonStreamingResponse({ credentials, providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log, nativeResponseProjection }) {
   trackDone();
+  const isNativeGeminiResponse = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
   const contentType = providerResponse.headers.get("content-type") || "";
   let responseBody;
 
   if (contentType.includes("text/event-stream")) {
+    if (isNativeGeminiResponse) {
+      const message = "Unexpected streaming response for non-streaming Gemini request";
+      try { await providerResponse.body?.cancel(message); } catch { /* Keep the framing error even if upstream cancellation fails. */ }
+      appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
+      return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, message);
+    }
     const sseText = await providerResponse.text();
     const parsed = parseSSEToOpenAIResponse(sseText, model);
     if (!parsed) {
@@ -253,6 +324,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     } catch (err) {
       appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
       console.error(`[ChatCore] Failed to parse JSON from ${provider}:`, err.message);
+      if (isNativeGeminiResponse) return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
     }
   }
@@ -263,6 +335,23 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   responseBody = unwrapClineEnvelope(responseBody, provider);
 
   reqLogger.logProviderResponse(providerResponse.status, providerResponse.statusText, providerResponse.headers, responseBody);
+  if (isNativeGeminiResponse) {
+    if (!isValidNativeGeminiResponse(responseBody, nativeResponseProjection)) {
+      const message = `Invalid native Gemini response from ${provider}`;
+      appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
+      return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, message);
+    }
+    if (responseBody.error) {
+      const reportedCode = Number(responseBody.error.code);
+      const status = Number.isInteger(reportedCode) && reportedCode >= 400 && reportedCode <= 599
+        ? reportedCode : HTTP_STATUS.BAD_GATEWAY;
+      const message = typeof responseBody.error.message === "string"
+        ? responseBody.error.message : `Native Gemini error from ${provider}`;
+      appendLog({ status: `FAILED ${status}` });
+      const validError = typeof responseBody.error === "object" && !Array.isArray(responseBody.error);
+      return nativeGeminiErrorResult(providerResponse, status, message, validError ? responseBody : null);
+    }
+  }
   if (onRequestSuccess) {
     Promise.resolve()
       .then(onRequestSuccess)
@@ -280,7 +369,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: Date.now() - requestStartTime } }));
 
   const translatedResponse = needsTranslation(targetFormat, sourceFormat)
-    ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames)
+    ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames, credentials?._geminiTurnScope, credentials?._clientSessionId, credentials?._geminiServerPartsSessionId)
     : responseBody;
   const isClaudeMessageResponse = sourceFormat === FORMATS.CLAUDE && translatedResponse?.type === "message";
   // Responses-format translation produces a `object:"response"` body with no
@@ -288,7 +377,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   const isResponsesResponse = sourceFormat === FORMATS.OPENAI_RESPONSES && translatedResponse?.object === "response";
 
   // Fix finish_reason for tool_calls: some providers return non-standard values (e.g. "other")
-  if (translatedResponse?.choices?.[0]) {
+  if (!isNativeGeminiResponse && translatedResponse?.choices?.[0]) {
     const choice = translatedResponse.choices[0];
     const msg = choice.message;
     const hasToolCalls = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
@@ -298,27 +387,27 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   }
 
   // Ensure OpenAI-required fields
-  if (!isClaudeMessageResponse && !isResponsesResponse) {
+  if (!isClaudeMessageResponse && !isResponsesResponse && !isNativeGeminiResponse) {
     if (!translatedResponse.object) translatedResponse.object = "chat.completion";
     if (!translatedResponse.created) translatedResponse.created = Math.floor(Date.now() / 1000);
   }
 
   // Strip Azure-specific fields
-  if (!isClaudeMessageResponse && !isResponsesResponse) {
+  if (!isClaudeMessageResponse && !isResponsesResponse && !isNativeGeminiResponse) {
     delete translatedResponse.prompt_filter_results;
     if (translatedResponse?.choices) {
       for (const choice of translatedResponse.choices) delete choice.content_filter_results;
     }
   }
 
-  if (translatedResponse?.usage) {
+  if (!isNativeGeminiResponse && translatedResponse?.usage) {
     translatedResponse.usage = filterUsageForFormat(addBufferToUsage(translatedResponse.usage), sourceFormat);
   }
 
   // Strip reasoning_content only when content is non-empty.
   // When content is empty (e.g. thinking models that used all tokens for reasoning),
   // reasoning_content is the only useful output and must be preserved.
-  if (!isClaudeMessageResponse && !isResponsesResponse && translatedResponse?.choices) {
+  if (!isClaudeMessageResponse && !isResponsesResponse && !isNativeGeminiResponse && translatedResponse?.choices) {
     for (const choice of translatedResponse.choices) {
       if (choice?.message?.reasoning_content && choice.message.content) {
         delete choice.message.reasoning_content;

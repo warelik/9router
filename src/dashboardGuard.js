@@ -13,7 +13,7 @@ async function getCliToken() {
   return cachedCliToken;
 }
 
-async function hasValidCliToken(request) {
+export async function hasValidCliToken(request) {
   const token = request.headers.get(CLI_TOKEN_HEADER);
   if (!token) return false;
   return token === await getCliToken();
@@ -35,7 +35,7 @@ const PUBLIC_API_PATHS = [
 
 // Public top-level prefixes (LLM API endpoints with their own API key auth).
 // Keep root-level rewrites here too: middleware runs before Next.js rewrites.
-const PUBLIC_PREFIXES = ["/v1", "/v1beta", "/api/v1", "/api/v1beta", "/codex", "/responses"];
+const PUBLIC_PREFIXES = ["/v1", "/v1beta", "/v1alpha", "/api/v1", "/api/v1beta", "/api/v1alpha", "/codex", "/responses"];
 
 // Always require JWT token regardless of requireLogin setting
 const ALWAYS_PROTECTED = [
@@ -145,7 +145,9 @@ function extractApiKey(request) {
   if (apiKeyHeader) return apiKeyHeader;
   const googleApiKeyHeader = request.headers.get("x-goog-api-key");
   if (googleApiKeyHeader) return googleApiKeyHeader;
-  return request.nextUrl.searchParams?.get("key") || null;
+  return request.nextUrl.searchParams?.get("key")
+    || request.nextUrl.searchParams?.get("$key")
+    || null;
 }
 
 async function hasValidApiKey(request) {

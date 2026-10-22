@@ -21,6 +21,8 @@ const SPECIALIZED = new Set([
   "codex", "cursor", "vertex", "vertex-partner", "opencode",
   "opencode-go", "grok-web", "perplexity-web", "ollama-local", "commandcode",
   "xiaomi-tokenplan", "mimo-free",
+  // Fork-only local bridge; its URL and header contract is locked by unit/aistudio-provider.test.js.
+  "aistudio",
 ]);
 
 // Sanitize header: khử token + field thời gian động (kimi X-Msh-Device-Id) để snapshot ổn định.
@@ -62,7 +64,14 @@ describe("GOLDEN buildHeaders (default executor providers)", () => {
         oauth: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : OAUTH_CRED, true))),
         nonStream: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, false))),
       };
-      expect(snap).toMatchSnapshot();
+      const sessionMatchers = Object.fromEntries(
+        Object.entries(snap)
+          .filter(([, headers]) => typeof headers?.["X-Mavis-Session-Id"] === "string")
+          .map(([kind]) => [kind, {
+            "X-Mavis-Session-Id": expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+          }])
+      );
+      expect(snap).toMatchSnapshot(sessionMatchers);
     });
   }
 });

@@ -312,6 +312,13 @@ export class CodexExecutor extends BaseExecutor {
         result.response = codexSseErrorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, peek.message || CODEX_MODEL_CAPACITY_MESSAGE);
         return result;
       }
+      // A terminal error event before any user-visible output is a failed
+      // attempt, not a transient overload — surface it instead of retrying.
+      if (peek.status) {
+        args.log?.warn?.("RETRY", `CODEX | SSE error before output "${peek.message || peek.matched}" → ${peek.status}`);
+        result.response = codexSseErrorResponse(peek.status, peek.message || peek.matched);
+        return result;
+      }
       if (attempt >= attempts) {
         args.log?.warn?.("RETRY", `CODEX | SSE overloaded "${peek.matched}" — retries exhausted (${attempt}/${attempts})`);
         result.response = codexSseErrorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, peek.message || peek.matched);
@@ -325,16 +332,18 @@ export class CodexExecutor extends BaseExecutor {
   }
 
   // Peek first N bytes of SSE body to detect upstream transient errors.
-  // Returns { matched: string|null, message: string|null, accountFallback: boolean, replacementBody: ReadableStream|null }.
+  // Returns { matched: string|null, message: string|null, accountFallback: boolean, status: number|null, replacementBody: ReadableStream|null }.
   // Caller must use replacementBody when no error matched (original body has been read).
   async _peekSseTransientError(response) {
-    if (!response || !response.ok || !response.body) return { matched: null, message: null, accountFallback: false, replacementBody: null };
+    if (!response || !response.ok || !response.body) return { matched: null, message: null, accountFallback: false, status: null, replacementBody: null };
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const chunks = [];
     let text = "";
     let matched = null;
     let accountFallback = false;
+    let sseError = null;
+    let lineScanOffset = 0;
     try {
       while (text.length < CODEX_SSE_PEEK_BYTES) {
         const { done, value } = await reader.read();
@@ -346,16 +355,54 @@ export class CodexExecutor extends BaseExecutor {
         if (accountHit) { matched = accountHit; accountFallback = true; break; }
         const retryHit = CODEX_SSE_RETRY_PATTERNS.find(p => lowerText.includes(p));
         if (retryHit) { matched = retryHit; break; }
-        if (CODEX_SSE_USER_OUTPUT_PATTERNS.some(p => lowerText.includes(p))) break;
+        // Error events are terminal only while they precede user-visible output;
+        // past that point the stream must reach the client untouched.
+        let outputIdx = -1;
+        for (const pattern of CODEX_SSE_USER_OUTPUT_PATTERNS) {
+          const idx = lowerText.indexOf(pattern);
+          if (idx !== -1 && (outputIdx === -1 || idx < outputIdx)) outputIdx = idx;
+        }
+        const scanEnd = outputIdx === -1 ? text.lastIndexOf("\n") : Math.min(text.lastIndexOf("\n"), outputIdx);
+        while (lineScanOffset <= scanEnd) {
+          const nl = text.indexOf("\n", lineScanOffset);
+          if (nl === -1 || nl > scanEnd) break;
+          const line = text.slice(lineScanOffset, nl);
+          lineScanOffset = nl + 1;
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === "[DONE]") continue;
+          try {
+            const event = JSON.parse(data);
+            if (event?.type === "error" || event?.type === "response.failed") {
+              const err = event.type === "response.failed" ? event.response?.error : event.error;
+              sseError = {
+                type: event.type,
+                status: (err?.type === "invalid_request_error" || err?.code === "invalid_request_error")
+                  ? HTTP_STATUS.BAD_REQUEST : HTTP_STATUS.BAD_GATEWAY,
+              };
+            }
+          } catch { /* ignore non-JSON SSE data lines */ }
+          if (sseError) break;
+        }
+        if (sseError || outputIdx !== -1) break;
       }
     } catch (e) {
       dbg("CODEX", `peek read error: ${e.message}`);
     }
 
-    if (matched) {
+    if (matched || sseError) {
       try { await reader.cancel(); } catch { /* noop */ }
       try { reader.releaseLock(); } catch { /* noop */ }
-      return { matched, message: extractSseErrorMessage(text, matched), accountFallback, replacementBody: null };
+      if (matched) {
+        return { matched, message: extractSseErrorMessage(text, matched), accountFallback, status: null, replacementBody: null };
+      }
+      return {
+        matched: sseError.type,
+        message: extractSseErrorMessage(text, sseError.type),
+        accountFallback: false,
+        status: sseError.status,
+        replacementBody: null,
+      };
     }
 
     reader.releaseLock();
@@ -379,7 +426,7 @@ export class CodexExecutor extends BaseExecutor {
         try { upstreamReader?.cancel(reason); } catch { /* noop */ }
       },
     });
-    return { matched: null, message: null, accountFallback: false, replacementBody };
+    return { matched: null, message: null, accountFallback: false, status: null, replacementBody };
   }
 
   // Parse Codex usage_limit_reached to extract precise resetsAtMs; fallback to default otherwise
@@ -423,7 +470,13 @@ export class CodexExecutor extends BaseExecutor {
     // Register hosted search before choosing transport; Lite cannot execute it.
     const autoWebSearch = body._autoCodexWebSearch === true;
     delete body._autoCodexWebSearch;
-    if (autoWebSearch && !body.tools?.some?.(tool => tool?.type === "web_search")) {
+    // History with hosted web_search_call items requires the tool to be declared;
+    // otherwise upstream answers 200 with a terminal SSE error. The /compact
+    // endpoint was not observed failing this way, so its request is left unchanged.
+    const hasHostedSearchHistory = !this._isCompact && Array.isArray(body.input)
+      && body.input.some(item => item?.type === "web_search_call");
+    if ((autoWebSearch || hasHostedSearchHistory)
+      && !body.tools?.some?.(tool => tool?.type === "web_search")) {
       body.tools = [...(Array.isArray(body.tools) ? body.tools : []), { type: "web_search" }];
     }
     // Hosted search cannot run from a Lite input prefix. When switching to
