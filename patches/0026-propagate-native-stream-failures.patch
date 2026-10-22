@@ -1,18 +1,19 @@
-From 7fc68d5b7d25736802b081f2c0687211191d20bf Mon Sep 17 00:00:00 2001
+From 0162cc9bfc842482c798d3d328b8f52291f2ce3b Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]"
  <41898282+github-actions[bot]@users.noreply.github.com>
-Date: Thu, 22 Oct 2026 21:49:15 +0000
-Subject: [PATCH] Propagate native stream failures to account state and request
- accounting
+Date: Thu, 22 Oct 2026 22:01:50 +0000
+Subject: [PATCH] Propagate native stream failures through every terminal path
+ before completion
 
 ---
- open-sse/handlers/chatCore.js                 |  4 +-
- .../handlers/chatCore/streamingHandler.js     | 15 +++++--
- open-sse/utils/stream.js                      | 23 ++++++++++-
- src/sse/handlers/chat.js                      | 12 ++++++
- .../unit/gemini-native-entry-contract.test.js | 20 +++++++++
- tests/unit/gemini-native-stream.test.js       | 41 ++++++++++++++++++-
- 6 files changed, 106 insertions(+), 9 deletions(-)
+ open-sse/handlers/chatCore.js                 |   4 +-
+ .../handlers/chatCore/streamingHandler.js     |  57 +++++---
+ open-sse/utils/stream.js                      |  95 ++++++++----
+ open-sse/utils/streamHandler.js               |  24 ++-
+ src/sse/handlers/chat.js                      |  12 ++
+ .../unit/gemini-native-entry-contract.test.js |  20 +++
+ tests/unit/gemini-native-stream.test.js       | 137 +++++++++++++++++-
+ 7 files changed, 292 insertions(+), 57 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
 index b5c13a8d..bbd34dae 100644
@@ -37,19 +38,74 @@ index b5c13a8d..bbd34dae 100644
    const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
  
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index cc50c76e..e9a49490 100644
+index cc50c76e..d9474201 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
-@@ -114,7 +114,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
-   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
-   const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, nativeGeminiJson);
+@@ -89,7 +89,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+   const deferNativeGeminiSuccess = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
+   const reportRequestSuccess = () => {
+     if (!onRequestSuccess) return;
+-    Promise.resolve()
++    return Promise.resolve()
+       .then(onRequestSuccess)
+       .catch(err => {
+         console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
+@@ -101,20 +101,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
  
+   const nativeGeminiJson = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
+     && upstreamContentType.includes("application/json");
+-  const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, onNativeResponseSuccess: deferNativeGeminiSuccess ? reportRequestSuccess : null, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
+-
+-  // Terminal bytes when the stream aborts after HTTP 200 was already sent, so the
+-  // client sees a real error instead of a silently truncated stream.
+-  // Responses passthrough keeps its own response.failed shape; every other client
+-  // format gets the OpenAI error frame + [DONE], or `event: error` for Claude.
+-  const isResponsesPassthrough = sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES;
+-  const onAbortTerminal = nativeGeminiJson ? null : isResponsesPassthrough
+-    ? buildAbortedResponsesTerminalBytes
+-    : (message) => buildStreamErrorBytes(HTTP_STATUS.GATEWAY_TIMEOUT, message, sourceFormat);
+-  const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
+-  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, nativeGeminiJson);
+-
 -  saveRequestDetail(buildRequestDetail({
-+  if (!deferNativeGeminiSuccess) saveRequestDetail(buildRequestDetail({
++  const initialDetailWrite = saveRequestDetail(buildRequestDetail({
      provider, model, connectionId,
      latency: { ttft: 0, total: Date.now() - requestStartTime },
      tokens: { prompt_tokens: 0, completion_tokens: 0 },
-@@ -145,10 +145,16 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+@@ -123,10 +110,31 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+     providerResponse: "[Streaming - raw response not captured]",
+     response: { content: "[Streaming in progress...]", thinking: null, type: "streaming" },
+     pxpipe,
+-    status: "success"
++    status: deferNativeGeminiSuccess ? "pending" : "success",
+   }, { id: streamDetailId })).catch(err => {
+     console.error("[RequestDetail] Failed to save streaming request:", err.message);
+   });
++  const completeStream = async (...args) => {
++    await initialDetailWrite;
++    return onStreamComplete?.(...args);
++  };
++  const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete: completeStream, onNativeResponseSuccess: deferNativeGeminiSuccess ? reportRequestSuccess : null, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
++
++  // Terminal bytes when the stream aborts after HTTP 200 was already sent, so the
++  // client sees a real error instead of a silently truncated stream.
++  // Responses passthrough keeps its own response.failed shape; every other client
++  // format gets the OpenAI error frame + [DONE], or `event: error` for Claude.
++  const isResponsesPassthrough = sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES;
++  const onAbortTerminal = nativeGeminiJson ? null : isResponsesPassthrough
++    ? buildAbortedResponsesTerminalBytes
++    : (message) => buildStreamErrorBytes(HTTP_STATUS.GATEWAY_TIMEOUT, message, sourceFormat);
++  const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
++  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, nativeGeminiJson,
++    typeof transformStream.finalizeNativeResponse === "function" ? (error, clientCancelled) => transformStream.finalizeNativeResponse({
++      status: clientCancelled ? 499 : HTTP_STATUS.GATEWAY_TIMEOUT,
++      error: error.message,
++      clientCancelled,
++    }) : null);
+ 
+   return {
+     success: true,
+@@ -145,10 +153,16 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
  /**
   * Build onStreamComplete callback for streaming usage tracking.
   */
@@ -57,17 +113,27 @@ index cc50c76e..e9a49490 100644
 +export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest, pxpipe, reqTag, log, onRequestFailure }) {
    const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
  
-   const onStreamComplete = (contentObj, usage, ttftAt) => {
+-  const onStreamComplete = (contentObj, usage, ttftAt) => {
++  const onStreamComplete = async (contentObj, usage, ttftAt) => {
 +    const failure = contentObj?.error;
-+    if (failure && onRequestFailure) {
-+      Promise.resolve().then(() => onRequestFailure(failure)).catch(err => {
++    if (failure && !failure.clientCancelled && onRequestFailure) {
++      await Promise.resolve().then(() => onRequestFailure(failure)).catch(err => {
 +        console.error("[ChatCore] onRequestFailure failed:", err?.message || err);
 +      });
 +    }
      const latency = {
        ttft: ttftAt ? ttftAt - requestStartTime : Date.now() - requestStartTime,
        total: Date.now() - requestStartTime
-@@ -165,14 +171,15 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
+@@ -156,7 +170,7 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
+     const safeContent = contentObj?.content || "[Empty streaming response]";
+     const safeThinking = contentObj?.thinking || null;
+ 
+-    saveRequestDetail(buildRequestDetail({
++    await saveRequestDetail(buildRequestDetail({
+       provider, model, connectionId,
+       latency,
+       tokens: usage || { prompt_tokens: 0, completion_tokens: 0 },
+@@ -165,14 +179,15 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
        providerResponse: safeContent,
        response: { content: safeContent, thinking: safeThinking, type: "streaming" },
        pxpipe,
@@ -86,10 +152,21 @@ index cc50c76e..e9a49490 100644
  
    return { onStreamComplete, streamDetailId };
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index a608c70e..827b9678 100644
+index a608c70e..4dc50845 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
-@@ -144,6 +144,7 @@ export function createSSEStream(options = {}) {
+@@ -140,10 +140,18 @@ export function createSSEStream(options = {}) {
+   let openAIResponsesDoneSent = false;
+   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
+   let finalized = false;
++  let finalizationPromise = null;
++  let pendingRequestCleared = false;
++  const clearPendingRequest = () => {
++    if (pendingRequestCleared) return;
++    pendingRequestCleared = true;
++    trackPendingRequest(model, provider, connectionId, false);
++  };
+   let completionFlushTimer = null;
    const nativeGeminiCandidates = new Map();
    let nativeGeminiFailureSeen = false;
    let nativeGeminiErrorSeen = false;
@@ -97,7 +174,7 @@ index a608c70e..827b9678 100644
    let nativeGeminiInvalidResponseSeen = false;
    let nativeGeminiResponseSeen = false;
    let nativeGeminiMultipleCandidatesSeen = false;
-@@ -171,6 +172,12 @@ export function createSSEStream(options = {}) {
+@@ -171,6 +179,12 @@ export function createSSEStream(options = {}) {
      if (parsed.error || response.error) {
        nativeGeminiFailureSeen = true;
        nativeGeminiErrorSeen = true;
@@ -110,13 +187,30 @@ index a608c70e..827b9678 100644
      }
      if (response.promptFeedback?.blockReason) {
        nativeGeminiFailureSeen = true;
-@@ -232,13 +239,23 @@ export function createSSEStream(options = {}) {
+@@ -218,38 +232,50 @@ export function createSSEStream(options = {}) {
+   const reportNativeGeminiSuccess = () => {
+     if (!onNativeResponseSuccess || nativeGeminiSuccessReported) return;
+     nativeGeminiSuccessReported = true;
+-    Promise.resolve().then(onNativeResponseSuccess).catch(err => {
++    return Promise.resolve().then(onNativeResponseSuccess).catch(err => {
+       console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
+     });
+   };
+ 
+   // Usage/logging tail, callable from transform() as well as flush(): a client that
+   // closes right after the terminal event cancels the reader, and flush() never runs.
+-  const finalizeStream = () => {
++  const finalizeStream = (interruption = null) => {
+     if (completionFlushTimer) { clearTimeout(completionFlushTimer); completionFlushTimer = null; }
+-    if (finalized) return;
++    if (finalized) return finalizationPromise;
+     finalized = true;
  
      const isPassthrough = mode === STREAM_MODE.PASSTHROUGH;
      let finalUsage = isPassthrough ? usage : state?.usage;
 +    const observesNativeGemini = nativeGeminiPassthrough || observeNativeGeminiTransform || transformNativeGeminiJson;
 +    const nativeFailure = observesNativeGemini
-+      ? nativeGeminiError || (
++      ? nativeGeminiError || interruption || (
 +        nativeGeminiInvalidResponseSeen || !nativeGeminiResponseSeen || nativeGeminiHasIncompleteCandidate()
 +          ? { status: HTTP_STATUS.BAD_GATEWAY, error: "Upstream Gemini stream ended with invalid or incomplete response data" }
 +          : null)
@@ -135,24 +229,275 @@ index a608c70e..827b9678 100644
        logUsage(isPassthrough ? provider : (state?.provider || targetFormat), finalUsage, model, connectionId, apiKey);
      } else {
        appendRequestLog({ model, provider, connectionId, tokens: null, status: "200 OK" }).catch(() => { });
-@@ -247,7 +264,8 @@ export function createSSEStream(options = {}) {
-     if (onStreamComplete) {
-       onStreamComplete({
+     }
+ 
+-    if (onStreamComplete) {
+-      onStreamComplete({
++    finalizationPromise = onStreamComplete
++      ? Promise.resolve().then(() => onStreamComplete({
          content: accumulatedContent,
 -        thinking: accumulatedThinking
+-      }, finalUsage, ttftAt);
+-    }
 +        thinking: accumulatedThinking,
 +        ...(nativeFailure ? { error: nativeFailure } : {}),
-       }, finalUsage, ttftAt);
-     }
++      }, finalUsage, ttftAt))
++      : Promise.resolve();
++    return finalizationPromise;
    };
-@@ -601,6 +619,7 @@ export function createSSEStream(options = {}) {
+ 
+   // Emit the deferred response.completed now — at [DONE], or when the watchdog
+@@ -266,7 +292,7 @@ export function createSSEStream(options = {}) {
+     finalizeStream();
+   };
+ 
+-  return new TransformStream({
++  const resultStream = new TransformStream({
+     transform(chunk, controller) {
+       if (!ttftAt) ttftAt = Date.now();
+       const text = decoder.decode(chunk, { stream: true });
+@@ -569,10 +595,10 @@ export function createSSEStream(options = {}) {
+       }
+     },
+ 
+-    flush(controller) {
++    async flush(controller) {
+       const evtSummary = Object.entries(eventTypeCounts).map(([k, v]) => `${k}=${v}`).join(",") || "none";
+       dbg("SSE", `flush | provider=${provider} | model=${model} | recvLines=${sseLineCount} | emitted=${sseEmittedCount} | events=[${evtSummary}]`);
+-      trackPendingRequest(model, provider, connectionId, false);
++      clearPendingRequest();
+       try {
+         const remaining = decoder.decode();
+         if (transformNativeGeminiJson) {
+@@ -580,8 +606,8 @@ export function createSSEStream(options = {}) {
+           let nativeResponse;
+           try { nativeResponse = JSON.parse(nativeGeminiJson); }
+           catch {
++            await finalizeStream();
+             controller.error(new Error("Upstream Gemini JSON stream ended with invalid or incomplete JSON"));
+-            finalizeStream();
+             return;
+           }
+           const responses = Array.isArray(nativeResponse) ? nativeResponse : [nativeResponse];
+@@ -590,27 +616,28 @@ export function createSSEStream(options = {}) {
+             if (!captureNativeGeminiBody(response)) nativeGeminiInvalidResponseSeen = true;
+           }
+           if (nativeGeminiInvalidResponseSeen || !nativeGeminiResponseSeen) {
++            await finalizeStream();
+             controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
+-            finalizeStream();
+             return;
+           }
+           if (nativeGeminiHasIncompleteCandidate()) {
++            await finalizeStream();
+             controller.error(new Error("Upstream Gemini JSON stream ended before a candidate finished"));
+-            finalizeStream();
+             return;
            }
            const translated = translateResponse(targetFormat, sourceFormat, nativeResponse, state);
            if (!Array.isArray(translated) || translated.length !== 1 || translated[0] == null) {
 +            nativeGeminiInvalidResponseSeen = true;
++            await finalizeStream();
              controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
-             finalizeStream();
+-            finalizeStream();
              return;
+           }
+           const output = JSON.stringify(translated[0]);
+           reqLogger?.appendConvertedChunk?.(output);
+           controller.enqueue(sharedEncoder.encode(output));
+           sseEmittedCount++;
+-          if (!nativeGeminiErrorSeen) reportNativeGeminiSuccess();
+-          finalizeStream();
++          if (!nativeGeminiErrorSeen) await reportNativeGeminiSuccess();
++          await finalizeStream();
+           return;
+         }
+         if (remaining) buffer += remaining;
+@@ -627,8 +654,8 @@ export function createSSEStream(options = {}) {
+               let nativeResponse;
+               try { nativeResponse = JSON.parse(nativeGeminiJson); }
+               catch {
++                await finalizeStream();
+                 controller.error(new Error("Upstream Gemini JSON stream ended with invalid or incomplete JSON"));
+-                finalizeStream();
+                 return;
+               }
+               const responses = Array.isArray(nativeResponse) ? nativeResponse : [nativeResponse];
+@@ -642,8 +669,8 @@ export function createSSEStream(options = {}) {
+             }
+             if (nativeGeminiInvalidResponseSeen || !nativeGeminiResponseSeen) {
+               if (nativeJson) {
++                await finalizeStream();
+                 controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
+-                finalizeStream();
+                 return;
+               }
+               const message = nativeGeminiInvalidResponseSeen
+@@ -654,17 +681,17 @@ export function createSSEStream(options = {}) {
+               controller.enqueue(failure);
+             } else if (nativeGeminiHasIncompleteCandidate()) {
+               if (nativeJson) {
++                await finalizeStream();
+                 controller.error(new Error("Upstream Gemini JSON stream ended before a candidate finished"));
+-                finalizeStream();
+                 return;
+               }
+               const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream ended before a candidate finished", sourceFormat);
+               reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
+               controller.enqueue(failure);
+             } else if (!nativeGeminiErrorSeen) {
+-              reportNativeGeminiSuccess();
++              await reportNativeGeminiSuccess();
+             }
+-            finalizeStream();
++            await finalizeStream();
+             return;
+           }
+           if (buffer) {
+@@ -686,7 +713,7 @@ export function createSSEStream(options = {}) {
+             controller.enqueue(sharedEncoder.encode(doneOutput));
+           }
+ 
+-          finalizeStream();
++          await finalizeStream();
+           return;
+         }
+ 
+@@ -775,15 +802,29 @@ export function createSSEStream(options = {}) {
+ 
+         if (observeNativeGeminiTransform && !nativeGeminiInvalidResponseSeen
+             && nativeGeminiResponseSeen && !nativeGeminiErrorSeen
+-            && !nativeGeminiHasIncompleteCandidate()) reportNativeGeminiSuccess();
++            && !nativeGeminiHasIncompleteCandidate()) await reportNativeGeminiSuccess();
+ 
+-        finalizeStream();
++        await finalizeStream();
+       } catch (error) {
+         console.log("Error in flush:", error);
+-        finalizeStream();
++        if (nativeGeminiPassthrough || observeNativeGeminiTransform || transformNativeGeminiJson) {
++          await resultStream.finalizeNativeResponse({ status: HTTP_STATUS.BAD_GATEWAY,
++            error: "Upstream Gemini stream could not be validated" });
++          controller.error(error);
++        } else {
++          await finalizeStream();
++        }
+       }
+     }
+   });
++  if (nativeGeminiPassthrough || observeNativeGeminiTransform || transformNativeGeminiJson) {
++    // Transport aborts skip flush; share its accounting and awaited completion.
++    resultStream.finalizeNativeResponse = interruption => {
++      if (!finalized) clearPendingRequest();
++      return finalizeStream(interruption);
++    };
++  }
++  return resultStream;
+ }
+ 
+ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null, credentials = null, nativeResponseProjection = null, onNativeResponseSuccess = null, nativeJson = false) {
+diff --git a/open-sse/utils/streamHandler.js b/open-sse/utils/streamHandler.js
+index 05967639..35f2cb68 100644
+--- a/open-sse/utils/streamHandler.js
++++ b/open-sse/utils/streamHandler.js
+@@ -19,10 +19,12 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
+   const abortController = new AbortController();
+   const startTime = Date.now();
+   let disconnected = false;
++  let clientDisconnected = false;
+   let abortTimeout = null;
+   const detachClientAbort = () => clientSignal?.removeEventListener("abort", onClientAbort);
+   const onClientAbort = () => {
+     if (disconnected) return;
++    clientDisconnected = true;
+     disconnected = true;
+     detachClientAbort();
+     abortController.abort(clientSignal.reason);
+@@ -45,10 +47,12 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
+     startTime,
+ 
+     isConnected: () => !disconnected,
++    isClientDisconnected: () => clientDisconnected,
+ 
+     // Call when client disconnects
+     handleDisconnect: (reason = "client_closed") => {
+       if (disconnected) return;
++      clientDisconnected = true;
+       disconnected = true;
+       detachClientAbort();
+ 
+@@ -114,10 +118,13 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
+  * @param {boolean} [propagateAbortErrors] - Reject interrupted JSON streams
+  * instead of treating transport closure as successful EOF.
+  */
+-export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, propagateAbortErrors = false) {
++export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, propagateAbortErrors = false, onStreamInterrupted = null) {
+   const reader = transformStream.readable.getReader();
+   const writer = transformStream.writable.getWriter();
+   let terminalEmitted = false;
++  const interrupted = async (error, clientCancelled = false) => {
++    if (onStreamInterrupted) await onStreamInterrupted(error, clientCancelled);
++  };
+ 
+   // Emit a synthesized terminal payload (e.g. Responses response.failed + [DONE]) once
+   const emitTerminal = (controller) => {
+@@ -132,6 +139,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
+   return new ReadableStream({
+     async pull(controller) {
+       if (!streamController.isConnected()) {
++        await interrupted(new Error("Upstream stream interrupted"), streamController.isClientDisconnected?.() === true);
+         if (propagateAbortErrors) {
+           const error = new Error("Upstream stream interrupted");
+           streamController.handleError(error);
+@@ -162,6 +170,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
+         if (!isControllerClosed) streamController.handleError(error);
+         reader.cancel().catch(() => {});
+         writer.abort().catch(() => {});
++        await interrupted(error, streamController.isClientDisconnected?.() === true);
+ 
+         // Treat network resets / socket hang up / abort as graceful close
+         const msg = error?.message || "";
+@@ -196,10 +205,10 @@ export function createDisconnectAwareStream(transformStream, streamController, o
+       }
+     },
+ 
+-    cancel(reason) {
++    async cancel(reason) {
+       streamController.handleDisconnect(reason || "cancelled");
+-      reader.cancel();
+-      writer.abort();
++      await Promise.allSettled([reader.cancel(reason), writer.abort(reason)]);
++      await interrupted(new Error(String(reason || "Client cancelled the stream")), streamController.isClientDisconnected?.() !== false);
+     }
+   });
+ }
+@@ -222,7 +231,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
+  * @param {boolean} [propagateAbortErrors] - Preserve transport failures for
+  * native JSON framing, which cannot accept an SSE error trailer.
+  */
+-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, propagateAbortErrors = false) {
++export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, propagateAbortErrors = false, onStreamInterrupted = null) {
+   let stallTimer = null;
+   let chunkCount = 0;
+   let totalBytes = 0;
+@@ -251,6 +260,7 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
+     signal: streamController.signal,
+     startTime: streamController.startTime,
+     isConnected: () => streamController.isConnected(),
++    isClientDisconnected: () => streamController.isClientDisconnected?.() === true,
+     handleComplete: () => { dbg(tag, `complete | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleComplete(); },
+     handleError: (e) => { dbg(tag, `error: ${e?.message} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleError(e); },
+     handleDisconnect: (r) => { dbg(tag, `disconnect: ${r} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleDisconnect(r); },
+@@ -285,6 +295,8 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
+     { readable: transformedBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
+     wrappedController,
+     onAbortTerminal ? () => onAbortTerminal(abortMessage) : null,
+-    propagateAbortErrors
++    propagateAbortErrors,
++    onStreamInterrupted ? (error, clientCancelled) => onStreamInterrupted(
++      new Error(abortMessage === "stream stall timeout" ? abortMessage : error?.message || abortMessage), clientCancelled) : null,
+   );
+ }
 diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
 index 253d020d..276ecd91 100644
 --- a/src/sse/handlers/chat.js
@@ -208,10 +553,10 @@ index 4afe24f1..84c907bf 100644
        it(`${provider}: ${first} to ${second} fallback preserves signed tool history and native settings`, async () => {
          const original = nativeBody();
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index eed61962..5127e459 100644
+index eed61962..0f1f1c33 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
-@@ -7,12 +7,14 @@ vi.mock("@/lib/usageDb.js", () => ({
+@@ -7,12 +7,16 @@ vi.mock("@/lib/usageDb.js", () => ({
    trackPendingRequest: vi.fn(),
    appendRequestLog: vi.fn(async () => {}),
    saveRequestDetail: vi.fn(async () => {}),
@@ -223,14 +568,109 @@ index eed61962..5127e459 100644
  const { createStreamController, pipeWithDisconnect } = await import("../../open-sse/utils/streamHandler.js");
 -const { handleStreamingResponse } = await import("../../open-sse/handlers/chatCore/streamingHandler.js");
 +const { handleStreamingResponse, buildOnStreamComplete } = await import("../../open-sse/handlers/chatCore/streamingHandler.js");
-+const { saveRequestDetail, appendRequestLog } = await import("@/lib/usageDb.js");
++const { saveRequestDetail, appendRequestLog, trackPendingRequest } = await import("@/lib/usageDb.js");
++const { STREAM_STALL_TIMEOUT_MS } = await import("../../open-sse/config/runtimeConfig.js");
++const { PROVIDERS } = await import("../../open-sse/config/providers.js");
  const { FORMATS } = await import("../../open-sse/translator/formats.js");
  
  const encode = text => new TextEncoder().encode(text);
-@@ -34,6 +36,43 @@ const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nat
+@@ -34,6 +38,137 @@ const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nat
  const readText = stream => new Response(stream).text();
  
  describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
++  it("waits for the failed account update before exposing native EOF", async () => {
++    for (const nativeJson of [false, true]) {
++      let releaseAccount;
++      const accountUpdated = new Promise(resolve => { releaseAccount = resolve; });
++      const failed = vi.fn(() => accountUpdated);
++      const shared = { provider: "aistudio", model: "gemini-native-test", connectionId: "account",
++        body: {}, stream: true, requestStartTime: Date.now(), onRequestFailure: failed };
++      const payload = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" } };
++      const raw = nativeJson ? JSON.stringify(payload) : frame(payload);
++      const result = await handleStreamingResponse({
++        ...shared, ...buildOnStreamComplete(shared),
++        providerResponse: new Response(inputStream([encode(raw)]), {
++          headers: { "content-type": nativeJson ? "application/json" : "text/event-stream" },
++        }),
++        sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
++        streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test" }),
++      });
++      let finished = false;
++      const reading = result.response.text().then(value => { finished = true; return value; });
++      await vi.waitFor(() => expect(failed).toHaveBeenCalledOnce());
++      expect(finished).toBe(false);
++      releaseAccount();
++      await reading;
++      expect(finished).toBe(true);
++    }
++  });
++
++  it.each(["socket error", "stall"])("finalizes account state and history after native %s", async termination => {
++    for (const nativeJson of [false, true]) {
++      vi.clearAllMocks();
++      if (termination === "stall") vi.useFakeTimers();
++      try {
++        const failed = vi.fn();
++        const controller = createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } });
++        let upstream;
++        const body = new ReadableStream({ start(value) {
++          upstream = value;
++          controller.signal.addEventListener("abort", () => value.error(Object.assign(new Error("upstream aborted"), { name: "AbortError" })), { once: true });
++        } });
++        const shared = { provider: "aistudio", model: "gemini-native-test", connectionId: "failed-account",
++          body: {}, stream: true, requestStartTime: Date.now(), onRequestFailure: failed };
++        const callbacks = buildOnStreamComplete(shared);
++        const result = await handleStreamingResponse({
++          ...shared, ...callbacks,
++          providerResponse: new Response(body, { headers: { "content-type": nativeJson ? "application/json" : "text/event-stream" } }),
++          sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI, streamController: controller,
++        });
++        const reading = result.response.text().then(text => ({ text }), error => ({ error }));
++        if (termination === "stall") await vi.advanceTimersByTimeAsync((PROVIDERS.aistudio?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS) + 1);
++        else upstream.error(new Error("socket hang up"));
++        const output = await reading;
++        if (nativeJson) expect(output.error).toBeDefined();
++        else expect(output.text).toContain('"code":504');
++        expect(failed).toHaveBeenCalledOnce();
++        expect(failed.mock.calls[0][0]).toMatchObject({ status: 504, clientCancelled: false });
++        const details = saveRequestDetail.mock.calls.map(([detail]) => detail)
++          .filter(detail => detail.id === callbacks.streamDetailId);
++        expect(details.map(detail => detail.status)).toEqual(["pending", "error"]);
++        expect(trackPendingRequest).toHaveBeenCalledOnce();
++      } finally {
++        if (termination === "stall") vi.useRealTimers();
++      }
++    }
++  });
++
++  it("retains cancelled native requests without penalizing the provider account", async () => {
++    vi.clearAllMocks();
++    vi.useFakeTimers();
++    try {
++      const failed = vi.fn();
++      const shared = { provider: "aistudio", model: "gemini-native-test", connectionId: "account",
++        body: {}, stream: true, requestStartTime: Date.now(), onRequestFailure: failed };
++      const callbacks = buildOnStreamComplete(shared);
++      const controller = createStreamController({ provider: "aistudio", model: "gemini-native-test" });
++      const result = await handleStreamingResponse({
++        ...shared, ...callbacks,
++        providerResponse: new Response(new ReadableStream(), { headers: { "content-type": "text/event-stream" } }),
++        sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI, streamController: controller,
++      });
++      await result.response.body.cancel("client finished");
++      expect(failed).not.toHaveBeenCalled();
++      expect(controller.isClientDisconnected()).toBe(true);
++      const details = saveRequestDetail.mock.calls.map(([detail]) => detail)
++        .filter(detail => detail.id === callbacks.streamDetailId);
++      expect(details.map(detail => detail.status)).toEqual(["pending", "error"]);
++      expect(appendRequestLog).toHaveBeenCalledWith(expect.objectContaining({ status: "499 ERROR" }));
++      expect(trackPendingRequest).toHaveBeenCalledOnce();
++      await vi.advanceTimersByTimeAsync(501);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
 +  it.each([
 +    ["quota", { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "fixture quota" } }, 429],
 +    ["malformed content", { candidates: [{ finishReason: "STOP", content: { parts: "invalid" } }] }, 502],
@@ -260,9 +700,10 @@ index eed61962..5127e459 100644
 +        await vi.waitFor(() => expect(failed).toHaveBeenCalledOnce());
 +        expect(failed.mock.calls[0][0]).toMatchObject({ status, error: expect.any(String) });
 +        expect(succeeded).not.toHaveBeenCalled();
-+        const details = saveRequestDetail.mock.calls.filter(([, options]) => options.id === callbacks.streamDetailId);
-+        expect(details).toHaveLength(1);
-+        expect(details[0][0]).toMatchObject({ status: "error", connectionId: "failed-account" });
++        const details = saveRequestDetail.mock.calls.filter(([detail]) => detail.id === callbacks.streamDetailId);
++        expect(details).toHaveLength(2);
++        expect(details[0][0].status).toBe("pending");
++        expect(details[1][0]).toMatchObject({ status: "error", connectionId: "failed-account" });
 +        expect(appendRequestLog).toHaveBeenCalledWith(expect.objectContaining({ status: `${status} ERROR` }));
 +      }
 +    }
