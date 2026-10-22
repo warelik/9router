@@ -42,6 +42,7 @@ const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
 const { FORMATS } = await import("../../open-sse/translator/formats.js");
 const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
 const { ANTIGRAVITY_HEADERS } = await import("../../open-sse/config/appConstants.js");
+const { AntigravityExecutor } = await import("../../open-sse/executors/antigravity.js");
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const MODEL = "gemini-3.8-flash-high";
@@ -241,6 +242,17 @@ function loadRouteHarness() {
   vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
   vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
   return { context, services };
+}
+
+async function postNativeGemini(context, requestBody = nativeBody()) {
+  const request = new Request(`https://router.test/v1beta/models/antigravity/${MODEL}:generateContent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
+  });
+  return context.POST(request, {
+    params: Promise.resolve({ path: ["antigravity", `${MODEL}:generateContent`] }),
+  });
 }
 
 describe("native Gemini through Antigravity", () => {
@@ -575,5 +587,84 @@ describe("Gemini endpoint source selection for Antigravity", () => {
       functionCall: { id: "call-native-17", name: "lookup_record", args: { key: "opaque-9" } },
       thoughtSignature: "native-call-signature",
     });
+  });
+
+  it("wraps real fetch failures after account fallback exhaustion in the Gemini error envelope", async () => {
+    const { context, services } = loadRouteHarness();
+    const executor = new AntigravityExecutor();
+    executor.config = {
+      ...executor.config,
+      retry: { ...(executor.config.retry || {}), 502: { attempts: 0, delayMs: 0 } },
+    };
+    executorInstances.set("antigravity", executor);
+
+    const credentials = connectionId => ({
+      accessToken: `offline-token-${connectionId}`,
+      projectId: "fixture-project",
+      connectionId,
+      providerSpecificData: {},
+    });
+    services.getProviderCredentials.mockReset()
+      .mockResolvedValueOnce(credentials("first-account"))
+      .mockResolvedValueOnce(credentials("second-account"))
+      .mockResolvedValueOnce(null);
+    services.markAccountUnavailable.mockReset()
+      .mockResolvedValueOnce({ shouldFallback: true })
+      .mockResolvedValueOnce({ shouldFallback: true });
+    network.mockReset()
+      .mockRejectedValueOnce(new Error("first account fetch failed"))
+      .mockRejectedValueOnce(new Error("second account fetch failed"));
+
+    const response = await postNativeGemini(context);
+
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({ error: {
+      code: 502,
+      status: "UNAVAILABLE",
+      message: expect.stringContaining("second account fetch failed"),
+    } });
+    expect(network).toHaveBeenCalledTimes(2);
+    expect(services.getProviderCredentials).toHaveBeenCalledTimes(3);
+  });
+
+  it("preserves a marked upstream Gemini error body and headers through account fallback", async () => {
+    const { context, services } = loadRouteHarness();
+    const raw = '{ "error": { "code": 400, "status": "INVALID_ARGUMENT", "message": "native upstream detail", "details": [{"field":"contents"}] } }';
+    services.getProviderCredentials.mockReset()
+      .mockResolvedValueOnce({
+        accessToken: "offline-provider-token",
+        projectId: "fixture-project",
+        connectionId: "first-account",
+        providerSpecificData: {},
+      })
+      .mockResolvedValueOnce(null);
+    services.markAccountUnavailable.mockReset().mockResolvedValueOnce({ shouldFallback: true });
+    network.mockReset().mockResolvedValueOnce(new Response(raw, { status: 400, headers: {
+      "Content-Type": "application/json",
+      "Retry-After": "13",
+      "X-Google-Trace": "native-trace",
+    } }));
+
+    const response = await postNativeGemini(context);
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("retry-after")).toBe("13");
+    expect(response.headers.get("x-google-trace")).toBe("native-trace");
+    expect(await response.text()).toBe(raw);
+    expect(network).toHaveBeenCalledOnce();
+  });
+
+  it("returns the Gemini status field for unexpected route failures", async () => {
+    const { context, services } = loadRouteHarness();
+    services.getModelInfo.mockRejectedValueOnce(new Error("fixture route setup failed"));
+
+    const response = await postNativeGemini(context);
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: {
+      code: 500,
+      status: "INTERNAL",
+      message: "fixture route setup failed",
+    } });
   });
 });

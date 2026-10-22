@@ -144,7 +144,7 @@ export async function POST(request, { params }) {
   } catch (error) {
     console.log("Error handling Gemini request:", error);
     return Response.json(
-      { error: { message: error.message, code: 500 } },
+      { error: { code: 500, status: "INTERNAL", message: error?.message || "Internal server error" } },
       { status: 500 }
     );
   }
