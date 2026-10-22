@@ -21,10 +21,19 @@ export function isValidNativeGeminiResponse(response, projection = null) {
   if (!nativeResponse || typeof nativeResponse !== "object" || Array.isArray(nativeResponse)) return false;
   if (!allowsEmpty && Object.keys(nativeResponse).length === 0) return false;
   if (nativeResponse.error) return true;
-  if (nativeResponse.candidates !== undefined && (
-    !Array.isArray(nativeResponse.candidates)
-    || nativeResponse.candidates.some(candidate => !candidate || typeof candidate !== "object" || Array.isArray(candidate))
-  )) return false;
+  if (nativeResponse.candidates !== undefined) {
+    if (!Array.isArray(nativeResponse.candidates)) return false;
+    for (const candidate of nativeResponse.candidates) {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+      if (candidate.content === undefined) continue;
+      const content = candidate.content;
+      if (!content || typeof content !== "object" || Array.isArray(content)) return false;
+      if (content.parts !== undefined && (
+        !Array.isArray(content.parts)
+        || content.parts.some(part => !part || typeof part !== "object" || Array.isArray(part))
+      )) return false;
+    }
+  }
   return true;
 }
 
