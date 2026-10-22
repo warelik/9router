@@ -1,0 +1,252 @@
+From 28a596478dd912a94c30bcc0c2fbce09c51e80c7 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 15:10:11 +0000
+Subject: [PATCH] Distinguish namespaced function and custom aliases
+
+---
+ .../concerns/portableCollaboration.js         |  7 +-
+ .../translator/request/openai-responses.js    | 43 ++++++-----
+ .../unit/openai-responses-namespaces.test.js  | 75 +++++++++++++++++++
+ 3 files changed, 102 insertions(+), 23 deletions(-)
+
+diff --git a/open-sse/translator/concerns/portableCollaboration.js b/open-sse/translator/concerns/portableCollaboration.js
+index 00b6043..9cc6da4 100644
+--- a/open-sse/translator/concerns/portableCollaboration.js
++++ b/open-sse/translator/concerns/portableCollaboration.js
+@@ -38,12 +38,13 @@ export function preparePortableCollaboration(body) {
+   }
+   for (const item of inputs) if (!item?.namespace && typeof item?.name === "string") reserved.add(item.name);
+   const aliasFor = (name, type = RESPONSES_TOOL.FUNCTION) => {
+-    if (aliases.has(name)) return aliases.get(name);
+-    const hash = createHash("sha256").update(JSON.stringify([namespace, name])).digest("hex").slice(0, 16);
++    const identity = JSON.stringify([namespace, name, type]);
++    if (aliases.has(identity)) return aliases.get(identity);
++    const hash = createHash("sha256").update(identity).digest("hex").slice(0, 16);
+     const base = PORTABLE_COLLABORATION.aliasPrefix + String(name).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 30) + "_" + hash;
+     let alias = base;
+     for (let n = 1; reserved.has(alias); n++) alias = base.slice(0, 58) + "_" + n;
+-    reserved.add(alias); aliases.set(name, alias);
++    reserved.add(alias); aliases.set(identity, alias);
+     toolNameMap.set(alias, { name, namespace, type });
+     return alias;
+   };
+diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
+index 8bf93aa..e59f8be 100644
+--- a/open-sse/translator/request/openai-responses.js
++++ b/open-sse/translator/request/openai-responses.js
+@@ -14,7 +14,7 @@ import {
+   coerceResponsesArguments,
+   coerceResponsesOutput,
+ } from "../formats/responsesApi.js";
+-import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
++import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, RESPONSES_TOOL } from "../schema/index.js";
+ 
+ const MAX_TOOL_NAME_LEN = 128;
+ 
+@@ -45,14 +45,14 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+ 
+   const reserveToolName = (tool) => {
+     if (!tool || typeof tool !== "object" || Array.isArray(tool)) return;
+-    if (tool.type === "namespace") return;
++    if (tool.type === RESPONSES_TOOL.NAMESPACE) return;
+     const n = tool.function?.name ?? tool.name;
+     if (typeof n === "string" && n.trim()) reservedNames.add(n.trim());
+   };
+   for (const tool of Array.isArray(body.tools) ? body.tools : []) reserveToolName(tool);
+ 
+-  const aliasFor = (namespace, name) => {
+-    const identity = JSON.stringify([namespace, name]);
++  const aliasFor = (namespace, name, type) => {
++    const identity = JSON.stringify([namespace, name, type]);
+     if (aliasCache.has(identity)) return aliasCache.get(identity);
+     const stem = `ns_${namespace}_${name}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40);
+     const hash = createHash("sha256").update(identity).digest("hex").slice(0, 16);
+@@ -154,11 +154,12 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+       // Skip items with empty/missing name — Codex/OpenAI reject nameless tool calls (#444)
+       if (!item.name || typeof item.name !== "string" || item.name.trim() === "") continue;
+       const namespace = typeof item.namespace === "string" && item.namespace.trim() ? item.namespace.trim() : null;
+-      const callName = namespace ? aliasFor(namespace, item.name) : item.name;
++      const type = itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION;
++      const callName = namespace ? aliasFor(namespace, item.name, type) : item.name;
+       if (namespace) {
+-        namespaceToolMap.set(callName, { name: item.name, namespace, type: itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL ? "custom" : "function" });
++        namespaceToolMap.set(callName, { name: item.name, namespace, type });
+       }
+-      if (itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL) customToolNames.add(callName);
++      if (type === RESPONSES_TOOL.CUSTOM) customToolNames.add(callName);
+       const toolInput = itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL
+         ? { input: typeof item.input === "string" ? item.input : JSON.stringify(item.input ?? "") }
+         : item.arguments;
+@@ -225,10 +226,10 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+   // such as Gemini, which strictly validates function names.
+   const responseTools = [];
+   for (const tool of [...(Array.isArray(body.tools) ? body.tools : []), ...additionalTools]) {
+-    if (tool && typeof tool === "object" && !Array.isArray(tool) && tool.type === "namespace") {
++    if (tool && typeof tool === "object" && !Array.isArray(tool) && tool.type === RESPONSES_TOOL.NAMESPACE) {
+       if (typeof tool.name === "string" && tool.name.trim() && Array.isArray(tool.tools)) {
+         for (const child of tool.tools) {
+-          if (child?.type === "function" || child?.type === "custom") responseTools.push({ child, ns: tool });
++          if (child?.type === RESPONSES_TOOL.FUNCTION || child?.type === RESPONSES_TOOL.CUSTOM) responseTools.push({ child, ns: tool });
+         }
+       }
+       continue;
+@@ -255,11 +256,12 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+         // in translator-only metadata for the response conversion.
+         const name = tool.name;
+         if (!name || typeof name !== "string" || name.trim() === "") return null;
+-        const wireName = ns ? aliasFor(ns.name.trim(), name) : name;
+-        if (ns) namespaceToolMap.set(wireName, { name, namespace: ns.name.trim(), type: tool.type === "custom" ? "custom" : "function" });
++        const type = tool.type === RESPONSES_TOOL.CUSTOM ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION;
++        const wireName = ns ? aliasFor(ns.name.trim(), name, type) : name;
++        if (ns) namespaceToolMap.set(wireName, { name, namespace: ns.name.trim(), type });
+         const label = ns ? `[${ns.name.trim()}.${name}]` : "";
+         const nsDescription = ns ? String(ns.description || "") : "";
+-        if (tool.type === "custom") {
++        if (type === RESPONSES_TOOL.CUSTOM) {
+           customToolNames.add(wireName);
+           const formatHint = [tool.format?.syntax, tool.format?.definition].filter(Boolean).join("\n");
+           return {
+@@ -297,19 +299,20 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+   }
+ 
+   if (result.tool_choice && typeof result.tool_choice === "object" && !Array.isArray(result.tool_choice)
+-    && (result.tool_choice.type === "function" || result.tool_choice.type === "custom")
++    && (result.tool_choice.type === RESPONSES_TOOL.FUNCTION || result.tool_choice.type === RESPONSES_TOOL.CUSTOM)
+     && typeof result.tool_choice.name === "string") {
+     const choice = result.tool_choice;
+     const choiceNs = typeof choice.namespace === "string" && choice.namespace.trim() ? choice.namespace.trim() : null;
+-    const choiceName = choiceNs ? aliasFor(choiceNs, choice.name) : choice.name;
++    const choiceType = choice.type === RESPONSES_TOOL.CUSTOM ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION;
++    const choiceName = choiceNs ? aliasFor(choiceNs, choice.name, choiceType) : choice.name;
+     if (choiceNs) {
+       const existing = namespaceToolMap.get(choiceName);
+-      if (choice.type === "custom") {
++      if (choiceType === RESPONSES_TOOL.CUSTOM) {
+         const declaration = responseTools.find(({ child, ns }) =>
+-          child?.type === "custom" && ns?.name?.trim() === choiceNs && child.name === choice.name);
+-        const descriptor = existing?.type === "custom"
++          child?.type === RESPONSES_TOOL.CUSTOM && ns?.name?.trim() === choiceNs && child.name === choice.name);
++        const descriptor = existing?.type === RESPONSES_TOOL.CUSTOM
+           ? existing
+-          : { name: choice.name, namespace: choiceNs, type: "custom" };
++          : { name: choice.name, namespace: choiceNs, type: RESPONSES_TOOL.CUSTOM };
+         const format = declaration?.child.format ?? choice.format;
+         if (format !== undefined) {
+           namespaceToolMap.set(choiceName, { ...descriptor, format });
+@@ -317,10 +320,10 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+           namespaceToolMap.set(choiceName, descriptor);
+         }
+       } else if (!existing) {
+-        namespaceToolMap.set(choiceName, { name: choice.name, namespace: choiceNs, type: "function" });
++        namespaceToolMap.set(choiceName, { name: choice.name, namespace: choiceNs, type: RESPONSES_TOOL.FUNCTION });
+       }
+     }
+-    if (choice.type === "custom") customToolNames.add(choiceName);
++    if (choiceType === RESPONSES_TOOL.CUSTOM) customToolNames.add(choiceName);
+     result.tool_choice = { type: "function", function: { name: choiceName } };
+   }
+   if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
+diff --git a/tests/unit/openai-responses-namespaces.test.js b/tests/unit/openai-responses-namespaces.test.js
+index 7efe3e8..645f7eb 100644
+--- a/tests/unit/openai-responses-namespaces.test.js
++++ b/tests/unit/openai-responses-namespaces.test.js
+@@ -28,6 +28,7 @@ const fixture = () => ({
+   tool_choice: { type: "function", name: "read", namespace: "beta" },
+ });
+ const alias = (map, namespace, name) => [...map].find(([, value]) => value && typeof value === "object" && value.namespace === namespace && value.name === name)?.[0];
++const typedAlias = (map, namespace, name, type) => [...map].find(([, value]) => value && typeof value === "object" && value.namespace === namespace && value.name === name && value.type === type)?.[0];
+ 
+ it("expands namespace declarations without conflating root or equal leaf names", () => {
+   const body = fixture();
+@@ -51,6 +52,44 @@ it("expands namespace declarations without conflating root or equal leaf names",
+   expect(historyOnly.messages.find(message => message.tool_calls).tool_calls[0].function.name).toBe(alpha);
+ });
+ 
++it("keeps same-name namespaced function and custom tools distinct through request mapping and restoration", () => {
++  const makeBody = type => ({
++    model: "m",
++    tools: [{ type: "namespace", name: "automation", tools: [
++      { type: "function", name: "run", parameters: schema },
++      { type: "custom", name: "run", format: { type: "text" } },
++    ] }],
++    input: [
++      { type: "function_call", name: "run", namespace: "automation", call_id: "call_function", arguments: '{"title":"record","count":3}' },
++      { type: "custom_tool_call", name: "run", namespace: "automation", call_id: "call_custom", input: "RAW_INPUT" },
++    ],
++    tool_choice: { type, name: "run", namespace: "automation" },
++  });
++  const translated = openaiResponsesToOpenAIRequest("m", makeBody("custom"), true, {});
++  const functionAlias = typedAlias(translated._toolNameMap, "automation", "run", "function");
++  const customAlias = typedAlias(translated._toolNameMap, "automation", "run", "custom");
++
++  expect(functionAlias).toBeTruthy();
++  expect(customAlias).toBeTruthy();
++  expect(functionAlias).not.toBe(customAlias);
++  expect(translated.tools.map(tool => tool.function.name)).toEqual([functionAlias, customAlias]);
++  expect(translated._toolNameMap.get(functionAlias)).toEqual({ name: "run", namespace: "automation", type: "function" });
++  expect(translated._toolNameMap.get(customAlias)).toEqual({ name: "run", namespace: "automation", type: "custom", format: { type: "text" } });
++  expect(translated.messages[0].tool_calls.map(call => call.function.name)).toEqual([functionAlias, customAlias]);
++  expect(translated.tool_choice).toEqual({ type: "function", function: { name: customAlias } });
++  expect(translated._customToolNames).toContain(customAlias);
++  expect(translated._customToolNames).not.toContain(functionAlias);
++  expect(restoreToolNames({ type: "function_call", name: functionAlias, call_id: "call_function", arguments: "{}" }, translated._toolNameMap)).toEqual({
++    type: "function_call", name: "run", namespace: "automation", call_id: "call_function", arguments: "{}",
++  });
++  expect(restoreToolNames({ type: "function_call", name: customAlias, call_id: "call_custom", arguments: "RAW_INPUT" }, translated._toolNameMap)).toEqual({
++    type: "custom_tool_call", name: "run", namespace: "automation", call_id: "call_custom", input: "RAW_INPUT",
++  });
++
++  const functionChoice = openaiResponsesToOpenAIRequest("m", makeBody("function"), true, {});
++  expect(functionChoice.tool_choice).toEqual({ type: "function", function: { name: typedAlias(functionChoice._toolNameMap, "automation", "run", "function") } });
++});
++
+ it("restores namespace identity after a chained rename in event and terminal output", () => {
+   const map = new Map([["provider_name", "wire_name"], ["wire_name", { name: "read", namespace: "alpha", type: "function" }]]);
+   const item = { type: "function_call", name: "provider_name", call_id: "call_1", arguments: "{}" };
+@@ -266,6 +305,42 @@ const collaborationBody = () => ({
+ });
+ 
+ describe("portable collaboration preparation", () => {
++  it("keeps same-name function and custom declarations, history, choices, and restored outputs distinct", () => {
++    const body = {
++      model: "m",
++      tools: [{ type: "namespace", name: "collaboration", tools: [
++        { type: "function", name: "run", parameters: schema },
++        { type: "custom", name: "run", format: { type: "text" } },
++      ] }],
++      input: [
++        { type: "function_call", name: "run", namespace: "collaboration", call_id: "call_function", arguments: "{}" },
++        { type: "custom_tool_call", name: "run", namespace: "collaboration", call_id: "call_custom", input: "RAW_INPUT" },
++      ],
++      tool_choice: { type: "allowed_tools", mode: "auto", tools: [
++        { type: "function", name: "run", namespace: "collaboration" },
++        { type: "custom", name: "run", namespace: "collaboration" },
++      ] },
++    };
++    const { body: out, toolNameMap } = preparePortableCollaboration(body);
++    const functionAlias = typedAlias(toolNameMap, "collaboration", "run", "function");
++    const customAlias = typedAlias(toolNameMap, "collaboration", "run", "custom");
++
++    expect(functionAlias).toBeTruthy();
++    expect(customAlias).toBeTruthy();
++    expect(functionAlias).not.toBe(customAlias);
++    expect(out.tools.map(tool => tool.name)).toEqual([functionAlias, customAlias]);
++    expect(out.input.map(item => item.name)).toEqual([functionAlias, customAlias]);
++    expect(out.tool_choice.tools.map(choice => choice.name)).toEqual([functionAlias, customAlias]);
++    expect(toolNameMap.get(functionAlias)).toEqual({ name: "run", namespace: "collaboration", type: "function" });
++    expect(toolNameMap.get(customAlias)).toEqual({ name: "run", namespace: "collaboration", type: "custom" });
++    expect(restoreToolNames({ type: "function_call", name: functionAlias, call_id: "call_function", arguments: "{}" }, toolNameMap)).toEqual({
++      type: "function_call", name: "run", namespace: "collaboration", call_id: "call_function", arguments: "{}",
++    });
++    expect(restoreToolNames({ type: "function_call", name: customAlias, call_id: "call_custom", arguments: "RAW_INPUT" }, toolNameMap)).toEqual({
++      type: "custom_tool_call", name: "run", namespace: "collaboration", call_id: "call_custom", input: "RAW_INPUT",
++    });
++  });
++
+   it("flattens collaboration declarations and drops encrypted only from the listed message schemas", () => {
+     const body = collaborationBody();
+     const before = JSON.stringify(body);
+-- 
+2.55.0
+
