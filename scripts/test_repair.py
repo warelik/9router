@@ -1448,9 +1448,16 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
                 stale_baseline = {**baseline, "configuration_sha": "f" * 40}
                 with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
                       patch.object(release, "pages", side_effect=native_pages)):
-                    stale = release._transition_review_candidates(
-                        REPO, CONFIG, lifecycle, accepted_baseline=stale_baseline)
-                self.assertEqual(stale, [], "A pair for an obsolete accepted baseline must not be retained")
+                    if application_only:
+                        with self.assertRaisesRegex(
+                                ValueError, "Transition review request no longer identifies its exact native PR"):
+                            release._transition_review_candidates(
+                                REPO, CONFIG, lifecycle, accepted_baseline=stale_baseline)
+                    else:
+                        stale = release._transition_review_candidates(
+                            REPO, CONFIG, lifecycle, accepted_baseline=stale_baseline)
+                        self.assertEqual(
+                            stale, [], "A pair for an obsolete accepted baseline must not be retained")
                 if application_only:
                     stale_application = {**baseline, "application_sha": "f" * 40}
                     with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
@@ -1800,6 +1807,9 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
 
         def prepare_source(_app, upstream, _patch_root):
             selected_upstreams.append(upstream)
+            application_root = Path(_app)
+            application_root.mkdir(parents=True, exist_ok=True)
+            (application_root / "Dockerfile").write_text("FROM node:fixture\n", encoding="utf-8")
             return candidate["application_sha"], candidate["patchset_sha256"], "1.0.0"
 
         def review(*args, **kwargs):
@@ -1829,6 +1839,9 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            workflow = root / ".github/workflows/release.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text("name: full-only resume fixture\n", encoding="utf-8")
             repair = {"waiting": False, "state": None, "config_sha": CONFIG,
                       "config_root": root, "patch_root": root / "patches"}
             with (patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GITHUB_SHA": CONFIG}),
@@ -4117,7 +4130,10 @@ class AdoptionTests(unittest.TestCase):
             self.assertFalse({"GH_TOKEN", "GITHUB_TOKEN", "CODEX_REQUEST_TOKEN",
                               "NINEROUTER_KEY", "GITHUB_ENV", "GITHUB_PATH"} & env.keys())
             self.assertEqual(env["CI"], "true")
-            self.assertEqual(args[:4], ["docker", "run", "--rm", "--read-only"])
+            self.assertEqual(args[:2], ["docker", "run"])
+            self.assertEqual(args[2], "--name")
+            self.assertRegex(args[3], r"^9router-policy-tests-[A-Za-z0-9_-]+$")
+            self.assertEqual(args[4:6], ["--rm", "--read-only"])
             self.assertIn("--network=none", args)
             self.assertIn("--cap-drop=ALL", args)
             self.assertIn("--security-opt=no-new-privileges", args)
@@ -4279,7 +4295,8 @@ class AdoptionTests(unittest.TestCase):
             "policy-check": {"contents": "read"},
             "finalize": {"contents": "read", "issues": "write", "pull-requests": "read", "actions": "read"},
             "policy-only": {"contents": "write", "pull-requests": "write", "actions": "write"},
-            "test": {"contents": "read"},
+            # The test job inherits the workflow-wide read-only permission.
+            "test": None,
             "build": {"contents": "read"},
             "publish": {"contents": "write", "pull-requests": "write", "actions": "write"},
             "repair": {"contents": "write", "pull-requests": "write", "issues": "write", "actions": "read"},
@@ -4291,7 +4308,7 @@ class AdoptionTests(unittest.TestCase):
             "policy-check": {"name", "needs", "if", "runs-on", "timeout-minutes", "permissions", "steps"},
             "finalize": {"name", "needs", "if", "runs-on", "timeout-minutes", "permissions", "outputs", "steps"},
             "policy-only": {"name", "needs", "if", "runs-on", "timeout-minutes", "permissions", "steps"},
-            "test": {"name", "needs", "if", "runs-on", "timeout-minutes", "permissions", "env", "steps"},
+            "test": {"name", "needs", "if", "runs-on", "timeout-minutes", "env", "steps"},
             "build": {"name", "needs", "if", "runs-on", "timeout-minutes", "permissions", "env", "steps"},
             "publish": {"name", "needs", "if", "runs-on", "timeout-minutes", "permissions", "steps"},
             "repair": {"name", "needs", "if", "runs-on", "timeout-minutes", "permissions", "steps"},

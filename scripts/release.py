@@ -2683,7 +2683,7 @@ def _verify_sanitized_repair_candidate(repo, candidate, full_evidence, repair, a
             or repair.get("config_sha") != candidate.get("configuration_sha")
             or not SHA.fullmatch(candidate.get("configuration_sha", ""))
             or not SHA.fullmatch(candidate.get("application_sha", ""))
-            or not SHA.fullmatch(candidate.get("patchset_sha256", ""))):
+            or not re.fullmatch(r"[0-9a-f]{64}", candidate.get("patchset_sha256", ""))):
         raise ValueError("Disposition proposal is not bound to the current application or policy candidate")
     _verify_repair_proposal_pull(repo, state)
     changed = repair.get("changed")
