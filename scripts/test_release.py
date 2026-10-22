@@ -232,11 +232,12 @@ class TestEnvironmentTests(unittest.TestCase):
         for fails in (False, True):
             paths = []
 
-            def execute(args, *, cwd, env, check):
+            def execute(args, *, cwd, env, check, timeout):
                 self.assertEqual(args[-2:], ["translator/example.test.js", "--update"])
                 self.assertEqual(cwd, Path("/example/tests"))
                 self.assertEqual(env["CI"], "true")
                 self.assertTrue(check)
+                self.assertEqual(timeout, 1550)
                 self.assertFalse({"GH_TOKEN", "GITHUB_TOKEN", "CODEX_REQUEST_TOKEN"} & env.keys())
                 for name in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
                              "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "TMPDIR", "DATA_DIR"):

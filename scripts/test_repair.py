@@ -1021,6 +1021,18 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
                                separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(canonical).hexdigest()
 
+    @staticmethod
+    def _comment_pull_number(path):
+        route = path.split("?", 1)[0]
+        parts = route.split("/")
+        if len(parts) < 2 or parts[-1] != "comments":
+            raise AssertionError(f"Unexpected issue-comment route: {path}")
+        return int(parts[-2])
+
+    def comment(self, native_id, body, user):
+        return {"id": native_id, "created_at": self.timestamp,
+                "updated_at": self.timestamp, "user": user, "body": body}
+
     def setUp(self):
         self.candidate_id = "a" * 64
         self.candidate = {
@@ -1038,7 +1050,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         body = (
             "<!-- fork-candidate:v1 " + release._candidate_json(self.candidate) + " -->\n"
             "<!-- fork-policy-validation:v1 " + json.dumps(self.payload, separators=(",", ":")) + " -->")
-        self.comment = {
+        self.comment_record = {
             "id": 901, "created_at": self.timestamp, "updated_at": self.timestamp,
             "user": {"login": "github-actions[bot]", "type": "Bot"}, "body": body,
         }
@@ -1081,7 +1093,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
              "completed_at": "2026-10-20T06:00:01Z", "steps": []},
         ]
         self.record = {
-            "run": self.run, "marker": self.payload, "reservation": self.comment,
+            "run": self.run, "marker": self.payload, "reservation": self.comment_record,
         }
         self.lifecycle = SimpleNamespace(candidate_identity=lambda _candidate: self.candidate_id)
 
@@ -1103,7 +1115,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
                             step["started_at"] = self.timestamp
                 jobs = [{**self.policy_job, "steps": steps}, *self.jobs[1:]]
                 with (patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
-                      patch.object(release, "_shared_review_comments", return_value=[self.comment]),
+                      patch.object(release, "_shared_review_comments", return_value=[self.comment_record]),
                       patch.object(release, "_policy_validation_history", return_value=history) as proof,
                       patch.object(release, "_native_attempt_jobs", return_value=(jobs, "jobs-endpoint")),
                       patch.object(release, "_shared_file", side_effect=[
@@ -1123,7 +1135,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         mismatched_pin = {**self.private_lock, "revision": self.parent,
                           "module_sha256": "e" * 64}
         with (patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
-              patch.object(release, "_shared_review_comments", return_value=[self.comment]),
+              patch.object(release, "_shared_review_comments", return_value=[self.comment_record]),
               patch.object(release, "_policy_validation_history",
                            return_value={"state": "verified", "record": self.record}),
               patch.object(release, "_native_attempt_jobs", return_value=(self.jobs, "jobs-endpoint")),
@@ -1136,21 +1148,43 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
 
     def test_transition_receipt_refuses_a_failed_policy_step_or_started_heavy_job(self):
         history = {"state": "verified", "record": self.record}
+        failed_steps = [dict(step) for step in self.policy_job["steps"]]
+        failed_policy_step = next(
+            step for step in failed_steps
+            if step["name"] == "Enforce Trusted Tests And Validate Proposed YAML")
+        failed_policy_step["conclusion"] = "failure"
+        failed_policy_job = {**self.policy_job, "steps": failed_steps}
         for jobs in (
-                [{**self.policy_job, "steps": [{"status": "completed", "conclusion": "failure"}]},
-                 *self.jobs[1:]],
+                [failed_policy_job, *self.jobs[1:]],
                 [self.policy_job, {**self.jobs[1], "started_at": self.timestamp,
                                    "steps": [{"name": "test", "status": "completed",
                                               "conclusion": "success"}]}, self.jobs[2]],
         ):
             with (patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
-                  patch.object(release, "_shared_review_comments", return_value=[self.comment]),
+                  patch.object(release, "_shared_review_comments", return_value=[self.comment_record]),
                   patch.object(release, "_policy_validation_history", return_value=history),
                   patch.object(release, "_native_attempt_jobs", return_value=(jobs, "jobs-endpoint")),
                   patch.object(release, "_shared_file", return_value=self.private_lock_bytes),
                   self.assertRaisesRegex(ValueError, "mandatory step|heavy application job")):
                 release._transition_policy_receipt(
                     REPO, self.candidate, self.parent, self.lifecycle)
+
+    def test_transition_receipt_requires_each_exact_conditional_baseline_private_step(self):
+        history = {"state": "verified", "record": self.record}
+        for missing in ("Checkout The Trusted Baseline Private Module",
+                        "Record The Exact Trusted Baseline Private Checkout Receipt"):
+            with self.subTest(missing=missing):
+                steps = [step for step in self.policy_job["steps"] if step["name"] != missing]
+                jobs = [{**self.policy_job, "steps": steps}, *self.jobs[1:]]
+                with (patch.object(release, "_all_shared_review_pulls", return_value=[{"number": 7}]),
+                      patch.object(release, "_shared_review_comments", return_value=[self.comment_record]),
+                      patch.object(release, "_policy_validation_history", return_value=history),
+                      patch.object(release, "_native_attempt_jobs", return_value=(jobs, "jobs-endpoint")),
+                      patch.object(release, "_shared_file", return_value=self.private_lock_bytes),
+                      self.assertRaisesRegex(
+                          ValueError, "omitted an exact conditional baseline-private step")):
+                    release._transition_policy_receipt(
+                        REPO, self.candidate, self.parent, self.lifecycle)
 
     def test_transition_retry_uses_only_post_pin_h_runs_and_excludes_current_run(self):
         pin_updated_at = "2026-10-20T06:00:00Z"
@@ -1331,7 +1365,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         calls = []
 
         def native_pages(path):
-            number = int(path.rsplit("/", 1)[-1])
+            number = self._comment_pull_number(path)
             calls.append(number)
             return comments[number]
 
@@ -1399,7 +1433,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
                 lifecycle = SimpleNamespace(candidate_identity=self._candidate_identity)
 
                 def native_pages(path):
-                    number = int(path.rsplit("/", 1)[-1])
+                    number = self._comment_pull_number(path)
                     return comments[number]
 
                 with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
@@ -1460,7 +1494,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         lifecycle = SimpleNamespace(candidate_identity=self._candidate_identity)
 
         def native_pages(path):
-            return comments[int(path.rsplit("/", 1)[-1])]
+            return comments[self._comment_pull_number(path)]
 
         with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
               patch.object(release, "pages", side_effect=native_pages),
@@ -1502,7 +1536,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         }
 
         def duplicate_pages(path):
-            return duplicate_comments[int(path.rsplit("/", 1)[-1])]
+            return duplicate_comments[self._comment_pull_number(path)]
 
         with (patch.object(release, "_open_shared_review_pulls",
                            return_value=[*pulls, duplicate_full]),
@@ -1547,7 +1581,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         lifecycle = SimpleNamespace(candidate_identity=self._candidate_identity)
 
         def native_pages(path):
-            return comments[int(path.rsplit("/", 1)[-1])]
+            return comments[self._comment_pull_number(path)]
 
         with (patch.object(release, "_all_shared_review_pulls", return_value=pulls),
               patch.object(release, "pages", side_effect=native_pages),
@@ -1565,7 +1599,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         }
 
         def mismatched_pages(path):
-            return mismatched_comments[int(path.rsplit("/", 1)[-1])]
+            return mismatched_comments[self._comment_pull_number(path)]
 
         with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
               patch.object(release, "pages", side_effect=mismatched_pages),
@@ -1581,7 +1615,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
                                            "full", pulls[0]["head"]["sha"], UPSTREAM)}]}
 
         def malformed_pages(path):
-            return malformed_comments[int(path.rsplit("/", 1)[-1])]
+            return malformed_comments[self._comment_pull_number(path)]
 
         with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
               patch.object(release, "pages", side_effect=malformed_pages),
@@ -1594,7 +1628,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         with (patch.object(release, "_open_shared_review_pulls",
                            return_value=[pulls[0], moved_delta]),
               patch.object(release, "pages", side_effect=lambda path:
-                           comments[int(path.rsplit("/", 1)[-1])]),
+                           comments[self._comment_pull_number(path)]),
               self.assertRaisesRegex(ValueError, "no longer identifies its exact native PR")):
             release._transition_review_candidates(
                 REPO, CONFIG, lifecycle, accepted_baseline=baseline)
@@ -1604,7 +1638,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         with (patch.object(release, "_open_shared_review_pulls",
                            return_value=[moved_full, pulls[1]]),
               patch.object(release, "pages", side_effect=lambda path:
-                           comments[int(path.rsplit("/", 1)[-1])]),
+                           comments[self._comment_pull_number(path)]),
               self.assertRaisesRegex(ValueError, "no longer identifies its exact native PR")):
             release._transition_review_candidates(
                 REPO, CONFIG, lifecycle, accepted_baseline=baseline)
@@ -1624,7 +1658,7 @@ class WorkflowTransitionEvidenceTests(unittest.TestCase):
         comments[12].insert(0, older_other)
 
         def native_pages(path):
-            return comments[int(path.rsplit("/", 1)[-1])]
+            return comments[self._comment_pull_number(path)]
 
         with (patch.object(release, "_open_shared_review_pulls", return_value=pulls),
               patch.object(release, "pages", side_effect=native_pages)):
@@ -2575,6 +2609,7 @@ class SharedHistoryAdapterTests(unittest.TestCase):
             git(root, "config", "user.email", "fixture@example.invalid")
 
         def commit(root, message):
+            git(root, "add", "--", ".")
             env = {**os.environ, "GIT_AUTHOR_NAME": "Fixture",
                    "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
                    "GIT_COMMITTER_NAME": "Fixture",
@@ -3709,6 +3744,8 @@ class AdoptionTests(unittest.TestCase):
             if path == f"repos/{REPO}/git/commits/{HEAD}":
                 return {"sha": HEAD, "parents": [{"sha": CONFIG}],
                         "message": "Review sanitized 9router repair #2"}
+            if path == f"repos/{REPO}/git/ref/heads/downstream":
+                return {"ref": "refs/heads/downstream", "object": {"type": "commit", "sha": HEAD}}
             if path == f"repos/{REPO}/git/refs/heads/downstream":
                 if method == "PATCH":
                     events.append("adopt")
@@ -3754,15 +3791,18 @@ class AdoptionTests(unittest.TestCase):
                 "patches/source.json": {"mode": "100644", "blob_sha": UPSTREAM}}
         policy_id, trusted_pin = "f" * 64, "9" * 40
         calls = []
+        adopted = False
 
         def native(path, *, method="GET", data=None, token=None):
+            nonlocal adopted
             calls.append((path, method, data))
             if path == f"repos/{REPO}/commits/downstream":
-                return {"sha": CONFIG}
+                return {"sha": HEAD if adopted else CONFIG}
             if path == f"repos/{REPO}/git/commits/{HEAD}":
                 return {"sha": HEAD, "parents": [{"sha": CONFIG}],
                         "message": "Review sanitized 9router repair #2"}
             if path == f"repos/{REPO}/git/refs/heads/downstream" and method == "PATCH":
+                adopted = True
                 return {"ref": "refs/heads/downstream", "object": {"type": "commit", "sha": HEAD}}
             self.fail(f"Unexpected native API request: {method} {path}")
 
@@ -3848,7 +3888,7 @@ class AdoptionTests(unittest.TestCase):
             calls.append((path, method, data, token))
             if path == f"repos/{REPO}":
                 return {"default_branch": "downstream"}
-            if path == f"repos/{REPO}/git/refs/heads/downstream":
+            if path == f"repos/{REPO}/git/ref/heads/downstream":
                 return {"ref": "refs/heads/downstream", "object": {"type": "commit", "sha": reviewed}}
             if path == f"repos/{REPO}/actions/variables/ZED_TRUSTED_POLICY":
                 if method == "PATCH":
@@ -3874,7 +3914,7 @@ class AdoptionTests(unittest.TestCase):
                     calls.append((path, method, data, token))
                     if path == f"repos/{REPO}":
                         return {"default_branch": "downstream"}
-                    if path == f"repos/{REPO}/git/refs/heads/downstream":
+                    if path == f"repos/{REPO}/git/ref/heads/downstream":
                         sha = SEED if conflict == "downstream" else reviewed
                         return {"ref": "refs/heads/downstream",
                                 "object": {"type": "commit", "sha": sha}}
@@ -3990,12 +4030,23 @@ class AdoptionTests(unittest.TestCase):
                 return ""
             self.fail(f"Unexpected ref mutation: {args}")
 
-        with (patch.object(release, "pages", side_effect=[[closed, opened], [closed, opened]]),
+        pages_calls = []
+
+        def native_pages(path):
+            pages_calls.append(path)
+            if path == f"repos/{REPO}/pulls?state=all":
+                return [closed, opened]
+            if path == f"repos/{REPO}/issues/2/comments":
+                return []
+            self.fail(f"Unexpected paginated API request: {path}")
+
+        with (patch.object(release, "pages", side_effect=native_pages),
               patch.object(release, "api", side_effect=native),
               patch.object(release, "run", side_effect=command)):
             self.assertEqual(release._cleanup_shared_refs(REPO, lifecycle), [])
         self.assertEqual(lifecycle.plans, 2)
         self.assertEqual(lifecycle.asserted_active_refs, {"unrelated", "downstream"})
+        self.assertEqual(pages_calls.count(f"repos/{REPO}/pulls?state=all"), 2)
 
     def test_readme_is_the_only_documentation_path_in_a_policy_repair(self):
         with patch.object(release, "run", side_effect=["", "", "", CONFIG, "README.md",
