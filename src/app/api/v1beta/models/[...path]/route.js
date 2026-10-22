@@ -283,8 +283,13 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
       attemptController.abort();
     }, GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS);
     const abortAttempt = () => attemptController.abort();
+    const cleanup = () => {
+      clearTimeout(timeout);
+      request.signal?.removeEventListener("abort", abortAttempt);
+    };
 
     if (request.signal?.aborted) {
+      cleanup();
       console.log(`[GEMINI_NATIVE] client aborted model=${modelId} ms=0 conn=${safeConnection}`);
       return Response.json({ error: { message: "Client closed request" } }, { status: 499 });
     }
@@ -337,28 +342,49 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
 
       return Response.json({ error: { message: errorText } }, { status });
     } finally {
-      clearTimeout(timeout);
-      if (!upstreamResponse?.ok || !upstreamResponse.body) {
-        request.signal?.removeEventListener("abort", abortAttempt);
-      }
+      if (!upstreamResponse) cleanup();
     }
 
     console.log(`[GEMINI_NATIVE] upstream model=${modelId} status=${upstreamResponse.status} ms=${Date.now() - startedAt} conn=${safeConnection} ct=${upstreamResponse.headers.get("content-type") || "?"} cl=${upstreamResponse.headers.get("content-length") || "?"}`);
 
     if (upstreamResponse.ok) {
-      await clearAccountError(credentials.connectionId, credentials, modelId);
+      const reportSuccess = () => Promise.resolve()
+        .then(() => clearAccountError(credentials.connectionId, credentials, modelId))
+        .catch(err => console.error("[GEMINI_NATIVE] account success update failed:", err?.message || err));
       const reader = upstreamResponse.body?.getReader();
-      const cleanup = () => request.signal?.removeEventListener("abort", abortAttempt);
+      let cancelled = false;
       const responseBody = reader ? new ReadableStream({
         async pull(controller) {
+          let chunk;
           try {
-            const { value, done } = await reader.read();
-            if (done) { cleanup(); controller.close(); }
-            else controller.enqueue(value);
-          } catch (error) { cleanup(); controller.error(error); }
+            chunk = await reader.read();
+          } catch (error) {
+            cleanup();
+            if (timedOut || (!cancelled && !request.signal?.aborted)) {
+              const status = isGeminiNativeTimeoutError(error, timedOut) ? 504 : 502;
+              await Promise.resolve().then(() => markAccountUnavailable(credentials.connectionId, status,
+                getSafeGeminiNativeErrorText(error), "gemini", modelId)).catch(err => {
+                console.error("[GEMINI_NATIVE] account failure update failed:", err?.message || err);
+              });
+            }
+            if (!cancelled) controller.error(error);
+            return;
+          }
+          if (cancelled) return;
+          if (chunk.done) {
+            cleanup();
+            if (!cancelled && !request.signal?.aborted) {
+              await reportSuccess();
+            }
+            if (!cancelled) controller.close();
+          } else controller.enqueue(chunk.value);
         },
-        cancel(reason) { cleanup(); attemptController.abort(); return reader.cancel(reason); },
+        cancel(reason) { cancelled = true; cleanup(); attemptController.abort(); return reader.cancel(reason); },
       }) : null;
+      if (!reader) {
+        cleanup();
+        await reportSuccess();
+      }
       return new Response(responseBody, {
         status: upstreamResponse.status,
         statusText: upstreamResponse.statusText,
@@ -366,7 +392,14 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
       });
     }
 
-    const errorText = await upstreamResponse.text();
+    let errorText;
+    try {
+      errorText = await upstreamResponse.text();
+    } catch (error) {
+      errorText = JSON.stringify({ error: { message: getSafeGeminiNativeErrorText(error) } });
+    } finally {
+      cleanup();
+    }
     const { shouldFallback } = await markAccountUnavailable(
       credentials.connectionId,
       upstreamResponse.status,

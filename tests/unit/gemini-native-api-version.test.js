@@ -153,6 +153,7 @@ describe("Gemini native stable and beta API versions", () => {
     expect(new URL(url).pathname).toBe("/v1/models/tts-model:generateContent");
     expect(new URL(url).searchParams.has("key")).toBe(false);
     expect(JSON.parse(options.body)).toEqual(input);
+    await response.arrayBuffer();
   });
 
   for (const version of ["v1", "v1beta"]) {
@@ -177,12 +178,14 @@ describe("Gemini native stable and beta API versions", () => {
   it("accepts the $key alias on the native AUDIO path without leaking it to Google", async () => {
     const input = { contents: [{ parts: [{ text: "Speak" }] }], generationConfig: { responseModalities: ["AUDIO"] } };
     const request = new Request("https://router.test/v1beta/models/tts-model:generateContent?$key=fixture-client-key&fields=candidates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
-    expect((await beta.POST(request, { params: Promise.resolve({ path: ["tts-model:generateContent"] }) })).status).toBe(200);
+    const response = await beta.POST(request, { params: Promise.resolve({ path: ["tts-model:generateContent"] }) });
+    expect(response.status).toBe(200);
     const [url, options] = mocks.proxyAwareFetch.mock.calls[0];
     expect(new URL(url).searchParams.has("$key")).toBe(false);
     expect(new URL(url).searchParams.has("key")).toBe(false);
     expect(options.headers["x-goog-api-key"]).toBe("fixture-provider-key");
     expect(JSON.parse(options.body)).toEqual(input);
+    await response.arrayBuffer();
   });
 
   it("does not change a translated client's configured provider API version", () => {

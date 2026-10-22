@@ -134,6 +134,7 @@ describe("native Gemini alpha generation contract", () => {
     mocks.validateApiKey.mockClear();
     const allowed = await beta.POST(requestFor("restricted-tts"), params);
     expect(allowed.status).toBe(200);
+    await allowed.arrayBuffer();
     expect(mocks.validateApiKey).toHaveBeenCalledWith("restricted-tts");
     expect(mocks.network).toHaveBeenCalledOnce();
 
@@ -165,6 +166,7 @@ describe("native Gemini alpha generation contract", () => {
     );
     const allowed = await beta.POST(xApiKey, params);
     expect(allowed.status).toBe(200);
+    await allowed.arrayBuffer();
     expect(mocks.validateApiKey).toHaveBeenCalledWith("restricted-tts");
     expect(mocks.network).toHaveBeenCalledOnce();
 
