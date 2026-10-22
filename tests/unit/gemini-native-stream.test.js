@@ -38,6 +38,36 @@ const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nat
 const readText = stream => new Response(stream).text();
 
 describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
+  it.each([
+    ["openai", FORMATS.OPENAI, 'data: {"choices":[{"delta":{"content":"fixture"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'],
+    ["claude", FORMATS.CLAUDE, 'event: message_stop\ndata: {"type":"message_stop"}\n\n'],
+    ["codex", FORMATS.OPENAI_RESPONSES, 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"fixture","status":"completed","output":[]}}\n\n'],
+  ])("keeps %s EOF independent of pending usage detail writes", async (provider, format, raw) => {
+    vi.clearAllMocks();
+    let releaseDetails;
+    const detailsWritten = new Promise(resolve => { releaseDetails = resolve; });
+    saveRequestDetail.mockImplementationOnce(() => detailsWritten);
+    const shared = { provider, model: "ordinary-test", connectionId: "ordinary-account",
+      body: {}, stream: true, requestStartTime: Date.now() };
+    const callbacks = buildOnStreamComplete(shared);
+    const result = await handleStreamingResponse({
+      ...shared, ...callbacks, userAgent: "codex-cli",
+      providerResponse: new Response(inputStream([encode(raw)]), { headers: { "content-type": "text/event-stream" } }),
+      sourceFormat: format, targetFormat: format,
+      streamController: createStreamController({ provider, model: "ordinary-test" }),
+    });
+    let finished = false;
+    const reading = result.response.text().then(text => { finished = true; return text; });
+    try {
+      await vi.waitFor(() => expect(finished).toBe(true));
+      await reading;
+      expect(saveRequestDetail).toHaveBeenCalledOnce();
+    } finally {
+      releaseDetails();
+    }
+    await vi.waitFor(() => expect(saveRequestDetail).toHaveBeenCalledTimes(2));
+  });
+
   it("waits for the failed account update before exposing native EOF", async () => {
     for (const nativeJson of [false, true]) {
       let releaseAccount;
