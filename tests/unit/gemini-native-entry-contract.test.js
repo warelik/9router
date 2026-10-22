@@ -178,6 +178,26 @@ describe("native Gemini endpoint entry contract", () => {
       expect(await response.json()).toEqual(error);
     });
 
+    it(`${provider}: a late native stream failure marks the selected account unavailable`, async () => {
+      services.handleChatCore.mockImplementationOnce(async options => ({
+        success: true,
+        response: new Response(new ReadableStream({
+          async pull(controller) {
+            await options.onRequestFailure({ status: 429, error: "fixture stream quota" });
+            controller.enqueue(new TextEncoder().encode('data: {"error":{"code":429,"message":"fixture stream quota"}}\n\n'));
+            controller.close();
+          },
+        }), { headers: { "Content-Type": "text/event-stream" } }),
+      }));
+      const response = await call(provider, "streamGenerateContent");
+      expect(await response.text()).toContain('"code":429');
+      expect(services.markAccountUnavailable).toHaveBeenCalledOnce();
+      expect(services.markAccountUnavailable.mock.calls[0].slice(0, 5)).toEqual([
+        "fixture-connection", 429, "fixture stream quota", provider, "gemini-3.5-flash-lite(high)",
+      ]);
+      expect(services.clearAccountError).not.toHaveBeenCalled();
+    });
+
     for (const [first, second] of [["account-a", "account-b"], ["account-b", "account-a"]]) {
       it(`${provider}: ${first} to ${second} fallback preserves signed tool history and native settings`, async () => {
         const original = nativeBody();
