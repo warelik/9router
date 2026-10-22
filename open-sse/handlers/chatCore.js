@@ -62,7 +62,7 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, serverPartsTenant = null, providerThinking, providerOverrides }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onRequestFailure, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, serverPartsTenant = null, providerThinking, providerOverrides }) {
   if (credentials) credentials._geminiServerPartsSessionId = null;
   const { provider, model } = modelInfo;
   if (clientSignal?.aborted) return createErrorResult(499, "Request aborted");
@@ -584,7 +584,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     return nativeErrorResponse ? { ...result, response: nativeErrorResponse, nativeResponse: true } : result;
   }
 
-  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log, nativeResponseProjection };
+  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, onRequestFailure, pxpipe: pxpipeSummary, reqTag, log, nativeResponseProjection };
   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
 

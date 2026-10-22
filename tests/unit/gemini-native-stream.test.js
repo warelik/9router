@@ -7,12 +7,14 @@ vi.mock("@/lib/usageDb.js", () => ({
   trackPendingRequest: vi.fn(),
   appendRequestLog: vi.fn(async () => {}),
   saveRequestDetail: vi.fn(async () => {}),
+  saveRequestUsage: vi.fn(async () => {}),
 }));
 
 const { createPassthroughStreamWithLogger } = await import("../../open-sse/utils/stream.js");
 const { buildStreamErrorBytes } = await import("../../open-sse/utils/streamHelpers.js");
 const { createStreamController, pipeWithDisconnect } = await import("../../open-sse/utils/streamHandler.js");
-const { handleStreamingResponse } = await import("../../open-sse/handlers/chatCore/streamingHandler.js");
+const { handleStreamingResponse, buildOnStreamComplete } = await import("../../open-sse/handlers/chatCore/streamingHandler.js");
+const { saveRequestDetail, appendRequestLog } = await import("@/lib/usageDb.js");
 const { FORMATS } = await import("../../open-sse/translator/formats.js");
 
 const encode = text => new TextEncoder().encode(text);
@@ -34,6 +36,43 @@ const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nat
 const readText = stream => new Response(stream).text();
 
 describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
+  it.each([
+    ["quota", { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "fixture quota" } }, 429],
+    ["malformed content", { candidates: [{ finishReason: "STOP", content: { parts: "invalid" } }] }, 502],
+    ["unfinished candidate", { candidates: [{ content: { parts: [{ text: "partial" }] } }] }, 502],
+  ])("reports %s to account handling and records failed stream completion", async (_name, payload, status) => {
+    for (const nativeJson of [false, true]) {
+      for (const toolNameMap of [null, new Map([["wire_tool", "original_tool"]])]) {
+        vi.clearAllMocks();
+        const failed = vi.fn();
+        const succeeded = vi.fn();
+        const shared = {
+          provider: "aistudio", model: "gemini-native-test", connectionId: "failed-account",
+          body: {}, stream: true, requestStartTime: Date.now(), onRequestFailure: failed,
+        };
+        const callbacks = buildOnStreamComplete(shared);
+        const raw = nativeJson ? JSON.stringify(payload) : frame(payload);
+        const result = await handleStreamingResponse({
+          ...shared, ...callbacks, sourceFormat: FORMATS.GEMINI, targetFormat: FORMATS.GEMINI,
+          providerResponse: new Response(inputStream([encode(raw)]), {
+            headers: { "content-type": nativeJson ? "application/json" : "text/event-stream" },
+          }),
+          streamController: createStreamController({ provider: "aistudio", model: "gemini-native-test", log: { errorLine: vi.fn() } }),
+          toolNameMap, onRequestSuccess: succeeded,
+        });
+        if (nativeJson && status === 502) await expect(result.response.text()).rejects.toThrow("Upstream Gemini JSON stream");
+        else await result.response.text();
+        await vi.waitFor(() => expect(failed).toHaveBeenCalledOnce());
+        expect(failed.mock.calls[0][0]).toMatchObject({ status, error: expect.any(String) });
+        expect(succeeded).not.toHaveBeenCalled();
+        const details = saveRequestDetail.mock.calls.filter(([, options]) => options.id === callbacks.streamDetailId);
+        expect(details).toHaveLength(1);
+        expect(details[0][0]).toMatchObject({ status: "error", connectionId: "failed-account" });
+        expect(appendRequestLog).toHaveBeenCalledWith(expect.objectContaining({ status: `${status} ERROR` }));
+      }
+    }
+  });
+
   it.each([null, "invalid", [], { parts: "invalid" }, { parts: [null] }, { parts: [[]] }, { parts: ["invalid"] }].map(content => [content]))(
     "rejects malformed candidate content %j before recording streaming success", async content => {
       const payload = { candidates: [{ index: 0, finishReason: "STOP", content }] };

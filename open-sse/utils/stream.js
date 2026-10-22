@@ -144,6 +144,7 @@ export function createSSEStream(options = {}) {
   const nativeGeminiCandidates = new Map();
   let nativeGeminiFailureSeen = false;
   let nativeGeminiErrorSeen = false;
+  let nativeGeminiError = null;
   let nativeGeminiInvalidResponseSeen = false;
   let nativeGeminiResponseSeen = false;
   let nativeGeminiMultipleCandidatesSeen = false;
@@ -171,6 +172,12 @@ export function createSSEStream(options = {}) {
     if (parsed.error || response.error) {
       nativeGeminiFailureSeen = true;
       nativeGeminiErrorSeen = true;
+      const error = parsed.error || response.error;
+      nativeGeminiError = {
+        status: Number.isInteger(error.code) && error.code >= 400 && error.code <= 599
+          ? error.code : HTTP_STATUS.BAD_GATEWAY,
+        error: typeof error.message === "string" ? error.message : "Upstream Gemini stream failed",
+      };
     }
     if (response.promptFeedback?.blockReason) {
       nativeGeminiFailureSeen = true;
@@ -232,13 +239,23 @@ export function createSSEStream(options = {}) {
 
     const isPassthrough = mode === STREAM_MODE.PASSTHROUGH;
     let finalUsage = isPassthrough ? usage : state?.usage;
+    const observesNativeGemini = nativeGeminiPassthrough || observeNativeGeminiTransform || transformNativeGeminiJson;
+    const nativeFailure = observesNativeGemini
+      ? nativeGeminiError || (
+        nativeGeminiInvalidResponseSeen || !nativeGeminiResponseSeen || nativeGeminiHasIncompleteCandidate()
+          ? { status: HTTP_STATUS.BAD_GATEWAY, error: "Upstream Gemini stream ended with invalid or incomplete response data" }
+          : null)
+      : null;
 
     if (!hasValidUsage(finalUsage) && totalContentLength > 0) {
       finalUsage = estimateUsage(body, totalContentLength, isPassthrough ? FORMATS.OPENAI : sourceFormat);
       if (isPassthrough) usage = finalUsage; else state.usage = finalUsage;
     }
 
-    if (hasValidUsage(finalUsage)) {
+    if (nativeFailure) {
+      appendRequestLog({ model, provider, connectionId, tokens: finalUsage,
+        status: `${nativeFailure.status} ERROR` }).catch(() => { });
+    } else if (hasValidUsage(finalUsage)) {
       logUsage(isPassthrough ? provider : (state?.provider || targetFormat), finalUsage, model, connectionId, apiKey);
     } else {
       appendRequestLog({ model, provider, connectionId, tokens: null, status: "200 OK" }).catch(() => { });
@@ -247,7 +264,8 @@ export function createSSEStream(options = {}) {
     if (onStreamComplete) {
       onStreamComplete({
         content: accumulatedContent,
-        thinking: accumulatedThinking
+        thinking: accumulatedThinking,
+        ...(nativeFailure ? { error: nativeFailure } : {}),
       }, finalUsage, ttftAt);
     }
   };
@@ -601,6 +619,7 @@ export function createSSEStream(options = {}) {
           }
           const translated = translateResponse(targetFormat, sourceFormat, nativeResponse, state);
           if (!Array.isArray(translated) || translated.length !== 1 || translated[0] == null) {
+            nativeGeminiInvalidResponseSeen = true;
             controller.error(new Error("Upstream Gemini JSON stream returned no valid response"));
             finalizeStream();
             return;

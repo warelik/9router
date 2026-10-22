@@ -114,7 +114,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
   const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, nativeGeminiJson);
 
-  saveRequestDetail(buildRequestDetail({
+  if (!deferNativeGeminiSuccess) saveRequestDetail(buildRequestDetail({
     provider, model, connectionId,
     latency: { ttft: 0, total: Date.now() - requestStartTime },
     tokens: { prompt_tokens: 0, completion_tokens: 0 },
@@ -145,10 +145,16 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
 /**
  * Build onStreamComplete callback for streaming usage tracking.
  */
-export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest, pxpipe, reqTag, log }) {
+export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest, pxpipe, reqTag, log, onRequestFailure }) {
   const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
   const onStreamComplete = (contentObj, usage, ttftAt) => {
+    const failure = contentObj?.error;
+    if (failure && onRequestFailure) {
+      Promise.resolve().then(() => onRequestFailure(failure)).catch(err => {
+        console.error("[ChatCore] onRequestFailure failed:", err?.message || err);
+      });
+    }
     const latency = {
       ttft: ttftAt ? ttftAt - requestStartTime : Date.now() - requestStartTime,
       total: Date.now() - requestStartTime
@@ -165,14 +171,15 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
       providerResponse: safeContent,
       response: { content: safeContent, thinking: safeThinking, type: "streaming" },
       pxpipe,
-      status: "success"
+      status: failure ? "error" : "success",
     }, { id: streamDetailId })).catch(err => {
       console.error("[RequestDetail] Failed to update streaming content:", err.message);
     });
 
     // Persist stream usage to DB (no console line; the "📊 done" line below is authoritative)
     saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, label: "STREAM USAGE", silent: true });
-    if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency }));
+    if (log?.line) log.line(reqTag, failure ? "✗" : "📊",
+      failure ? `FAILED ${failure.status} · ${failure.error}` : formatDoneLine({ usage, latency }));
   };
 
   return { onStreamComplete, streamDetailId };
