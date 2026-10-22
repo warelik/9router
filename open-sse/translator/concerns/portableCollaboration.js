@@ -38,12 +38,13 @@ export function preparePortableCollaboration(body) {
   }
   for (const item of inputs) if (!item?.namespace && typeof item?.name === "string") reserved.add(item.name);
   const aliasFor = (name, type = RESPONSES_TOOL.FUNCTION) => {
-    if (aliases.has(name)) return aliases.get(name);
-    const hash = createHash("sha256").update(JSON.stringify([namespace, name])).digest("hex").slice(0, 16);
+    const identity = JSON.stringify([namespace, name, type]);
+    if (aliases.has(identity)) return aliases.get(identity);
+    const hash = createHash("sha256").update(identity).digest("hex").slice(0, 16);
     const base = PORTABLE_COLLABORATION.aliasPrefix + String(name).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 30) + "_" + hash;
     let alias = base;
     for (let n = 1; reserved.has(alias); n++) alias = base.slice(0, 58) + "_" + n;
-    reserved.add(alias); aliases.set(name, alias);
+    reserved.add(alias); aliases.set(identity, alias);
     toolNameMap.set(alias, { name, namespace, type });
     return alias;
   };
