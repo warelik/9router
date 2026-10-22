@@ -28,6 +28,7 @@ const fixture = () => ({
   tool_choice: { type: "function", name: "read", namespace: "beta" },
 });
 const alias = (map, namespace, name) => [...map].find(([, value]) => value && typeof value === "object" && value.namespace === namespace && value.name === name)?.[0];
+const typedAlias = (map, namespace, name, type) => [...map].find(([, value]) => value && typeof value === "object" && value.namespace === namespace && value.name === name && value.type === type)?.[0];
 
 it("expands namespace declarations without conflating root or equal leaf names", () => {
   const body = fixture();
@@ -49,6 +50,44 @@ it("expands namespace declarations without conflating root or equal leaf names",
   expect(alias(repeated._toolNameMap, "alpha", "read")).toBe(alpha);
   const historyOnly = openaiResponsesToOpenAIRequest(body.model, { input: body.input.filter(item => item.type !== RESPONSES_ITEM.ADDITIONAL_TOOLS) }, true, {});
   expect(historyOnly.messages.find(message => message.tool_calls).tool_calls[0].function.name).toBe(alpha);
+});
+
+it("keeps same-name namespaced function and custom tools distinct through request mapping and restoration", () => {
+  const makeBody = type => ({
+    model: "m",
+    tools: [{ type: "namespace", name: "automation", tools: [
+      { type: "function", name: "run", parameters: schema },
+      { type: "custom", name: "run", format: { type: "text" } },
+    ] }],
+    input: [
+      { type: "function_call", name: "run", namespace: "automation", call_id: "call_function", arguments: '{"title":"record","count":3}' },
+      { type: "custom_tool_call", name: "run", namespace: "automation", call_id: "call_custom", input: "RAW_INPUT" },
+    ],
+    tool_choice: { type, name: "run", namespace: "automation" },
+  });
+  const translated = openaiResponsesToOpenAIRequest("m", makeBody("custom"), true, {});
+  const functionAlias = typedAlias(translated._toolNameMap, "automation", "run", "function");
+  const customAlias = typedAlias(translated._toolNameMap, "automation", "run", "custom");
+
+  expect(functionAlias).toBeTruthy();
+  expect(customAlias).toBeTruthy();
+  expect(functionAlias).not.toBe(customAlias);
+  expect(translated.tools.map(tool => tool.function.name)).toEqual([functionAlias, customAlias]);
+  expect(translated._toolNameMap.get(functionAlias)).toEqual({ name: "run", namespace: "automation", type: "function" });
+  expect(translated._toolNameMap.get(customAlias)).toEqual({ name: "run", namespace: "automation", type: "custom", format: { type: "text" } });
+  expect(translated.messages[0].tool_calls.map(call => call.function.name)).toEqual([functionAlias, customAlias]);
+  expect(translated.tool_choice).toEqual({ type: "function", function: { name: customAlias } });
+  expect(translated._customToolNames).toContain(customAlias);
+  expect(translated._customToolNames).not.toContain(functionAlias);
+  expect(restoreToolNames({ type: "function_call", name: functionAlias, call_id: "call_function", arguments: "{}" }, translated._toolNameMap)).toEqual({
+    type: "function_call", name: "run", namespace: "automation", call_id: "call_function", arguments: "{}",
+  });
+  expect(restoreToolNames({ type: "function_call", name: customAlias, call_id: "call_custom", arguments: "RAW_INPUT" }, translated._toolNameMap)).toEqual({
+    type: "custom_tool_call", name: "run", namespace: "automation", call_id: "call_custom", input: "RAW_INPUT",
+  });
+
+  const functionChoice = openaiResponsesToOpenAIRequest("m", makeBody("function"), true, {});
+  expect(functionChoice.tool_choice).toEqual({ type: "function", function: { name: typedAlias(functionChoice._toolNameMap, "automation", "run", "function") } });
 });
 
 it("restores namespace identity after a chained rename in event and terminal output", () => {
@@ -266,6 +305,42 @@ const collaborationBody = () => ({
 });
 
 describe("portable collaboration preparation", () => {
+  it("keeps same-name function and custom declarations, history, choices, and restored outputs distinct", () => {
+    const body = {
+      model: "m",
+      tools: [{ type: "namespace", name: "collaboration", tools: [
+        { type: "function", name: "run", parameters: schema },
+        { type: "custom", name: "run", format: { type: "text" } },
+      ] }],
+      input: [
+        { type: "function_call", name: "run", namespace: "collaboration", call_id: "call_function", arguments: "{}" },
+        { type: "custom_tool_call", name: "run", namespace: "collaboration", call_id: "call_custom", input: "RAW_INPUT" },
+      ],
+      tool_choice: { type: "allowed_tools", mode: "auto", tools: [
+        { type: "function", name: "run", namespace: "collaboration" },
+        { type: "custom", name: "run", namespace: "collaboration" },
+      ] },
+    };
+    const { body: out, toolNameMap } = preparePortableCollaboration(body);
+    const functionAlias = typedAlias(toolNameMap, "collaboration", "run", "function");
+    const customAlias = typedAlias(toolNameMap, "collaboration", "run", "custom");
+
+    expect(functionAlias).toBeTruthy();
+    expect(customAlias).toBeTruthy();
+    expect(functionAlias).not.toBe(customAlias);
+    expect(out.tools.map(tool => tool.name)).toEqual([functionAlias, customAlias]);
+    expect(out.input.map(item => item.name)).toEqual([functionAlias, customAlias]);
+    expect(out.tool_choice.tools.map(choice => choice.name)).toEqual([functionAlias, customAlias]);
+    expect(toolNameMap.get(functionAlias)).toEqual({ name: "run", namespace: "collaboration", type: "function" });
+    expect(toolNameMap.get(customAlias)).toEqual({ name: "run", namespace: "collaboration", type: "custom" });
+    expect(restoreToolNames({ type: "function_call", name: functionAlias, call_id: "call_function", arguments: "{}" }, toolNameMap)).toEqual({
+      type: "function_call", name: "run", namespace: "collaboration", call_id: "call_function", arguments: "{}",
+    });
+    expect(restoreToolNames({ type: "function_call", name: customAlias, call_id: "call_custom", arguments: "RAW_INPUT" }, toolNameMap)).toEqual({
+      type: "custom_tool_call", name: "run", namespace: "collaboration", call_id: "call_custom", input: "RAW_INPUT",
+    });
+  });
+
   it("flattens collaboration declarations and drops encrypted only from the listed message schemas", () => {
     const body = collaborationBody();
     const before = JSON.stringify(body);
