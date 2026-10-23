@@ -290,6 +290,10 @@ describe("native Gemini requests through real chat core and executor", () => {
       ["unknown object", { message: "bridge failure" }],
       ["event-only object", { event: "bridge_failure", data: "unavailable" }],
       ["wrapped unknown object", { response: { message: "bridge failure" } }],
+      ["null response wrapper", { response: null }],
+      ["false response wrapper", { response: false }],
+      ["zero response wrapper", { response: 0 }],
+      ["empty-string response wrapper", { response: "" }],
       ["unprojected unknown-only extension", { futureNativeResult: { task: { type: "customer", value: 9 } } }],
       ["non-array candidates", { candidates: {} }],
       ["null candidate entry", { candidates: [null] }],
@@ -315,12 +319,25 @@ describe("native Gemini requests through real chat core and executor", () => {
       expect(await result.response.json()).toEqual({});
     });
 
+    it(`${provider}: preserves a projected null wrapper without inventing a failure`, async () => {
+      const response = { response: null };
+      const succeeded = vi.fn();
+      network.mockImplementationOnce(async () => Response.json(response));
+      const result = await run(provider, body(), {
+        queryParams: [["fields", "modelStatus"]], onRequestSuccess: succeeded,
+      });
+      expect(result.success).toBe(true);
+      expect(await result.response.json()).toEqual(response);
+      await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+    });
+
     it.each([
       { promptFeedback: { blockReason: "SAFETY" } },
       { candidates: [{ index: 0, finishReason: "MAX_TOKENS", content: { role: "model", parts: [] } }] },
       { usageMetadata: { totalTokenCount: 0 } },
       { modelVersion: "gemini-native-test" },
       { responseId: "native-metadata-only" },
+      { response: null, responseId: "native-outer-fallback" },
       { modelStatus: { message: "native model status" } },
       { createTime: "2026-10-23T00:00:00Z" },
       { responseId: "native-with-extension", futureNativeResult: { task: { type: "customer", value: 9 } } },

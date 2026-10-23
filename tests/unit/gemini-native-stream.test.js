@@ -167,6 +167,10 @@ describe("native Gemini SSE preserves provider payload and follows the client pr
     ["unknown object", { message: "bridge failure" }, 502],
     ["event-only object", { event: "bridge_failure", data: "unavailable" }, 502],
     ["wrapped unknown object", { response: { message: "bridge failure" } }, 502],
+    ["null response wrapper", { response: null }, 502],
+    ["false response wrapper", { response: false }, 502],
+    ["zero response wrapper", { response: 0 }, 502],
+    ["empty-string response wrapper", { response: "" }, 502],
     ["unprojected unknown-only extension", { futureNativeResult: { task: { type: "customer", value: 9 } } }, 502],
     ["unfinished candidate", { candidates: [{ content: { parts: [{ text: "partial" }] } }] }, 502],
   ])("reports %s to account handling and records failed stream completion", async (_name, payload, status) => {
@@ -446,6 +450,9 @@ describe("native response projections preserve requested data without inventing 
     const original = frame({});
     expect(await readText(inputStream([encode(original)])
       .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, false, { masks: ["modelStatus"] })))).toBe(original);
+    const nullWrapper = JSON.stringify({ response: null });
+    expect(await readText(inputStream([encode(nullWrapper)])
+      .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, true, { masks: ["modelStatus"] })))).toBe(nullWrapper);
   });
 
   it.each([
@@ -648,7 +655,8 @@ describe("native stream integration and failure cleanup", () => {
   it.each([
     ["finishReason is masked", frame({ candidates: [{ content: { parts: [{ text: "projected answer" }] } }] }), { masks: ["candidates/content/parts/text"] }],
     ["the selected empty object is masked", frame({}), { masks: ["modelStatus"] }],
-    ["a null response wrapper falls back to its nonempty outer object", frame({ response: null }), null],
+    ["a null response wrapper falls back to its nonempty outer object", frame({ response: null, responseId: "native-outer-fallback" }), null],
+    ["a null wrapper is explicitly projected", frame({ response: null }), { masks: ["modelStatus"] }],
   ])("reports native success at accepted EOF when %s", async (_name, raw, nativeResponseProjection) => {
     const succeeded = vi.fn();
     const result = await handleStreamingResponse({
@@ -664,7 +672,23 @@ describe("native stream integration and failure cleanup", () => {
   });
 
   it.each([
+    { response: null }, { response: false }, { response: 0 }, { response: "" },
+    { event: "native-heartbeat" }, { futureNativeResult: { pending: true } },
+  ])("preserves opaque transport objects before a recognized native reply %j", async opaque => {
+    for (const nativeJson of [false, true]) {
+      const responses = [opaque, chunk, lateUsage];
+      const raw = nativeJson ? JSON.stringify(responses) : responses.map(frame).join("");
+      const succeeded = vi.fn();
+      const output = await readText(inputStream([encode(raw)]).pipeThrough(
+        nativeTransform("aistudio", FORMATS.GEMINI, null, nativeJson, null, succeeded)));
+      expect(output).toBe(raw);
+      await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+    }
+  });
+
+  it.each([
     ["HTTP 200 native error", frame(chunk) + frame({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" } }), "quota"],
+    ["null wrapper without a native reply", frame({ response: null }), '"code":502'],
     ["native error with malformed candidate field", frame({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" }, candidates: {} }), "quota"],
     ["malformed data after a terminal", frame(chunk) + "data: {not-json}\n\n", '"code":502'],
     ["non-array candidate list", frame({ candidates: {} }), '"code":502'],
@@ -691,6 +715,10 @@ describe("native stream integration and failure cleanup", () => {
     ["array with empty object", "[{}]"],
     ["array with scalar", "[17]"],
     ["empty wrapped object", '{"response":{}}'],
+    ["null response wrapper", '{"response":null}'],
+    ["false response wrapper", '{"response":false}'],
+    ["zero response wrapper", '{"response":0}'],
+    ["empty-string response wrapper", '{"response":""}'],
     ["non-array candidate list", '{"candidates":{}}'],
     ["null candidate entry", '{"candidates":[null]}'],
   ])("does not report native request success for JSON %s", async (_name, raw) => {
