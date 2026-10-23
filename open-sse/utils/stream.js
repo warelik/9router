@@ -168,7 +168,11 @@ export function createSSEStream(options = {}) {
     );
 
   const captureNativeGeminiBody = (parsed) => {
-    if (!isValidNativeGeminiResponse(parsed, nativeResponseProjection)) return false;
+    if (!isValidNativeGeminiResponse(parsed, nativeResponseProjection)) {
+      // Opaque transport objects may precede a real reply. Preserve their bytes
+      // without counting them as response evidence; an opaque-only EOF fails.
+      return isValidNativeGeminiResponse(parsed, nativeResponseProjection, true);
+    }
     nativeGeminiResponseSeen = true;
     const extracted = extractUsage(parsed);
     if (extracted) {
