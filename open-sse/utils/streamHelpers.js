@@ -11,7 +11,7 @@ function nativeResponseProjectionAllowsEmpty(projection) {
   }) || false;
 }
 
-export function isValidNativeGeminiResponse(response, projection = null) {
+export function isValidNativeGeminiResponse(response, projection = null, allowUnrecognized = false) {
   if (!response || typeof response !== "object" || Array.isArray(response)) return false;
   const allowsEmpty = nativeResponseProjectionAllowsEmpty(projection);
   if (!allowsEmpty && Object.keys(response).length === 0) return false;
@@ -24,7 +24,7 @@ export function isValidNativeGeminiResponse(response, projection = null) {
   // GenerateContent metadata can be the whole reply. Keep unknown extensions
   // opaque, while requiring a recognizable reply unless a mask projects it out.
   const nativeFields = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
-  if (!allowsEmpty && !nativeFields.some(field => Object.hasOwn(nativeResponse, field))) return false;
+  if (!allowsEmpty && !allowUnrecognized && !nativeFields.some(field => Object.hasOwn(nativeResponse, field))) return false;
   if (nativeResponse.candidates !== undefined) {
     if (!Array.isArray(nativeResponse.candidates)) return false;
     for (const candidate of nativeResponse.candidates) {
