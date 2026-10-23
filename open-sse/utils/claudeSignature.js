@@ -8,7 +8,7 @@ const MAX_CLAUDE_SIGNATURE_LEN = 32 * 1024 * 1024;
 const CLAUDE_SIGNATURE_MARKER = 0x12;
 
 function stripCachePrefix(rawSignature) {
-  const sig = (rawSignature || "").trim();
+  const sig = typeof rawSignature === "string" ? rawSignature.trim() : "";
   if (!sig) return "";
   const idx = sig.indexOf("#");
   return idx >= 0 ? sig.slice(idx + 1).trim() : sig;
@@ -30,20 +30,35 @@ export function hasClaudeSignaturePrefix(rawSignature) {
   return sig.length > 0 && (sig[0] === "E" || sig[0] === "R");
 }
 
-// Strict-ish: validates base64 layers + Claude marker byte.
-export function isValidClaudeSignature(rawSignature) {
+function decodeBase64Strict(text) {
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(text)) return null;
+  if (/[+/]/.test(text) && /[-_]/.test(text)) return null;
+  const standard = text.replace(/-/g, "+").replace(/_/g, "/");
+  const decoded = Buffer.from(standard, "base64");
+  const canonical = decoded.toString("base64");
+  const expected = standard.includes("=") ? canonical : canonical.replace(/=+$/, "");
+  return standard === expected ? decoded : null;
+}
+
+// Preserve the encoded provider value; remove only legacy cache metadata.
+// Both encoding layers must be complete canonical padded or unpadded base64.
+export function normalizeClaudeSignature(rawSignature) {
+  if (typeof rawSignature !== "string" || rawSignature.length > MAX_CLAUDE_SIGNATURE_LEN) return null;
   const sig = stripCachePrefix(rawSignature);
-  if (!sig || sig.length > MAX_CLAUDE_SIGNATURE_LEN) return false;
+  if (!sig) return null;
 
   try {
-    const decoded = Buffer.from(sig, "base64");
-    if (!decoded.length) return false;
-    if (hasClaudeMarker(decoded)) return true;
+    const decoded = decodeBase64Strict(sig);
+    if (!decoded?.length) return null;
+    if (hasClaudeMarker(decoded)) return sig;
     const outerText = decoded.toString("latin1");
-    if (!/^[A-Za-z0-9+/]+=*$/.test(outerText)) return false;
-    const inner = Buffer.from(outerText, "base64");
-    return inner.length > 0 && hasClaudeMarker(inner);
+    const inner = decodeBase64Strict(outerText);
+    return inner?.length > 0 && hasClaudeMarker(inner) ? sig : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+export function isValidClaudeSignature(rawSignature) {
+  return normalizeClaudeSignature(rawSignature) !== null;
 }

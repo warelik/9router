@@ -4,7 +4,7 @@ import { ROLE, CLAUDE_BLOCK } from "../schema/index.js";
 import { adjustMaxTokens } from "./maxTokens.js";
 import { applyCloaking } from "../../utils/claudeCloaking.js";
 import { resolveSessionId } from "../../utils/sessionManager.js";
-import { isValidClaudeSignature } from "../../utils/claudeSignature.js";
+import { normalizeClaudeSignature } from "../../utils/claudeSignature.js";
 import { PROVIDERS } from "../../providers/index.js";
 import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 import { isDeepSeekModel } from "../../providers/models/helpers.js";
@@ -288,9 +288,10 @@ export function normalizeClaudePassthrough(body, model = "") {
       const kept = [];
       for (const block of msg.content) {
         if (block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING) {
-          if (isValidClaudeSignature(block.signature)) {
+          const signature = normalizeClaudeSignature(block.signature);
+          if (signature !== null) {
             hasKeptThinking = true;
-            kept.push(block);
+            kept.push(signature === block.signature ? block : { ...block, signature });
           }
           continue;
         }
@@ -640,9 +641,10 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
             if (isThinking) {
               if (!String(block.thinking ?? "").trim()) continue;
               if (isClaudeNative) {
-                if (isValidClaudeSignature(block.signature)) {
+                const signature = normalizeClaudeSignature(block.signature);
+                if (signature !== null) {
                   hasKeptThinking = true;
-                  kept.push(block);
+                  kept.push(signature === block.signature ? block : { ...block, signature });
                 }
               } else if (deepSeekServed) {
                 hasKeptThinking = true;

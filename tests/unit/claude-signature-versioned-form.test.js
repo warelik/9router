@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isValidClaudeSignature } from "../../open-sse/utils/claudeSignature.js";
+import { isValidClaudeSignature, normalizeClaudeSignature } from "../../open-sse/utils/claudeSignature.js";
 import { normalizeClaudePassthrough, prepareClaudeRequest } from "../../open-sse/translator/formats/claude.js";
 
 const b64 = bytes => Buffer.from(bytes).toString("base64");
@@ -36,6 +36,32 @@ describe("isValidClaudeSignature accepts every Claude signature form", () => {
   it("returns a boolean for non-base64 garbage without throwing", () => {
     expect(typeof isValidClaudeSignature("CAQS!!@@$$%%")).toBe("boolean");
   });
+
+  it.each([
+    ["garbage in a C-form", "CAQS!!@@$$%%"],
+    ["garbage after a valid signature", `${cForm}!`],
+    ["internal whitespace", `${cForm.slice(0, 4)}\n${cForm.slice(4)}`],
+    ["extra padding", `${cForm}=`],
+    ["interior padding", `${cForm.slice(0, 4)}=${cForm.slice(4)}`],
+    ["noncanonical padding bits", "Eh=="],
+    ["mixed base64 alphabets", "Ev+_"],
+    ["garbage in the inner layer", Buffer.from(`${cForm}!!`).toString("base64")],
+    ["bad inner padding", Buffer.from(`${cForm}=`).toString("base64")],
+    ["inner whitespace", Buffer.from(`${cForm}\n`).toString("base64")],
+    ["non-string object", {}], ["non-string number", 7],
+    ["non-string array", []], ["non-string boolean", true],
+  ])("rejects the complete encoding for %s", (_name, signature) => {
+    expect(isValidClaudeSignature(signature)).toBe(false);
+    expect(normalizeClaudeSignature(signature)).toBeNull();
+  });
+
+  it.each([
+    eForm.replace(/=+$/, ""), rForm.replace(/=+$/, ""),
+    Buffer.from([0x12, 0xfb, 0xff]).toString("base64url"),
+  ])("preserves a valid unpadded or URL-safe provider value %s", signature => {
+    expect(isValidClaudeSignature(signature)).toBe(true);
+    expect(normalizeClaudeSignature(signature)).toBe(signature);
+  });
 });
 
 const historyWith = signature => ({
@@ -58,6 +84,31 @@ const assistantContent = body => body.messages[1].content;
 const isPlaceholder = block => block.type === "thinking" && block.thinking === ".";
 
 describe("claude passthrough keeps versioned signatures in history", () => {
+  it.each(["CAQS!!@@$$%%", `${qForm}!`, Buffer.from(`${cForm}!!`).toString("base64"), `${cForm}=`])(
+    "never forwards corrupted thinking signatures %s", signature => {
+      const normalized = historyWith(signature);
+      normalizeClaudePassthrough(normalized, "claude-opus-5-5");
+      const prepared = prepareClaudeRequest(historyWith(signature), "claude", "sk-ant-api-test");
+      for (const body of [normalized, prepared]) {
+        const content = assistantContent(body);
+        expect(content.some(block => block.signature === signature)).toBe(false);
+        expect(content.filter(block => block.type === "thinking")).toEqual([
+          expect.objectContaining({ thinking: "." }),
+        ]);
+      }
+    });
+
+  it.each([`cached-model#${cForm}`, `  ${cForm}\n`])(
+    "forwards only the validated value after legacy cache normalization %s", signature => {
+      const normalized = historyWith(signature);
+      normalizeClaudePassthrough(normalized, "claude-opus-5-5");
+      const prepared = prepareClaudeRequest(historyWith(signature), "claude", "sk-ant-api-test");
+      for (const body of [normalized, prepared]) {
+        expect(assistantContent(body)[0]).toEqual({ type: "thinking", thinking: "t", signature: cForm });
+        expect(assistantContent(body).some(isPlaceholder)).toBe(false);
+      }
+    });
+
   it("keeps a C-form thinking block and adds no placeholder (normalizeClaudePassthrough)", () => {
     const body = historyWith(cForm);
     normalizeClaudePassthrough(body, "claude-opus-5-5");
