@@ -1,0 +1,93 @@
+From fd2af2e80b137282c39f1c33428d578102c9aab8 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 00:51:31 +0000
+Subject: [PATCH] Reject unrecognized unprojected native replies while
+ preserving metadata and field masks
+
+---
+ open-sse/utils/streamHelpers.js         |  4 ++++
+ tests/unit/gemini-native-core.test.js   | 16 +++++++++++++++-
+ tests/unit/gemini-native-stream.test.js |  9 +++++++++
+ 3 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
+index a4fdc84e..2b239fd6 100644
+--- a/open-sse/utils/streamHelpers.js
++++ b/open-sse/utils/streamHelpers.js
+@@ -21,6 +21,10 @@ export function isValidNativeGeminiResponse(response, projection = null) {
+   if (!nativeResponse || typeof nativeResponse !== "object" || Array.isArray(nativeResponse)) return false;
+   if (!allowsEmpty && Object.keys(nativeResponse).length === 0) return false;
+   if (nativeResponse.error) return true;
++  // GenerateContent metadata can be the whole reply. Keep unknown extensions
++  // opaque, while requiring a recognizable reply unless a mask projects it out.
++  const nativeFields = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
++  if (!allowsEmpty && !nativeFields.some(field => Object.hasOwn(nativeResponse, field))) return false;
+   if (nativeResponse.candidates !== undefined) {
+     if (!Array.isArray(nativeResponse.candidates)) return false;
+     for (const candidate of nativeResponse.candidates) {
+diff --git a/tests/unit/gemini-native-core.test.js b/tests/unit/gemini-native-core.test.js
+index 3d42ce39..731c0591 100644
+--- a/tests/unit/gemini-native-core.test.js
++++ b/tests/unit/gemini-native-core.test.js
+@@ -287,6 +287,10 @@ describe("native Gemini requests through real chat core and executor", () => {
+       ["string", "unexpected response"],
+       ["scalar", 17],
+       ["empty object", {}],
++      ["unknown object", { message: "bridge failure" }],
++      ["event-only object", { event: "bridge_failure", data: "unavailable" }],
++      ["wrapped unknown object", { response: { message: "bridge failure" } }],
++      ["unprojected unknown-only extension", { futureNativeResult: { task: { type: "customer", value: 9 } } }],
+       ["non-array candidates", { candidates: {} }],
+       ["null candidate entry", { candidates: [null] }],
+     ])(`${provider}: rejects invalid native JSON response shape %s rather than a successful empty SDK result`, async (_shape, response) => {
+@@ -314,11 +318,21 @@ describe("native Gemini requests through real chat core and executor", () => {
+     it.each([
+       { promptFeedback: { blockReason: "SAFETY" } },
+       { candidates: [{ index: 0, finishReason: "MAX_TOKENS", content: { role: "model", parts: [] } }] },
++      { usageMetadata: { totalTokenCount: 0 } },
++      { modelVersion: "gemini-native-test" },
++      { responseId: "native-metadata-only" },
++      { modelStatus: { message: "native model status" } },
++      { createTime: "2026-10-23T00:00:00Z" },
++      { responseId: "native-with-extension", futureNativeResult: { task: { type: "customer", value: 9 } } },
+       { futureNativeResult: { task: { type: "customer", value: 9 } } },
+     ])(`${provider}: preserves native blocked, finished zero-content and nonempty future responses`, async response => {
+       const succeeded = vi.fn();
+       network.mockImplementationOnce(async () => Response.json(response));
+-      const result = await run(provider, body(), { onRequestSuccess: succeeded });
++      // A future-only reply is legitimate when the client explicitly projects
++      // out the existing response fields. Preserve the original body/assertions.
++      const queryParams = response.futureNativeResult && !response.responseId
++        ? [["fields", "futureNativeResult"]] : [];
++      const result = await run(provider, body(), { onRequestSuccess: succeeded, queryParams });
+       expect(result.success).toBe(true);
+       expect(await result.response.json()).toEqual(response);
+       await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
+index 2321dfe2..d8d3703e 100644
+--- a/tests/unit/gemini-native-stream.test.js
++++ b/tests/unit/gemini-native-stream.test.js
+@@ -164,6 +164,10 @@ describe("native Gemini SSE preserves provider payload and follows the client pr
+   it.each([
+     ["quota", { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "fixture quota" } }, 429],
+     ["malformed content", { candidates: [{ finishReason: "STOP", content: { parts: "invalid" } }] }, 502],
++    ["unknown object", { message: "bridge failure" }, 502],
++    ["event-only object", { event: "bridge_failure", data: "unavailable" }, 502],
++    ["wrapped unknown object", { response: { message: "bridge failure" } }, 502],
++    ["unprojected unknown-only extension", { futureNativeResult: { task: { type: "customer", value: 9 } } }, 502],
+     ["unfinished candidate", { candidates: [{ content: { parts: [{ text: "partial" }] } }] }, 502],
+   ])("reports %s to account handling and records failed stream completion", async (_name, payload, status) => {
+     for (const nativeJson of [false, true]) {
+@@ -318,6 +322,11 @@ describe("native Gemini SSE preserves provider payload and follows the client pr
+     { promptFeedback: { blockReason: "SAFETY" } },
+     { candidates: [{ index: 0, finishReason: "SAFETY", safetyRatings: [{ blocked: true }] }] },
+     lateUsage,
++    { modelVersion: "gemini-native-test" },
++    { responseId: "native-metadata-only" },
++    { modelStatus: { message: "native model status" } },
++    { createTime: "2026-10-23T00:00:00Z" },
++    { responseId: "native-with-extension", futureNativeResult: { task: { type: "customer", value: 9 } } },
+   ])("does not fabricate failure for a refusal, empty finished candidate or usage-only response", async body => {
+     const original = frame(body);
+     expect(await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("aistudio")))).toBe(original);
