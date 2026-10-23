@@ -1,0 +1,165 @@
+From 7ccd9350fc4005585a608be3f26964b38a7db467 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 01:02:23 +0000
+Subject: [PATCH] Keep opaque native transport frames separate from reply
+ evidence and align null-wrapper regressions
+
+---
+ open-sse/utils/stream.js                |  6 ++++-
+ open-sse/utils/streamHelpers.js         |  4 ++--
+ tests/unit/gemini-native-core.test.js   | 17 ++++++++++++++
+ tests/unit/gemini-native-stream.test.js | 30 ++++++++++++++++++++++++-
+ 4 files changed, 53 insertions(+), 4 deletions(-)
+
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index 4dc5084..655c07d 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -168,7 +168,11 @@ export function createSSEStream(options = {}) {
+     );
+ 
+   const captureNativeGeminiBody = (parsed) => {
+-    if (!isValidNativeGeminiResponse(parsed, nativeResponseProjection)) return false;
++    if (!isValidNativeGeminiResponse(parsed, nativeResponseProjection)) {
++      // Opaque transport objects may precede a real reply. Preserve their bytes
++      // without counting them as response evidence; an opaque-only EOF fails.
++      return isValidNativeGeminiResponse(parsed, nativeResponseProjection, true);
++    }
+     nativeGeminiResponseSeen = true;
+     const extracted = extractUsage(parsed);
+     if (extracted) {
+diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
+index 2b239fd..aaf2e60 100644
+--- a/open-sse/utils/streamHelpers.js
++++ b/open-sse/utils/streamHelpers.js
+@@ -11,7 +11,7 @@ function nativeResponseProjectionAllowsEmpty(projection) {
+   }) || false;
+ }
+ 
+-export function isValidNativeGeminiResponse(response, projection = null) {
++export function isValidNativeGeminiResponse(response, projection = null, allowUnrecognized = false) {
+   if (!response || typeof response !== "object" || Array.isArray(response)) return false;
+   const allowsEmpty = nativeResponseProjectionAllowsEmpty(projection);
+   if (!allowsEmpty && Object.keys(response).length === 0) return false;
+@@ -24,7 +24,7 @@ export function isValidNativeGeminiResponse(response, projection = null) {
+   // GenerateContent metadata can be the whole reply. Keep unknown extensions
+   // opaque, while requiring a recognizable reply unless a mask projects it out.
+   const nativeFields = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
+-  if (!allowsEmpty && !nativeFields.some(field => Object.hasOwn(nativeResponse, field))) return false;
++  if (!allowsEmpty && !allowUnrecognized && !nativeFields.some(field => Object.hasOwn(nativeResponse, field))) return false;
+   if (nativeResponse.candidates !== undefined) {
+     if (!Array.isArray(nativeResponse.candidates)) return false;
+     for (const candidate of nativeResponse.candidates) {
+diff --git a/tests/unit/gemini-native-core.test.js b/tests/unit/gemini-native-core.test.js
+index 731c059..6ddb5f2 100644
+--- a/tests/unit/gemini-native-core.test.js
++++ b/tests/unit/gemini-native-core.test.js
+@@ -290,6 +290,10 @@ describe("native Gemini requests through real chat core and executor", () => {
+       ["unknown object", { message: "bridge failure" }],
+       ["event-only object", { event: "bridge_failure", data: "unavailable" }],
+       ["wrapped unknown object", { response: { message: "bridge failure" } }],
++      ["null response wrapper", { response: null }],
++      ["false response wrapper", { response: false }],
++      ["zero response wrapper", { response: 0 }],
++      ["empty-string response wrapper", { response: "" }],
+       ["unprojected unknown-only extension", { futureNativeResult: { task: { type: "customer", value: 9 } } }],
+       ["non-array candidates", { candidates: {} }],
+       ["null candidate entry", { candidates: [null] }],
+@@ -315,12 +319,25 @@ describe("native Gemini requests through real chat core and executor", () => {
+       expect(await result.response.json()).toEqual({});
+     });
+ 
++    it(`${provider}: preserves a projected null wrapper without inventing a failure`, async () => {
++      const response = { response: null };
++      const succeeded = vi.fn();
++      network.mockImplementationOnce(async () => Response.json(response));
++      const result = await run(provider, body(), {
++        queryParams: [["fields", "modelStatus"]], onRequestSuccess: succeeded,
++      });
++      expect(result.success).toBe(true);
++      expect(await result.response.json()).toEqual(response);
++      await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
++    });
++
+     it.each([
+       { promptFeedback: { blockReason: "SAFETY" } },
+       { candidates: [{ index: 0, finishReason: "MAX_TOKENS", content: { role: "model", parts: [] } }] },
+       { usageMetadata: { totalTokenCount: 0 } },
+       { modelVersion: "gemini-native-test" },
+       { responseId: "native-metadata-only" },
++      { response: null, responseId: "native-outer-fallback" },
+       { modelStatus: { message: "native model status" } },
+       { createTime: "2026-10-23T00:00:00Z" },
+       { responseId: "native-with-extension", futureNativeResult: { task: { type: "customer", value: 9 } } },
+diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
+index d8d3703..f1602eb 100644
+--- a/tests/unit/gemini-native-stream.test.js
++++ b/tests/unit/gemini-native-stream.test.js
+@@ -167,6 +167,10 @@ describe("native Gemini SSE preserves provider payload and follows the client pr
+     ["unknown object", { message: "bridge failure" }, 502],
+     ["event-only object", { event: "bridge_failure", data: "unavailable" }, 502],
+     ["wrapped unknown object", { response: { message: "bridge failure" } }, 502],
++    ["null response wrapper", { response: null }, 502],
++    ["false response wrapper", { response: false }, 502],
++    ["zero response wrapper", { response: 0 }, 502],
++    ["empty-string response wrapper", { response: "" }, 502],
+     ["unprojected unknown-only extension", { futureNativeResult: { task: { type: "customer", value: 9 } } }, 502],
+     ["unfinished candidate", { candidates: [{ content: { parts: [{ text: "partial" }] } }] }, 502],
+   ])("reports %s to account handling and records failed stream completion", async (_name, payload, status) => {
+@@ -446,6 +450,9 @@ describe("native response projections preserve requested data without inventing
+     const original = frame({});
+     expect(await readText(inputStream([encode(original)])
+       .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, false, { masks: ["modelStatus"] })))).toBe(original);
++    const nullWrapper = JSON.stringify({ response: null });
++    expect(await readText(inputStream([encode(nullWrapper)])
++      .pipeThrough(nativeTransform("gemini", FORMATS.GEMINI, null, true, { masks: ["modelStatus"] })))).toBe(nullWrapper);
+   });
+ 
+   it.each([
+@@ -648,7 +655,8 @@ describe("native stream integration and failure cleanup", () => {
+   it.each([
+     ["finishReason is masked", frame({ candidates: [{ content: { parts: [{ text: "projected answer" }] } }] }), { masks: ["candidates/content/parts/text"] }],
+     ["the selected empty object is masked", frame({}), { masks: ["modelStatus"] }],
+-    ["a null response wrapper falls back to its nonempty outer object", frame({ response: null }), null],
++    ["a null response wrapper falls back to its nonempty outer object", frame({ response: null, responseId: "native-outer-fallback" }), null],
++    ["a null wrapper is explicitly projected", frame({ response: null }), { masks: ["modelStatus"] }],
+   ])("reports native success at accepted EOF when %s", async (_name, raw, nativeResponseProjection) => {
+     const succeeded = vi.fn();
+     const result = await handleStreamingResponse({
+@@ -663,8 +671,24 @@ describe("native stream integration and failure cleanup", () => {
+     await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+   });
+ 
++  it.each([
++    { response: null }, { response: false }, { response: 0 }, { response: "" },
++    { event: "native-heartbeat" }, { futureNativeResult: { pending: true } },
++  ])("preserves opaque transport objects before a recognized native reply %j", async opaque => {
++    for (const nativeJson of [false, true]) {
++      const responses = [opaque, chunk, lateUsage];
++      const raw = nativeJson ? JSON.stringify(responses) : responses.map(frame).join("");
++      const succeeded = vi.fn();
++      const output = await readText(inputStream([encode(raw)]).pipeThrough(
++        nativeTransform("aistudio", FORMATS.GEMINI, null, nativeJson, null, succeeded)));
++      expect(output).toBe(raw);
++      await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
++    }
++  });
++
+   it.each([
+     ["HTTP 200 native error", frame(chunk) + frame({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" } }), "quota"],
++    ["null wrapper without a native reply", frame({ response: null }), '"code":502'],
+     ["native error with malformed candidate field", frame({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota" }, candidates: {} }), "quota"],
+     ["malformed data after a terminal", frame(chunk) + "data: {not-json}\n\n", '"code":502'],
+     ["non-array candidate list", frame({ candidates: {} }), '"code":502'],
+@@ -691,6 +715,10 @@ describe("native stream integration and failure cleanup", () => {
+     ["array with empty object", "[{}]"],
+     ["array with scalar", "[17]"],
+     ["empty wrapped object", '{"response":{}}'],
++    ["null response wrapper", '{"response":null}'],
++    ["false response wrapper", '{"response":false}'],
++    ["zero response wrapper", '{"response":0}'],
++    ["empty-string response wrapper", '{"response":""}'],
+     ["non-array candidate list", '{"candidates":{}}'],
+     ["null candidate entry", '{"candidates":[null]}'],
+   ])("does not report native request success for JSON %s", async (_name, raw) => {
