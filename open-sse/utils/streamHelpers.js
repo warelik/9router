@@ -22,6 +22,10 @@ export function isValidNativeGeminiResponse(response, projection = null) {
   if (!nativeResponse || typeof nativeResponse !== "object" || Array.isArray(nativeResponse)) return false;
   if (!allowsEmpty && Object.keys(nativeResponse).length === 0) return false;
   if (nativeResponse.error) return true;
+  // GenerateContent metadata can be the whole reply. Keep unknown extensions
+  // opaque, while requiring a recognizable reply unless a mask projects it out.
+  const nativeFields = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
+  if (!allowsEmpty && !nativeFields.some(field => Object.hasOwn(nativeResponse, field))) return false;
   if (nativeResponse.candidates !== undefined) {
     if (!Array.isArray(nativeResponse.candidates)) return false;
     for (const candidate of nativeResponse.candidates) {

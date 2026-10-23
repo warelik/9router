@@ -287,6 +287,10 @@ describe("native Gemini requests through real chat core and executor", () => {
       ["string", "unexpected response"],
       ["scalar", 17],
       ["empty object", {}],
+      ["unknown object", { message: "bridge failure" }],
+      ["event-only object", { event: "bridge_failure", data: "unavailable" }],
+      ["wrapped unknown object", { response: { message: "bridge failure" } }],
+      ["unprojected unknown-only extension", { futureNativeResult: { task: { type: "customer", value: 9 } } }],
       ["non-array candidates", { candidates: {} }],
       ["null candidate entry", { candidates: [null] }],
     ])(`${provider}: rejects invalid native JSON response shape %s rather than a successful empty SDK result`, async (_shape, response) => {
@@ -314,11 +318,21 @@ describe("native Gemini requests through real chat core and executor", () => {
     it.each([
       { promptFeedback: { blockReason: "SAFETY" } },
       { candidates: [{ index: 0, finishReason: "MAX_TOKENS", content: { role: "model", parts: [] } }] },
+      { usageMetadata: { totalTokenCount: 0 } },
+      { modelVersion: "gemini-native-test" },
+      { responseId: "native-metadata-only" },
+      { modelStatus: { message: "native model status" } },
+      { createTime: "2026-10-23T00:00:00Z" },
+      { responseId: "native-with-extension", futureNativeResult: { task: { type: "customer", value: 9 } } },
       { futureNativeResult: { task: { type: "customer", value: 9 } } },
     ])(`${provider}: preserves native blocked, finished zero-content and nonempty future responses`, async response => {
       const succeeded = vi.fn();
       network.mockImplementationOnce(async () => Response.json(response));
-      const result = await run(provider, body(), { onRequestSuccess: succeeded });
+      // A future-only reply is legitimate when the client explicitly projects
+      // out the existing response fields. Preserve the original body/assertions.
+      const queryParams = response.futureNativeResult && !response.responseId
+        ? [["fields", "futureNativeResult"]] : [];
+      const result = await run(provider, body(), { onRequestSuccess: succeeded, queryParams });
       expect(result.success).toBe(true);
       expect(await result.response.json()).toEqual(response);
       await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
