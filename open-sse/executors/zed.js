@@ -90,9 +90,16 @@ function buildProviderRequest(provider, model, body, stream, credentials) {
   return { ...(body || {}), model, stream: stream !== false };
 }
 
-function initProviderState(provider, model) {
+function initProviderState(provider, model, continuity = null) {
   if (provider === ZED_PROVIDER.anthropic) return initState(FORMATS.CLAUDE);
-  if (provider === ZED_PROVIDER.google) return initState(FORMATS.GEMINI);
+  if (provider === ZED_PROVIDER.google) {
+    return {
+      ...initState(FORMATS.GEMINI), model,
+      sessionId: continuity?.sessionId || null,
+      serverPartsSessionId: continuity?.serverPartsSessionId || null,
+      turnScope: continuity?.turnScope || null,
+    };
+  }
   if (provider === ZED_PROVIDER.openai) return initState(FORMATS.OPENAI_RESPONSES);
   const state = initState(FORMATS.OPENAI);
   state.model = model;
@@ -157,12 +164,12 @@ function normalizeStatus(status) {
   return null;
 }
 
-function wrapZedCompletionStream(response, provider, model) {
+function wrapZedCompletionStream(response, provider, model, continuity = null) {
   if (!response.ok || !response.body) return response;
 
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
-  const state = initProviderState(provider, model);
+  const state = initProviderState(provider, model, continuity);
   let buffer = "";
   let done = false;
 
@@ -258,6 +265,13 @@ class ZedExecutor extends BaseExecutor {
   async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
     const { provider } = await this.resolveModel(model, credentials, signal, log);
     const providerRequest = buildProviderRequest(provider, model, body, stream, credentials);
+    // Request translation records the exact history scope. Snapshot it before
+    // awaiting fetch so another request cannot replace this decoder's context.
+    const continuity = provider === ZED_PROVIDER.google ? {
+      sessionId: credentials?._clientSessionId || null,
+      serverPartsSessionId: credentials?._geminiServerPartsSessionId || null,
+      turnScope: credentials?._geminiTurnScope || null,
+    } : null;
     const bodyRecord = body || {};
     const payload = {
       thread_id: bodyRecord.thread_id || credentials?._clientSessionId,
@@ -284,7 +298,7 @@ class ZedExecutor extends BaseExecutor {
       },
     });
 
-    const wrapped = response.ok ? wrapZedCompletionStream(response, provider, model) : response;
+    const wrapped = response.ok ? wrapZedCompletionStream(response, provider, model, continuity) : response;
     return {
       response: wrapped,
       url: `${this.config?.llmBaseUrl || "https://cloud.zed.dev"}/completions`,
