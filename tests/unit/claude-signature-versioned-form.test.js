@@ -57,7 +57,7 @@ describe("isValidClaudeSignature accepts every Claude signature form", () => {
 
   it.each([
     eForm.replace(/=+$/, ""), rForm.replace(/=+$/, ""),
-    Buffer.from([0x12, 0xfb, 0xff]).toString("base64url"),
+    Buffer.from([0x12, 0x02, 0xfb, 0xff]).toString("base64url"),
   ])("preserves a valid unpadded or URL-safe provider value %s", signature => {
     expect(isValidClaudeSignature(signature)).toBe(true);
     expect(normalizeClaudeSignature(signature)).toBe(signature);
