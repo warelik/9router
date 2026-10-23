@@ -164,6 +164,10 @@ describe("native Gemini SSE preserves provider payload and follows the client pr
   it.each([
     ["quota", { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "fixture quota" } }, 429],
     ["malformed content", { candidates: [{ finishReason: "STOP", content: { parts: "invalid" } }] }, 502],
+    ["unknown object", { message: "bridge failure" }, 502],
+    ["event-only object", { event: "bridge_failure", data: "unavailable" }, 502],
+    ["wrapped unknown object", { response: { message: "bridge failure" } }, 502],
+    ["unprojected unknown-only extension", { futureNativeResult: { task: { type: "customer", value: 9 } } }, 502],
     ["unfinished candidate", { candidates: [{ content: { parts: [{ text: "partial" }] } }] }, 502],
   ])("reports %s to account handling and records failed stream completion", async (_name, payload, status) => {
     for (const nativeJson of [false, true]) {
@@ -318,6 +322,11 @@ describe("native Gemini SSE preserves provider payload and follows the client pr
     { promptFeedback: { blockReason: "SAFETY" } },
     { candidates: [{ index: 0, finishReason: "SAFETY", safetyRatings: [{ blocked: true }] }] },
     lateUsage,
+    { modelVersion: "gemini-native-test" },
+    { responseId: "native-metadata-only" },
+    { modelStatus: { message: "native model status" } },
+    { createTime: "2026-10-23T00:00:00Z" },
+    { responseId: "native-with-extension", futureNativeResult: { task: { type: "customer", value: 9 } } },
   ])("does not fabricate failure for a refusal, empty finished candidate or usage-only response", async body => {
     const original = frame(body);
     expect(await readText(inputStream([encode(original)]).pipeThrough(nativeTransform("aistudio")))).toBe(original);
