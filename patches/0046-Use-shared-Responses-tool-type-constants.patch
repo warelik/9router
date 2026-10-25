@@ -1,4 +1,4 @@
-From b764839e897aec81f55cdc79f4243e438a2381fd Mon Sep 17 00:00:00 2001
+From 0447942274fb57fe87324af98ccfa9c8cc35fba1 Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]"
  <41898282+github-actions[bot]@users.noreply.github.com>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
@@ -7,6 +7,11 @@ Subject: [PATCH] Use shared translator protocol discriminators
 ---
  open-sse/executors/codex.js                   | 17 +++---
  open-sse/executors/default.js                 |  5 +-
+ open-sse/executors/zed.js                     |  2 +-
+ .../handlers/chatCore/nonStreamingHandler.js  |  4 +-
+ open-sse/providers/registry/aistudio.js       |  4 +-
+ open-sse/services/provider.js                 |  3 +-
+ .../translator/concerns/thinkingUnified.js    |  5 +-
  open-sse/translator/concerns/toolCall.js      | 15 +++---
  open-sse/translator/formats/gemini.js         |  4 +-
  open-sse/translator/index.js                  |  6 ++-
@@ -18,7 +23,7 @@ Subject: [PATCH] Use shared translator protocol discriminators
  open-sse/utils/opencodeFingerprint.js         | 16 +++---
  .../unit/codex-hosted-search-history.test.js  |  6 +++
  .../unit/openai-responses-web-search.test.js  | 52 +++++++++++++++++++
- 13 files changed, 108 insertions(+), 35 deletions(-)
+ 18 files changed, 119 insertions(+), 42 deletions(-)
 
 diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
 index da0824495ac7e602afbce2b922dd592e37679eee..751cb0a48e3ffa2944ea91e42f6259a6058e4da1 100644
@@ -106,6 +111,113 @@ index 3c8cbaaf77989d41f6147e45e665d7a7b38ee61e..9e8d87c83c21d9619a5812c934cbff7b
  }
  
  function normalizeResponsesReasoning(body) {
+diff --git a/open-sse/executors/zed.js b/open-sse/executors/zed.js
+index 1233e77239f6cae3ca5f15c925d2d0c340333a0d..bfe3a2cc8d8c8e0d0b66c88ecaeba4d14a59ebbd 100644
+--- a/open-sse/executors/zed.js
++++ b/open-sse/executors/zed.js
+@@ -68,7 +68,7 @@ function buildProviderRequest(provider, model, body, stream, credentials) {
+   if (provider === ZED_PROVIDER.google) {
+     ensureToolCallIds(body, { preserveIds: true });
+     const geminiRequest = openaiToGeminiRequest(model, body, true, credentials);
+-    applyThinking("gemini", model, geminiRequest, "gemini", captureThinking(body));
++    applyThinking(FORMATS.GEMINI, model, geminiRequest, "gemini", captureThinking(body));
+     // Zed's hosted Gemini backend speaks the Vertex safety vocabulary, not the
+     // public Gemini API enum the shared translator emits (`OFF`, `CIVIC_INTEGRITY`,
+     // `DANGEROUS_CONTENT`). Drop client-side safetySettings for the Zed Google
+diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
+index f46bddd6cbebf920087efa3a4292d9eb185268f4..74017ed02de4573c9d5b264b17c25ff2b85b4034 100644
+--- a/open-sse/handlers/chatCore/nonStreamingHandler.js
++++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
+@@ -211,7 +211,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
+     if (toolCalls.length > 0) message.tool_calls = toolCalls;
+     if (!message.content && !message.tool_calls) message.content = "";
+ 
+-    let finishReason = toOpenAIFinish(candidate.finishReason || "STOP", "gemini");
++    let finishReason = toOpenAIFinish(candidate.finishReason || "STOP", FORMATS.GEMINI);
+     if (finishReason === "stop" && toolCalls.length > 0) finishReason = "tool_calls";
+ 
+     const result = {
+@@ -223,7 +223,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
+     };
+ 
+     if (usage) {
+-      result.usage = toOpenAIUsage(usage, "gemini");
++      result.usage = toOpenAIUsage(usage, FORMATS.GEMINI);
+     }
+     // Same hand-off as the OpenAI-shaped branches above: Claude and Responses clients must not
+     // receive a bare chat.completion body.
+diff --git a/open-sse/providers/registry/aistudio.js b/open-sse/providers/registry/aistudio.js
+index 71b07e57171495d83b06b4f0787faef1120dac5b..2eeed51b64712e5c3d35d509e01e5243c9f470bc 100644
+--- a/open-sse/providers/registry/aistudio.js
++++ b/open-sse/providers/registry/aistudio.js
+@@ -3,6 +3,8 @@
+ // `thoughtSignature` of a thinking turn; its OpenAI and Claude surfaces drop it (or fake it), and
+ // without it the model cannot use its own earlier reasoning. So this provider talks Gemini wire.
+ // The model list is whatever the bridge serves, hence passthroughModels and no seeded ids.
++import { FORMATS } from "../../translator/formats.js";
++
+ export default {
+   id: "aistudio",
+   priority: 60,
+@@ -22,7 +24,7 @@ export default {
+   authModes: ["apikey"],
+   transport: {
+     baseUrl: "http://127.0.0.1:7860/v1beta/models",
+-    format: "gemini",
++    format: FORMATS.GEMINI,
+     validateUrl: "http://127.0.0.1:7860/v1/models",
+     auth: {
+       apiKey: {
+diff --git a/open-sse/services/provider.js b/open-sse/services/provider.js
+index a15cb6fa6b5f1b82c44ee490fdaf7818ac2c9253..c6bcba8b253e986d50f5f80aadd4f8bf92db26b7 100644
+--- a/open-sse/services/provider.js
++++ b/open-sse/services/provider.js
+@@ -1,5 +1,6 @@
+ import { PROVIDERS } from "../config/providers.js";
+ import { OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
++import { FORMATS } from "../translator/formats.js";
+ 
+ const OPENAI_COMPATIBLE_PREFIX = "openai-compatible-";
+ const OPENAI_COMPATIBLE_DEFAULTS = {
+@@ -146,7 +147,7 @@ export function getTargetFormat(provider, credentials = null) {
+ // Its executor can adapt that envelope without translating the Gemini payload.
+ // Other Antigravity models (including image generation) keep their own path.
+ export function supportsNativeGemini(provider, model) {
+-  if (getTargetFormat(provider) === "gemini") return true;
++  if (getTargetFormat(provider) === FORMATS.GEMINI) return true;
+   return provider === "antigravity" && typeof model === "string"
+     && model.startsWith("gemini-") && !/image|imagen/i.test(model);
+ }
+diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
+index d1ff50ae5a26b7ba88657f2ae04e347407365e83..64fece84a30d0c47b4cfc26d26e0917ff4ea6b21 100644
+--- a/open-sse/translator/concerns/thinkingUnified.js
++++ b/open-sse/translator/concerns/thinkingUnified.js
+@@ -7,6 +7,7 @@ import { getThinkingLevels } from "../../providers/thinkingLevels.js";
+ import { PROVIDERS } from "../../providers/index.js";
+ import { LEVEL_TO_BUDGET, budgetToLevel, effortToBudget, effortToThinkingLevel } from "./thinking.js";
+ import { DEFAULT_PROVIDER_THINKING_BUDGET, NATIVE_GEMINI_THINKING_KEYS } from "../../config/runtimeConfig.js";
++import { FORMATS } from "../formats.js";
+ 
+ // Map a target wire-format to its native thinking format (when capability has none).
+ const FORMAT_TO_NATIVE = {
+@@ -451,7 +452,7 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
+   const fmt = resolveFormat(targetFormat, cleanModel, provider);
+   const supportedLevels = getThinkingLevels(provider, cleanModel);
+   // A translated/native Responses request already owns its wire options; preserve explicit effort and opaque reasoning fields without inventing a summary.
+-  if (preserveResponsesOptions && targetFormat === "openai-responses") {
++  if (preserveResponsesOptions && targetFormat === FORMATS.OPENAI_RESPONSES) {
+     const current = body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning) ? body.reasoning : {};
+     const rawEffort = body.reasoning_effort ?? current.effort;
+     const inferred = cfg.mode === "none" ? "none" : toLevel(cfg);
+@@ -488,7 +489,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
+ 
+   // Reuse the capability-aware mapping, without its translated-request output
+   // floor or its replacement of client-native options such as includeThoughts.
+-  const mapped = applyThinking("gemini", model, {}, provider, intent).generationConfig?.thinkingConfig;
++  const mapped = applyThinking(FORMATS.GEMINI, model, {}, provider, intent).generationConfig?.thinkingConfig;
+   if (!mapped) return body;
+   const thinking = { ...clientThinking };
+   for (const key of NATIVE_GEMINI_THINKING_KEYS) delete thinking[key];
 diff --git a/open-sse/translator/concerns/toolCall.js b/open-sse/translator/concerns/toolCall.js
 index 95cca8b61b744248601e85a208cff7f2c3293b23..51d2372fc74e1d9c3e217c8537659fd4d7d63fd6 100644
 --- a/open-sse/translator/concerns/toolCall.js
