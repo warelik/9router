@@ -1,15 +1,19 @@
-From 0447942274fb57fe87324af98ccfa9c8cc35fba1 Mon Sep 17 00:00:00 2001
+From 77cc43123e4c03a4b4424262fc4c953a0f710d29 Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]"
  <41898282+github-actions[bot]@users.noreply.github.com>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Use shared translator protocol discriminators
 
 ---
- open-sse/executors/codex.js                   | 17 +++---
+ open-sse/executors/antigravity.js             |  2 +-
+ open-sse/executors/codex.js                   | 29 ++++++-----
  open-sse/executors/default.js                 |  5 +-
  open-sse/executors/zed.js                     |  2 +-
- .../handlers/chatCore/nonStreamingHandler.js  |  4 +-
+ open-sse/handlers/chatCore.js                 |  2 +-
+ .../handlers/chatCore/nonStreamingHandler.js  | 14 ++---
+ .../handlers/chatCore/streamingHandler.js     |  2 +-
  open-sse/providers/registry/aistudio.js       |  4 +-
+ open-sse/services/aistudioModels.js           |  4 +-
  open-sse/services/provider.js                 |  3 +-
  .../translator/concerns/thinkingUnified.js    |  5 +-
  open-sse/translator/concerns/toolCall.js      | 15 +++---
@@ -20,18 +24,33 @@ Subject: [PATCH] Use shared translator protocol discriminators
  .../translator/response/openai-responses.js   |  8 +--
  open-sse/translator/schema/blocks.js          |  5 ++
  open-sse/translator/schema/index.js           |  1 +
+ open-sse/utils/antigravityNative.js           | 16 +++---
  open-sse/utils/opencodeFingerprint.js         | 16 +++---
+ open-sse/utils/stream.js                      |  2 +-
  .../unit/codex-hosted-search-history.test.js  |  6 +++
  .../unit/openai-responses-web-search.test.js  | 52 +++++++++++++++++++
- 18 files changed, 119 insertions(+), 42 deletions(-)
+ 24 files changed, 145 insertions(+), 66 deletions(-)
 
+diff --git a/open-sse/executors/antigravity.js b/open-sse/executors/antigravity.js
+index 5df814499b11bde62e8c316bd714c4a76b04639b..9cdd7f7abd28472ee8db4a3f82e1cbab994db002 100644
+--- a/open-sse/executors/antigravity.js
++++ b/open-sse/executors/antigravity.js
+@@ -429,7 +429,7 @@ export class AntigravityExecutor extends BaseExecutor {
+     const jsonOutput = Boolean(options.credentials?.nativeGeminiPassthrough && nativeGeminiRequestsJsonOutput(options.body));
+     if (options.credentials?.nativeGeminiPassthrough) {
+       const error = validateAntigravityFieldMask(options.credentials.nativeGeminiRequest);
+-      if (error) return { response: Response.json(error, { status: 400 }), headers: {}, url: null, transformedBody: null };
++      if (error) return { response: Response.json(error, { status: HTTP_STATUS.BAD_REQUEST }), headers: {}, url: null, transformedBody: null };
+     }
+     const result = await super.execute(options);
+     if (options.credentials?.nativeGeminiPassthrough) {
 diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
-index da0824495ac7e602afbce2b922dd592e37679eee..751cb0a48e3ffa2944ea91e42f6259a6058e4da1 100644
+index da0824495ac7e602afbce2b922dd592e37679eee..67b766b26fb45253ec919a5236fce009f19915d7 100644
 --- a/open-sse/executors/codex.js
 +++ b/open-sse/executors/codex.js
 @@ -1,4 +1,5 @@
  import { BaseExecutor } from "./base.js";
-+import { RESPONSES_ITEM, RESPONSES_TOOL } from "../translator/schema/index.js";
++import { RESPONSES_ITEM, RESPONSES_TOOL, ROLE } from "../translator/schema/index.js";
  import { CODEX_DEFAULT_INSTRUCTIONS } from "../config/codexInstructions.js";
  import { PROVIDERS } from "../config/providers.js";
  import {
@@ -53,7 +72,7 @@ index da0824495ac7e602afbce2b922dd592e37679eee..751cb0a48e3ffa2944ea91e42f6259a6
        headers["x-openai-internal-codex-responses-lite"] = "true";
      }
      headers["session_id"] = this._currentSessionId || credentials?.connectionId || "default";
-@@ -474,17 +475,17 @@ export class CodexExecutor extends BaseExecutor {
+@@ -474,32 +475,32 @@ export class CodexExecutor extends BaseExecutor {
      // otherwise upstream answers 200 with a terminal SSE error. The /compact
      // endpoint was not observed failing this way, so its request is left unchanged.
      const hasHostedSearchHistory = !this._isCompact && Array.isArray(body.input)
@@ -72,12 +91,22 @@ index da0824495ac7e602afbce2b922dd592e37679eee..751cb0a48e3ffa2944ea91e42f6259a6
 -      && (body.tools?.some?.(tool => tool?.type === "web_search")
 -        || body.input.some(item => item?.type === "additional_tools" && item.tools?.some?.(tool => tool?.type === "web_search")))) {
 +      && (body.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH)
-+        || body.input.some(item => item?.type === "additional_tools" && item.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH)))) {
++        || body.input.some(item => item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS && item.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH)))) {
        const tools = Array.isArray(body.tools) ? [...body.tools] : [];
        const seen = new Set(tools.map(tool => `${tool?.type}:${tool?.name || tool?.function?.name || ""}`));
        for (const item of body.input) {
-@@ -499,7 +500,7 @@ export class CodexExecutor extends BaseExecutor {
-       body.input = body.input.filter(item => item?.type !== "additional_tools");
+-        if (item?.type !== "additional_tools" || !Array.isArray(item.tools)) continue;
++        if (item?.type !== RESPONSES_ITEM.ADDITIONAL_TOOLS || !Array.isArray(item.tools)) continue;
+         for (const tool of item.tools) {
+           const name = `${tool?.type}:${tool?.name || tool?.function?.name || ""}`;
+           if (!seen.has(name)) { tools.push(tool); seen.add(name); }
+         }
+       }
+       body.tools = tools;
+-      convertedLitePrefix = body.input.some(item => item?.type === "additional_tools");
+-      body.input = body.input.filter(item => item?.type !== "additional_tools");
++      convertedLitePrefix = body.input.some(item => item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS);
++      body.input = body.input.filter(item => item?.type !== RESPONSES_ITEM.ADDITIONAL_TOOLS);
      }
      const responsesLite = isCodexResponsesLiteModel(upstreamModel)
 -      && !body.tools?.some?.(tool => tool?.type === "web_search");
@@ -85,6 +114,23 @@ index da0824495ac7e602afbce2b922dd592e37679eee..751cb0a48e3ffa2944ea91e42f6259a6
  
      // Ensure input is present and non-empty (Codex API rejects empty input)
      if (!body.input || (Array.isArray(body.input) && body.input.length === 0)) {
+@@ -535,13 +536,13 @@ export class CodexExecutor extends BaseExecutor {
+     if (responsesLite) {
+       // Codex 0.155 carries tools and instructions as input prefix items.
+       const input = Array.isArray(body.input) ? body.input : [body.input];
+-      const hasLitePrefix = input.some((item) => item?.type === "additional_tools");
++      const hasLitePrefix = input.some((item) => item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS);
+       if (!hasLitePrefix) {
+         const instructions = typeof body.instructions === "string" && body.instructions.trim()
+           ? body.instructions : CODEX_DEFAULT_INSTRUCTIONS;
+-        const prefix = [{ type: "additional_tools", role: "developer", tools: Array.isArray(body.tools) ? body.tools : [] }];
++        const prefix = [{ type: RESPONSES_ITEM.ADDITIONAL_TOOLS, role: ROLE.DEVELOPER, tools: Array.isArray(body.tools) ? body.tools : [] }];
+         if (instructions) {
+-          prefix.push({ type: "message", role: "developer", content: [{ type: "input_text", text: instructions }] });
++          prefix.push({ type: RESPONSES_ITEM.MESSAGE, role: ROLE.DEVELOPER, content: [{ type: RESPONSES_ITEM.INPUT_TEXT, text: instructions }] });
+         }
+         input.unshift(...prefix);
+       }
 diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
 index 3c8cbaaf77989d41f6147e45e665d7a7b38ee61e..9e8d87c83c21d9619a5812c934cbff7b2e22c613 100644
 --- a/open-sse/executors/default.js
@@ -124,19 +170,54 @@ index 1233e77239f6cae3ca5f15c925d2d0c340333a0d..bfe3a2cc8d8c8e0d0b66c88ecaeba4d1
      // Zed's hosted Gemini backend speaks the Vertex safety vocabulary, not the
      // public Gemini API enum the shared translator emits (`OFF`, `CIVIC_INTEGRITY`,
      // `DANGEROUS_CONTENT`). Drop client-side safetySettings for the Zed Google
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index 8f3f50548465847593d9d4bcfbc38ee2026a6be3..d405c2ad194df160eea418f10521542bf737e55b 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -65,7 +65,7 @@ export function stripContinuityFields(body) {
+ export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onRequestFailure, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, serverPartsTenant = null, providerThinking, providerOverrides }) {
+   if (credentials) credentials._geminiServerPartsSessionId = null;
+   const { provider, model } = modelInfo;
+-  if (clientSignal?.aborted) return createErrorResult(499, "Request aborted");
++  if (clientSignal?.aborted) return createErrorResult(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+   const requestStartTime = Date.now();
+   // Stable per-session color so all lines of one CLI conversation share a tag
+   const sessionSeed = (() => {
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index f46bddd6cbebf920087efa3a4292d9eb185268f4..74017ed02de4573c9d5b264b17c25ff2b85b4034 100644
+index f46bddd6cbebf920087efa3a4292d9eb185268f4..7cecf6203812401370fc74dcfe452525c1a32308 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
-@@ -211,7 +211,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
+@@ -14,7 +14,7 @@ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, sav
+ import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+ import { decloakToolNames } from "../../utils/claudeCloaking.js";
+ import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
+-import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
++import { ROLE, RESPONSES_ITEM, OPENAI_FINISH, GEMINI_FINISH } from "../../translator/schema/index.js";
+ import { storeGeminiTurnSignature, storeGeminiThoughtSignature, storeGeminiServerParts, storeGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
+ import { toOpenAIFinish } from "../../translator/concerns/finishReason.js";
+ 
+@@ -99,8 +99,8 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
+ 
+   const usage = responseBody.usage || {};
+   // Responses has no "length"/"content_filter" status: a cut-off turn is `incomplete` with a reason.
+-  const incompleteReason = choice.finish_reason === "length" ? "max_output_tokens"
+-    : choice.finish_reason === "content_filter" ? "content_filter" : null;
++  const incompleteReason = choice.finish_reason === OPENAI_FINISH.LENGTH ? "max_output_tokens"
++    : choice.finish_reason === OPENAI_FINISH.CONTENT_FILTER ? "content_filter" : null;
+   const status = incompleteReason ? "incomplete" : "completed";
+ 
+   return {
+@@ -211,8 +211,8 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
      if (toolCalls.length > 0) message.tool_calls = toolCalls;
      if (!message.content && !message.tool_calls) message.content = "";
  
 -    let finishReason = toOpenAIFinish(candidate.finishReason || "STOP", "gemini");
-+    let finishReason = toOpenAIFinish(candidate.finishReason || "STOP", FORMATS.GEMINI);
-     if (finishReason === "stop" && toolCalls.length > 0) finishReason = "tool_calls";
+-    if (finishReason === "stop" && toolCalls.length > 0) finishReason = "tool_calls";
++    let finishReason = toOpenAIFinish(candidate.finishReason || GEMINI_FINISH.STOP, FORMATS.GEMINI);
++    if (finishReason === OPENAI_FINISH.STOP && toolCalls.length > 0) finishReason = OPENAI_FINISH.TOOL_CALLS;
  
      const result = {
+       id: `chatcmpl-${response.responseId || Date.now()}`,
 @@ -223,7 +223,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
      };
  
@@ -146,6 +227,28 @@ index f46bddd6cbebf920087efa3a4292d9eb185268f4..74017ed02de4573c9d5b264b17c25ff2
      }
      // Same hand-off as the OpenAI-shaped branches above: Claude and Responses clients must not
      // receive a bare chat.completion body.
+@@ -344,7 +344,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
+     }
+     if (responseBody.error) {
+       const reportedCode = Number(responseBody.error.code);
+-      const status = Number.isInteger(reportedCode) && reportedCode >= 400 && reportedCode <= 599
++      const status = Number.isInteger(reportedCode) && reportedCode >= HTTP_STATUS.BAD_REQUEST && reportedCode <= 599
+         ? reportedCode : HTTP_STATUS.BAD_GATEWAY;
+       const message = typeof responseBody.error.message === "string"
+         ? responseBody.error.message : `Native Gemini error from ${provider}`;
+diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
+index f9ee8f3d0e954b8b95ea5ccd745bec0e81e68cf5..cbbecda1f3914ceb8a2d6b2ac0afef42025ae4f3 100644
+--- a/open-sse/handlers/chatCore/streamingHandler.js
++++ b/open-sse/handlers/chatCore/streamingHandler.js
+@@ -64,7 +64,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+     const sanitizedTitle = (titleMatch?.[1] || '').replace(/<[^>]*>/g, '').replace(/[\r\n]+/g, ' ').trim().slice(0, 160);
+     const shortMsg = sanitizedTitle
+       || (bodyText.length < 200 ? bodyText.replace(/<[^>]*>/g, '').trim().slice(0, 160) : `Upstream returned non-SSE response (${upstreamContentType})`);
+-    const status = providerResponse.status >= 400 ? providerResponse.status : HTTP_STATUS.BAD_GATEWAY;
++    const status = providerResponse.status >= HTTP_STATUS.BAD_REQUEST ? providerResponse.status : HTTP_STATUS.BAD_GATEWAY;
+     if (log?.errorLine) log.errorLine(reqTag, "✗", `BLOCKED ${status} · ${provider}/${model} · non-SSE (${upstreamContentType})\n    ${shortMsg}`);
+     else console.warn(`[STREAM] ${provider} | ${model} | blocked pipe: ${shortMsg} [${status}]`);
+     streamController?.handleError?.(new Error(`upstream non-SSE: ${status}`));
 diff --git a/open-sse/providers/registry/aistudio.js b/open-sse/providers/registry/aistudio.js
 index 71b07e57171495d83b06b4f0787faef1120dac5b..2eeed51b64712e5c3d35d509e01e5243c9f470bc 100644
 --- a/open-sse/providers/registry/aistudio.js
@@ -168,6 +271,25 @@ index 71b07e57171495d83b06b4f0787faef1120dac5b..2eeed51b64712e5c3d35d509e01e5243
      validateUrl: "http://127.0.0.1:7860/v1/models",
      auth: {
        apiKey: {
+diff --git a/open-sse/services/aistudioModels.js b/open-sse/services/aistudioModels.js
+index 1681724a949ed2a840864b742785d246d32b84f0..cd8ec80c321825be9243259ab65d19d94ab91ae1 100644
+--- a/open-sse/services/aistudioModels.js
++++ b/open-sse/services/aistudioModels.js
+@@ -1,12 +1,12 @@
+ import { PROVIDERS } from "../config/providers.js";
+ import { proxyAwareFetch } from "../utils/proxyFetch.js";
+-import { FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
++import { FETCH_CONNECT_TIMEOUT_MS, HTTP_STATUS } from "../config/runtimeConfig.js";
+ 
+ // The registry is intentionally unseeded; keep bridge model IDs opaque.
+ export async function resolveAIStudioModels(credentials, options = {}) {
+   const apiKey = credentials?.apiKey;
+   if (!apiKey) {
+-    return { error: "No valid token found", status: 401 };
++    return { error: "No valid token found", status: HTTP_STATUS.UNAUTHORIZED };
+   }
+   const res = await proxyAwareFetch(PROVIDERS.aistudio.validateUrl, {
+     headers: {
 diff --git a/open-sse/services/provider.js b/open-sse/services/provider.js
 index a15cb6fa6b5f1b82c44ee490fdaf7818ac2c9253..c6bcba8b253e986d50f5f80aadd4f8bf92db26b7 100644
 --- a/open-sse/services/provider.js
@@ -465,6 +587,77 @@ index 6cacd21de95f1c28fa3383b6bfdaab2e878f157a..3e4d43c08cfe86fb5605ef2db07e9e50
  } from "./blocks.js";
  export { OPENAI_FINISH, CLAUDE_STOP, GEMINI_FINISH } from "./finishReasons.js";
  export { MODEL_FALLBACK, DEFAULT_IMAGE_MIME } from "./defaults.js";
+diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
+index 6629b3f46999bc38e70ce92e427f7e928dadc225..5761ed8050a78add69f4fd248796a4cee204a150 100644
+--- a/open-sse/utils/antigravityNative.js
++++ b/open-sse/utils/antigravityNative.js
+@@ -4,7 +4,9 @@ import {
+   NATIVE_GEMINI_JSON_FENCE_PENDING_STATES,
+   REWRITTEN_RESPONSE_HEADERS,
+   SSE_DONE_PAYLOAD,
++  HTTP_STATUS,
+ } from "../config/runtimeConfig.js";
++import { GEMINI_FINISH } from "../translator/schema/index.js";
+ 
+ // Adapt Cloud Code's response envelope, keeping the Gemini payload available
+ // to the existing native response validation, usage observer and client.
+@@ -13,7 +15,7 @@ function unwrap(value) {
+   if (value && typeof value === "object" && Object.hasOwn(value, "response") && !value.error) {
+     const { response, ...metadata } = value;
+     if (response === null || typeof response !== "object" || Array.isArray(response) || !Object.keys(response).length) {
+-      return { error: { code: 502, status: "INTERNAL", message: "Invalid Antigravity response envelope" } };
++      return { error: { code: HTTP_STATUS.BAD_GATEWAY, status: "INTERNAL", message: "Invalid Antigravity response envelope" } };
+     }
+     return { ...metadata, ...response };
+   }
+@@ -292,7 +294,7 @@ function normalizeNativeJsonResponse(value) {
+   }
+   if (!value || typeof value !== "object" || isNativeError(value) || !Array.isArray(value.candidates)) return value;
+   for (const candidate of value.candidates) {
+-    if (!candidate || (candidate.finishReason ?? candidate.finish_reason) !== "STOP") continue;
++    if (!candidate || (candidate.finishReason ?? candidate.finish_reason) !== GEMINI_FINISH.STOP) continue;
+     const { text, spans } = nativeCandidateText(candidate);
+     const ranges = nativeJsonFenceRemovalRanges(text);
+     if (ranges) removeNativeJsonFenceRanges(spans, ranges);
+@@ -332,7 +334,7 @@ function updateNativeJsonStreamStates(value, states) {
+     }
+ 
+     const finishReason = candidate.finishReason ?? candidate.finish_reason;
+-    if (finishReason === "STOP") {
++    if (finishReason === GEMINI_FINISH.STOP) {
+       if (state.status === "open") {
+         const ranges = nativeJsonFenceRemovalRanges(state.text);
+         if (ranges) {
+@@ -362,7 +364,7 @@ export function validateAntigravityFieldMask(nativeRequest = {}) {
+   } catch (error) {
+     return {
+       error: {
+-        code: 400,
++        code: HTTP_STATUS.BAD_REQUEST,
+         status: "INVALID_ARGUMENT",
+         message: error.message,
+       },
+@@ -378,9 +380,9 @@ export async function unwrapAntigravityResponse(response, stream, nativeRequest
+     if (!response.ok) return response;
+     response.body?.cancel().catch(() => {});
+     return new Response(JSON.stringify({
+-      error: { code: 400, status: "INVALID_ARGUMENT", message: error.message },
++      error: { code: HTTP_STATUS.BAD_REQUEST, status: "INVALID_ARGUMENT", message: error.message },
+     }), {
+-      status: 400,
++      status: HTTP_STATUS.BAD_REQUEST,
+       statusText: "Bad Request",
+       headers: responseHeaders(response, "application/json"),
+     });
+@@ -458,7 +460,7 @@ export async function unwrapAntigravityResponse(response, stream, nativeRequest
+     catch {
+       failed = true;
+       flushPendingNativeResponses(controller);
+-      emit({ error: { code: 502, status: "INTERNAL", message: "Invalid Antigravity stream event" } }, controller);
++      emit({ error: { code: HTTP_STATUS.BAD_GATEWAY, status: "INTERNAL", message: "Invalid Antigravity stream event" } }, controller);
+     }
+   };
+   const line = (value, controller) => {
 diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
 index 96456e0ce5eb7717713412f52a2d9b138eefeb15..4902f59c4176256c55e42fd141b44937876136cf 100644
 --- a/open-sse/utils/opencodeFingerprint.js
@@ -522,6 +715,19 @@ index 96456e0ce5eb7717713412f52a2d9b138eefeb15..4902f59c4176256c55e42fd141b44937
      const restored = restoreResponsesItem(item);
      if (restored !== item) put("item", restored);
    }
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index 9bcab8c8d8b55c614ac4215e0811ca37b95162b0..3d6d14693621c2ab2ec55b83a16a5803c7a8ffba 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -186,7 +186,7 @@ export function createSSEStream(options = {}) {
+       nativeGeminiErrorSeen = true;
+       const error = parsed.error || response.error;
+       nativeGeminiError = {
+-        status: Number.isInteger(error.code) && error.code >= 400 && error.code <= 599
++        status: Number.isInteger(error.code) && error.code >= HTTP_STATUS.BAD_REQUEST && error.code <= 599
+           ? error.code : HTTP_STATUS.BAD_GATEWAY,
+         error: typeof error.message === "string" ? error.message : "Upstream Gemini stream failed",
+       };
 diff --git a/tests/unit/codex-hosted-search-history.test.js b/tests/unit/codex-hosted-search-history.test.js
 index e34ca443f8d9d703c8f9b95e7848aefe16b90a10..2b486faabb38487db305b21b48d0fc78582f3a0f 100644
 --- a/tests/unit/codex-hosted-search-history.test.js
