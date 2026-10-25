@@ -1,0 +1,108 @@
+From 926a1b3e2ef29208e7a2a8b018c558049949e56f Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]"
+ <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] Use shared Responses tool type constants
+
+---
+ open-sse/translator/response/openai-responses.js |  8 ++++----
+ open-sse/utils/opencodeFingerprint.js            | 16 +++++++++-------
+ 2 files changed, 13 insertions(+), 11 deletions(-)
+
+diff --git a/open-sse/translator/response/openai-responses.js b/open-sse/translator/response/openai-responses.js
+index 2e5cc352a2c9380833dc8c9a2f6802f2b60f77a4..9f309b8b36ac85b2ef02222f9902118d70852004 100644
+--- a/open-sse/translator/response/openai-responses.js
++++ b/open-sse/translator/response/openai-responses.js
+@@ -8,7 +8,7 @@ import { buildChunk } from "../concerns/chunk.js";
+ import { buildUsage } from "../concerns/usage.js";
+ import { fallbackToolCallId } from "../concerns/toolCall.js";
+ import { reasoningDelta, extractReasoningText } from "../concerns/reasoning.js";
+-import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, OPENAI_FINISH, MODEL_FALLBACK } from "../schema/index.js";
++import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, RESPONSES_TOOL, OPENAI_FINISH, MODEL_FALLBACK } from "../schema/index.js";
+ import { resolveToolName } from "../../utils/opencodeFingerprint.js";
+ 
+ /**
+@@ -344,7 +344,7 @@ function isCustomTool(state, name) {
+   if (!name) return false;
+   if (state.customToolNames?.has(name)) return true;
+   const resolved = resolveToolName(name, state.toolNameMap);
+-  if (resolved.descriptor) return resolved.descriptor.type === "custom";
++  if (resolved.descriptor) return resolved.descriptor.type === RESPONSES_TOOL.CUSTOM;
+   return !!resolved.name && state.customToolNames?.has(resolved.name) === true;
+ }
+ 
+@@ -595,7 +595,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
+   // merges parallel calls into index 0 whenever upstream emits all addeds
+   // before dones — the client then concatenates N JSON payloads into one
+   // tool input and fails validation. The server item id is the correlator.
+-  if (eventType === "response.output_item.added" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
++  if (eventType === "response.output_item.added" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL)) {
+     const item = data.item;
+     state.currentToolCallId = item.call_id || fallbackToolCallId();
+     state.respToolChatIndex ??= new Map();
+@@ -640,7 +640,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
+   // Function call done (standard or custom_tool_call variant).
+   // Index was assigned at added-time; nothing to advance. Some upstreams send
+   // complete arguments only here (no deltas) — emit them once in that case.
+-  if (eventType === "response.output_item.done" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
++  if (eventType === "response.output_item.done" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL)) {
+     const key = data.item?.id || data.item_id;
+     const idx = (key && state.respToolChatIndex?.get(key)) ?? Math.max(0, (state.toolCallIndex || 1) - 1);
+     const fullArgs = data.item?.arguments;
+diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
+index 96456e0ce5eb7717713412f52a2d9b138eefeb15..4902f59c4176256c55e42fd141b44937876136cf 100644
+--- a/open-sse/utils/opencodeFingerprint.js
++++ b/open-sse/utils/opencodeFingerprint.js
+@@ -1,3 +1,5 @@
++import { RESPONSES_ITEM, RESPONSES_TOOL } from "../translator/schema/index.js";
++
+ /**
+  * Helpers for the OpenCode free-tier client fingerprint.
+  *
+@@ -303,8 +305,8 @@ export function restoreToolNames(payload, map) {
+     const resolved = resolveToolName(item.name, map);
+     if (resolved.descriptor) {
+       const restored = { ...item, name: resolved.descriptor.name, namespace: resolved.descriptor.namespace };
+-      if (resolved.descriptor.type === "custom") {
+-        restored.type = "custom_tool_call";
++      if (resolved.descriptor.type === RESPONSES_TOOL.CUSTOM) {
++        restored.type = RESPONSES_ITEM.CUSTOM_TOOL_CALL;
+         if (Object.hasOwn(restored, "arguments")) {
+           restored.input = restored.arguments;
+           delete restored.arguments;
+@@ -315,15 +317,15 @@ export function restoreToolNames(payload, map) {
+     return resolved.name === item.name ? item : { ...item, name: resolved.name };
+   };
+ 
+-  if ((payload.type === "function_call" || payload.type === "custom_tool_call") && typeof payload.name === "string") {
++  if ((payload.type === RESPONSES_ITEM.FUNCTION_CALL || payload.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL) && typeof payload.name === "string") {
+     if (typeof payload.namespace === "string" && payload.namespace) return out;
+     if (map.has(payload.name)) {
+       const resolved = resolveToolName(payload.name, map);
+       if (resolved.descriptor) {
+         put("name", resolved.descriptor.name);
+         put("namespace", resolved.descriptor.namespace);
+-        if (resolved.descriptor.type === "custom") {
+-          put("type", "custom_tool_call");
++        if (resolved.descriptor.type === RESPONSES_TOOL.CUSTOM) {
++          put("type", RESPONSES_ITEM.CUSTOM_TOOL_CALL);
+           if (Object.hasOwn(payload, "arguments")) {
+             put("input", payload.arguments);
+             if (out === payload) out = { ...payload };
+@@ -398,14 +400,14 @@ export function restoreToolNames(payload, map) {
+   // OpenAI Responses final JSON body.
+   if (Array.isArray(payload.output)) {
+     put("output", payload.output.map((item) =>
+-      (item?.type === "function_call" || item?.type === "custom_tool_call") && typeof item.name === "string"
++      (item?.type === RESPONSES_ITEM.FUNCTION_CALL || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL) && typeof item.name === "string"
+         ? restoreResponsesItem(item)
+         : item));
+   }
+ 
+   // OpenAI Responses SSE events such as response.output_item.added/done.
+   const item = payload.item;
+-  if ((item?.type === "function_call" || item?.type === "custom_tool_call") && typeof item.name === "string") {
++  if ((item?.type === RESPONSES_ITEM.FUNCTION_CALL || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL) && typeof item.name === "string") {
+     const restored = restoreResponsesItem(item);
+     if (restored !== item) put("item", restored);
+   }
