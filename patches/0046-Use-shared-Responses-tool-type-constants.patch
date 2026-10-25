@@ -1,17 +1,80 @@
-From 0eaec27813e943c0ca5f5c0bf895a1d0305e734b Mon Sep 17 00:00:00 2001
+From 83a9b1d99f53ee8432870cb4f0c7429f79da4a5d Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]"
  <41898282+github-actions[bot]@users.noreply.github.com>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Use shared translator protocol discriminators
 
 ---
- open-sse/translator/concerns/toolCall.js         | 15 ++++++++-------
- open-sse/translator/formats/gemini.js            |  4 ++--
- open-sse/translator/request/openai-responses.js  |  2 +-
- open-sse/translator/response/openai-responses.js |  8 ++++----
- open-sse/utils/opencodeFingerprint.js            | 16 +++++++++-------
- 5 files changed, 24 insertions(+), 21 deletions(-)
+ open-sse/executors/codex.js                     | 17 +++++++++--------
+ open-sse/translator/concerns/toolCall.js        | 15 ++++++++-------
+ open-sse/translator/formats/gemini.js           |  4 ++--
+ open-sse/translator/request/openai-responses.js |  4 ++--
+ .../translator/response/openai-responses.js     |  8 ++++----
+ open-sse/translator/schema/blocks.js            |  2 ++
+ open-sse/utils/opencodeFingerprint.js           | 16 +++++++++-------
+ tests/unit/codex-hosted-search-history.test.js  |  6 ++++++
+ 8 files changed, 42 insertions(+), 30 deletions(-)
 
+diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
+index da0824495ac7e602afbce2b922dd592e37679eee..751cb0a48e3ffa2944ea91e42f6259a6058e4da1 100644
+--- a/open-sse/executors/codex.js
++++ b/open-sse/executors/codex.js
+@@ -1,4 +1,5 @@
+ import { BaseExecutor } from "./base.js";
++import { RESPONSES_ITEM, RESPONSES_TOOL } from "../translator/schema/index.js";
+ import { CODEX_DEFAULT_INSTRUCTIONS } from "../config/codexInstructions.js";
+ import { PROVIDERS } from "../config/providers.js";
+ import {
+@@ -35,7 +36,7 @@ const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
+ 
+ // Hosted tool types that Codex/OpenAI Responses executes server-side
+ const CODEX_HOSTED_TOOL_TYPES = new Set([
+-  "image_generation", "web_search", "web_search_preview", "file_search",
++  "image_generation", RESPONSES_TOOL.WEB_SEARCH, "web_search_preview", "file_search",
+   "computer", "computer_use_preview", "code_interpreter", "mcp", "local_shell",
+   "tool_search"
+ ]);
+@@ -219,7 +220,7 @@ export class CodexExecutor extends BaseExecutor {
+    */
+   buildHeaders(credentials, stream = true, _url = null, model = null, body = null) {
+     const headers = super.buildHeaders(credentials, stream);
+-    if (isCodexResponsesLiteModel(model && getModelUpstreamId("cx", model)) && !body?.tools?.some?.(tool => tool?.type === "web_search")) {
++    if (isCodexResponsesLiteModel(model && getModelUpstreamId("cx", model)) && !body?.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH)) {
+       headers["x-openai-internal-codex-responses-lite"] = "true";
+     }
+     headers["session_id"] = this._currentSessionId || credentials?.connectionId || "default";
+@@ -474,17 +475,17 @@ export class CodexExecutor extends BaseExecutor {
+     // otherwise upstream answers 200 with a terminal SSE error. The /compact
+     // endpoint was not observed failing this way, so its request is left unchanged.
+     const hasHostedSearchHistory = !this._isCompact && Array.isArray(body.input)
+-      && body.input.some(item => item?.type === "web_search_call");
++      && body.input.some(item => item?.type === RESPONSES_ITEM.WEB_SEARCH_CALL);
+     if ((autoWebSearch || hasHostedSearchHistory)
+-      && !body.tools?.some?.(tool => tool?.type === "web_search")) {
+-      body.tools = [...(Array.isArray(body.tools) ? body.tools : []), { type: "web_search" }];
++      && !body.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH)) {
++      body.tools = [...(Array.isArray(body.tools) ? body.tools : []), { type: RESPONSES_TOOL.WEB_SEARCH }];
+     }
+     // Hosted search cannot run from a Lite input prefix. When switching to
+     // regular Responses, move all prefixed tools without duplicating definitions.
+     let convertedLitePrefix = false;
+     if (isCodexResponsesLiteModel(upstreamModel) && Array.isArray(body.input)
+-      && (body.tools?.some?.(tool => tool?.type === "web_search")
+-        || body.input.some(item => item?.type === "additional_tools" && item.tools?.some?.(tool => tool?.type === "web_search")))) {
++      && (body.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH)
++        || body.input.some(item => item?.type === "additional_tools" && item.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH)))) {
+       const tools = Array.isArray(body.tools) ? [...body.tools] : [];
+       const seen = new Set(tools.map(tool => `${tool?.type}:${tool?.name || tool?.function?.name || ""}`));
+       for (const item of body.input) {
+@@ -499,7 +500,7 @@ export class CodexExecutor extends BaseExecutor {
+       body.input = body.input.filter(item => item?.type !== "additional_tools");
+     }
+     const responsesLite = isCodexResponsesLiteModel(upstreamModel)
+-      && !body.tools?.some?.(tool => tool?.type === "web_search");
++      && !body.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH);
+ 
+     // Ensure input is present and non-empty (Codex API rejects empty input)
+     if (!body.input || (Array.isArray(body.input) && body.input.length === 0)) {
 diff --git a/open-sse/translator/concerns/toolCall.js b/open-sse/translator/concerns/toolCall.js
 index 95cca8b61b744248601e85a208cff7f2c3293b23..51d2372fc74e1d9c3e217c8537659fd4d7d63fd6 100644
 --- a/open-sse/translator/concerns/toolCall.js
@@ -109,9 +172,18 @@ index 7721a4ca9e22e08be51eb37af3bc26da6482bd0c..7bc6d1ef7116724e9774c96cccb0bafc
      } else {
        out.push({ role: "user", parts: [{ text: "Continue." }] });
 diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
-index e59f8be662e685d816176358f6d7bbf1005f134c..42ba6222e3825c21353c7a2a514f0ff7a5d1b917 100644
+index e59f8be662e685d816176358f6d7bbf1005f134c..59f01c09bdb4c55d5f0bd0961afa90cc268b3148 100644
 --- a/open-sse/translator/request/openai-responses.js
 +++ b/open-sse/translator/request/openai-responses.js
+@@ -243,7 +243,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+         // Hosted web_search has no function declaration. Flag it for Gemini-native
+         // targets that can serve googleSearch; cached-only (external_web_access:false)
+         // and domain-restricted variants cannot be honored upstream, so they stay dropped.
+-        if (tool.type === "web_search") {
++        if (tool.type === RESPONSES_TOOL.WEB_SEARCH) {
+           const restricted = Array.isArray(tool.filters?.allowed_domains) && tool.filters.allowed_domains.length > 0;
+           if (tool.external_web_access !== false && !restricted) result._webSearch = true;
+           return null;
 @@ -324,7 +324,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
        }
      }
@@ -161,6 +233,26 @@ index 2e5cc352a2c9380833dc8c9a2f6802f2b60f77a4..9f309b8b36ac85b2ef02222f9902118d
      const key = data.item?.id || data.item_id;
      const idx = (key && state.respToolChatIndex?.get(key)) ?? Math.max(0, (state.toolCallIndex || 1) - 1);
      const fullArgs = data.item?.arguments;
+diff --git a/open-sse/translator/schema/blocks.js b/open-sse/translator/schema/blocks.js
+index dc2b09109dece637ca5906f240a42036cbf91acd..fb47ac5a013f1127203b20de35de20b5d7cd37e7 100644
+--- a/open-sse/translator/schema/blocks.js
++++ b/open-sse/translator/schema/blocks.js
+@@ -33,6 +33,7 @@ export const RESPONSES_ITEM = {
+   FUNCTION_CALL_OUTPUT: "function_call_output",
+   CUSTOM_TOOL_CALL: "custom_tool_call",
+   CUSTOM_TOOL_CALL_OUTPUT: "custom_tool_call_output",
++  WEB_SEARCH_CALL: "web_search_call",
+   ADDITIONAL_TOOLS: "additional_tools",
+   REASONING: "reasoning",
+   OUTPUT_TEXT: "output_text",
+@@ -48,6 +49,7 @@ export const RESPONSES_TOOL = {
+   NAMESPACE: "namespace",
+   FUNCTION: "function",
+   CUSTOM: "custom",
++  WEB_SEARCH: "web_search",
+   ALLOWED_TOOLS: "allowed_tools",
+ };
+ 
 diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
 index 96456e0ce5eb7717713412f52a2d9b138eefeb15..4902f59c4176256c55e42fd141b44937876136cf 100644
 --- a/open-sse/utils/opencodeFingerprint.js
@@ -218,3 +310,24 @@ index 96456e0ce5eb7717713412f52a2d9b138eefeb15..4902f59c4176256c55e42fd141b44937
      const restored = restoreResponsesItem(item);
      if (restored !== item) put("item", restored);
    }
+diff --git a/tests/unit/codex-hosted-search-history.test.js b/tests/unit/codex-hosted-search-history.test.js
+index e34ca443f8d9d703c8f9b95e7848aefe16b90a10..2b486faabb38487db305b21b48d0fc78582f3a0f 100644
+--- a/tests/unit/codex-hosted-search-history.test.js
++++ b/tests/unit/codex-hosted-search-history.test.js
+@@ -1,3 +1,4 @@
++import { RESPONSES_ITEM, RESPONSES_TOOL } from "../../open-sse/translator/schema/index.js";
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ 
+ import { CodexExecutor } from "../../open-sse/executors/codex.js";
+@@ -9,6 +10,11 @@ const USER_MSG = { type: "message", role: "user", content: [{ type: "input_text"
+ const HOSTED_SEARCH = { type: "web_search_call", id: "ws_1", status: "completed" };
+ 
+ describe("Codex hosted search history forces regular transport", () => {
++  it("schema discriminators carry the exact wire names", () => {
++    expect(RESPONSES_TOOL.WEB_SEARCH).toBe("web_search");
++    expect(RESPONSES_ITEM.WEB_SEARCH_CALL).toBe("web_search_call");
++  });
++
+   it("declares web_search when a Lite request history contains web_search_call items", () => {
+     const executor = new CodexExecutor();
+     const body = executor.transformRequest("gpt-6.1-sol", {
