@@ -1,19 +1,24 @@
-From 83a9b1d99f53ee8432870cb4f0c7429f79da4a5d Mon Sep 17 00:00:00 2001
+From b764839e897aec81f55cdc79f4243e438a2381fd Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]"
  <41898282+github-actions[bot]@users.noreply.github.com>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Use shared translator protocol discriminators
 
 ---
- open-sse/executors/codex.js                     | 17 +++++++++--------
- open-sse/translator/concerns/toolCall.js        | 15 ++++++++-------
- open-sse/translator/formats/gemini.js           |  4 ++--
- open-sse/translator/request/openai-responses.js |  4 ++--
- .../translator/response/openai-responses.js     |  8 ++++----
- open-sse/translator/schema/blocks.js            |  2 ++
- open-sse/utils/opencodeFingerprint.js           | 16 +++++++++-------
- tests/unit/codex-hosted-search-history.test.js  |  6 ++++++
- 8 files changed, 42 insertions(+), 30 deletions(-)
+ open-sse/executors/codex.js                   | 17 +++---
+ open-sse/executors/default.js                 |  5 +-
+ open-sse/translator/concerns/toolCall.js      | 15 +++---
+ open-sse/translator/formats/gemini.js         |  4 +-
+ open-sse/translator/index.js                  |  6 ++-
+ .../translator/request/openai-responses.js    |  4 +-
+ .../translator/request/openai-to-gemini.js    |  4 +-
+ .../translator/response/openai-responses.js   |  8 +--
+ open-sse/translator/schema/blocks.js          |  5 ++
+ open-sse/translator/schema/index.js           |  1 +
+ open-sse/utils/opencodeFingerprint.js         | 16 +++---
+ .../unit/codex-hosted-search-history.test.js  |  6 +++
+ .../unit/openai-responses-web-search.test.js  | 52 +++++++++++++++++++
+ 13 files changed, 108 insertions(+), 35 deletions(-)
 
 diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
 index da0824495ac7e602afbce2b922dd592e37679eee..751cb0a48e3ffa2944ea91e42f6259a6058e4da1 100644
@@ -75,6 +80,32 @@ index da0824495ac7e602afbce2b922dd592e37679eee..751cb0a48e3ffa2944ea91e42f6259a6
  
      // Ensure input is present and non-empty (Codex API rejects empty input)
      if (!body.input || (Array.isArray(body.input) && body.input.length === 0)) {
+diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
+index 3c8cbaaf77989d41f6147e45e665d7a7b38ee61e..9e8d87c83c21d9619a5812c934cbff7b2e22c613 100644
+--- a/open-sse/executors/default.js
++++ b/open-sse/executors/default.js
+@@ -9,6 +9,7 @@ import { buildClineHeaders } from "../shared/clineAuth.js";
+ import { proxyAwareFetch } from "../utils/proxyFetch.js";
+ import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
+ import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
++import { FORMATS } from "../translator/formats.js";
+ import { adaptAIStudioStructuredOutput } from "../translator/formats/gemini.js";
+ import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
+ 
+@@ -79,11 +80,11 @@ const REFRESH_GRANTS = Object.fromEntries(
+ 
+ function isResponsesWire(provider, config, credentials) {
+   const runtimeFormat = credentials?.runtimeTransport?.format;
+-  if (runtimeFormat) return runtimeFormat === "openai-responses";
++  if (runtimeFormat) return runtimeFormat === FORMATS.OPENAI_RESPONSES;
+   if (provider?.startsWith?.("openai-compatible-")) {
+     return resolveOpenAICompatibleApiType(provider, credentials) === "responses";
+   }
+-  return config?.format === "openai-responses";
++  return config?.format === FORMATS.OPENAI_RESPONSES;
+ }
+ 
+ function normalizeResponsesReasoning(body) {
 diff --git a/open-sse/translator/concerns/toolCall.js b/open-sse/translator/concerns/toolCall.js
 index 95cca8b61b744248601e85a208cff7f2c3293b23..51d2372fc74e1d9c3e217c8537659fd4d7d63fd6 100644
 --- a/open-sse/translator/concerns/toolCall.js
@@ -171,6 +202,35 @@ index 7721a4ca9e22e08be51eb37af3bc26da6482bd0c..7bc6d1ef7116724e9774c96cccb0bafc
        }
      } else {
        out.push({ role: "user", parts: [{ text: "Continue." }] });
+diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
+index 14460727f6be76925546ccd18f4571a4de189f80..61fa8eb0544a8616f24bfd4d60865863e1e67363 100644
+--- a/open-sse/translator/index.js
++++ b/open-sse/translator/index.js
+@@ -1,4 +1,5 @@
+ import { FORMATS } from "./formats.js";
++import { OPENAI_TOOL_CHOICE_NONE } from "./schema/index.js";
+ import { ensureToolCallIds, fixMissingToolResponses, isGeminiFamilyTarget } from "./concerns/toolCall.js";
+ import { prepareClaudeRequest, ensureTrailingUserTurn } from "./formats/claude.js";
+ import { cloakClaudeTools, decloakStreamChunk } from "../utils/claudeCloaking.js";
+@@ -72,6 +73,9 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+   let result = body;
+   // Role the client actually ended on, before any translator drops an emptied turn.
+   const clientLastRole = detectClientLastRole(body);
++  // The original client may have prohibited all tools; downstream conversion
++  // can drop tool_choice, so the intent is captured before any mutation.
++  const clientDisablesTools = body?.tool_choice === OPENAI_TOOL_CHOICE_NONE;
+ 
+   // Strip explicit content types (opt-in via strip[] in PROVIDER_MODELS entry)
+   stripContentTypes(result, stripList);
+@@ -163,7 +167,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+   // unverified, so the flag is consumed without effect for them. The internal
+   // marker must never reach a provider body.
+   if (sourceFormat !== targetFormat && result && typeof result === "object") {
+-    const wantsWebSearch = result._webSearch === true;
++    const wantsWebSearch = result._webSearch === true && !clientDisablesTools;
+     delete result._webSearch;
+     const webSearchEnabled = wantsWebSearch && targetFormat === FORMATS.GEMINI && (provider === "gemini" || provider === "aistudio")
+       && getCapabilitiesForModel(provider, stripThinkingSuffix(String(model ?? ""))).serverSideToolInvocations === true;
 diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
 index e59f8be662e685d816176358f6d7bbf1005f134c..59f01c09bdb4c55d5f0bd0961afa90cc268b3148 100644
 --- a/open-sse/translator/request/openai-responses.js
@@ -193,6 +253,28 @@ index e59f8be662e685d816176358f6d7bbf1005f134c..59f01c09bdb4c55d5f0bd0961afa90cc
    }
    if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
    if (namespaceToolMap.size > 0) result._toolNameMap = namespaceToolMap;
+diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
+index 89b027d76a1a2a2c02d10eb882b1dc4b16f5453b..5e2876e114df22619f82b187409991c120ffd51b 100644
+--- a/open-sse/translator/request/openai-to-gemini.js
++++ b/open-sse/translator/request/openai-to-gemini.js
+@@ -23,7 +23,7 @@ import {
+   GEMINI_RESERVED_RESPONSE_KEYS
+ } from "../formats/gemini.js";
+ import { deriveSessionId, toNumericSessionId } from "../../utils/sessionManager.js";
+-import { ROLE, GEMINI_ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
++import { ROLE, GEMINI_ROLE, OPENAI_BLOCK, CLAUDE_BLOCK, OPENAI_TOOL_CHOICE_NONE } from "../schema/index.js";
+ import { isGemini4Model } from "../../providers/capabilities.js";
+ 
+ // Sanitize function names for Gemini API.
+@@ -338,7 +338,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+       const choice = body.tool_choice;
+       if (choice === "auto") {
+         result.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
+-      } else if (choice === "none") {
++      } else if (choice === OPENAI_TOOL_CHOICE_NONE) {
+         result.toolConfig = { functionCallingConfig: { mode: "NONE" } };
+       } else if (choice === "required") {
+         result.toolConfig = { functionCallingConfig: { mode: "ANY" } };
 diff --git a/open-sse/translator/response/openai-responses.js b/open-sse/translator/response/openai-responses.js
 index 2e5cc352a2c9380833dc8c9a2f6802f2b60f77a4..9f309b8b36ac85b2ef02222f9902118d70852004 100644
 --- a/open-sse/translator/response/openai-responses.js
@@ -234,7 +316,7 @@ index 2e5cc352a2c9380833dc8c9a2f6802f2b60f77a4..9f309b8b36ac85b2ef02222f9902118d
      const idx = (key && state.respToolChatIndex?.get(key)) ?? Math.max(0, (state.toolCallIndex || 1) - 1);
      const fullArgs = data.item?.arguments;
 diff --git a/open-sse/translator/schema/blocks.js b/open-sse/translator/schema/blocks.js
-index dc2b09109dece637ca5906f240a42036cbf91acd..fb47ac5a013f1127203b20de35de20b5d7cd37e7 100644
+index dc2b09109dece637ca5906f240a42036cbf91acd..e136bab6a65c947db143529d07726f84357c79b0 100644
 --- a/open-sse/translator/schema/blocks.js
 +++ b/open-sse/translator/schema/blocks.js
 @@ -33,6 +33,7 @@ export const RESPONSES_ITEM = {
@@ -245,7 +327,7 @@ index dc2b09109dece637ca5906f240a42036cbf91acd..fb47ac5a013f1127203b20de35de20b5
    ADDITIONAL_TOOLS: "additional_tools",
    REASONING: "reasoning",
    OUTPUT_TEXT: "output_text",
-@@ -48,6 +49,7 @@ export const RESPONSES_TOOL = {
+@@ -48,9 +49,13 @@ export const RESPONSES_TOOL = {
    NAMESPACE: "namespace",
    FUNCTION: "function",
    CUSTOM: "custom",
@@ -253,6 +335,24 @@ index dc2b09109dece637ca5906f240a42036cbf91acd..fb47ac5a013f1127203b20de35de20b5
    ALLOWED_TOOLS: "allowed_tools",
  };
  
++// The client-facing tool_choice value that prohibits every tool call.
++export const OPENAI_TOOL_CHOICE_NONE = "none";
++
+ // Valid OpenAI block types (used by filterToOpenAIFormat).
+ export const VALID_OPENAI_CONTENT_TYPES = [
+   OPENAI_BLOCK.TEXT, OPENAI_BLOCK.IMAGE_URL, OPENAI_BLOCK.IMAGE, OPENAI_BLOCK.INPUT_AUDIO, OPENAI_BLOCK.AUDIO_URL, OPENAI_BLOCK.FILE,
+diff --git a/open-sse/translator/schema/index.js b/open-sse/translator/schema/index.js
+index 6cacd21de95f1c28fa3383b6bfdaab2e878f157a..3e4d43c08cfe86fb5605ef2db07e9e5011c516d6 100644
+--- a/open-sse/translator/schema/index.js
++++ b/open-sse/translator/schema/index.js
+@@ -3,6 +3,7 @@ export { ROLE, GEMINI_ROLE } from "./roles.js";
+ export {
+   OPENAI_BLOCK, CLAUDE_BLOCK, RESPONSES_ITEM, RESPONSES_TOOL,
+   VALID_OPENAI_CONTENT_TYPES, VALID_OPENAI_MESSAGE_TYPES,
++  OPENAI_TOOL_CHOICE_NONE,
+ } from "./blocks.js";
+ export { OPENAI_FINISH, CLAUDE_STOP, GEMINI_FINISH } from "./finishReasons.js";
+ export { MODEL_FALLBACK, DEFAULT_IMAGE_MIME } from "./defaults.js";
 diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
 index 96456e0ce5eb7717713412f52a2d9b138eefeb15..4902f59c4176256c55e42fd141b44937876136cf 100644
 --- a/open-sse/utils/opencodeFingerprint.js
@@ -331,3 +431,80 @@ index e34ca443f8d9d703c8f9b95e7848aefe16b90a10..2b486faabb38487db305b21b48d0fc78
    it("declares web_search when a Lite request history contains web_search_call items", () => {
      const executor = new CodexExecutor();
      const body = executor.transformRequest("gpt-6.1-sol", {
+diff --git a/tests/unit/openai-responses-web-search.test.js b/tests/unit/openai-responses-web-search.test.js
+index aef21c1d8022117a02aafa455d764bad2eacac14..32e97091245102f462b917515f40f6707d43e309 100644
+--- a/tests/unit/openai-responses-web-search.test.js
++++ b/tests/unit/openai-responses-web-search.test.js
+@@ -117,6 +117,12 @@ describe("Responses web_search request translation", () => {
+     expect(translated.toolConfig).toEqual({ includeServerSideToolInvocations: true });
+   });
+ 
++  it("enables googleSearch for aistudio when web_search is the only tool", () => {
++    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, requestBody([webSearch]), true, {}, "aistudio");
++    expect(translated.tools).toEqual([{ googleSearch: {} }]);
++    expect(translated.toolConfig).toEqual({ includeServerSideToolInvocations: true });
++  });
++
+   for (const [label, format, provider, model, tools] of [
+     ["antigravity", FORMATS.ANTIGRAVITY, "antigravity", MODEL, undefined],
+     ["gemini-cli", FORMATS.GEMINI_CLI, "gemini-cli", MODEL, undefined],
+@@ -137,6 +143,26 @@ describe("Responses web_search request translation", () => {
+     });
+   }
+ 
++  for (const [provider, tools] of [
++    ["gemini", [webSearch]],
++    ["aistudio", [webSearch]],
++    ["gemini", [recordVersion(), webSearch]],
++    ["aistudio", [recordVersion(), webSearch]],
++  ]) {
++    it(`honors client tool_choice none for ${provider} (${tools.length > 1 ? "mixed" : "search-only"} tools)`, () => {
++      const body = structuredClone(requestBody(tools));
++      body.tool_choice = "none";
++      const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, body, true, { projectId: "p" }, provider);
++      expect(translated.tools ?? []).not.toContainEqual({ googleSearch: {} });
++      expect(translated.toolConfig?.includeServerSideToolInvocations).not.toBe(true);
++      expect("_webSearch" in translated).toBe(false);
++      if (tools.length > 1) {
++        expect(translated.tools ?? []).toContainEqual(expect.objectContaining({ functionDeclarations: expect.arrayContaining([expect.objectContaining({ name: "record_version" })]) }));
++        expect(translated.toolConfig?.functionCallingConfig).toEqual({ mode: "NONE" });
++      }
++    });
++  }
++
+   it("never puts web_search into chat tools for a non-Gemini target", () => {
+     const translated = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, "gpt-5", requestBody([recordVersion(), webSearch]), true, {}, "openai");
+     expect(translated.tools).toHaveLength(1);
+@@ -205,6 +231,32 @@ describe("server-executed tool parts in responses", () => {
+     expect(toolTurn.parts[0].functionResponse).toMatchObject({ id: "call_393372", name: "record_version" });
+   });
+ 
++  it("does not replay server parts when the client disabled tools", async () => {
++    const credentials = session("web-search-disabled-replay-fixture");
++    await runStream([nativeResponse(probeParts)], credentials);
++    const next = {
++      model: MODEL,
++      instructions: "You are a precise assistant.",
++      tools: [recordVersion(), webSearch],
++      tool_choice: "none",
++      input: [
++        userMessage(),
++        { type: "function_call", name: "record_version", call_id: "call_393372", arguments: '{"version":"24.21.0"}' },
++        { type: "function_call_output", call_id: "call_393372", output: '{"ok":true}' },
++        { type: "message", role: "user", content: [{ type: "input_text", text: "Anything else?" }] },
++      ],
++    };
++    const translated = translateForTenant(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI, MODEL, next, credentials, "aistudio");
++    const allParts = (translated.contents ?? []).flatMap(c => c.parts ?? []);
++    expect(allParts.filter(p => p.toolCall || p.toolResponse)).toEqual([]);
++    expect(translated.tools ?? []).not.toContainEqual({ googleSearch: {} });
++    expect(translated.toolConfig?.includeServerSideToolInvocations).not.toBe(true);
++    expect("_webSearch" in translated).toBe(false);
++    const modelTurn = translated.contents.find(c => c.role === "model");
++    const fc = modelTurn.parts.find(p => p.functionCall);
++    expect(fc).toEqual({ functionCall: { id: "call_393372", name: "record_version", args: { version: "24.21.0" } }, thoughtSignature: CALL_SIG });
++  });
++
+   it("anchors server parts to the turn key when the turn ends on text", async () => {
+     const credentials = session();
+     const textParts = [
