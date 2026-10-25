@@ -1,14 +1,126 @@
-From 926a1b3e2ef29208e7a2a8b018c558049949e56f Mon Sep 17 00:00:00 2001
+From 0eaec27813e943c0ca5f5c0bf895a1d0305e734b Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]"
  <41898282+github-actions[bot]@users.noreply.github.com>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
-Subject: [PATCH] Use shared Responses tool type constants
+Subject: [PATCH] Use shared translator protocol discriminators
 
 ---
+ open-sse/translator/concerns/toolCall.js         | 15 ++++++++-------
+ open-sse/translator/formats/gemini.js            |  4 ++--
+ open-sse/translator/request/openai-responses.js  |  2 +-
  open-sse/translator/response/openai-responses.js |  8 ++++----
  open-sse/utils/opencodeFingerprint.js            | 16 +++++++++-------
- 2 files changed, 13 insertions(+), 11 deletions(-)
+ 5 files changed, 24 insertions(+), 21 deletions(-)
 
+diff --git a/open-sse/translator/concerns/toolCall.js b/open-sse/translator/concerns/toolCall.js
+index 95cca8b61b744248601e85a208cff7f2c3293b23..51d2372fc74e1d9c3e217c8537659fd4d7d63fd6 100644
+--- a/open-sse/translator/concerns/toolCall.js
++++ b/open-sse/translator/concerns/toolCall.js
+@@ -1,6 +1,7 @@
+ // Tool call helper functions for translator
+ 
+ import { FORMATS } from "../formats.js";
++import { CLAUDE_BLOCK, OPENAI_BLOCK, ROLE } from "../schema/index.js";
+ 
+ // Anthropic tool_use.id must match: ^[a-zA-Z0-9_-]+$
+ const TOOL_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+@@ -39,7 +40,7 @@ export function ensureToolCallIds(body, { preserveIds = false } = {}) {
+ 
+   for (let i = 0; i < body.messages.length; i++) {
+     const msg = body.messages[i];
+-    if (msg.role === "assistant" && msg.tool_calls && Array.isArray(msg.tool_calls)) {
++    if (msg.role === ROLE.ASSISTANT && msg.tool_calls && Array.isArray(msg.tool_calls)) {
+       for (let j = 0; j < msg.tool_calls.length; j++) {
+         const tc = msg.tool_calls[j];
+         // Validate or regenerate ID for Anthropic compatibility
+@@ -48,7 +49,7 @@ export function ensureToolCallIds(body, { preserveIds = false } = {}) {
+           tc.id = sanitized || generateToolCallId(i, j, tc.function?.name);
+         }
+         if (!tc.type) {
+-          tc.type = "function";
++          tc.type = OPENAI_BLOCK.FUNCTION;
+         }
+         // Ensure arguments is JSON string, not object
+         if (tc.function?.arguments && typeof tc.function.arguments !== "string") {
+@@ -58,7 +59,7 @@ export function ensureToolCallIds(body, { preserveIds = false } = {}) {
+     }
+ 
+     // Validate tool_call_id in tool messages (role: "tool")
+-    if (msg.role === "tool") {
++    if (msg.role === ROLE.TOOL) {
+       if (preserveIds ? !msg.tool_call_id : (msg.tool_call_id && !TOOL_ID_PATTERN.test(msg.tool_call_id))) {
+         const sanitized = preserveIds ? null : sanitizeToolId(msg.tool_call_id);
+         msg.tool_call_id = sanitized || generateToolCallId(i, 0);
+@@ -69,14 +70,14 @@ export function ensureToolCallIds(body, { preserveIds = false } = {}) {
+     if (Array.isArray(msg.content)) {
+       for (let k = 0; k < msg.content.length; k++) {
+         const block = msg.content[k];
+-        if (block.type === "tool_use") {
++        if (block.type === CLAUDE_BLOCK.TOOL_USE) {
+           if (preserveIds ? !block.id : (block.id && !TOOL_ID_PATTERN.test(block.id))) {
+             const sanitized = preserveIds ? null : sanitizeToolId(block.id);
+             block.id = sanitized || generateToolCallId(i, k, block.name);
+           }
+         }
+         // Validate tool_use_id in tool_result blocks
+-        if (block.type === "tool_result") {
++        if (block.type === CLAUDE_BLOCK.TOOL_RESULT) {
+           if (preserveIds ? !block.tool_use_id : (block.tool_use_id && !TOOL_ID_PATTERN.test(block.tool_use_id))) {
+             const sanitized = preserveIds ? null : sanitizeToolId(block.tool_use_id);
+             block.tool_use_id = sanitized || generateToolCallId(i, k);
+@@ -91,7 +92,7 @@ export function ensureToolCallIds(body, { preserveIds = false } = {}) {
+ 
+ // Get tool_call ids from assistant message (OpenAI format: tool_calls, Claude format: tool_use in content)
+ export function getToolCallIds(msg) {
+-  if (msg.role !== "assistant") return [];
++  if (msg.role !== ROLE.ASSISTANT) return [];
+ 
+   const ids = [];
+ 
+@@ -105,7 +106,7 @@ export function getToolCallIds(msg) {
+   // Claude format: tool_use blocks in content
+   if (Array.isArray(msg.content)) {
+     for (const block of msg.content) {
+-      if (block.type === "tool_use" && block.id) {
++      if (block.type === CLAUDE_BLOCK.TOOL_USE && block.id) {
+         ids.push(block.id);
+       }
+     }
+diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
+index 7721a4ca9e22e08be51eb37af3bc26da6482bd0c..7bc6d1ef7116724e9774c96cccb0bafc1951e7d9 100644
+--- a/open-sse/translator/formats/gemini.js
++++ b/open-sse/translator/formats/gemini.js
+@@ -1,7 +1,7 @@
+ // Gemini helper functions for translator
+ 
+ import { safeParseJSON } from "../concerns/json.js";
+-import { OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
++import { OPENAI_BLOCK, RESPONSES_ITEM, GEMINI_ROLE } from "../schema/index.js";
+ import { isGemini4Model } from "../../providers/capabilities.js";
+ import { FILE_EXTENSION_MIME, GEMINI_DEFAULT_FILE_MIME_TYPE, SCHEMA_MAP_KEYS, SCHEMA_ARRAY_KEYS, SCHEMA_SINGLE_KEYS,
+   PROTO_SCHEMA_TYPES, LEGACY_PROTO_SCHEMA_KEYS } from "../../config/runtimeConfig.js";
+@@ -568,7 +568,7 @@ export function normalizeGeminiContents(contents, modelOrOptions = null, extraOp
+           if (call.id) fr.id = call.id;
+           return { functionResponse: fr };
+         });
+-        out.push({ role: "user", parts: responses });
++        out.push({ role: GEMINI_ROLE.USER, parts: responses });
+       }
+     } else {
+       out.push({ role: "user", parts: [{ text: "Continue." }] });
+diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
+index e59f8be662e685d816176358f6d7bbf1005f134c..42ba6222e3825c21353c7a2a514f0ff7a5d1b917 100644
+--- a/open-sse/translator/request/openai-responses.js
++++ b/open-sse/translator/request/openai-responses.js
+@@ -324,7 +324,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
+       }
+     }
+     if (choiceType === RESPONSES_TOOL.CUSTOM) customToolNames.add(choiceName);
+-    result.tool_choice = { type: "function", function: { name: choiceName } };
++    result.tool_choice = { type: OPENAI_BLOCK.FUNCTION, function: { name: choiceName } };
+   }
+   if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
+   if (namespaceToolMap.size > 0) result._toolNameMap = namespaceToolMap;
 diff --git a/open-sse/translator/response/openai-responses.js b/open-sse/translator/response/openai-responses.js
 index 2e5cc352a2c9380833dc8c9a2f6802f2b60f77a4..9f309b8b36ac85b2ef02222f9902118d70852004 100644
 --- a/open-sse/translator/response/openai-responses.js
