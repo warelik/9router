@@ -1,25 +1,26 @@
-From 94be77a35c4999cae7fc267e9f4a7d85b82e44ee Mon Sep 17 00:00:00 2001
+From ac53f5c21ca5b7fb21263bc324240e98f80c014b Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]"
  <41898282+github-actions[bot]@users.noreply.github.com>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Centralize inline native Gemini configuration
 
 ---
- open-sse/config/runtimeConfig.js              | 23 +++++++++++
+ open-sse/config/runtimeConfig.js              | 24 +++++++++++
  open-sse/executors/codex.js                   |  4 +-
  open-sse/executors/default.js                 |  4 +-
- open-sse/handlers/chatCore.js                 |  6 +--
+ open-sse/handlers/chatCore.js                 | 10 ++---
  .../handlers/chatCore/nonStreamingHandler.js  |  4 +-
  .../handlers/chatCore/streamingHandler.js     |  6 +--
  open-sse/translator/formats/gemini.js         |  4 +-
- open-sse/utils/antigravityNative.js           | 15 +++++--
+ open-sse/utils/antigravityNative.js           | 24 +++++++----
  open-sse/utils/stream.js                      | 10 ++---
  open-sse/utils/streamHelpers.js               |  4 +-
  tests/unit/chat-to-gemini-contract.test.js    | 41 +++++++++++++++++++
- 11 files changed, 96 insertions(+), 25 deletions(-)
+ tests/unit/gemini-native-core.test.js         | 20 +++++++++
+ 12 files changed, 124 insertions(+), 31 deletions(-)
 
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index 489863a6d6202f235369c237892ca81225790823..8cd69a2e92d5cfb8295621a6c3c7be026537596c 100644
+index 489863a6d6202f235369c237892ca81225790823..8783853ecae9cd1d028a6a9c31f5d357247d5369 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
 @@ -1,3 +1,5 @@
@@ -36,7 +37,7 @@ index 489863a6d6202f235369c237892ca81225790823..8cd69a2e92d5cfb8295621a6c3c7be02
    SERVER_ERROR: 500,
    BAD_GATEWAY: 502,
    SERVICE_UNAVAILABLE: 503,
-@@ -133,3 +136,23 @@ export const NATIVE_GEMINI_THINKING_KEYS = ["thinkingLevel", "thinking_level", "
+@@ -133,3 +136,24 @@ export const NATIVE_GEMINI_THINKING_KEYS = ["thinkingLevel", "thinking_level", "
  
  export const NATIVE_GEMINI_RESPONSE_FIELDS = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
  export const NATIVE_GEMINI_BRIDGE_FIELDS = new Set(["message", "event", "data", "status", "code", "success", "response"]);
@@ -53,6 +54,7 @@ index 489863a6d6202f235369c237892ca81225790823..8cd69a2e92d5cfb8295621a6c3c7be02
 +
 +export const NATIVE_GEMINI_API_VERSIONS = ["v1", "v1alpha"];
 +export const NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES = ["fields", "$fields"];
++export const NATIVE_GEMINI_FIELD_MASK_HEADER_NAME = "x-goog-fieldmask";
 +export const NATIVE_GEMINI_JSON_FENCE_PENDING_STATES = ["start", "possible", "open"];
 +export const NATIVE_GEMINI_FINISH_REASON_FIELDS = ["finishReason", "finish_reason"];
 +export const NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES = ["*", "candidates", "candidates/*"];
@@ -105,7 +107,7 @@ index 93f8a233ad7f84a901c8a5ba0f22608476b23704..3c8cbaaf77989d41f6147e45e665d7a7
        const baseUrl = nativeVersion
          ? this.config.baseUrl.replace("/v1beta/", `/${nativeVersion}/`) : this.config.baseUrl;
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index 42d151df5cc9538c32cd7407d9cd02f82c2e1a75..3706ea5d979bd9049c1fd067d851cf836b785eb8 100644
+index 42d151df5cc9538c32cd7407d9cd02f82c2e1a75..8f3f50548465847593d9d4bcfbc38ee2026a6be3 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
 @@ -12,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
@@ -113,10 +115,23 @@ index 42d151df5cc9538c32cd7407d9cd02f82c2e1a75..3706ea5d979bd9049c1fd067d851cf83
  import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
  import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
 -import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET } from "../config/runtimeConfig.js";
-+import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET, REWRITTEN_RESPONSE_HEADERS, AISTUDIO_NATIVE_GEMINI_API_VERSION } from "../config/runtimeConfig.js";
++import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET, REWRITTEN_RESPONSE_HEADERS, AISTUDIO_NATIVE_GEMINI_API_VERSION, NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES, NATIVE_GEMINI_FIELD_MASK_HEADER_NAME } from "../config/runtimeConfig.js";
  import { handleBypassRequest } from "../utils/bypassHandler.js";
  import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
  import { getExecutor } from "../executors/index.js";
+@@ -123,10 +123,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   const nativeResponseProjection = nativeGemini ? {
+     masks: [
+       ...(clientRawRequest?.queryParams || [])
+-        .filter(([name]) => name === "fields" || name === "$fields")
++        .filter(([name]) => NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.includes(name))
+         .map(([, value]) => value),
+       ...Object.entries(clientRawRequest?.headers || {})
+-        .filter(([name]) => name.toLowerCase() === "x-goog-fieldmask")
++        .filter(([name]) => name.toLowerCase() === NATIVE_GEMINI_FIELD_MASK_HEADER_NAME)
+         .map(([, value]) => value),
+     ],
+   } : null;
 @@ -217,7 +217,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
        headers: clientRawRequest?.headers || {},
        // Client and provider versions are separate routing decisions. The
@@ -211,12 +226,13 @@ index 48f2c612e9065d91b52065b2c2bd35171eb8b56e..7721a4ca9e22e08be51eb37af3bc26da
      parts.push({ fileData: { fileUri: file.file_url, ...(mime ? { mimeType: mime } : {}) } });
    }
 diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
-index b987c3d8996b4e4201580aa47b30e4c9dcdfc710..5444168fe3fb6529b3aac5d11970733b176eda45 100644
+index b987c3d8996b4e4201580aa47b30e4c9dcdfc710..6629b3f46999bc38e70ce92e427f7e928dadc225 100644
 --- a/open-sse/utils/antigravityNative.js
 +++ b/open-sse/utils/antigravityNative.js
-@@ -1,3 +1,10 @@
+@@ -1,3 +1,11 @@
 +import {
 +  NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES,
++  NATIVE_GEMINI_FIELD_MASK_HEADER_NAME,
 +  NATIVE_GEMINI_JSON_FENCE_PENDING_STATES,
 +  REWRITTEN_RESPONSE_HEADERS,
 +  SSE_DONE_PAYLOAD,
@@ -225,7 +241,7 @@ index b987c3d8996b4e4201580aa47b30e4c9dcdfc710..5444168fe3fb6529b3aac5d11970733b
  // Adapt Cloud Code's response envelope, keeping the Gemini payload available
  // to the existing native response validation, usage observer and client.
  function unwrap(value) {
-@@ -14,7 +21,7 @@ function unwrap(value) {
+@@ -14,7 +22,7 @@ function unwrap(value) {
  
  function responseHeaders(response, contentType) {
    const headers = new Headers(response.headers);
@@ -234,7 +250,16 @@ index b987c3d8996b4e4201580aa47b30e4c9dcdfc710..5444168fe3fb6529b3aac5d11970733b
    headers.set("Content-Type", contentType);
    return headers;
  }
-@@ -127,7 +134,7 @@ function parseFieldMask(rawMask, source) {
+@@ -57,7 +65,7 @@ function parseFieldMask(rawMask, source) {
+     }
+     return child;
+   };
+-  const isPathSeparator = character => source === "x-goog-fieldmask"
++  const isPathSeparator = character => source === NATIVE_GEMINI_FIELD_MASK_HEADER_NAME
+     ? character === "."
+     : character === "/" || character === ".";
+ 
+@@ -127,7 +135,7 @@ function parseFieldMask(rawMask, source) {
  function nativeResponseMasks(nativeRequest = {}) {
    const query = new URLSearchParams(nativeRequest.query || []);
    const masks = [];
@@ -243,7 +268,27 @@ index b987c3d8996b4e4201580aa47b30e4c9dcdfc710..5444168fe3fb6529b3aac5d11970733b
      for (const value of query.getAll(name)) {
        const parsed = parseFieldMask(value, name);
        if (parsed) masks.push(parsed);
-@@ -308,7 +315,7 @@ function updateNativeJsonStreamStates(value, states) {
+@@ -137,16 +145,16 @@ function nativeResponseMasks(nativeRequest = {}) {
+   const headers = nativeRequest.headers;
+   let headerMask = null;
+   if (headers && typeof headers.get === "function") {
+-    headerMask = headers.get("x-goog-fieldmask");
++    headerMask = headers.get(NATIVE_GEMINI_FIELD_MASK_HEADER_NAME);
+   } else if (headers && typeof headers === "object") {
+     for (const [name, value] of Object.entries(headers)) {
+-      if (name.toLowerCase() !== "x-goog-fieldmask") continue;
++      if (name.toLowerCase() !== NATIVE_GEMINI_FIELD_MASK_HEADER_NAME) continue;
+       headerMask = Array.isArray(value) ? value.join(",") : value;
+       break;
+     }
+   }
+   if (headerMask != null) {
+-    const parsed = parseFieldMask(headerMask, "x-goog-fieldmask");
++    const parsed = parseFieldMask(headerMask, NATIVE_GEMINI_FIELD_MASK_HEADER_NAME);
+     if (parsed) masks.push(parsed);
+   }
+   return masks;
+@@ -308,7 +316,7 @@ function updateNativeJsonStreamStates(value, states) {
        states.set(candidateIndex, state);
      }
  
@@ -252,7 +297,7 @@ index b987c3d8996b4e4201580aa47b30e4c9dcdfc710..5444168fe3fb6529b3aac5d11970733b
        const parts = candidate.content?.parts;
        if (Array.isArray(parts)) {
          for (const part of parts) {
-@@ -442,7 +449,7 @@ export async function unwrapAntigravityResponse(response, stream, nativeRequest
+@@ -442,7 +450,7 @@ export async function unwrapAntigravityResponse(response, stream, nativeRequest
      const value = data.join("\n");
      data = [];
      // Gemini terminates at EOF. Its finishReason is preserved independently.
@@ -384,6 +429,48 @@ index 0b92ab8977ac6dcada99c3e1c937dcd421876ec7..2d27dac81e3109a85923d18f7d356216
  });
  
  describe("Antigravity executor contract on translated Gemini bodies", () => {
--- 
-2.43.0
-
+diff --git a/tests/unit/gemini-native-core.test.js b/tests/unit/gemini-native-core.test.js
+index 38c620a160043168037774ab641b0ca8bc993ada..3d8e7538a13cba63792bc0937a4b73f80be494d1 100644
+--- a/tests/unit/gemini-native-core.test.js
++++ b/tests/unit/gemini-native-core.test.js
+@@ -1,6 +1,7 @@
+ // Real chat core + DefaultExecutor HTTP preparation. Only network/accounting
+ // boundaries are replaced. No provider requests, secrets, or live DB writes.
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES } from "../../open-sse/config/runtimeConfig.js";
+ 
+ const { network, executors } = vi.hoisted(() => ({ network: vi.fn(), executors: new Map() }));
+ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: network }));
+@@ -188,6 +189,7 @@ describe("native Gemini requests through real chat core and executor", () => {
+       ["fields query", [["fields", "candidates/content/parts/text"]], {}],
+       ["$fields query", [["$fields", "candidates(content(parts(text)))"]], {}],
+       ["fieldmask header", [], { "X-Goog-FieldMask": "candidates.content.parts.text" }],
++      ["mixed-case fieldmask header", [], { "X-gOoG-fIeLdMaSk": "candidates.content.parts.text" }],
+     ])(`${provider}: %s projection remains transparent through the real core and stream observer`, async (_name, queryParams, clientHeaders) => {
+       const projected = { candidates: [{ content: { parts: [{ text: "completed projected output" }] } }] };
+       for (const nativeJson of [false, true]) {
+@@ -321,6 +323,24 @@ describe("native Gemini requests through real chat core and executor", () => {
+       expect(await result.response.json()).toEqual({});
+     });
+ 
++    it(`${provider}: reads configured field-mask query names through the real core`, async () => {
++      const saved = [...NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES];
++      try {
++        NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.push("configuredProjection");
++        network.mockImplementationOnce(async () => Response.json({}));
++        const original = body();
++        const result = await run(provider, original, { queryParams: [["configuredProjection", "modelStatus"]] });
++        expect(result.success).toBe(true);
++        expect(result.response.status).toBe(200);
++        expect(await result.response.json()).toEqual({});
++        expect(wireBody()).toEqual(original);
++        const upstreamURL = new URL(network.mock.calls.at(-1)[0]);
++        expect(upstreamURL.searchParams.get("configuredProjection")).toBe("modelStatus");
++      } finally {
++        NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.splice(0, NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.length, ...saved);
++      }
++    });
++
+     it(`${provider}: preserves a projected null wrapper without inventing a failure`, async () => {
+       const response = { response: null };
+       const succeeded = vi.fn();
