@@ -192,6 +192,13 @@ class PatchBoundaryTests(unittest.TestCase):
             "src/app/api/v1alpha/models/[...path]/route.js", "tests/unit/example.test.js",
         ])
 
+    def test_release_owned_docker_workflow_is_the_only_allowed_workflow_path(self):
+        release.validate_paths([".github/workflows/docker-publish.yml"])
+        for path in (".github/workflows/other.yml", ".github/workflows/docker-publish.yml.bak",
+                     ".github/docker-publish.yml", ".github/workflows/AGENTS.md"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                release.validate_paths([path])
+
     def test_old_controller_and_instructions_are_not_application_patches(self):
         for path in (".github/workflows/warelik-sync.yml", "warelik/automation/controller.py",
                      ".gitignore", "README.md", "package.json", "package-lock.json",
