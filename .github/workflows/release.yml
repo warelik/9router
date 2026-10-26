@@ -96,7 +96,6 @@ jobs:
       - name: Record The Exact Private Checkout Receipt
         run: |
           python3 -c 'import json,pathlib,subprocess; p=pathlib.Path("private-maintenance"); lock=json.loads(pathlib.Path("trusted/scripts/maintenance.lock.json").read_text()); actual=subprocess.check_output(["git","-C",str(p),"rev-parse","HEAD"],text=True).strip(); assert actual==lock["revision"]; (p/".maintenance-source.json").write_text(json.dumps({"repository":lock["repository"],"revision":actual},separators=(",",":"))+"\n")'
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Select Source And Request The Native Review Pair
         id: snapshot
         env:

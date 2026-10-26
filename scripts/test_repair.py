@@ -4537,7 +4537,6 @@ class AdoptionTests(unittest.TestCase):
                 ("run", "Read The Trusted Private Module Pin", ""),
                 ("uses", "", "actions/checkout"),
                 ("run", "Record The Exact Private Checkout Receipt", ""),
-                ("uses", "", "docker/setup-buildx-action"),
                 ("run", "Select Source And Request The Native Review Pair", ""),
                 ("uses", "", "actions/upload-artifact"),
                 ("run", "Report The Actual State", ""),
@@ -4660,7 +4659,7 @@ class AdoptionTests(unittest.TestCase):
 
         buildx_steps = [(job_name, step) for job_name, job in jobs.items() for step in job["steps"]
                         if step.get("uses", "").startswith("docker/setup-buildx-action@")]
-        self.assertEqual(len(buildx_steps), 2, "Registry inspection and final build use the pinned Buildx action")
+        self.assertEqual(len(buildx_steps), 1, "Only the final image build may set up the pinned Buildx action")
         self.assertTrue(all(step.get("with") is None for _, step in buildx_steps),
                         "Buildx must retain the upstream action's default driver and configuration")
         node_steps = [step for job in jobs.values() for step in job["steps"]
@@ -5039,9 +5038,8 @@ class AdoptionTests(unittest.TestCase):
         self.assertNotIn("unittest", "\n".join(str(step.get("run", "")) for step in prepare["steps"]))
         buildx_steps = [(index, step) for index, step in enumerate(prepare["steps"])
                         if step.get("uses", "").startswith("docker/setup-buildx-action@")]
-        self.assertEqual(len(buildx_steps), 1,
-                         "Preparation needs the pinned registry-inspection tool, not an image build")
-        self.assertLess(buildx_steps[0][0], prepare["steps"].index(prep_call))
+        self.assertEqual(buildx_steps, [],
+                         "Source preparation only inspects registry metadata with the preinstalled CLI")
         self.assertEqual(named_steps("prepare", "Require The Trusted Controller Pin")[1].get("with"), None,
                          "Trusted controller pin check cannot be replaced by an untrusted checkout")
         controller = next((step for step in prepare["steps"]
