@@ -1,0 +1,134 @@
+From 90a3fa05b2f9f2a3bc44fe7e65d6b6fed4f459cf Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Tue, 27 Oct 2026 06:19:14 +0000
+Subject: [PATCH] Frame unterminated native events and replay scopes from
+ canonical history
+
+---
+ .../translator/request/openai-to-gemini.js    |  2 +-
+ open-sse/utils/stream.js                      |  8 ++++++-
+ tests/unit/gemini-native-stream.test.js       | 22 +++++++++++++++++++
+ tests/unit/gemini-turn-signature.test.js      | 16 ++++++++++++++
+ 4 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
+index 93c6684..b42a48f 100644
+--- a/open-sse/translator/request/openai-to-gemini.js
++++ b/open-sse/translator/request/openai-to-gemini.js
+@@ -213,7 +213,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
+         const turnSystem = turnInstructionParts.length > 0
+           ? { role: GEMINI_ROLE.USER, parts: turnInstructionParts }
+           : null;
+-        const turnScope = geminiTurnScope(result.contents, turnSystem);
++        const turnScope = geminiTurnScope(normalizeGeminiContents(result.contents, model, { synthesizeTerminalToolResponse: false }), turnSystem);
+         // Signature the provider issued for this tool-free turn (Gemini only accepts its own).
+         const turnSig = msg.tool_calls?.length
+           ? null
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index bc43f57..47a2b33 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -118,6 +118,7 @@ export function createSSEStream(options = {}) {
+ 
+   let buffer = "";
+   let nativeSseEvent = [];
++  let nativeForwardedUnterminated = false;
+   let pendingTrailingCr = false;
+   let usage = null;
+   // The client's wire protocol determines termination, regardless of which
+@@ -373,6 +374,7 @@ export function createSSEStream(options = {}) {
+           if (restored) controller.enqueue(sharedEncoder.encode(restored));
+           return;
+         }
++        nativeForwardedUnterminated = !text.endsWith("\n");
+         controller.enqueue(chunk);
+         return;
+       }
+@@ -778,6 +780,7 @@ export function createSSEStream(options = {}) {
+                 : "Upstream Gemini stream returned no valid response";
+               const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, message, sourceFormat);
+               reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
++              if (nativeForwardedUnterminated) controller.enqueue(sharedEncoder.encode("\n\n"));
+               controller.enqueue(failure);
+             } else if (nativeGeminiHasIncompleteCandidate()) {
+               if (nativeJson) {
+@@ -787,12 +790,15 @@ export function createSSEStream(options = {}) {
+               }
+               const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream ended before a candidate finished", sourceFormat);
+               reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
++              if (nativeForwardedUnterminated) controller.enqueue(sharedEncoder.encode("\n\n"));
+               controller.enqueue(failure);
+             } else {
+               if (toolNameMap?.size) {
+                 const tail = nativeJson
+                   ? JSON.stringify(restoreToolNames(JSON.parse(nativeGeminiJson), toolNameMap))
+-                  : (nativeSseEvent.length ? restoreSseEvent(nativeSseEvent, toolNameMap) + "\n" : "") + restoreSseEvent([buffer], toolNameMap);
++                  : buffer
++                    ? restoreSseEvent([...nativeSseEvent, buffer], toolNameMap)
++                    : nativeSseEvent.length ? restoreSseEvent(nativeSseEvent, toolNameMap) + "\n" : "";
+                 if (tail) {
+                   reqLogger?.appendConvertedChunk?.(tail);
+                   controller.enqueue(sharedEncoder.encode(tail));
+diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
+index d993062..afa094e 100644
+--- a/tests/unit/gemini-native-stream.test.js
++++ b/tests/unit/gemini-native-stream.test.js
+@@ -622,6 +622,28 @@ describe("native stream integration and failure cleanup", () => {
+     expect(output).not.toContain("wire_tool");
+   });
+ 
++  it("restores mapped tool names in an unterminated multi-line native event at EOF", async () => {
++    const toolNameMap = new Map([["wire_tool", "original_tool"]]);
++    const event = { candidates: [{ index: 0, content: { role: "model", parts: [
++      { functionCall: { id: "call-4", name: "wire_tool", args: { value: 4 } } },
++    ] }, finishReason: "STOP" }] };
++    const json = JSON.stringify(event);
++    const split = json.indexOf('"args"');
++    const raw = `data: ${json.slice(0, split)}\ndata: ${json.slice(split)}`;
++    const output = await readText(inputStream([encode(raw)])
++      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, false, null, null, toolNameMap)));
++    expect(output).toContain('"id":"call-4"');
++    expect(output).toContain('"name":"original_tool"');
++    expect(output).not.toContain("wire_tool");
++  });
++
++  it("separates an unterminated forwarded native event from the synthesized failure frame", async () => {
++    const partial = { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "partial" }] } }] };
++    const output = await readText(inputStream([encode(`data: ${JSON.stringify(partial)}`)])
++      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI)));
++    expect(output).not.toContain("}data:");
++  });
++
+   it("restores mapped tool names in a native JSON response body", async () => {
+     const toolNameMap = new Map([["wire_tool", "original_tool"]]);
+     const response = { candidates: [{ index: 0, content: { role: "model", parts: [
+diff --git a/tests/unit/gemini-turn-signature.test.js b/tests/unit/gemini-turn-signature.test.js
+index 5cfcbcd..5053c4a 100644
+--- a/tests/unit/gemini-turn-signature.test.js
++++ b/tests/unit/gemini-turn-signature.test.js
+@@ -149,6 +149,22 @@ describe("signature of a tool-free thinking turn survives the round trip", () =>
+     expect(replay({ k: 1 }, "result two")).toEqual([{ text: "shared reply t" }]);
+   });
+ 
++  it("replays a Gemini 4 turn whose user message follows a tool result from the same canonical history", () => {
++    const model = "gemini-4-turn-signature-test";
++    const sessionId = "authenticated-fixture-conversation";
++    const call = { role: "assistant", content: null, tool_calls: [{ id: "c4", type: "function", function: { name: "lookup", arguments: "{}" } }] };
++    const history = [ask("gemini4 tool"), call, { role: "tool", tool_call_id: "c4", content: "gemini4 result" }, ask("gemini4 follow-up")];
++    const credentials = { _geminiServerPartsSessionId: sessionId };
++    openaiToGeminiRequest(model, { messages: history }, true, credentials);
++    const state = { model, turnScope: credentials._geminiTurnScope, serverPartsSessionId: sessionId };
++    geminiToOpenAIResponse(chunk([{ text: "gemini4 reply", thoughtSignature: "sig-g4" }], "STOP"), state);
++    const req = openaiToGeminiRequest(model, {
++      messages: [...history, { role: "assistant", content: "gemini4 reply" }, ask("again")],
++    }, false, { _geminiServerPartsSessionId: sessionId });
++    const parts = req.contents.filter((c) => c.role === "model").flatMap((c) => c.parts);
++    expect(parts).toContainEqual({ text: "gemini4 reply", thoughtSignature: "sig-g4" });
++  });
++
+   it("separates otherwise identical tool exchanges that carry different call ids", () => {
+     const history = (id) => [
+       ask("ids"),
+-- 
+2.43.0
+
