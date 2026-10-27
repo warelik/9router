@@ -4868,6 +4868,7 @@ class AdoptionTests(unittest.TestCase):
             },
             ("policy-check", "Enforce Trusted Tests And Validate Proposed YAML"): {
                 "FORK_MAINTENANCE_ROOT": "${{ github.workspace }}/private-maintenance",
+                "TMPDIR": "${{ runner.temp }}",
                 "NINEROUTER_POLICY_BASELINE_MAINTENANCE": "${{ steps.private-pin.outputs.revision == steps.baseline-private-pin.outputs.revision && format('{0}/private-maintenance', github.workspace) || format('{0}/private-maintenance-baseline', github.workspace) }}",
             },
             ("finalize", "Reject A Job-Only Rerun Before Final Authorization"): {
