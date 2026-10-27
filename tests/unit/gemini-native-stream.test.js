@@ -35,7 +35,7 @@ const chunk = {
 };
 const lateUsage = { usageMetadata: { promptTokenCount: 4096, candidatesTokenCount: 7, thoughtsTokenCount: 20, cachedContentTokenCount: 2048, totalTokenCount: 4123 } };
 const inputStream = chunks => new ReadableStream({ start(controller) { for (const value of chunks) controller.enqueue(value); controller.close(); } });
-const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nativeJson = false, projection = null, onNativeResponseSuccess = null) => createPassthroughStreamWithLogger(provider, null, "gemini-native-test", null, null, complete, null, source, nativeJson, projection, onNativeResponseSuccess);
+const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nativeJson = false, projection = null, onNativeResponseSuccess = null, toolNameMap = null) => createPassthroughStreamWithLogger(provider, null, "gemini-native-test", null, null, complete, null, toolNameMap, source, nativeJson, projection, onNativeResponseSuccess);
 const readText = stream => new Response(stream).text();
 
 describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
@@ -592,6 +592,45 @@ describe("native stream integration and failure cleanup", () => {
     expect(succeeded).not.toHaveBeenCalled();
     expect(await result.response.text()).toBe(original);
     await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+  });
+
+  it("restores mapped tool names in a final native SSE data line without a newline", async () => {
+    const toolNameMap = new Map([["wire_tool", "original_tool"]]);
+    const first = { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "hi" }] }, finishReason: "STOP" }] };
+    const last = { candidates: [{ index: 0, content: { role: "model", parts: [
+      { functionCall: { id: "call-2", name: "wire_tool", args: { value: 2 } } },
+    ] }, finishReason: "STOP" }] };
+    const output = await readText(inputStream([encode(frame(first) + `data: ${JSON.stringify(last)}`)])
+      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, false, null, null, toolNameMap)));
+    expect(output).toContain('"id":"call-2"');
+    expect(output).toContain('"name":"original_tool"');
+    expect(output).not.toContain("wire_tool");
+  });
+
+  it("restores mapped tool names in a native SSE event split across data lines", async () => {
+    const toolNameMap = new Map([["wire_tool", "original_tool"]]);
+    const event = { candidates: [{ index: 0, content: { role: "model", parts: [
+      { functionCall: { id: "call-3", name: "wire_tool", args: { value: 3 } } },
+    ] }, finishReason: "STOP" }] };
+    const json = JSON.stringify(event);
+    const split = json.indexOf('"args"');
+    const raw = `data: ${json.slice(0, split)}\ndata: ${json.slice(split)}\n\n`;
+    const output = await readText(inputStream([encode(raw)])
+      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, false, null, null, toolNameMap)));
+    expect(output).toContain('"id":"call-3"');
+    expect(output).toContain('"name":"original_tool"');
+    expect(output).not.toContain("wire_tool");
+  });
+
+  it("restores mapped tool names in a native JSON response body", async () => {
+    const toolNameMap = new Map([["wire_tool", "original_tool"]]);
+    const response = { candidates: [{ index: 0, content: { role: "model", parts: [
+      { functionCall: { id: "call-1", name: "wire_tool", args: { value: 1 } } },
+    ] }, finishReason: "STOP" }] };
+    const output = await readText(inputStream([encode(JSON.stringify(response))])
+      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, true, null, null, toolNameMap)));
+    expect(output).toContain('"name":"original_tool"');
+    expect(output).not.toContain("wire_tool");
   });
 
   it("defers native request success through the same-format tool-name transform", async () => {
