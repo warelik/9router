@@ -1,0 +1,45 @@
+From 8f5b065c9d9afa0bd891d2815db3218e0651f8fe Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Tue, 27 Oct 2026 09:38:35 +0000
+Subject: [PATCH] Keep opaque agent messages that carry an image deliverable
+
+---
+ open-sse/translator/concerns/portableCollaboration.js | 2 +-
+ tests/unit/openai-responses-agent-messages.test.js    | 8 ++++++++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/open-sse/translator/concerns/portableCollaboration.js b/open-sse/translator/concerns/portableCollaboration.js
+index 84d70d4..6315598 100644
+--- a/open-sse/translator/concerns/portableCollaboration.js
++++ b/open-sse/translator/concerns/portableCollaboration.js
+@@ -22,7 +22,7 @@ export function hasUndeliverableAgentMessage(input) {
+       while (lines.length && (!lines[0].trim() || /^(Message Type|Task name|Sender):/.test(lines[0].trimStart()))) lines.shift();
+       text = lines.join("\n").replace(/^\s*Payload:[ \t]*/, "");
+     }
+-    return text.trim() === "";
++    return text.trim() === "" && !item.content.some(part => part?.type === RESPONSES_ITEM.INPUT_IMAGE);
+   });
+ }
+ 
+diff --git a/tests/unit/openai-responses-agent-messages.test.js b/tests/unit/openai-responses-agent-messages.test.js
+index beb6cef..7d6b9cb 100644
+--- a/tests/unit/openai-responses-agent-messages.test.js
++++ b/tests/unit/openai-responses-agent-messages.test.js
+@@ -192,6 +192,14 @@ describe("opaque agent_message detection", () => {
+     expect(hasUndeliverableAgentMessage([{ type: "agent_message", content: [{ type: "encrypted_content", encrypted_content: FERNET }] }])).toBe(true);
+   });
+ 
++  it("keeps an opaque agent message with an image deliverable", () => {
++    const withImage = { type: "agent_message", content: [
++      { type: "input_image", image_url: "data:image/png;base64,AAAA" },
++      { type: "encrypted_content", encrypted_content: FERNET },
++    ] };
++    expect(hasUndeliverableAgentMessage([withImage])).toBe(false);
++  });
++
+   it("ignores plaintext agent messages, ordinary reasoning ciphertext and non-array input", () => {
+     expect(hasUndeliverableAgentMessage([newTask, message, finalAnswer])).toBe(false);
+     expect(hasUndeliverableAgentMessage([{ type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] }])).toBe(false);
+-- 
+2.43.0
+
