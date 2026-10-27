@@ -5424,6 +5424,7 @@ def _actionlint_sandbox_command(container_engine, engine_kind, root, container_n
         "--cap-drop=ALL", "--security-opt=no-new-privileges",
         "--memory=512m", "--cpus=1", "--pids-limit=64",
         "--user", f"{os.getuid()}:{os.getgid()}",
+        *(["--userns=keep-id"] if engine_kind == "podman" else []),
         "--mount", f"type=bind,source={root},target=/input,readonly{relabel}",
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m", "--workdir", "/input",
         "--env", "HOME=/tmp", "--env", "PYTHONDONTWRITEBYTECODE=1",

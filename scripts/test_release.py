@@ -656,5 +656,15 @@ class PublicationTests(unittest.TestCase):
                             release.verify_published_release("warelik/9router", published, HEAD, OTHER,
                                                              env["PATCHSET_SHA256"], env["APP_VERSION"])
 
+class ActionlintSandboxCommandTests(unittest.TestCase):
+    def test_podman_maps_the_host_user_and_docker_does_not(self):
+        root = Path("/tmp/policy-lint")
+        podman = release._actionlint_sandbox_command(["podman"], "podman", root, "lint")
+        docker = release._actionlint_sandbox_command(["docker"], "docker", root, "lint")
+        self.assertIn("--userns=keep-id", podman)
+        self.assertNotIn("--userns=keep-id", docker)
+        self.assertEqual([arg.replace(",relabel=shared", "") for arg in podman[1:] if arg != "--userns=keep-id"], docker[1:])
+
+
 if __name__ == "__main__":
     unittest.main()
