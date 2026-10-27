@@ -1,0 +1,102 @@
+From caeb86e55e3012e60d854d3337a8e59940d816bd Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Tue, 27 Oct 2026 05:50:47 +0000
+Subject: [PATCH] Restore mapped tool names on native Gemini and frame the
+ final buffered stream line
+
+---
+ open-sse/utils/stream.js                | 25 +++++++++++++++++++++++++
+ tests/unit/gemini-native-stream.test.js | 13 ++++++++++++-
+ 2 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index ec0ae9e..8ebd47e 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -41,6 +41,15 @@ const PENDING_COMPLETION_FLUSH_MS = 3000;
+ // https://developers.google.com/workspace/drive/api/guides/fields-parameter
+ // Require a terminal only when every supplied projection clearly retains it.
+ // Unknown selectors remain transparent instead of fabricating a failure.
++function restoreSseDataLine(line, toolNameMap) {
++  if (!toolNameMap?.size || !line.startsWith("data:")) return line;
++  let parsed;
++  try { parsed = JSON.parse(line.slice(5)); }
++  catch { return line; }
++  const restored = restoreToolNames(parsed, toolNameMap);
++  return restored === parsed ? line : "data: " + JSON.stringify(restored);
++}
++
+ function nativeCandidateFieldIsVisible(projection, field) {
+   return (projection?.masks || []).every(value => {
+     const mask = String(value ?? "").replace(/\s/g, "");
+@@ -343,6 +352,15 @@ export function createSSEStream(options = {}) {
+         // Accounting observes complete lines; the client receives original
+         // bytes, including fragmented UTF-8, tool calls and usage-only trailers.
+         reqLogger?.appendConvertedChunk?.(text);
++        if (nativeJson) {
++          if (!toolNameMap?.size) controller.enqueue(chunk);
++          return;
++        }
++        if (toolNameMap?.size) {
++          const restored = lines.map(line => restoreSseDataLine(line, toolNameMap) + "\n").join("");
++          if (restored) controller.enqueue(sharedEncoder.encode(restored));
++          return;
++        }
+         controller.enqueue(chunk);
+         return;
+       }
+@@ -759,6 +777,11 @@ export function createSSEStream(options = {}) {
+               reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
+               controller.enqueue(failure);
+             } else if (!nativeGeminiErrorSeen) {
++              if (nativeJson && toolNameMap?.size) {
++                const json = JSON.stringify(restoreToolNames(JSON.parse(nativeGeminiJson), toolNameMap));
++                reqLogger?.appendConvertedChunk?.(json);
++                controller.enqueue(sharedEncoder.encode(json));
++              }
+               await reportNativeGeminiSuccess();
+             }
+             await finalizeStream();
+@@ -769,6 +792,8 @@ export function createSSEStream(options = {}) {
+             if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
+               output = "data: " + buffer.slice(5);
+             }
++            output = restoreSseDataLine(output, toolNameMap);
++            if (!output.endsWith("\n")) output += "\n\n";
+             reqLogger?.appendConvertedChunk?.(output);
+             controller.enqueue(sharedEncoder.encode(output));
+           }
+diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
+index e811e69..ff61be2 100644
+--- a/tests/unit/gemini-native-stream.test.js
++++ b/tests/unit/gemini-native-stream.test.js
+@@ -35,7 +35,7 @@ const chunk = {
+ };
+ const lateUsage = { usageMetadata: { promptTokenCount: 4096, candidatesTokenCount: 7, thoughtsTokenCount: 20, cachedContentTokenCount: 2048, totalTokenCount: 4123 } };
+ const inputStream = chunks => new ReadableStream({ start(controller) { for (const value of chunks) controller.enqueue(value); controller.close(); } });
+-const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nativeJson = false, projection = null, onNativeResponseSuccess = null) => createPassthroughStreamWithLogger(provider, null, "gemini-native-test", null, null, complete, null, source, nativeJson, projection, onNativeResponseSuccess);
++const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nativeJson = false, projection = null, onNativeResponseSuccess = null, toolNameMap = null) => createPassthroughStreamWithLogger(provider, null, "gemini-native-test", null, null, complete, null, toolNameMap, source, nativeJson, projection, onNativeResponseSuccess);
+ const readText = stream => new Response(stream).text();
+ 
+ describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
+@@ -594,6 +594,17 @@ describe("native stream integration and failure cleanup", () => {
+     await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
+   });
+ 
++  it("restores mapped tool names in a native JSON response body", async () => {
++    const toolNameMap = new Map([["wire_tool", "original_tool"]]);
++    const response = { candidates: [{ index: 0, content: { role: "model", parts: [
++      { functionCall: { id: "call-1", name: "wire_tool", args: { value: 1 } } },
++    ] }, finishReason: "STOP" }] };
++    const output = await readText(inputStream([encode(JSON.stringify(response))])
++      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, true, null, null, toolNameMap)));
++    expect(output).toContain('"name":"original_tool"');
++    expect(output).not.toContain("wire_tool");
++  });
++
+   it("defers native request success through the same-format tool-name transform", async () => {
+     const toolNameMap = new Map([["wire_tool", "original_tool"]]);
+     const response = { candidates: [{ index: 0, content: { role: "model", parts: [
+-- 
+2.43.0
+
