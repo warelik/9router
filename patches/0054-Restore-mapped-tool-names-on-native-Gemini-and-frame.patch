@@ -1,16 +1,16 @@
-From caeb86e55e3012e60d854d3337a8e59940d816bd Mon Sep 17 00:00:00 2001
+From 653621b83ddbe24d95d2bd2bca66688a799c031e Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 27 Oct 2026 05:50:47 +0000
 Subject: [PATCH] Restore mapped tool names on native Gemini and frame the
  final buffered stream line
 
 ---
- open-sse/utils/stream.js                | 25 +++++++++++++++++++++++++
- tests/unit/gemini-native-stream.test.js | 13 ++++++++++++-
- 2 files changed, 37 insertions(+), 1 deletion(-)
+ open-sse/utils/stream.js                | 33 +++++++++++++++++++++++--
+ tests/unit/gemini-native-stream.test.js | 26 ++++++++++++++++++-
+ 2 files changed, 56 insertions(+), 3 deletions(-)
 
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index ec0ae9e..8ebd47e 100644
+index ec0ae9e..0164de2 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -41,6 +41,15 @@ const PENDING_COMPLETION_FLUSH_MS = 3000;
@@ -45,19 +45,27 @@ index ec0ae9e..8ebd47e 100644
          controller.enqueue(chunk);
          return;
        }
-@@ -759,6 +777,11 @@ export function createSSEStream(options = {}) {
+@@ -758,8 +776,17 @@ export function createSSEStream(options = {}) {
+               const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream ended before a candidate finished", sourceFormat);
                reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
                controller.enqueue(failure);
-             } else if (!nativeGeminiErrorSeen) {
-+              if (nativeJson && toolNameMap?.size) {
-+                const json = JSON.stringify(restoreToolNames(JSON.parse(nativeGeminiJson), toolNameMap));
-+                reqLogger?.appendConvertedChunk?.(json);
-+                controller.enqueue(sharedEncoder.encode(json));
+-            } else if (!nativeGeminiErrorSeen) {
+-              await reportNativeGeminiSuccess();
++            } else {
++              if (toolNameMap?.size) {
++                const tail = nativeJson
++                  ? JSON.stringify(restoreToolNames(JSON.parse(nativeGeminiJson), toolNameMap))
++                  : restoreSseDataLine(buffer, toolNameMap);
++                if (tail) {
++                  reqLogger?.appendConvertedChunk?.(tail);
++                  controller.enqueue(sharedEncoder.encode(tail));
++                }
 +              }
-               await reportNativeGeminiSuccess();
++              if (!nativeGeminiErrorSeen) await reportNativeGeminiSuccess();
              }
              await finalizeStream();
-@@ -769,6 +792,8 @@ export function createSSEStream(options = {}) {
+             return;
+@@ -769,6 +796,8 @@ export function createSSEStream(options = {}) {
              if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
                output = "data: " + buffer.slice(5);
              }
@@ -67,7 +75,7 @@ index ec0ae9e..8ebd47e 100644
              controller.enqueue(sharedEncoder.encode(output));
            }
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index e811e69..ff61be2 100644
+index e811e69..a77342d 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -35,7 +35,7 @@ const chunk = {
@@ -79,10 +87,23 @@ index e811e69..ff61be2 100644
  const readText = stream => new Response(stream).text();
  
  describe("native Gemini SSE preserves provider payload and follows the client protocol", () => {
-@@ -594,6 +594,17 @@ describe("native stream integration and failure cleanup", () => {
+@@ -594,6 +594,30 @@ describe("native stream integration and failure cleanup", () => {
      await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
    });
  
++  it("restores mapped tool names in a final native SSE data line without a newline", async () => {
++    const toolNameMap = new Map([["wire_tool", "original_tool"]]);
++    const first = { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "hi" }] }, finishReason: "STOP" }] };
++    const last = { candidates: [{ index: 0, content: { role: "model", parts: [
++      { functionCall: { id: "call-2", name: "wire_tool", args: { value: 2 } } },
++    ] }, finishReason: "STOP" }] };
++    const output = await readText(inputStream([encode(frame(first) + `data: ${JSON.stringify(last)}`)])
++      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, false, null, null, toolNameMap)));
++    expect(output).toContain('"id":"call-2"');
++    expect(output).toContain('"name":"original_tool"');
++    expect(output).not.toContain("wire_tool");
++  });
++
 +  it("restores mapped tool names in a native JSON response body", async () => {
 +    const toolNameMap = new Map([["wire_tool", "original_tool"]]);
 +    const response = { candidates: [{ index: 0, content: { role: "model", parts: [
