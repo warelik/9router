@@ -1,0 +1,43 @@
+From fba99ee3d918191651eb0fa1b61bc56190a2cf8c Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Tue, 27 Oct 2026 03:38:13 +0000
+Subject: [PATCH 53/53] Validate Mavis session UUIDs before sanitizing the
+ golden snapshot
+
+---
+ tests/translator/golden-url-header.test.js | 19 +++++++++++--------
+ 1 file changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
+index 49eb9df..881eb6a 100644
+--- a/tests/translator/golden-url-header.test.js
++++ b/tests/translator/golden-url-header.test.js
+@@ -68,14 +68,17 @@ describe("GOLDEN buildHeaders (default executor providers)", () => {
+         oauth: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : OAUTH_CRED, true))),
+         nonStream: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, false))),
+       };
+-      const sessionMatchers = Object.fromEntries(
+-        Object.entries(snap)
+-          .filter(([, headers]) => typeof headers?.["X-Mavis-Session-Id"] === "string")
+-          .map(([kind]) => [kind, {
+-            "X-Mavis-Session-Id": expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+-          }])
+-      );
+-      expect(snap).toMatchSnapshot(sessionMatchers);
++      const raw = {
++        apiKey: safe(() => ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, true)),
++        oauth: safe(() => ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : OAUTH_CRED, true)),
++        nonStream: safe(() => ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, false)),
++      };
++      for (const headers of Object.values(raw)) {
++        if (typeof headers?.["X-Mavis-Session-Id"] === "string") {
++          expect(headers["X-Mavis-Session-Id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
++        }
++      }
++      expect(snap).toMatchSnapshot();
+     });
+   }
+ });
+-- 
+2.43.0
+
