@@ -20,7 +20,7 @@ index e21a45b..31807c8 100644
 @@ -36,7 +36,11 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
    }
  
-   if (needsTranslation(targetFormat, sourceFormat) || toolNameMap?.size) {
+   if (needsTranslation(targetFormat, sourceFormat)) {
 -    return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
 +    return createSSETransformStreamWithLogger(
 +      targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId,
