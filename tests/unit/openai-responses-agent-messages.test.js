@@ -192,6 +192,14 @@ describe("opaque agent_message detection", () => {
     expect(hasUndeliverableAgentMessage([{ type: "agent_message", content: [{ type: "encrypted_content", encrypted_content: FERNET }] }])).toBe(true);
   });
 
+  it("keeps an opaque agent message with an image deliverable", () => {
+    const withImage = { type: "agent_message", content: [
+      { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+      { type: "encrypted_content", encrypted_content: FERNET },
+    ] };
+    expect(hasUndeliverableAgentMessage([withImage])).toBe(false);
+  });
+
   it("ignores plaintext agent messages, ordinary reasoning ciphertext and non-array input", () => {
     expect(hasUndeliverableAgentMessage([newTask, message, finalAnswer])).toBe(false);
     expect(hasUndeliverableAgentMessage([{ type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] }])).toBe(false);

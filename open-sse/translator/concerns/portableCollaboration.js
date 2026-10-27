@@ -22,7 +22,7 @@ export function hasUndeliverableAgentMessage(input) {
       while (lines.length && (!lines[0].trim() || /^(Message Type|Task name|Sender):/.test(lines[0].trimStart()))) lines.shift();
       text = lines.join("\n").replace(/^\s*Payload:[ \t]*/, "");
     }
-    return text.trim() === "";
+    return text.trim() === "" && !item.content.some(part => part?.type === RESPONSES_ITEM.INPUT_IMAGE);
   });
 }
 
