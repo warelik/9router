@@ -118,6 +118,7 @@ export function createSSEStream(options = {}) {
 
   let buffer = "";
   let nativeSseEvent = [];
+  let nativeForwardedUnterminated = false;
   let pendingTrailingCr = false;
   let usage = null;
   // The client's wire protocol determines termination, regardless of which
@@ -373,6 +374,7 @@ export function createSSEStream(options = {}) {
           if (restored) controller.enqueue(sharedEncoder.encode(restored));
           return;
         }
+        nativeForwardedUnterminated = !text.endsWith("\n");
         controller.enqueue(chunk);
         return;
       }
@@ -778,6 +780,7 @@ export function createSSEStream(options = {}) {
                 : "Upstream Gemini stream returned no valid response";
               const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, message, sourceFormat);
               reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
+              if (nativeForwardedUnterminated) controller.enqueue(sharedEncoder.encode("\n\n"));
               controller.enqueue(failure);
             } else if (nativeGeminiHasIncompleteCandidate()) {
               if (nativeJson) {
@@ -787,12 +790,15 @@ export function createSSEStream(options = {}) {
               }
               const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream ended before a candidate finished", sourceFormat);
               reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
+              if (nativeForwardedUnterminated) controller.enqueue(sharedEncoder.encode("\n\n"));
               controller.enqueue(failure);
             } else {
               if (toolNameMap?.size) {
                 const tail = nativeJson
                   ? JSON.stringify(restoreToolNames(JSON.parse(nativeGeminiJson), toolNameMap))
-                  : (nativeSseEvent.length ? restoreSseEvent(nativeSseEvent, toolNameMap) + "\n" : "") + restoreSseEvent([buffer], toolNameMap);
+                  : buffer
+                    ? restoreSseEvent([...nativeSseEvent, buffer], toolNameMap)
+                    : nativeSseEvent.length ? restoreSseEvent(nativeSseEvent, toolNameMap) + "\n" : "";
                 if (tail) {
                   reqLogger?.appendConvertedChunk?.(tail);
                   controller.enqueue(sharedEncoder.encode(tail));

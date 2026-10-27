@@ -622,6 +622,28 @@ describe("native stream integration and failure cleanup", () => {
     expect(output).not.toContain("wire_tool");
   });
 
+  it("restores mapped tool names in an unterminated multi-line native event at EOF", async () => {
+    const toolNameMap = new Map([["wire_tool", "original_tool"]]);
+    const event = { candidates: [{ index: 0, content: { role: "model", parts: [
+      { functionCall: { id: "call-4", name: "wire_tool", args: { value: 4 } } },
+    ] }, finishReason: "STOP" }] };
+    const json = JSON.stringify(event);
+    const split = json.indexOf('"args"');
+    const raw = `data: ${json.slice(0, split)}\ndata: ${json.slice(split)}`;
+    const output = await readText(inputStream([encode(raw)])
+      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, false, null, null, toolNameMap)));
+    expect(output).toContain('"id":"call-4"');
+    expect(output).toContain('"name":"original_tool"');
+    expect(output).not.toContain("wire_tool");
+  });
+
+  it("separates an unterminated forwarded native event from the synthesized failure frame", async () => {
+    const partial = { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "partial" }] } }] };
+    const output = await readText(inputStream([encode(`data: ${JSON.stringify(partial)}`)])
+      .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI)));
+    expect(output).not.toContain("}data:");
+  });
+
   it("restores mapped tool names in a native JSON response body", async () => {
     const toolNameMap = new Map([["wire_tool", "original_tool"]]);
     const response = { candidates: [{ index: 0, content: { role: "model", parts: [

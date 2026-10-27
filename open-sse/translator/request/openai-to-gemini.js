@@ -213,7 +213,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
         const turnSystem = turnInstructionParts.length > 0
           ? { role: GEMINI_ROLE.USER, parts: turnInstructionParts }
           : null;
-        const turnScope = geminiTurnScope(result.contents, turnSystem);
+        const turnScope = geminiTurnScope(normalizeGeminiContents(result.contents, model, { synthesizeTerminalToolResponse: false }), turnSystem);
         // Signature the provider issued for this tool-free turn (Gemini only accepts its own).
         const turnSig = msg.tool_calls?.length
           ? null

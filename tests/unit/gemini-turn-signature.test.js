@@ -149,6 +149,22 @@ describe("signature of a tool-free thinking turn survives the round trip", () =>
     expect(replay({ k: 1 }, "result two")).toEqual([{ text: "shared reply t" }]);
   });
 
+  it("replays a Gemini 4 turn whose user message follows a tool result from the same canonical history", () => {
+    const model = "gemini-4-turn-signature-test";
+    const sessionId = "authenticated-fixture-conversation";
+    const call = { role: "assistant", content: null, tool_calls: [{ id: "c4", type: "function", function: { name: "lookup", arguments: "{}" } }] };
+    const history = [ask("gemini4 tool"), call, { role: "tool", tool_call_id: "c4", content: "gemini4 result" }, ask("gemini4 follow-up")];
+    const credentials = { _geminiServerPartsSessionId: sessionId };
+    openaiToGeminiRequest(model, { messages: history }, true, credentials);
+    const state = { model, turnScope: credentials._geminiTurnScope, serverPartsSessionId: sessionId };
+    geminiToOpenAIResponse(chunk([{ text: "gemini4 reply", thoughtSignature: "sig-g4" }], "STOP"), state);
+    const req = openaiToGeminiRequest(model, {
+      messages: [...history, { role: "assistant", content: "gemini4 reply" }, ask("again")],
+    }, false, { _geminiServerPartsSessionId: sessionId });
+    const parts = req.contents.filter((c) => c.role === "model").flatMap((c) => c.parts);
+    expect(parts).toContainEqual({ text: "gemini4 reply", thoughtSignature: "sig-g4" });
+  });
+
   it("separates otherwise identical tool exchanges that carry different call ids", () => {
     const history = (id) => [
       ask("ids"),
