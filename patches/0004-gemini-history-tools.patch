@@ -7,40 +7,34 @@ Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
 Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
 Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
 ---
- open-sse/executors/zed.js                     |  14 +-
- open-sse/handlers/chatCore.js                 |   2 +-
- .../handlers/chatCore/nonStreamingHandler.js  |  57 +-
- open-sse/services/thoughtSignatureStore.js    | 113 +++
- open-sse/translator/concerns/toolCall.js      |  40 +-
- open-sse/translator/formats/gemini.js         | 205 +++--
- open-sse/translator/index.js                  |  13 +-
- .../translator/request/openai-to-gemini.js    | 334 +++----
- .../translator/request/openai-to-vertex.js    |   9 +-
- .../translator/response/gemini-to-openai.js   |  50 +-
- open-sse/utils/sessionManager.js              |  16 +
- open-sse/utils/stream.js                      |  29 +-
- open-sse/utils/usageTracking.js               |   2 +-
- .../__snapshots__/golden-request.test.js.snap |   4 +-
- .../bugs-gemini-cursor-commandcode.test.js    |   7 +-
- tests/translator/golden-request.test.js       |  18 +
- tests/unit/chat-to-gemini-contract.test.js    | 817 ++++++++++++++++++
- .../gemini-contents-normalization.test.js     |   4 +-
- .../gemini-nonstream-source-format.test.js    |  65 ++
- .../gemini-server-parts-isolation.test.js     | 130 +++
- tests/unit/gemini-tool-call-id-fifo.test.js   | 118 +++
- tests/unit/gemini-turn-signature.test.js      | 168 ++++
- .../unit/translated-chat-stream-done.test.js  |  57 ++
- tests/unit/zed-completions-wire.test.js       | 110 +++
+ open-sse/executors/zed.js                          |  14 +-
+ open-sse/handlers/chatCore.js                      |   2 +-
+ open-sse/handlers/chatCore/nonStreamingHandler.js  |  57 +-
+ open-sse/services/thoughtSignatureStore.js         | 113 +++
+ open-sse/translator/concerns/toolCall.js           |  40 +-
+ open-sse/translator/formats/gemini.js              | 205 +++---
+ open-sse/translator/index.js                       |  13 +-
+ open-sse/translator/request/openai-to-gemini.js    | 334 +++++----
+ open-sse/translator/request/openai-to-vertex.js    |   9 +-
+ open-sse/translator/response/gemini-to-openai.js   |  50 +-
+ open-sse/utils/sessionManager.js                   |  16 +
+ open-sse/utils/stream.js                           |  29 +-
+ open-sse/utils/usageTracking.js                    |   2 +-
+ .../__snapshots__/golden-request.test.js.snap      |   4 +-
+ .../bugs-gemini-cursor-commandcode.test.js         |   7 +-
+ tests/translator/golden-request.test.js            |  18 +
+ tests/unit/chat-to-gemini-contract.test.js         | 817 +++++++++++++++++++++
+ tests/unit/gemini-contents-normalization.test.js   |   4 +-
+ tests/unit/gemini-nonstream-source-format.test.js  |  65 ++
+ tests/unit/gemini-server-parts-isolation.test.js   | 130 ++++
+ tests/unit/gemini-tool-call-id-fifo.test.js        | 118 +++
+ tests/unit/gemini-turn-signature.test.js           | 168 +++++
+ tests/unit/translated-chat-stream-done.test.js     |  57 ++
+ tests/unit/zed-completions-wire.test.js            | 110 +++
  24 files changed, 2087 insertions(+), 295 deletions(-)
- create mode 100644 tests/unit/chat-to-gemini-contract.test.js
- create mode 100644 tests/unit/gemini-nonstream-source-format.test.js
- create mode 100644 tests/unit/gemini-server-parts-isolation.test.js
- create mode 100644 tests/unit/gemini-tool-call-id-fifo.test.js
- create mode 100644 tests/unit/gemini-turn-signature.test.js
- create mode 100644 tests/unit/translated-chat-stream-done.test.js
 
 diff --git a/open-sse/executors/zed.js b/open-sse/executors/zed.js
-index b88d2762..5d3a7e79 100644
+index b88d276..5d3a7e7 100644
 --- a/open-sse/executors/zed.js
 +++ b/open-sse/executors/zed.js
 @@ -17,6 +17,8 @@
@@ -87,10 +81,10 @@ index b88d2762..5d3a7e79 100644
  }
  
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index 827ce9b7..aa275eb3 100644
+index 104bdd1..b1d2b39 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
-@@ -589,7 +589,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -596,7 +596,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
  
    // True non-streaming response
    if (!stream) {
@@ -100,7 +94,7 @@ index 827ce9b7..aa275eb3 100644
      return result;
    }
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index ac79c218..70420821 100644
+index ac79c21..7042082 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
 @@ -1,6 +1,7 @@
@@ -214,7 +208,7 @@ index ac79c218..70420821 100644
    const isClaudeMessageResponse = sourceFormat === FORMATS.CLAUDE && translatedResponse?.type === "message";
    // Responses-format translation produces a `object:"response"` body with no
 diff --git a/open-sse/services/thoughtSignatureStore.js b/open-sse/services/thoughtSignatureStore.js
-index 71fb94b8..906cffc4 100644
+index 71fb94b..906cffc 100644
 --- a/open-sse/services/thoughtSignatureStore.js
 +++ b/open-sse/services/thoughtSignatureStore.js
 @@ -1,3 +1,4 @@
@@ -339,7 +333,7 @@ index 71fb94b8..906cffc4 100644
 +  return null;
 +}
 diff --git a/open-sse/translator/concerns/toolCall.js b/open-sse/translator/concerns/toolCall.js
-index 251850c1..95cca8b6 100644
+index 251850c..95cca8b 100644
 --- a/open-sse/translator/concerns/toolCall.js
 +++ b/open-sse/translator/concerns/toolCall.js
 @@ -23,8 +23,18 @@ function sanitizeToolId(id) {
@@ -413,7 +407,7 @@ index 251850c1..95cca8b6 100644
        }
      }
 diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
-index ba24aade..1f42b117 100644
+index ba24aad..1f42b11 100644
 --- a/open-sse/translator/formats/gemini.js
 +++ b/open-sse/translator/formats/gemini.js
 @@ -1,7 +1,7 @@
@@ -778,10 +772,10 @@ index ba24aade..1f42b117 100644
  
 -
 diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
-index 972ddeb4..59d90319 100644
+index 9254800..def9327 100644
 --- a/open-sse/translator/index.js
 +++ b/open-sse/translator/index.js
-@@ -79,13 +79,15 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+@@ -80,13 +80,15 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
    normalizeThinkingConfig(result);
  
    // Always ensure tool_calls have id (some providers require it)
@@ -800,7 +794,7 @@ index 972ddeb4..59d90319 100644
      fixMissingToolResponses(result);
    }
  
-@@ -97,6 +99,9 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+@@ -98,6 +100,9 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
    const clientSessionId = captureSessionId(result, credentials, connectionId, targetFormat);
    // Expose to downstream translators (gemini-cli/antigravity envelopes) that run after envelope is stripped
    if (credentials) credentials._clientSessionId = clientSessionId;
@@ -810,7 +804,7 @@ index 972ddeb4..59d90319 100644
  
    // If same format, skip translation steps
    if (sourceFormat !== targetFormat) {
-@@ -106,6 +111,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+@@ -107,6 +112,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
      const directFn = requestRegistry.get(`${sourceFormat}:${targetFormat}`);
      if (directFn) {
        result = directFn(model, result, stream, credentials);
@@ -818,7 +812,7 @@ index 972ddeb4..59d90319 100644
      } else {
        // Step 1: source -> openai (if source is not openai)
        if (sourceFormat !== FORMATS.OPENAI) {
-@@ -116,6 +122,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+@@ -117,6 +123,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
            reqLogger?.logOpenAIRequest?.(result);
          }
        }
@@ -827,7 +821,7 @@ index 972ddeb4..59d90319 100644
        // Step 2: openai -> target (if target is not openai)
        if (targetFormat !== FORMATS.OPENAI) {
 diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
-index 7b36bbfc..5ca519ce 100644
+index 7b36bbf..5ca519c 100644
 --- a/open-sse/translator/request/openai-to-gemini.js
 +++ b/open-sse/translator/request/openai-to-gemini.js
 @@ -2,7 +2,8 @@ import { register } from "../index.js";
@@ -1291,7 +1285,7 @@ index 7b36bbfc..5ca519ce 100644
    return gemini;
  }
 diff --git a/open-sse/translator/request/openai-to-vertex.js b/open-sse/translator/request/openai-to-vertex.js
-index 8fe8e637..4572497a 100644
+index 8fe8e63..4572497 100644
 --- a/open-sse/translator/request/openai-to-vertex.js
 +++ b/open-sse/translator/request/openai-to-vertex.js
 @@ -1,7 +1,12 @@
@@ -1318,7 +1312,7 @@ index 8fe8e637..4572497a 100644
        }
        // Strip id from functionCall
 diff --git a/open-sse/translator/response/gemini-to-openai.js b/open-sse/translator/response/gemini-to-openai.js
-index 14c47939..e7e5267d 100644
+index 14c4793..e7e5267 100644
 --- a/open-sse/translator/response/gemini-to-openai.js
 +++ b/open-sse/translator/response/gemini-to-openai.js
 @@ -37,6 +37,17 @@ function emitFunctionCall(functionCall, state, signature = null) {
@@ -1407,7 +1401,7 @@ index 14c47939..e7e5267d 100644
      if (finishReason === OPENAI_FINISH.STOP && state.geminiToolCallCount > 0) {
        finishReason = OPENAI_FINISH.TOOL_CALLS;
 diff --git a/open-sse/utils/sessionManager.js b/open-sse/utils/sessionManager.js
-index 4f701b88..8fb60815 100644
+index 4f701b8..8fb6081 100644
 --- a/open-sse/utils/sessionManager.js
 +++ b/open-sse/utils/sessionManager.js
 @@ -220,6 +220,22 @@ export function resolveSessionIdentity({ headers, body, connectionId, workspaceI
@@ -1434,10 +1428,10 @@ index 4f701b88..8fb60815 100644
      return resolveSessionIdentity(opts).sessionId;
  }
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index cf73241a..52720a31 100644
+index 62f5c85..6b79e23 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
-@@ -89,17 +89,26 @@ export function createSSEStream(options = {}) {
+@@ -91,11 +91,20 @@ export function createSSEStream(options = {}) {
      body = null,
      onStreamComplete = null,
      apiKey = null,
@@ -1457,7 +1451,9 @@ index cf73241a..52720a31 100644
 +  const observeNativeFinishReason = nativeCandidateFieldIsVisible(nativeResponseProjection, "finishReason");
 +  const observeNativeCandidateIndex = nativeCandidateFieldIsVisible(nativeResponseProjection, "index");
  
-   // Per-stream decoder with stream:true to correctly handle multi-byte chars split across chunks
+   // Tool-call ids already sent to the client, keyed by the tool-call index.
+   // A late fragment that opens a NEW index without an id must not reach the
+@@ -107,7 +116,7 @@ export function createSSEStream(options = {}) {
    const decoder = new TextDecoder("utf-8", { fatal: false });
  
    const state = mode === STREAM_MODE.TRANSLATE
@@ -1466,7 +1462,7 @@ index cf73241a..52720a31 100644
          // Which upstream format this stream came from. A response translator can be
          // reached either directly (target === its registered source) or as the second
          // hop of a pivot, and on the terminal null chunk the pivot drops it — so a
-@@ -574,9 +583,7 @@ export function createSSEStream(options = {}) {
+@@ -620,9 +629,7 @@ export function createSSEStream(options = {}) {
            // Some clients (e.g. OpenClaw) expect the OpenAI-style sentinel:
            //   data: [DONE]\n\n
            // Without it they can hang until timeout and trigger failover.
@@ -1477,7 +1473,7 @@ index cf73241a..52720a31 100644
              const doneOutput = "data: [DONE]\n\n";
              reqLogger?.appendConvertedChunk?.(doneOutput);
              controller.enqueue(sharedEncoder.encode(doneOutput));
-@@ -617,6 +624,7 @@ export function createSSEStream(options = {}) {
+@@ -663,6 +670,7 @@ export function createSSEStream(options = {}) {
                  const output = formatSSE(item, sourceFormat);
                  reqLogger?.appendConvertedChunk?.(output);
                  controller.enqueue(sharedEncoder.encode(output));
@@ -1485,7 +1481,7 @@ index cf73241a..52720a31 100644
                }
              }
            }
-@@ -637,6 +645,7 @@ export function createSSEStream(options = {}) {
+@@ -683,6 +691,7 @@ export function createSSEStream(options = {}) {
              const output = formatSSE(item, sourceFormat);
              reqLogger?.appendConvertedChunk?.(output);
              controller.enqueue(sharedEncoder.encode(output));
@@ -1493,7 +1489,7 @@ index cf73241a..52720a31 100644
            }
          }
  
-@@ -657,6 +666,16 @@ export function createSSEStream(options = {}) {
+@@ -703,6 +712,16 @@ export function createSSEStream(options = {}) {
            streamDoneSent = true;
          }
  
@@ -1511,7 +1507,7 @@ index cf73241a..52720a31 100644
        } catch (error) {
          console.log("Error in flush:", error);
 diff --git a/open-sse/utils/usageTracking.js b/open-sse/utils/usageTracking.js
-index 62a5cc76..09643fa5 100644
+index 62a5cc7..09643fa 100644
 --- a/open-sse/utils/usageTracking.js
 +++ b/open-sse/utils/usageTracking.js
 @@ -83,7 +83,7 @@ export function filterUsageForFormat(usage, targetFormat) {
@@ -1524,7 +1520,7 @@ index 62a5cc76..09643fa5 100644
        'estimated'
      ],
 diff --git a/tests/translator/__snapshots__/golden-request.test.js.snap b/tests/translator/__snapshots__/golden-request.test.js.snap
-index 8bcab641..bf1d55df 100644
+index 8bcab64..bf1d55d 100644
 --- a/tests/translator/__snapshots__/golden-request.test.js.snap
 +++ b/tests/translator/__snapshots__/golden-request.test.js.snap
 @@ -167,9 +167,7 @@ exports[`GOLDEN request: OpenAI → Gemini > full body (system/image/tool/tool_r
@@ -1539,7 +1535,7 @@ index 8bcab641..bf1d55df 100644
            },
          },
 diff --git a/tests/translator/bugs-gemini-cursor-commandcode.test.js b/tests/translator/bugs-gemini-cursor-commandcode.test.js
-index 8483bfc1..58e39274 100644
+index 8bbc3ff..1bb6c78 100644
 --- a/tests/translator/bugs-gemini-cursor-commandcode.test.js
 +++ b/tests/translator/bugs-gemini-cursor-commandcode.test.js
 @@ -9,9 +9,9 @@ const O2C = (body) => translateRequest(FORMATS.OPENAI, FORMATS.CURSOR, "m", body
@@ -1564,7 +1560,7 @@ index 8483bfc1..58e39274 100644
  });
  
 diff --git a/tests/translator/golden-request.test.js b/tests/translator/golden-request.test.js
-index 21cf49f7..5a12ae26 100644
+index 21cf49f..5a12ae2 100644
 --- a/tests/translator/golden-request.test.js
 +++ b/tests/translator/golden-request.test.js
 @@ -93,6 +93,24 @@ describe("GOLDEN request: OpenAI → Gemini", () => {
@@ -1594,7 +1590,7 @@ index 21cf49f7..5a12ae26 100644
  describe("GOLDEN request: OpenAI → Kiro", () => {
 diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
 new file mode 100644
-index 00000000..6efffa53
+index 0000000..6efffa5
 --- /dev/null
 +++ b/tests/unit/chat-to-gemini-contract.test.js
 @@ -0,0 +1,817 @@
@@ -2416,7 +2412,7 @@ index 00000000..6efffa53
 +  });
 +});
 diff --git a/tests/unit/gemini-contents-normalization.test.js b/tests/unit/gemini-contents-normalization.test.js
-index 6b8a94c8..e446e522 100644
+index 6b8a94c..e446e52 100644
 --- a/tests/unit/gemini-contents-normalization.test.js
 +++ b/tests/unit/gemini-contents-normalization.test.js
 @@ -190,7 +190,7 @@ describe("functionResponse `$ref` sanitization", () => {
@@ -2431,7 +2427,7 @@ index 6b8a94c8..e446e522 100644
 -
 diff --git a/tests/unit/gemini-nonstream-source-format.test.js b/tests/unit/gemini-nonstream-source-format.test.js
 new file mode 100644
-index 00000000..225c30b1
+index 0000000..225c30b
 --- /dev/null
 +++ b/tests/unit/gemini-nonstream-source-format.test.js
 @@ -0,0 +1,65 @@
@@ -2502,7 +2498,7 @@ index 00000000..225c30b1
 +});
 diff --git a/tests/unit/gemini-server-parts-isolation.test.js b/tests/unit/gemini-server-parts-isolation.test.js
 new file mode 100644
-index 00000000..e2949f2e
+index 0000000..e2949f2
 --- /dev/null
 +++ b/tests/unit/gemini-server-parts-isolation.test.js
 @@ -0,0 +1,130 @@
@@ -2638,7 +2634,7 @@ index 00000000..e2949f2e
 +});
 diff --git a/tests/unit/gemini-tool-call-id-fifo.test.js b/tests/unit/gemini-tool-call-id-fifo.test.js
 new file mode 100644
-index 00000000..c1930f9f
+index 0000000..c1930f9
 --- /dev/null
 +++ b/tests/unit/gemini-tool-call-id-fifo.test.js
 @@ -0,0 +1,118 @@
@@ -2762,7 +2758,7 @@ index 00000000..c1930f9f
 +});
 diff --git a/tests/unit/gemini-turn-signature.test.js b/tests/unit/gemini-turn-signature.test.js
 new file mode 100644
-index 00000000..455c36f7
+index 0000000..455c36f
 --- /dev/null
 +++ b/tests/unit/gemini-turn-signature.test.js
 @@ -0,0 +1,168 @@
@@ -2936,7 +2932,7 @@ index 00000000..455c36f7
 +});
 diff --git a/tests/unit/translated-chat-stream-done.test.js b/tests/unit/translated-chat-stream-done.test.js
 new file mode 100644
-index 00000000..63b74532
+index 0000000..63b7453
 --- /dev/null
 +++ b/tests/unit/translated-chat-stream-done.test.js
 @@ -0,0 +1,57 @@
@@ -2998,7 +2994,7 @@ index 00000000..63b74532
 +  });
 +});
 diff --git a/tests/unit/zed-completions-wire.test.js b/tests/unit/zed-completions-wire.test.js
-index 5be982ae..f8c9b53f 100644
+index 5be982a..f8c9b53 100644
 --- a/tests/unit/zed-completions-wire.test.js
 +++ b/tests/unit/zed-completions-wire.test.js
 @@ -19,6 +19,9 @@ import {

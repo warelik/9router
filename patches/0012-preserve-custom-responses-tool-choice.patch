@@ -4,8 +4,8 @@ Date: Tue, 20 Oct 2026 00:00:00 +0000
 Subject: [PATCH] Preserve custom Responses tool choice identity
 
 ---
- .../translator/request/openai-responses.js    | 25 ++++++++--
- ...eam-translator-history-regressions.test.js | 50 +++++++++++++++++++
+ open-sse/translator/request/openai-responses.js    | 25 +++++++++--
+ ...wnstream-translator-history-regressions.test.js | 50 ++++++++++++++++++++++
  2 files changed, 72 insertions(+), 3 deletions(-)
 
 diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
@@ -116,6 +116,3 @@ index 29d983a..c78f4e7 100644
 +    expect(out._customToolNames).toContain("apply_patch");
 +  });
 +});
--- 
-2.55.0
-

@@ -5,16 +5,16 @@ Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Centralize Gemini schema tables
 
 ---
- open-sse/config/runtimeConfig.js           |  7 +++++
- open-sse/translator/formats/gemini.js      |  9 ++-----
- tests/unit/chat-to-gemini-contract.test.js | 31 ++++++++++++++++++++++
+ open-sse/config/runtimeConfig.js           |  7 +++++++
+ open-sse/translator/formats/gemini.js      |  9 ++-------
+ tests/unit/chat-to-gemini-contract.test.js | 31 ++++++++++++++++++++++++++++++
  3 files changed, 40 insertions(+), 7 deletions(-)
 
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index e7d1d6efc221b3194dd6f90f0cdacd236ee56ea2..7d0ad546b10491734a0b2ac040de3617d78c644a 100644
+index 03ab5db..9823b5a 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
-@@ -73,6 +73,13 @@ export const FILE_EXTENSION_MIME = {
+@@ -78,6 +78,13 @@ export const FILE_EXTENSION_MIME = {
    txt: "text/plain", md: "text/markdown", csv: "text/csv",
  };
  
@@ -29,7 +29,7 @@ index e7d1d6efc221b3194dd6f90f0cdacd236ee56ea2..7d0ad546b10491734a0b2ac040de3617
  
  export const PORTABLE_COLLABORATION = {
 diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
-index 105f22ac4aa8e61cc5a60d8b15d4009c04dac677..48f2c612e9065d91b52065b2c2bd35171eb8b56e 100644
+index 105f22a..48f2c61 100644
 --- a/open-sse/translator/formats/gemini.js
 +++ b/open-sse/translator/formats/gemini.js
 @@ -3,7 +3,8 @@
@@ -70,7 +70,7 @@ index 105f22ac4aa8e61cc5a60d8b15d4009c04dac677..48f2c612e9065d91b52065b2c2bd3517
    if (!schema || typeof schema !== "object" || Array.isArray(schema)) return false;
    for (const key of Object.keys(schema)) {
 diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
-index 6037829620a008af967d6770dc259678e9df7d3f..3360b862190486c79e1adcbf2984afc0ddecdb76 100644
+index 6037829..3360b86 100644
 --- a/tests/unit/chat-to-gemini-contract.test.js
 +++ b/tests/unit/chat-to-gemini-contract.test.js
 @@ -36,6 +36,7 @@ import {
@@ -118,6 +118,3 @@ index 6037829620a008af967d6770dc259678e9df7d3f..3360b862190486c79e1adcbf2984afc0
    it("isLegacyGeminiSchema accepts proto shapes and rejects non-proto ones", () => {
      expect(isLegacyGeminiSchema({ type: "object", properties: { a: { type: "string" } }, required: ["a"], propertyOrdering: ["a"], enum: undefined })).toBe(true);
      expect(isLegacyGeminiSchema({ type: "array", items: { type: "string" } })).toBe(true);
--- 
-2.43.0
-

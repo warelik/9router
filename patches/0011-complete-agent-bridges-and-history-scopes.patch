@@ -5,12 +5,11 @@ Date: Tue, 20 Oct 2026 00:00:00 +0000
 Subject: [PATCH] Fix mixed agent messages and Gemini instruction-prefix replay
 
 ---
- open-sse/translator/formats/responsesApi.js   |  11 +-
- .../translator/request/openai-responses.js    |   2 +-
- .../translator/request/openai-to-gemini.js    |  34 +++---
- ...eam-translator-history-regressions.test.js | 103 ++++++++++++++++++
+ open-sse/translator/formats/responsesApi.js        |  11 ++-
+ open-sse/translator/request/openai-responses.js    |   2 +-
+ open-sse/translator/request/openai-to-gemini.js    |  34 ++++---
+ ...wnstream-translator-history-regressions.test.js | 103 +++++++++++++++++++++
  4 files changed, 133 insertions(+), 17 deletions(-)
- create mode 100644 tests/unit/downstream-translator-history-regressions.test.js
 
 diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
 index ca2e59a..1b63d64 100644
@@ -245,6 +244,3 @@ index 0000000..29d983a
 +    expect(isolatedParts).not.toContainEqual(searchPart);
 +  });
 +});
--- 
-2.55.0
-

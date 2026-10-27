@@ -6,17 +6,17 @@ Subject: [PATCH] Keep opaque native transport frames separate from reply
  evidence and align null-wrapper regressions
 
 ---
- open-sse/utils/stream.js                |  6 ++++-
+ open-sse/utils/stream.js                |  6 +++++-
  open-sse/utils/streamHelpers.js         |  4 ++--
- tests/unit/gemini-native-core.test.js   | 17 ++++++++++++++
- tests/unit/gemini-native-stream.test.js | 30 ++++++++++++++++++++++++-
+ tests/unit/gemini-native-core.test.js   | 17 +++++++++++++++++
+ tests/unit/gemini-native-stream.test.js | 30 +++++++++++++++++++++++++++++-
  4 files changed, 53 insertions(+), 4 deletions(-)
 
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 4dc5084..655c07d 100644
+index 163dba3..094ebb7 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
-@@ -168,7 +168,11 @@ export function createSSEStream(options = {}) {
+@@ -176,7 +176,11 @@ export function createSSEStream(options = {}) {
      );
  
    const captureNativeGeminiBody = (parsed) => {
@@ -30,10 +30,10 @@ index 4dc5084..655c07d 100644
      const extracted = extractUsage(parsed);
      if (extracted) {
 diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
-index 2b239fd..aaf2e60 100644
+index 0084b31..5a57055 100644
 --- a/open-sse/utils/streamHelpers.js
 +++ b/open-sse/utils/streamHelpers.js
-@@ -11,7 +11,7 @@ function nativeResponseProjectionAllowsEmpty(projection) {
+@@ -12,7 +12,7 @@ function nativeResponseProjectionAllowsEmpty(projection) {
    }) || false;
  }
  
@@ -42,7 +42,7 @@ index 2b239fd..aaf2e60 100644
    if (!response || typeof response !== "object" || Array.isArray(response)) return false;
    const allowsEmpty = nativeResponseProjectionAllowsEmpty(projection);
    if (!allowsEmpty && Object.keys(response).length === 0) return false;
-@@ -24,7 +24,7 @@ export function isValidNativeGeminiResponse(response, projection = null) {
+@@ -25,7 +25,7 @@ export function isValidNativeGeminiResponse(response, projection = null) {
    // GenerateContent metadata can be the whole reply. Keep unknown extensions
    // opaque, while requiring a recognizable reply unless a mask projects it out.
    const nativeFields = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];

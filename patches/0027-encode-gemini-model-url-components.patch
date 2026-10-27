@@ -11,7 +11,7 @@ Subject: [PATCH] Keep Gemini model identifiers inside their authenticated URL
  2 files changed, 31 insertions(+), 1 deletion(-)
 
 diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
-index bc135e75..0a2124af 100644
+index bc135e7..0a2124a 100644
 --- a/open-sse/executors/default.js
 +++ b/open-sse/executors/default.js
 @@ -191,7 +191,9 @@ export class DefaultExecutor extends BaseExecutor {
@@ -26,7 +26,7 @@ index bc135e75..0a2124af 100644
        if (credentials?.nativeGeminiPassthrough && Array.isArray(nativeQuery)) {
          for (const [key, value] of nativeQuery) {
 diff --git a/tests/unit/aistudio-provider.test.js b/tests/unit/aistudio-provider.test.js
-index 7c42dbcb..a443db61 100644
+index 7c42dbc..a443db6 100644
 --- a/tests/unit/aistudio-provider.test.js
 +++ b/tests/unit/aistudio-provider.test.js
 @@ -36,6 +36,34 @@ describe("aistudio provider (Gemini wire to the local bridge)", () => {

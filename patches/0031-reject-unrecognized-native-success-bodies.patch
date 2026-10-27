@@ -12,10 +12,10 @@ Subject: [PATCH] Reject unrecognized unprojected native replies while
  3 files changed, 28 insertions(+), 1 deletion(-)
 
 diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
-index a4fdc84e..2b239fd6 100644
+index dc91f4a..0084b31 100644
 --- a/open-sse/utils/streamHelpers.js
 +++ b/open-sse/utils/streamHelpers.js
-@@ -21,6 +21,10 @@ export function isValidNativeGeminiResponse(response, projection = null) {
+@@ -22,6 +22,10 @@ export function isValidNativeGeminiResponse(response, projection = null) {
    if (!nativeResponse || typeof nativeResponse !== "object" || Array.isArray(nativeResponse)) return false;
    if (!allowsEmpty && Object.keys(nativeResponse).length === 0) return false;
    if (nativeResponse.error) return true;
@@ -27,7 +27,7 @@ index a4fdc84e..2b239fd6 100644
      if (!Array.isArray(nativeResponse.candidates)) return false;
      for (const candidate of nativeResponse.candidates) {
 diff --git a/tests/unit/gemini-native-core.test.js b/tests/unit/gemini-native-core.test.js
-index 3d42ce39..731c0591 100644
+index 3d42ce3..731c059 100644
 --- a/tests/unit/gemini-native-core.test.js
 +++ b/tests/unit/gemini-native-core.test.js
 @@ -287,6 +287,10 @@ describe("native Gemini requests through real chat core and executor", () => {
@@ -65,7 +65,7 @@ index 3d42ce39..731c0591 100644
        expect(await result.response.json()).toEqual(response);
        await vi.waitFor(() => expect(succeeded).toHaveBeenCalledOnce());
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index 2321dfe2..d8d3703e 100644
+index 2321dfe..d8d3703 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -164,6 +164,10 @@ describe("native Gemini SSE preserves provider payload and follows the client pr

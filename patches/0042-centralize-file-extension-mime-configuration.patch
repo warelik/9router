@@ -11,10 +11,10 @@ Subject: [PATCH] Move file MIME types into shared configuration
  3 files changed, 21 insertions(+), 7 deletions(-)
 
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index 4558685356f0ded930ef38e3b8dbc2d6db9146c7..e7d1d6efc221b3194dd6f90f0cdacd236ee56ea2 100644
+index 2622627..03ab5db 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
-@@ -66,6 +66,13 @@ export const DEFAULT_MAX_TOKENS = 64000;
+@@ -71,6 +71,13 @@ export const DEFAULT_MAX_TOKENS = 64000;
  export const DEFAULT_MIN_TOKENS = 32000;
  export const DEFAULT_PROVIDER_THINKING_BUDGET = 10000;
  
@@ -29,7 +29,7 @@ index 4558685356f0ded930ef38e3b8dbc2d6db9146c7..e7d1d6efc221b3194dd6f90f0cdacd23
  
  export const PORTABLE_COLLABORATION = {
 diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
-index 1f42b11786efd5b0e426d2cb43072429ad1d320a..105f22ac4aa8e61cc5a60d8b15d4009c04dac677 100644
+index 1f42b11..105f22a 100644
 --- a/open-sse/translator/formats/gemini.js
 +++ b/open-sse/translator/formats/gemini.js
 @@ -3,6 +3,7 @@
@@ -55,7 +55,7 @@ index 1f42b11786efd5b0e426d2cb43072429ad1d320a..105f22ac4aa8e61cc5a60d8b15d4009c
    if (typeof explicit === "string" && explicit.includes("/")) return explicit;
    const ext = typeof filename === "string" ? filename.split(".").pop().toLowerCase() : "";
 diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
-index 6efffa5383eb4c38a1a018f5c6ad4e39c701168c..6037829620a008af967d6770dc259678e9df7d3f 100644
+index 6efffa5..6037829 100644
 --- a/tests/unit/chat-to-gemini-contract.test.js
 +++ b/tests/unit/chat-to-gemini-contract.test.js
 @@ -482,6 +482,19 @@ describe("media content", () => {
@@ -78,6 +78,3 @@ index 6efffa5383eb4c38a1a018f5c6ad4e39c701168c..6037829620a008af967d6770dc259678
    it("assistant multimodal content keeps its media parts instead of flattening to text", () => {
      const out = o2g({
        messages: [
--- 
-2.43.0
-

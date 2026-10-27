@@ -5,15 +5,15 @@ Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Centralize tool-choice and function-calling modes
 
 ---
- open-sse/executors/antigravity.js             |  5 ++--
- .../translator/request/openai-to-gemini.js    | 23 +++++++++++--------
- open-sse/translator/schema/blocks.js          | 10 +++++++-
- open-sse/translator/schema/index.js           |  4 +++-
- tests/unit/chat-to-gemini-contract.test.js    | 14 +++++++++++
+ open-sse/executors/antigravity.js               |  5 +++--
+ open-sse/translator/request/openai-to-gemini.js | 23 ++++++++++++++---------
+ open-sse/translator/schema/blocks.js            | 10 +++++++++-
+ open-sse/translator/schema/index.js             |  4 +++-
+ tests/unit/chat-to-gemini-contract.test.js      | 14 ++++++++++++++
  5 files changed, 43 insertions(+), 13 deletions(-)
 
 diff --git a/open-sse/executors/antigravity.js b/open-sse/executors/antigravity.js
-index 9cdd7f7abd28472ee8db4a3f82e1cbab994db002..adac267c17c7823bb04acefd5301e810848921e4 100644
+index 5acfcba..03c835c 100644
 --- a/open-sse/executors/antigravity.js
 +++ b/open-sse/executors/antigravity.js
 @@ -3,6 +3,7 @@ import { BaseExecutor } from "./base.js";
@@ -33,7 +33,7 @@ index 9cdd7f7abd28472ee8db4a3f82e1cbab994db002..adac267c17c7823bb04acefd5301e810
      );
    });
  }
-@@ -399,7 +400,7 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -403,7 +404,7 @@ export class AntigravityExecutor extends BaseExecutor {
        ...(tools && { tools }),
        sessionId,
        safetySettings: undefined,
@@ -43,7 +43,7 @@ index 9cdd7f7abd28472ee8db4a3f82e1cbab994db002..adac267c17c7823bb04acefd5301e810
  
      // Strip blacklisted thinking fields from top-level body (set by thinkingUnified.js at root, not body.request)
 diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
-index 5e2876e114df22619f82b187409991c120ffd51b..93c6684cc5a3c70ae759024d3a811332c0d23375 100644
+index 5e2876e..93c6684 100644
 --- a/open-sse/translator/request/openai-to-gemini.js
 +++ b/open-sse/translator/request/openai-to-gemini.js
 @@ -23,7 +23,12 @@ import {
@@ -104,10 +104,10 @@ index 5e2876e114df22619f82b187409991c120ffd51b..93c6684cc5a3c70ae759024d3a811332
      }
    }
 diff --git a/open-sse/translator/schema/blocks.js b/open-sse/translator/schema/blocks.js
-index e136bab6a65c947db143529d07726f84357c79b0..dd00546108c9d5f93636d177bc4b9783f9f0e105 100644
+index fe41f2c..577a3bb 100644
 --- a/open-sse/translator/schema/blocks.js
 +++ b/open-sse/translator/schema/blocks.js
-@@ -53,8 +53,16 @@ export const RESPONSES_TOOL = {
+@@ -59,8 +59,16 @@ export const RESPONSES_TOOL = {
    ALLOWED_TOOLS: "allowed_tools",
  };
  
@@ -126,22 +126,22 @@ index e136bab6a65c947db143529d07726f84357c79b0..dd00546108c9d5f93636d177bc4b9783
  // Valid OpenAI block types (used by filterToOpenAIFormat).
  export const VALID_OPENAI_CONTENT_TYPES = [
 diff --git a/open-sse/translator/schema/index.js b/open-sse/translator/schema/index.js
-index 3e4d43c08cfe86fb5605ef2db07e9e5011c516d6..2cc9cda1332cf93d1b0154444819620ec5b46090 100644
+index 0f5f556..e17f101 100644
 --- a/open-sse/translator/schema/index.js
 +++ b/open-sse/translator/schema/index.js
 @@ -3,7 +3,9 @@ export { ROLE, GEMINI_ROLE } from "./roles.js";
  export {
-   OPENAI_BLOCK, CLAUDE_BLOCK, RESPONSES_ITEM, RESPONSES_TOOL,
+   OPENAI_BLOCK, CLAUDE_BLOCK, COMMANDCODE_BLOCK, RESPONSES_ITEM, RESPONSES_TOOL,
    VALID_OPENAI_CONTENT_TYPES, VALID_OPENAI_MESSAGE_TYPES,
 -  OPENAI_TOOL_CHOICE_NONE,
 +  OPENAI_TOOL_CHOICE_AUTO, OPENAI_TOOL_CHOICE_NONE, OPENAI_TOOL_CHOICE_REQUIRED,
 +  GEMINI_FUNCTION_CALLING_MODE_AUTO, GEMINI_FUNCTION_CALLING_MODE_NONE,
 +  GEMINI_FUNCTION_CALLING_MODE_ANY, GEMINI_FUNCTION_CALLING_MODE_VALIDATED,
  } from "./blocks.js";
- export { OPENAI_FINISH, CLAUDE_STOP, GEMINI_FINISH } from "./finishReasons.js";
- export { MODEL_FALLBACK, DEFAULT_IMAGE_MIME } from "./defaults.js";
+ export { OPENAI_FINISH, CLAUDE_STOP, GEMINI_FINISH, RESPONSES_STATUS, RESPONSES_INCOMPLETE_REASON } from "./finishReasons.js";
+ export { CLAUDE_EVENT, CLAUDE_DELTA, RESPONSES_EVENT, RESPONSES_EVENT_PREFIX } from "./streamEvents.js";
 diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
-index 2d27dac81e3109a85923d18f7d356216d9116723..a9bb1971d6f082710f015e3ad69e1d3c94bcbd3a 100644
+index 2d27dac..a9bb197 100644
 --- a/tests/unit/chat-to-gemini-contract.test.js
 +++ b/tests/unit/chat-to-gemini-contract.test.js
 @@ -24,6 +24,11 @@ vi.mock("@/lib/db/helpers/kvStore.js", () => ({

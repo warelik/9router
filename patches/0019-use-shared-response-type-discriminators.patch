@@ -9,7 +9,7 @@ Subject: [PATCH] Use shared schema discriminators in Responses normalization
  1 file changed, 4 insertions(+), 4 deletions(-)
 
 diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
-index 1b63d644..ea75cc1f 100644
+index 1b63d64..ea75cc1 100644
 --- a/open-sse/translator/formats/responsesApi.js
 +++ b/open-sse/translator/formats/responsesApi.js
 @@ -33,16 +33,16 @@ export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";

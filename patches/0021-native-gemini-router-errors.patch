@@ -5,14 +5,14 @@ Date: Thu, 22 Oct 2026 19:26:08 +0000
 Subject: [PATCH] Preserve native Gemini errors on router failures
 
 ---
- src/app/api/v1beta/models/[...path]/route.js  |   2 +-
- src/sse/handlers/chat.js                      |  84 ++++++++++--
- tests/unit/antigravity-native-gemini.test.js  | 129 ++++++++++++++++++
- .../unit/gemini-native-entry-contract.test.js |   2 +-
+ src/app/api/v1beta/models/[...path]/route.js    |   2 +-
+ src/sse/handlers/chat.js                        |  84 ++++++++++++---
+ tests/unit/antigravity-native-gemini.test.js    | 129 ++++++++++++++++++++++++
+ tests/unit/gemini-native-entry-contract.test.js |   2 +-
  4 files changed, 202 insertions(+), 15 deletions(-)
 
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index 08b4ab72..46415895 100644
+index 08b4ab7..4641589 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -144,7 +144,7 @@ export async function POST(request, { params }) {
@@ -25,12 +25,12 @@ index 08b4ab72..46415895 100644
      );
    }
 diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
-index 4b7096f7..253d020d 100644
+index b971cf9..fc53451 100644
 --- a/src/sse/handlers/chat.js
 +++ b/src/sse/handlers/chat.js
-@@ -29,6 +29,63 @@ import { getProjectIdForConnection } from "open-sse/services/projectId.js";
- import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
+@@ -31,6 +31,63 @@ import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
  import { extractClientApiKey, getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
+ import { resolveSmartChoice } from "../services/systemoneRouter.js";
  
 +const GEMINI_ERROR_STATUS = Object.freeze({
 +  400: "INVALID_ARGUMENT",
@@ -92,7 +92,7 @@ index 4b7096f7..253d020d 100644
  /**
   * Handle chat completion request
   * Supports: OpenAI, Claude, Gemini, OpenAI Responses API formats
-@@ -40,7 +97,7 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+@@ -42,7 +99,7 @@ export async function handleChat(request, clientRawRequest = null, options = {})
      body = await request.json();
    } catch {
      log.warn("CHAT", "Invalid JSON body");
@@ -101,7 +101,7 @@ index 4b7096f7..253d020d 100644
    }
  
    // Build clientRawRequest for logging (if not provided)
-@@ -77,12 +134,12 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+@@ -82,12 +139,12 @@ export async function handleChat(request, clientRawRequest = null, options = {})
    if (settings.requireApiKey) {
      if (!apiKey) {
        log.warn("AUTH", "Missing API key (requireApiKey=true)");
@@ -116,7 +116,7 @@ index 4b7096f7..253d020d 100644
      }
      authenticatedApiKey = true;
      serverPartsApiKey = apiKey;
-@@ -118,7 +175,7 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+@@ -123,7 +180,7 @@ export async function handleChat(request, clientRawRequest = null, options = {})
  
    if (!modelStr) {
      log.warn("CHAT", "Missing model");
@@ -125,7 +125,7 @@ index 4b7096f7..253d020d 100644
    }
  
    // Per-key access control: a restricted key may call only its listed combos and
-@@ -126,12 +183,12 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+@@ -131,12 +188,12 @@ export async function handleChat(request, clientRawRequest = null, options = {})
    // and any credential lookup; an allowed combo grants the members it routes to.
    const keyAccess = await getKeyAccessContext(request);
    const keyAccessDenied = await enforceKeyAccess(keyAccess, modelStr);
@@ -140,7 +140,7 @@ index 4b7096f7..253d020d 100644
  
    const requiredCapabilities = detectRequiredCapabilities(body);
  
-@@ -261,7 +318,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -294,7 +351,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
        });
      }
      log.warn("CHAT", "Invalid model format", { model: modelStr });
@@ -149,7 +149,7 @@ index 4b7096f7..253d020d 100644
    }
  
    const { provider, model } = modelInfo;
-@@ -288,14 +345,15 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -321,14 +378,15 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
          const errorMsg = lastError || credentials.lastError || "Unavailable";
          const status = HTTP_STATUS.SERVICE_UNAVAILABLE;
          log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
@@ -168,7 +168,7 @@ index 4b7096f7..253d020d 100644
      }
  
      // Account selection shown in the unified "▶" line (acc:...)
-@@ -361,7 +419,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -396,7 +454,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
      });
  
      if (result.success) return result.response;
@@ -177,7 +177,7 @@ index 4b7096f7..253d020d 100644
  
      // Antigravity 409/429: refresh live quota to get exact resetAt before locking
      let quotaResetMs = null;
-@@ -386,10 +444,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -421,10 +479,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
        lastError = result.error;
        lastStatus = result.status;
        lastHeaders = upstreamResponseHeaders(result.response?.headers);
@@ -191,7 +191,7 @@ index 4b7096f7..253d020d 100644
    }
  }
 diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
-index 64764d26..3d2c9a00 100644
+index 64764d2..3d2c9a0 100644
 --- a/tests/unit/antigravity-native-gemini.test.js
 +++ b/tests/unit/antigravity-native-gemini.test.js
 @@ -42,6 +42,7 @@ const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
@@ -343,7 +343,7 @@ index 64764d26..3d2c9a00 100644
 +  });
  });
 diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
-index 6e3a47e4..4afe24f1 100644
+index 6e3a47e..4afe24f 100644
 --- a/tests/unit/gemini-native-entry-contract.test.js
 +++ b/tests/unit/gemini-native-entry-contract.test.js
 @@ -171,7 +171,7 @@ describe("native Gemini endpoint entry contract", () => {

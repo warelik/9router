@@ -11,10 +11,10 @@ Subject: [PATCH] Reuse shared unspecified Gemini finish reason
  3 files changed, 8 insertions(+), 1 deletion(-)
 
 diff --git a/open-sse/translator/schema/finishReasons.js b/open-sse/translator/schema/finishReasons.js
-index 88c320f1748ec458de09f88105359db226d5cb44..c7455e507993da642d4a61079017d0a9fc66c89e 100644
+index d0cc624..9143e9c 100644
 --- a/open-sse/translator/schema/finishReasons.js
 +++ b/open-sse/translator/schema/finishReasons.js
-@@ -21,6 +21,7 @@ export const CLAUDE_STOP = {
+@@ -32,6 +32,7 @@ export const RESPONSES_INCOMPLETE_REASON = {
  
  // Gemini finishReason values.
  export const GEMINI_FINISH = {
@@ -23,17 +23,17 @@ index 88c320f1748ec458de09f88105359db226d5cb44..c7455e507993da642d4a61079017d0a9
    MAX_TOKENS: "MAX_TOKENS",
    SAFETY: "SAFETY",
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 3d6d14693621c2ab2ec55b83a16a5803c7a8ffba..dbe473569b1fb22d16640279be921e70cd1eaa3b 100644
+index 733be6e..ec0ae9e 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -1,5 +1,6 @@
  import { translateResponse, initState } from "../translator/index.js";
  import { FORMATS } from "../translator/formats.js";
 +import { GEMINI_FINISH } from "../translator/schema/index.js";
- import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
- import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
- import {
-@@ -199,7 +200,7 @@ export function createSSEStream(options = {}) {
+ import { PROVIDERS } from "../config/providers.js";
+ import { HTTP_STATUS, NATIVE_GEMINI_FINISH_REASON_FIELDS, NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES, NATIVE_GEMINI_FORMATS } from "../config/runtimeConfig.js";
+ import { liftReasoningAliases } from "../translator/concerns/reasoning.js";
+@@ -207,7 +208,7 @@ export function createSSEStream(options = {}) {
      for (const [position, candidate] of candidates.entries()) {
        if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
        const finished = typeof candidate.finishReason === "string"
@@ -43,7 +43,7 @@ index 3d6d14693621c2ab2ec55b83a16a5803c7a8ffba..dbe473569b1fb22d16640279be921e70
          nativeGeminiAnyFinishSeen = true;
        }
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index 5ecae0cf1319c1beb01d4132cb172ce0e5f929c3..e811e69e87e80ec8b1105db6c5a449ba7abcddca 100644
+index 5ecae0c..e811e69 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -1,4 +1,5 @@

@@ -7,23 +7,20 @@ Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
 Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
 Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
 ---
- .../translator/concerns/thinkingUnified.js    |  15 +-
- open-sse/utils/claudeCloaking.js              |   6 +-
- open-sse/utils/claudeSignature.js             |  32 ++-
- open-sse/utils/streamHelpers.js               |   3 +-
- .../claude-adaptive-display.test.js           |  70 ++++++
- tests/unit/claude-same-format-stream.test.js  | 218 ++++++++++++++++++
- .../claude-signature-versioned-form.test.js   |  87 +++++++
+ open-sse/translator/concerns/thinkingUnified.js    |  15 +-
+ open-sse/utils/claudeCloaking.js                   |   6 +-
+ open-sse/utils/claudeSignature.js                  |  32 +--
+ open-sse/utils/streamHelpers.js                    |   3 +-
+ tests/translator/claude-adaptive-display.test.js   |  70 +++++++
+ tests/unit/claude-same-format-stream.test.js       | 218 +++++++++++++++++++++
+ tests/unit/claude-signature-versioned-form.test.js |  87 ++++++++
  7 files changed, 413 insertions(+), 18 deletions(-)
- create mode 100644 tests/translator/claude-adaptive-display.test.js
- create mode 100644 tests/unit/claude-same-format-stream.test.js
- create mode 100644 tests/unit/claude-signature-versioned-form.test.js
 
 diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
-index 8deab900..2a7958fd 100644
+index 6e8695a..10fbe88 100644
 --- a/open-sse/translator/concerns/thinkingUnified.js
 +++ b/open-sse/translator/concerns/thinkingUnified.js
-@@ -255,8 +255,15 @@ function stripAll(body) {
+@@ -258,8 +258,15 @@ function stripAll(body) {
    }
  }
  
@@ -40,7 +37,7 @@ index 8deab900..2a7958fd 100644
    const none = cfg.mode === "none";
    const canDisable = caps.thinkingCanDisable !== false;
    // Model cannot disable thinking → clamp "none" to minimal effort instead.
-@@ -288,8 +295,10 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
+@@ -291,8 +298,10 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
      case "claude-adaptive": {
        if (none && canDisable) { body.thinking = { type: "disabled" }; break; }
        // Models that can disable thinking need the explicit adaptive switch.
@@ -52,7 +49,7 @@ index 8deab900..2a7958fd 100644
        else delete body.thinking;
        const level = toLevel(eff);
        // xhigh is model-gated (Opus/Sonnet 4.6 reject it) — clamp when not advertised.
-@@ -424,7 +433,7 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
+@@ -432,7 +441,7 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
  // Mutates and returns body. No-op when model has no reasoning capability.
  // `intent` is a pre-captured config (from captureThinking on the original body);
  // falls back to extracting from the current body when omitted.
@@ -62,7 +59,7 @@ index 8deab900..2a7958fd 100644
  
    const { cleanModel, override } = parseSuffix(model);
 diff --git a/open-sse/utils/claudeCloaking.js b/open-sse/utils/claudeCloaking.js
-index 60e40b79..de5b523d 100644
+index 60e40b7..de5b523 100644
 --- a/open-sse/utils/claudeCloaking.js
 +++ b/open-sse/utils/claudeCloaking.js
 @@ -1,5 +1,6 @@
@@ -92,7 +89,7 @@ index 60e40b79..de5b523d 100644
    return { ...chunk, content_block: { ...block, name: original } };
  }
 diff --git a/open-sse/utils/claudeSignature.js b/open-sse/utils/claudeSignature.js
-index 1a186967..1f541825 100644
+index 1a18696..1f54182 100644
 --- a/open-sse/utils/claudeSignature.js
 +++ b/open-sse/utils/claudeSignature.js
 @@ -1,6 +1,7 @@
@@ -148,10 +145,10 @@ index 1a186967..1f541825 100644
      return false;
    }
 diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
-index 00dae23f..3742ae58 100644
+index 946e1d2..e455f72 100644
 --- a/open-sse/utils/streamHelpers.js
 +++ b/open-sse/utils/streamHelpers.js
-@@ -55,8 +55,9 @@ export function hasValuableContent(chunk, format) {
+@@ -56,8 +56,9 @@ export function hasValuableContent(chunk, format) {
      const hasText = chunk.delta?.text && chunk.delta.text !== "";
      const hasThinking = chunk.delta?.thinking && chunk.delta.thinking !== "";
      const hasInputJson = chunk.delta?.partial_json && chunk.delta.partial_json !== "";
@@ -164,7 +161,7 @@ index 00dae23f..3742ae58 100644
      return true;
 diff --git a/tests/translator/claude-adaptive-display.test.js b/tests/translator/claude-adaptive-display.test.js
 new file mode 100644
-index 00000000..390c3f9a
+index 0000000..390c3f9
 --- /dev/null
 +++ b/tests/translator/claude-adaptive-display.test.js
 @@ -0,0 +1,70 @@
@@ -240,7 +237,7 @@ index 00000000..390c3f9a
 +});
 diff --git a/tests/unit/claude-same-format-stream.test.js b/tests/unit/claude-same-format-stream.test.js
 new file mode 100644
-index 00000000..aa6502d0
+index 0000000..aa6502d
 --- /dev/null
 +++ b/tests/unit/claude-same-format-stream.test.js
 @@ -0,0 +1,218 @@
@@ -464,7 +461,7 @@ index 00000000..aa6502d0
 +
 diff --git a/tests/unit/claude-signature-versioned-form.test.js b/tests/unit/claude-signature-versioned-form.test.js
 new file mode 100644
-index 00000000..ad682605
+index 0000000..ad68260
 --- /dev/null
 +++ b/tests/unit/claude-signature-versioned-form.test.js
 @@ -0,0 +1,87 @@

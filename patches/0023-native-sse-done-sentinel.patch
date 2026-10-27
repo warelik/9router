@@ -7,12 +7,12 @@ Subject: [PATCH] Accept upstream DONE without invalidating native SSE
 
 ---
  open-sse/utils/sseConstants.js          |  3 ++-
- open-sse/utils/stream.js                |  3 ++-
+ open-sse/utils/stream.js                |  4 +++-
  tests/unit/gemini-native-stream.test.js | 19 +++++++++++++++++++
- 3 files changed, 23 insertions(+), 2 deletions(-)
+ 3 files changed, 24 insertions(+), 2 deletions(-)
 
 diff --git a/open-sse/utils/sseConstants.js b/open-sse/utils/sseConstants.js
-index 680a05ca..220ae332 100644
+index 680a05c..220ae33 100644
 --- a/open-sse/utils/sseConstants.js
 +++ b/open-sse/utils/sseConstants.js
 @@ -1,5 +1,6 @@
@@ -24,10 +24,10 @@ index 680a05ca..220ae332 100644
  export const SSE_HEADERS = {
    "Content-Type": "text/event-stream",
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index b188bd8b..a608c70e 100644
+index 07a1847..daab212 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
-@@ -11,7 +11,7 @@ import { restoreToolNames } from "./opencodeFingerprint.js";
+@@ -13,7 +13,7 @@ import { restoreToolNames } from "./opencodeFingerprint.js";
  import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
  import { dbg, isDebugEnabled } from "./debugLog.js";
  
@@ -36,16 +36,17 @@ index b188bd8b..a608c70e 100644
  
  export { COLORS, formatSSE };
  export { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER };
-@@ -205,6 +205,7 @@ export function createSSEStream(options = {}) {
+@@ -212,6 +212,8 @@ export function createSSEStream(options = {}) {
+     }
      if (line.trim() || !nativeGeminiData.length) return;
      const payload = nativeGeminiData.join("\n");
-     nativeGeminiData = [];
++    nativeGeminiData = [];
 +    if (payload.trim() === SSE_DONE_PAYLOAD) return;
      let parsed;
      try { parsed = JSON.parse(payload); }
      catch {
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index 051b599a..17f2e92f 100644
+index 051b599..17f2e92 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -58,6 +58,25 @@ describe("native Gemini SSE preserves provider payload and follows the client pr

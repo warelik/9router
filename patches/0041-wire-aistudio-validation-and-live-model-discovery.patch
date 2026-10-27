@@ -5,19 +5,17 @@ Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Wire AIStudio credential validation and live model discovery
 
 ---
- open-sse/services/aistudioModels.js          |  30 +++
+ open-sse/services/aistudioModels.js          |  30 ++++
  src/app/api/providers/[id]/models/route.js   |   6 +
  src/app/api/providers/[id]/test/testUtils.js |   1 +
  src/app/api/providers/validate/route.js      |   1 +
  src/app/api/v1/models/route.js               |   7 +
- tests/unit/aistudio-discovery.test.js        | 239 +++++++++++++++++++
+ tests/unit/aistudio-discovery.test.js        | 239 +++++++++++++++++++++++++++
  6 files changed, 284 insertions(+)
- create mode 100644 open-sse/services/aistudioModels.js
- create mode 100644 tests/unit/aistudio-discovery.test.js
 
 diff --git a/open-sse/services/aistudioModels.js b/open-sse/services/aistudioModels.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..1681724a949ed2a840864b742785d246d32b84f0
+index 0000000..1681724
 --- /dev/null
 +++ b/open-sse/services/aistudioModels.js
 @@ -0,0 +1,30 @@
@@ -52,7 +50,7 @@ index 0000000000000000000000000000000000000000..1681724a949ed2a840864b742785d246
 +  };
 +}
 diff --git a/src/app/api/providers/[id]/models/route.js b/src/app/api/providers/[id]/models/route.js
-index 609402dc83c618aa26531e12155275da56c203bc..5b00b0e9e03bfa080b9f842e8870d682fe0fe7da 100644
+index 609402d..5b00b0e 100644
 --- a/src/app/api/providers/[id]/models/route.js
 +++ b/src/app/api/providers/[id]/models/route.js
 @@ -9,6 +9,7 @@ import { resolveKiroModels } from "open-sse/services/kiroModels.js";
@@ -76,19 +74,19 @@ index 609402dc83c618aa26531e12155275da56c203bc..5b00b0e9e03bfa080b9f842e8870d682
      url: "https://api.meta.ai/v1/models",
      method: "GET",
 diff --git a/src/app/api/providers/[id]/test/testUtils.js b/src/app/api/providers/[id]/test/testUtils.js
-index f3ab8bfd2dc8592ffc2bff681e070427eb38530e..a68877e53b0b916d0b7390a149ab85d20abdf177 100644
+index bbe356f..0f929f9 100644
 --- a/src/app/api/providers/[id]/test/testUtils.js
 +++ b/src/app/api/providers/[id]/test/testUtils.js
-@@ -765,6 +765,7 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
+@@ -798,6 +798,7 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
        case "atria":
        case "agnes":
        case "bai":
 +      case "aistudio":
-       case "muse": {
+       case "muse":
+       case "runcrate": {
          const cfg = PROVIDERS[connection.provider];
-         const res = await fetchWithConnectionProxy(cfg.validateUrl, { headers: { Authorization: `Bearer ${connection.apiKey}` } }, effectiveProxy);
 diff --git a/src/app/api/providers/validate/route.js b/src/app/api/providers/validate/route.js
-index 47e1bed0c3ab39b4c6904865d1b01419beb58c81..435a1848df151b5a5d003f0565de6b2c24daaf9d 100644
+index d0ffce6..a458b14 100644
 --- a/src/app/api/providers/validate/route.js
 +++ b/src/app/api/providers/validate/route.js
 @@ -381,6 +381,7 @@ export async function POST(request) {
@@ -100,7 +98,7 @@ index 47e1bed0c3ab39b4c6904865d1b01419beb58c81..435a1848df151b5a5d003f0565de6b2c
          case "groq":
          case "xai":
 diff --git a/src/app/api/v1/models/route.js b/src/app/api/v1/models/route.js
-index 83ee968e5d41633c385aacd15f80dccc9b106bea..4d9a694d47955c84f6bcb4f28b64fc82a2cadece 100644
+index 83ee968..4d9a694 100644
 --- a/src/app/api/v1/models/route.js
 +++ b/src/app/api/v1/models/route.js
 @@ -17,6 +17,7 @@ import { resolveCopilotModels } from "open-sse/services/copilotModels.js";
@@ -126,7 +124,7 @@ index 83ee968e5d41633c385aacd15f80dccc9b106bea..4d9a694d47955c84f6bcb4f28b64fc82
        accessToken: conn.accessToken,
 diff --git a/tests/unit/aistudio-discovery.test.js b/tests/unit/aistudio-discovery.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..79e87264cb169b62bc2156f5ad63f82bb88a89bb
+index 0000000..79e8726
 --- /dev/null
 +++ b/tests/unit/aistudio-discovery.test.js
 @@ -0,0 +1,239 @@
@@ -369,6 +367,3 @@ index 0000000000000000000000000000000000000000..79e87264cb169b62bc2156f5ad63f82b
 +    expect(result.some(row => row.id === "aistudio/bridge-model-9")).toBe(false);
 +  });
 +});
--- 
-2.43.0
-

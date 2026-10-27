@@ -7,22 +7,17 @@ Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
 Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
 Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
 ---
- open-sse/executors/antigravity.js             | 126 +++-
- .../translator/request/openai-to-gemini.js    |  12 +-
- open-sse/utils/antigravityNative.js           | 491 +++++++++++++++
- ...igravity-native-disabled-functions.test.js | 364 +++++++++++
- tests/unit/antigravity-native-gemini.test.js  | 579 +++++++++++++++++
- .../antigravity-native-json-output.test.js    | 591 ++++++++++++++++++
- .../antigravity-native-sdk-heartbeat.test.js  |  38 ++
+ open-sse/executors/antigravity.js                  | 126 ++++-
+ open-sse/translator/request/openai-to-gemini.js    |  12 +-
+ open-sse/utils/antigravityNative.js                | 491 +++++++++++++++++
+ .../antigravity-native-disabled-functions.test.js  | 364 +++++++++++++
+ tests/unit/antigravity-native-gemini.test.js       | 579 ++++++++++++++++++++
+ tests/unit/antigravity-native-json-output.test.js  | 591 +++++++++++++++++++++
+ .../unit/antigravity-native-sdk-heartbeat.test.js  |  38 ++
  7 files changed, 2181 insertions(+), 20 deletions(-)
- create mode 100644 open-sse/utils/antigravityNative.js
- create mode 100644 tests/unit/antigravity-native-disabled-functions.test.js
- create mode 100644 tests/unit/antigravity-native-gemini.test.js
- create mode 100644 tests/unit/antigravity-native-json-output.test.js
- create mode 100644 tests/unit/antigravity-native-sdk-heartbeat.test.js
 
 diff --git a/open-sse/executors/antigravity.js b/open-sse/executors/antigravity.js
-index b117092d..5df81449 100644
+index c8164e3..bfe6044 100644
 --- a/open-sse/executors/antigravity.js
 +++ b/open-sse/executors/antigravity.js
 @@ -8,6 +8,7 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
@@ -125,7 +120,7 @@ index b117092d..5df81449 100644
      // OpenAI clients may include stream_options even for non-streaming calls.
      // Google generateContent rejects that combination before processing the request.
      if (stream !== true) delete body.stream_options;
-@@ -228,6 +307,7 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -232,6 +311,7 @@ export class AntigravityExecutor extends BaseExecutor {
  
      // ─── Standard (non-image) request ───
      // Fix contents for Claude models via Antigravity
@@ -133,7 +128,7 @@ index b117092d..5df81449 100644
      const rawContents = (body.request?.contents || []).map(c => {
        let role = c.role;
        // functionResponse must be role "user" for Claude models
-@@ -267,7 +347,7 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -271,7 +351,7 @@ export class AntigravityExecutor extends BaseExecutor {
          parts: modifiedParts || parts || [],
        };
      });
@@ -142,7 +137,7 @@ index b117092d..5df81449 100644
  
      // Sanitize tool schemas and function names before sending to Antigravity.
      let tools = body.request?.tools;
-@@ -281,13 +361,19 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -285,13 +365,19 @@ export class AntigravityExecutor extends BaseExecutor {
            const name = sanitizeFunctionName(fn.name);
            if (seenToolNames.has(name)) continue;
            seenToolNames.add(name);
@@ -169,7 +164,7 @@ index b117092d..5df81449 100644
          }
        }
        tools = allDeclarations.length > 0 ? [{ functionDeclarations: allDeclarations }] : [];
-@@ -299,14 +385,7 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -303,14 +389,7 @@ export class AntigravityExecutor extends BaseExecutor {
      
      // Rewrite competing-client branding in system prompts (e.g. Zed's Claude prompt,
      // OpenCode naming) so Antigravity doesn't flag the request with a 429 Quota Exhausted.
@@ -185,7 +180,7 @@ index b117092d..5df81449 100644
  
      const generationConfig = { ...(requestWithoutTools.generationConfig || {}) };
      if (generationConfig.maxOutputTokens > MAX_ANTIGRAVITY_OUTPUT_TOKENS) {
-@@ -320,7 +399,7 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -324,7 +403,7 @@ export class AntigravityExecutor extends BaseExecutor {
        ...(tools && { tools }),
        sessionId,
        safetySettings: undefined,
@@ -194,7 +189,7 @@ index b117092d..5df81449 100644
      };
  
      // Strip blacklisted thinking fields from top-level body (set by thinkingUnified.js at root, not body.request)
-@@ -346,6 +425,19 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -350,6 +429,19 @@ export class AntigravityExecutor extends BaseExecutor {
      };
    }
  
@@ -215,7 +210,7 @@ index b117092d..5df81449 100644
      if (!credentials.refreshToken) return null;
  
 diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
-index 182abf93..7b36bbfc 100644
+index 182abf9..7b36bbf 100644
 --- a/open-sse/translator/request/openai-to-gemini.js
 +++ b/open-sse/translator/request/openai-to-gemini.js
 @@ -367,11 +367,14 @@ function wrapInCloudCodeEnvelope(model, geminiCLI, credentials = null, isAntigra
@@ -260,7 +255,7 @@ index 182abf93..7b36bbfc 100644
  register(FORMATS.OPENAI, FORMATS.ANTIGRAVITY, openaiToAntigravityRequest, null);
 diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
 new file mode 100644
-index 00000000..228e3443
+index 0000000..228e344
 --- /dev/null
 +++ b/open-sse/utils/antigravityNative.js
 @@ -0,0 +1,491 @@
@@ -757,7 +752,7 @@ index 00000000..228e3443
 +}
 diff --git a/tests/unit/antigravity-native-disabled-functions.test.js b/tests/unit/antigravity-native-disabled-functions.test.js
 new file mode 100644
-index 00000000..a3c2fd7c
+index 0000000..a3c2fd7
 --- /dev/null
 +++ b/tests/unit/antigravity-native-disabled-functions.test.js
 @@ -0,0 +1,364 @@
@@ -1127,7 +1122,7 @@ index 00000000..a3c2fd7c
 +});
 diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
 new file mode 100644
-index 00000000..64764d26
+index 0000000..64764d2
 --- /dev/null
 +++ b/tests/unit/antigravity-native-gemini.test.js
 @@ -0,0 +1,579 @@
@@ -1712,7 +1707,7 @@ index 00000000..64764d26
 +});
 diff --git a/tests/unit/antigravity-native-json-output.test.js b/tests/unit/antigravity-native-json-output.test.js
 new file mode 100644
-index 00000000..2fe63a6f
+index 0000000..2fe63a6
 --- /dev/null
 +++ b/tests/unit/antigravity-native-json-output.test.js
 @@ -0,0 +1,591 @@
@@ -2309,7 +2304,7 @@ index 00000000..2fe63a6f
 +});
 diff --git a/tests/unit/antigravity-native-sdk-heartbeat.test.js b/tests/unit/antigravity-native-sdk-heartbeat.test.js
 new file mode 100644
-index 00000000..e3acccd7
+index 0000000..e3acccd
 --- /dev/null
 +++ b/tests/unit/antigravity-native-sdk-heartbeat.test.js
 @@ -0,0 +1,38 @@

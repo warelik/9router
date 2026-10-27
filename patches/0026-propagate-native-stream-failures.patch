@@ -6,29 +6,29 @@ Subject: [PATCH] Propagate native stream failures through every terminal path
  before completion
 
 ---
- open-sse/handlers/chatCore.js                 |   4 +-
- .../handlers/chatCore/streamingHandler.js     |  57 +++++---
- open-sse/utils/stream.js                      |  95 ++++++++----
- open-sse/utils/streamHandler.js               |  24 ++-
- src/sse/handlers/chat.js                      |  12 ++
- .../unit/gemini-native-entry-contract.test.js |  20 +++
- tests/unit/gemini-native-stream.test.js       | 137 +++++++++++++++++-
+ open-sse/handlers/chatCore.js                   |   4 +-
+ open-sse/handlers/chatCore/streamingHandler.js  |  57 ++++++----
+ open-sse/utils/stream.js                        |  95 +++++++++++-----
+ open-sse/utils/streamHandler.js                 |  24 +++--
+ src/sse/handlers/chat.js                        |  12 +++
+ tests/unit/gemini-native-entry-contract.test.js |  20 ++++
+ tests/unit/gemini-native-stream.test.js         | 137 +++++++++++++++++++++++-
  7 files changed, 292 insertions(+), 57 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index b5c13a8d..bbd34dae 100644
+index 1ae0d7e..e3aa5d5 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
-@@ -62,7 +62,7 @@ export function stripContinuityFields(body) {
+@@ -63,7 +63,7 @@ export function stripContinuityFields(body) {
    return body;
  }
  
--export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, serverPartsTenant = null, providerThinking, providerOverrides }) {
-+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onRequestFailure, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, serverPartsTenant = null, providerThinking, providerOverrides }) {
+-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, serverPartsTenant = null, providerThinking, providerOverrides }) {
++export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onRequestFailure, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, serverPartsTenant = null, providerThinking, providerOverrides }) {
    if (credentials) credentials._geminiServerPartsSessionId = null;
    const { provider, model } = modelInfo;
    if (clientSignal?.aborted) return createErrorResult(499, "Request aborted");
-@@ -584,7 +584,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -591,7 +591,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
      return nativeErrorResponse ? { ...result, response: nativeErrorResponse, nativeResponse: true } : result;
    }
  
@@ -38,10 +38,10 @@ index b5c13a8d..bbd34dae 100644
    const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
  
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index cc50c76e..d9474201 100644
+index 31807c8..4cb6f56 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
-@@ -89,7 +89,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+@@ -92,7 +92,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
    const deferNativeGeminiSuccess = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
    const reportRequestSuccess = () => {
      if (!onRequestSuccess) return;
@@ -50,7 +50,7 @@ index cc50c76e..d9474201 100644
        .then(onRequestSuccess)
        .catch(err => {
          console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
-@@ -101,20 +101,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+@@ -104,20 +104,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
  
    const nativeGeminiJson = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
      && upstreamContentType.includes("application/json");
@@ -72,7 +72,7 @@ index cc50c76e..d9474201 100644
      provider, model, connectionId,
      latency: { ttft: 0, total: Date.now() - requestStartTime },
      tokens: { prompt_tokens: 0, completion_tokens: 0 },
-@@ -123,10 +110,31 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+@@ -126,10 +113,31 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
      providerResponse: "[Streaming - raw response not captured]",
      response: { content: "[Streaming in progress...]", thinking: null, type: "streaming" },
      pxpipe,
@@ -105,7 +105,7 @@ index cc50c76e..d9474201 100644
  
    return {
      success: true,
-@@ -145,10 +153,16 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+@@ -148,10 +156,16 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
  /**
   * Build onStreamComplete callback for streaming usage tracking.
   */
@@ -124,7 +124,7 @@ index cc50c76e..d9474201 100644
      const latency = {
        ttft: ttftAt ? ttftAt - requestStartTime : Date.now() - requestStartTime,
        total: Date.now() - requestStartTime
-@@ -156,7 +170,7 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
+@@ -159,7 +173,7 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
      const safeContent = contentObj?.content || "[Empty streaming response]";
      const safeThinking = contentObj?.thinking || null;
  
@@ -133,7 +133,7 @@ index cc50c76e..d9474201 100644
        provider, model, connectionId,
        latency,
        tokens: usage || { prompt_tokens: 0, completion_tokens: 0 },
-@@ -165,14 +179,15 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
+@@ -168,14 +182,15 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
        providerResponse: safeContent,
        response: { content: safeContent, thinking: safeThinking, type: "streaming" },
        pxpipe,
@@ -152,10 +152,10 @@ index cc50c76e..d9474201 100644
  
    return { onStreamComplete, streamDetailId };
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index a608c70e..4dc50845 100644
+index daab212..163dba3 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
-@@ -140,10 +140,18 @@ export function createSSEStream(options = {}) {
+@@ -148,10 +148,18 @@ export function createSSEStream(options = {}) {
    let openAIResponsesDoneSent = false;
    let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
    let finalized = false;
@@ -174,7 +174,7 @@ index a608c70e..4dc50845 100644
    let nativeGeminiInvalidResponseSeen = false;
    let nativeGeminiResponseSeen = false;
    let nativeGeminiMultipleCandidatesSeen = false;
-@@ -171,6 +179,12 @@ export function createSSEStream(options = {}) {
+@@ -179,6 +187,12 @@ export function createSSEStream(options = {}) {
      if (parsed.error || response.error) {
        nativeGeminiFailureSeen = true;
        nativeGeminiErrorSeen = true;
@@ -187,7 +187,7 @@ index a608c70e..4dc50845 100644
      }
      if (response.promptFeedback?.blockReason) {
        nativeGeminiFailureSeen = true;
-@@ -218,38 +232,50 @@ export function createSSEStream(options = {}) {
+@@ -226,7 +240,7 @@ export function createSSEStream(options = {}) {
    const reportNativeGeminiSuccess = () => {
      if (!onNativeResponseSuccess || nativeGeminiSuccessReported) return;
      nativeGeminiSuccessReported = true;
@@ -196,6 +196,7 @@ index a608c70e..4dc50845 100644
        console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
      });
    };
+@@ -239,31 +253,43 @@ export function createSSEStream(options = {}) {
  
    // Usage/logging tail, callable from transform() as well as flush(): a client that
    // closes right after the terminal event cancels the reader, and flush() never runs.
@@ -247,7 +248,7 @@ index a608c70e..4dc50845 100644
    };
  
    // Emit the deferred response.completed now — at [DONE], or when the watchdog
-@@ -266,7 +292,7 @@ export function createSSEStream(options = {}) {
+@@ -280,7 +306,7 @@ export function createSSEStream(options = {}) {
      finalizeStream();
    };
  
@@ -256,7 +257,7 @@ index a608c70e..4dc50845 100644
      transform(chunk, controller) {
        if (!ttftAt) ttftAt = Date.now();
        const text = decoder.decode(chunk, { stream: true });
-@@ -569,10 +595,10 @@ export function createSSEStream(options = {}) {
+@@ -615,10 +641,10 @@ export function createSSEStream(options = {}) {
        }
      },
  
@@ -269,7 +270,7 @@ index a608c70e..4dc50845 100644
        try {
          const remaining = decoder.decode();
          if (transformNativeGeminiJson) {
-@@ -580,8 +606,8 @@ export function createSSEStream(options = {}) {
+@@ -626,8 +652,8 @@ export function createSSEStream(options = {}) {
            let nativeResponse;
            try { nativeResponse = JSON.parse(nativeGeminiJson); }
            catch {
@@ -279,7 +280,7 @@ index a608c70e..4dc50845 100644
              return;
            }
            const responses = Array.isArray(nativeResponse) ? nativeResponse : [nativeResponse];
-@@ -590,27 +616,28 @@ export function createSSEStream(options = {}) {
+@@ -636,27 +662,28 @@ export function createSSEStream(options = {}) {
              if (!captureNativeGeminiBody(response)) nativeGeminiInvalidResponseSeen = true;
            }
            if (nativeGeminiInvalidResponseSeen || !nativeGeminiResponseSeen) {
@@ -313,7 +314,7 @@ index a608c70e..4dc50845 100644
            return;
          }
          if (remaining) buffer += remaining;
-@@ -627,8 +654,8 @@ export function createSSEStream(options = {}) {
+@@ -673,8 +700,8 @@ export function createSSEStream(options = {}) {
                let nativeResponse;
                try { nativeResponse = JSON.parse(nativeGeminiJson); }
                catch {
@@ -323,7 +324,7 @@ index a608c70e..4dc50845 100644
                  return;
                }
                const responses = Array.isArray(nativeResponse) ? nativeResponse : [nativeResponse];
-@@ -642,8 +669,8 @@ export function createSSEStream(options = {}) {
+@@ -688,8 +715,8 @@ export function createSSEStream(options = {}) {
              }
              if (nativeGeminiInvalidResponseSeen || !nativeGeminiResponseSeen) {
                if (nativeJson) {
@@ -333,7 +334,7 @@ index a608c70e..4dc50845 100644
                  return;
                }
                const message = nativeGeminiInvalidResponseSeen
-@@ -654,17 +681,17 @@ export function createSSEStream(options = {}) {
+@@ -700,17 +727,17 @@ export function createSSEStream(options = {}) {
                controller.enqueue(failure);
              } else if (nativeGeminiHasIncompleteCandidate()) {
                if (nativeJson) {
@@ -354,7 +355,7 @@ index a608c70e..4dc50845 100644
              return;
            }
            if (buffer) {
-@@ -686,7 +713,7 @@ export function createSSEStream(options = {}) {
+@@ -732,7 +759,7 @@ export function createSSEStream(options = {}) {
              controller.enqueue(sharedEncoder.encode(doneOutput));
            }
  
@@ -363,7 +364,7 @@ index a608c70e..4dc50845 100644
            return;
          }
  
-@@ -775,15 +802,29 @@ export function createSSEStream(options = {}) {
+@@ -821,15 +848,29 @@ export function createSSEStream(options = {}) {
  
          if (observeNativeGeminiTransform && !nativeGeminiInvalidResponseSeen
              && nativeGeminiResponseSeen && !nativeGeminiErrorSeen
@@ -397,7 +398,7 @@ index a608c70e..4dc50845 100644
  
  export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null, credentials = null, nativeResponseProjection = null, onNativeResponseSuccess = null, nativeJson = false) {
 diff --git a/open-sse/utils/streamHandler.js b/open-sse/utils/streamHandler.js
-index 05967639..35f2cb68 100644
+index 0596763..35f2cb6 100644
 --- a/open-sse/utils/streamHandler.js
 +++ b/open-sse/utils/streamHandler.js
 @@ -19,10 +19,12 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
@@ -499,10 +500,10 @@ index 05967639..35f2cb68 100644
    );
  }
 diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
-index 253d020d..276ecd91 100644
+index fc53451..620480a 100644
 --- a/src/sse/handlers/chat.js
 +++ b/src/sse/handlers/chat.js
-@@ -415,6 +415,18 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -450,6 +450,18 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
          await clearAccountError(credentials.connectionId, credentials, model);
          // "Consecutive" strikes: a success clears the breaker for this pair.
          clearAntigravityStrikes(credentials.connectionId, model);
@@ -522,7 +523,7 @@ index 253d020d..276ecd91 100644
      });
  
 diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
-index 4afe24f1..84c907bf 100644
+index 4afe24f..84c907b 100644
 --- a/tests/unit/gemini-native-entry-contract.test.js
 +++ b/tests/unit/gemini-native-entry-contract.test.js
 @@ -178,6 +178,26 @@ describe("native Gemini endpoint entry contract", () => {
@@ -553,7 +554,7 @@ index 4afe24f1..84c907bf 100644
        it(`${provider}: ${first} to ${second} fallback preserves signed tool history and native settings`, async () => {
          const original = nativeBody();
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index eed61962..0f1f1c33 100644
+index eed6196..0f1f1c3 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -7,12 +7,16 @@ vi.mock("@/lib/usageDb.js", () => ({

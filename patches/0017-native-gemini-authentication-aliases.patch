@@ -6,11 +6,11 @@ Subject: [PATCH] Align native Gemini authentication aliases across existing
  public routes
 
 ---
- src/app/api/v1beta/models/[...path]/route.js  | 11 +--
- src/dashboardGuard.js                         |  6 +-
- src/sse/services/keyAccess.js                 |  5 +-
- .../unit/gemini-native-alpha-contract.test.js | 93 ++++++++++++++++++-
- .../unit/native-public-gemini-rewrite.test.js | 68 +++++++++++++-
+ src/app/api/v1beta/models/[...path]/route.js    | 11 +--
+ src/dashboardGuard.js                           |  6 +-
+ src/sse/services/keyAccess.js                   |  5 +-
+ tests/unit/gemini-native-alpha-contract.test.js | 93 ++++++++++++++++++++++++-
+ tests/unit/native-public-gemini-rewrite.test.js | 68 +++++++++++++++++-
  5 files changed, 167 insertions(+), 16 deletions(-)
 
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
@@ -310,6 +310,3 @@ index 78978a3..faa3a3d 100644
 +    }
 +  });
 +});
--- 
-2.55.0
-

@@ -5,22 +5,22 @@ Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Centralize inline native Gemini configuration
 
 ---
- open-sse/config/runtimeConfig.js              | 24 +++++++++++
- open-sse/executors/codex.js                   |  4 +-
- open-sse/executors/default.js                 |  4 +-
- open-sse/handlers/chatCore.js                 | 10 ++---
- .../handlers/chatCore/nonStreamingHandler.js  |  4 +-
- .../handlers/chatCore/streamingHandler.js     |  6 +--
- open-sse/translator/formats/gemini.js         |  4 +-
- open-sse/utils/antigravityNative.js           | 24 +++++++----
- open-sse/utils/stream.js                      | 10 ++---
- open-sse/utils/streamHelpers.js               |  4 +-
- tests/unit/chat-to-gemini-contract.test.js    | 41 +++++++++++++++++++
- tests/unit/gemini-native-core.test.js         | 20 +++++++++
+ open-sse/config/runtimeConfig.js                  | 24 +++++++++++++
+ open-sse/executors/codex.js                       |  4 +--
+ open-sse/executors/default.js                     |  4 +--
+ open-sse/handlers/chatCore.js                     | 10 +++---
+ open-sse/handlers/chatCore/nonStreamingHandler.js |  4 +--
+ open-sse/handlers/chatCore/streamingHandler.js    |  6 ++--
+ open-sse/translator/formats/gemini.js             |  4 +--
+ open-sse/utils/antigravityNative.js               | 24 ++++++++-----
+ open-sse/utils/stream.js                          | 10 +++---
+ open-sse/utils/streamHelpers.js                   |  4 +--
+ tests/unit/chat-to-gemini-contract.test.js        | 41 +++++++++++++++++++++++
+ tests/unit/gemini-native-core.test.js             | 20 +++++++++++
  12 files changed, 124 insertions(+), 31 deletions(-)
 
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index 489863a6d6202f235369c237892ca81225790823..8783853ecae9cd1d028a6a9c31f5d357247d5369 100644
+index ee80f28..047ae40 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
 @@ -1,3 +1,5 @@
@@ -37,7 +37,7 @@ index 489863a6d6202f235369c237892ca81225790823..8783853ecae9cd1d028a6a9c31f5d357
    SERVER_ERROR: 500,
    BAD_GATEWAY: 502,
    SERVICE_UNAVAILABLE: 503,
-@@ -133,3 +136,24 @@ export const NATIVE_GEMINI_THINKING_KEYS = ["thinkingLevel", "thinking_level", "
+@@ -138,3 +141,24 @@ export const NATIVE_GEMINI_THINKING_KEYS = ["thinkingLevel", "thinking_level", "
  
  export const NATIVE_GEMINI_RESPONSE_FIELDS = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
  export const NATIVE_GEMINI_BRIDGE_FIELDS = new Set(["message", "event", "data", "status", "code", "success", "response"]);
@@ -63,7 +63,7 @@ index 489863a6d6202f235369c237892ca81225790823..8783853ecae9cd1d028a6a9c31f5d357
 +export const AISTUDIO_NATIVE_GEMINI_API_VERSION = "v1beta";
 +export const GEMINI_DEFAULT_FILE_MIME_TYPE = "application/octet-stream";
 diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
-index 56aae02c5d825f6fe647379edf0023eeb5f362e5..da0824495ac7e602afbce2b922dd592e37679eee 100644
+index 56aae02..da08244 100644
 --- a/open-sse/executors/codex.js
 +++ b/open-sse/executors/codex.js
 @@ -9,7 +9,7 @@ import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
@@ -85,7 +85,7 @@ index 56aae02c5d825f6fe647379edf0023eeb5f362e5..da0824495ac7e602afbce2b922dd592e
              const event = JSON.parse(data);
              if (event?.type === "error" || event?.type === "response.failed") {
 diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
-index 93f8a233ad7f84a901c8a5ba0f22608476b23704..3c8cbaaf77989d41f6147e45e665d7a7b38ee61e 100644
+index 93f8a23..3c8cbaa 100644
 --- a/open-sse/executors/default.js
 +++ b/open-sse/executors/default.js
 @@ -4,7 +4,7 @@ import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
@@ -107,7 +107,7 @@ index 93f8a233ad7f84a901c8a5ba0f22608476b23704..3c8cbaaf77989d41f6147e45e665d7a7
        const baseUrl = nativeVersion
          ? this.config.baseUrl.replace("/v1beta/", `/${nativeVersion}/`) : this.config.baseUrl;
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index 42d151df5cc9538c32cd7407d9cd02f82c2e1a75..8f3f50548465847593d9d4bcfbc38ee2026a6be3 100644
+index 22bc1aa..7f3e687 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
 @@ -12,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
@@ -119,7 +119,7 @@ index 42d151df5cc9538c32cd7407d9cd02f82c2e1a75..8f3f50548465847593d9d4bcfbc38ee2
  import { handleBypassRequest } from "../utils/bypassHandler.js";
  import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
  import { getExecutor } from "../executors/index.js";
-@@ -123,10 +123,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -124,10 +124,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
    const nativeResponseProjection = nativeGemini ? {
      masks: [
        ...(clientRawRequest?.queryParams || [])
@@ -132,7 +132,7 @@ index 42d151df5cc9538c32cd7407d9cd02f82c2e1a75..8f3f50548465847593d9d4bcfbc38ee2
          .map(([, value]) => value),
      ],
    } : null;
-@@ -217,7 +217,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -219,7 +219,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
        headers: clientRawRequest?.headers || {},
        // Client and provider versions are separate routing decisions. The
        // browser-authenticated AIStudio generation API uses its beta wire.
@@ -141,7 +141,7 @@ index 42d151df5cc9538c32cd7407d9cd02f82c2e1a75..8f3f50548465847593d9d4bcfbc38ee2
      };
    }
  
-@@ -554,7 +554,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -561,7 +561,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
        const headers = new Headers(providerResponse.headers);
        // fetch exposes decoded bytes; forwarding compressed-length headers makes
        // native clients decompress them twice or wait for bytes that cannot arrive.
@@ -151,7 +151,7 @@ index 42d151df5cc9538c32cd7407d9cd02f82c2e1a75..8f3f50548465847593d9d4bcfbc38ee2
        nativeErrorResponse = new Response(providerResponse.clone().body, {
          status: providerResponse.status, statusText: providerResponse.statusText, headers,
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index e21d797f1a664169d7ef6865dc0e633acf9145c5..f46bddd6cbebf920087efa3a4292d9eb185268f4 100644
+index e21d797..f46bddd 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
 @@ -7,7 +7,7 @@ import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTrackin
@@ -173,7 +173,7 @@ index e21d797f1a664169d7ef6865dc0e633acf9145c5..f46bddd6cbebf920087efa3a4292d9eb
    headers.set("Access-Control-Allow-Origin", "*");
    const result = createErrorResult(status, message);
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index 39cff3e02eea1292bc7889bfab9c545e69a97dba..f9ee8f3d0e954b8b95ea5ccd745bec0e81e68cf5 100644
+index bafb215..d0ce6a1 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -3,7 +3,7 @@ import { needsTranslation } from "../../translator/index.js";
@@ -185,7 +185,7 @@ index 39cff3e02eea1292bc7889bfab9c545e69a97dba..f9ee8f3d0e954b8b95ea5ccd745bec0e
  import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
  import { buildStreamErrorBytes } from "../../utils/streamHelpers.js";
  import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
-@@ -77,7 +77,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+@@ -80,7 +80,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
          message: `[${status}]: ${shortMsg}`,
          ...(sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI ? {
            code: status,
@@ -194,7 +194,7 @@ index 39cff3e02eea1292bc7889bfab9c545e69a97dba..f9ee8f3d0e954b8b95ea5ccd745bec0e
          } : {}),
        } }), {
          status,
-@@ -136,7 +136,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+@@ -139,7 +139,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
    const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
    const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, nativeGeminiJson,
      typeof transformStream.finalizeNativeResponse === "function" ? (error, clientCancelled) => transformStream.finalizeNativeResponse({
@@ -204,7 +204,7 @@ index 39cff3e02eea1292bc7889bfab9c545e69a97dba..f9ee8f3d0e954b8b95ea5ccd745bec0e
        clientCancelled,
      }) : null);
 diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
-index 48f2c612e9065d91b52065b2c2bd35171eb8b56e..7721a4ca9e22e08be51eb37af3bc26da6482bd0c 100644
+index 48f2c61..7721a4c 100644
 --- a/open-sse/translator/formats/gemini.js
 +++ b/open-sse/translator/formats/gemini.js
 @@ -3,7 +3,7 @@
@@ -226,7 +226,7 @@ index 48f2c612e9065d91b52065b2c2bd35171eb8b56e..7721a4ca9e22e08be51eb37af3bc26da
      parts.push({ fileData: { fileUri: file.file_url, ...(mime ? { mimeType: mime } : {}) } });
    }
 diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
-index b987c3d8996b4e4201580aa47b30e4c9dcdfc710..6629b3f46999bc38e70ce92e427f7e928dadc225 100644
+index b987c3d..6629b3f 100644
 --- a/open-sse/utils/antigravityNative.js
 +++ b/open-sse/utils/antigravityNative.js
 @@ -1,3 +1,11 @@
@@ -307,19 +307,19 @@ index b987c3d8996b4e4201580aa47b30e4c9dcdfc710..6629b3f46999bc38e70ce92e427f7e92
        return;
      }
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 1b286b74dacaaf58fe6fa397251b540e94954aa1..9bcab8c8d8b55c614ac4215e0811ca37b95162b0 100644
+index 79550bb..a254fe6 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
-@@ -6,7 +6,7 @@ import {
-   parseSSELine, hasValuableContent, fixInvalidId, formatSSE, buildStreamErrorBytes,
-   isValidNativeGeminiResponse,
- } from "./streamHelpers.js";
+@@ -1,7 +1,7 @@
+ import { translateResponse, initState } from "../translator/index.js";
+ import { FORMATS } from "../translator/formats.js";
+ import { PROVIDERS } from "../config/providers.js";
 -import { HTTP_STATUS } from "../config/runtimeConfig.js";
 +import { HTTP_STATUS, NATIVE_GEMINI_FINISH_REASON_FIELDS, NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES, NATIVE_GEMINI_FORMATS } from "../config/runtimeConfig.js";
- import { restoreToolNames } from "./opencodeFingerprint.js";
- import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
- import { dbg, isDebugEnabled } from "./debugLog.js";
-@@ -59,8 +59,8 @@ function nativeCandidateFieldIsVisible(projection, field) {
+ import { liftReasoningAliases } from "../translator/concerns/reasoning.js";
+ import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
+ import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
+@@ -61,8 +61,8 @@ function nativeCandidateFieldIsVisible(projection, field) {
      }
      if (prefixes.length) return false;
      if (token) paths.push(path());
@@ -330,7 +330,7 @@ index 1b286b74dacaaf58fe6fa397251b540e94954aa1..9bcab8c8d8b55c614ac4215e0811ca37
    });
  }
  
-@@ -105,7 +105,7 @@ export function createSSEStream(options = {}) {
+@@ -107,7 +107,7 @@ export function createSSEStream(options = {}) {
    // provider serves it. Native Gemini SSE ends at EOF and carries arbitrary
    // Parts/metadata that must not pass through Chat normalization.
    const nativeGeminiPassthrough = mode === STREAM_MODE.PASSTHROUGH &&
@@ -339,7 +339,7 @@ index 1b286b74dacaaf58fe6fa397251b540e94954aa1..9bcab8c8d8b55c614ac4215e0811ca37
    const observeNativeGeminiTransform = mode === STREAM_MODE.TRANSLATE
      && sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
      && typeof onNativeResponseSuccess === "function";
-@@ -817,7 +817,7 @@ export function createSSEStream(options = {}) {
+@@ -863,7 +863,7 @@ export function createSSEStream(options = {}) {
          // upstream's own [DONE] is consumed above and Gemini/Claude streams have none. Nothing
          // else in this mode emits it, so one is written here.
          if (sourceFormat === FORMATS.OPENAI && sseEmittedCount > 0) {
@@ -349,11 +349,11 @@ index 1b286b74dacaaf58fe6fa397251b540e94954aa1..9bcab8c8d8b55c614ac4215e0811ca37
            controller.enqueue(sharedEncoder.encode(doneOutput));
            streamDoneSent = true;
 diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
-index 1bcfb93fbcee576c56314ea1f6227c56df07deeb..4284d2853f67e64547f7e7bdbd508ec0c09f6635 100644
+index 07c9284..571d03d 100644
 --- a/open-sse/utils/streamHelpers.js
 +++ b/open-sse/utils/streamHelpers.js
-@@ -1,7 +1,7 @@
- import { FORMATS } from "../translator/formats.js";
+@@ -2,7 +2,7 @@ import { FORMATS } from "../translator/formats.js";
+ import { fallbackToolCallId } from "../translator/concerns/toolCall.js";
  import { buildErrorBody } from "./error.js";
  import { SSE_DONE } from "./sseConstants.js";
 -import { NATIVE_GEMINI_RESPONSE_FIELDS, NATIVE_GEMINI_BRIDGE_FIELDS } from "../config/runtimeConfig.js";
@@ -361,7 +361,7 @@ index 1bcfb93fbcee576c56314ea1f6227c56df07deeb..4284d2853f67e64547f7e7bdbd508ec0
  
  const sharedEncoder = new TextEncoder();
  
-@@ -181,7 +181,7 @@ export function formatSSE(data, sourceFormat) {
+@@ -226,7 +226,7 @@ export function formatSSE(data, sourceFormat) {
  export function buildStreamErrorBytes(statusCode, message, clientFormat) {
    const { error } = buildErrorBody(statusCode, message);
  
@@ -371,7 +371,7 @@ index 1bcfb93fbcee576c56314ea1f6227c56df07deeb..4284d2853f67e64547f7e7bdbd508ec0
      // Keep the numeric failure code instead of an OpenAI symbolic error code.
      return sharedEncoder.encode(formatSSE({ error: { code: statusCode, message: error.message } }, clientFormat));
 diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
-index 0b92ab8977ac6dcada99c3e1c937dcd421876ec7..2d27dac81e3109a85923d18f7d356216d9116723 100644
+index 0b92ab8..2d27dac 100644
 --- a/tests/unit/chat-to-gemini-contract.test.js
 +++ b/tests/unit/chat-to-gemini-contract.test.js
 @@ -48,6 +48,19 @@ import {
@@ -430,7 +430,7 @@ index 0b92ab8977ac6dcada99c3e1c937dcd421876ec7..2d27dac81e3109a85923d18f7d356216
  
  describe("Antigravity executor contract on translated Gemini bodies", () => {
 diff --git a/tests/unit/gemini-native-core.test.js b/tests/unit/gemini-native-core.test.js
-index 38c620a160043168037774ab641b0ca8bc993ada..3d8e7538a13cba63792bc0937a4b73f80be494d1 100644
+index 38c620a..3d8e753 100644
 --- a/tests/unit/gemini-native-core.test.js
 +++ b/tests/unit/gemini-native-core.test.js
 @@ -1,6 +1,7 @@

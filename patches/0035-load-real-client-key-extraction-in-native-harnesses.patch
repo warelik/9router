@@ -6,10 +6,10 @@ Subject: [PATCH] Load real client-key extraction in native route regression
  harnesses
 
 ---
- ...igravity-native-disabled-functions.test.js |  7 +++++++
- tests/unit/antigravity-native-gemini.test.js  |  7 +++++++
- .../antigravity-native-json-output.test.js    |  7 +++++++
- .../unit/gemini-native-entry-contract.test.js | 21 +++++++++++++++++++
+ .../antigravity-native-disabled-functions.test.js   |  7 +++++++
+ tests/unit/antigravity-native-gemini.test.js        |  7 +++++++
+ tests/unit/antigravity-native-json-output.test.js   |  7 +++++++
+ tests/unit/gemini-native-entry-contract.test.js     | 21 +++++++++++++++++++++
  4 files changed, 42 insertions(+)
 
 diff --git a/tests/unit/antigravity-native-disabled-functions.test.js b/tests/unit/antigravity-native-disabled-functions.test.js
@@ -105,6 +105,3 @@ index c0a2016..da74666 100644
    it.each(["generateContent", "streamGenerateContent"])("TTS %s waits for EOF and its account update", async action => {
      let releaseAccount;
      const accountUpdated = new Promise(resolve => { releaseAccount = resolve; });
--- 
-2.43.0
-

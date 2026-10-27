@@ -6,13 +6,13 @@ Subject: [PATCH] Validate native Gemini streams before recording account
  success
 
 ---
- .../handlers/chatCore/streamingHandler.js     | 14 ++-
- open-sse/utils/stream.js                      | 88 +++++++++++++++----
- tests/unit/gemini-native-stream.test.js       | 82 ++++++++++++++++-
- 3 files changed, 160 insertions(+), 24 deletions(-)
+ open-sse/handlers/chatCore/streamingHandler.js | 14 ++--
+ open-sse/utils/stream.js                       | 89 ++++++++++++++++++++------
+ tests/unit/gemini-native-stream.test.js        | 82 +++++++++++++++++++++++-
+ 3 files changed, 160 insertions(+), 25 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index 09219bd..84c0703 100644
+index 21f0348..e21a45b 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -24,7 +24,7 @@ const CODEX_SOURCE_TO_TARGET = {
@@ -24,16 +24,16 @@ index 09219bd..84c0703 100644
    const isDroidCLI = userAgent?.toLowerCase().includes("droid") || userAgent?.toLowerCase().includes("codex-cli");
    // Responses-API providers (e.g. codex) emit Responses SSE → translate into client format
    const isResponsesProvider = PROVIDERS[provider]?.format === FORMATS.OPENAI_RESPONSES;
-@@ -39,7 +39,7 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
-     return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
-   }
- 
--  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, sourceFormat, nativeJson, nativeResponseProjection);
-+  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, sourceFormat, nativeJson, nativeResponseProjection, onNativeResponseSuccess);
+@@ -42,7 +42,7 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
+   // The passthrough path has no format translation, so the fingerprint's tool
+   // rename map (read -> read_client) has to be handed over explicitly —
+   // otherwise the client receives a call to a tool it never declared (#4986).
+-  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, toolNameMap, sourceFormat, nativeJson, nativeResponseProjection);
++  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, toolNameMap, sourceFormat, nativeJson, nativeResponseProjection, onNativeResponseSuccess);
  }
  
  /**
-@@ -82,17 +82,23 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+@@ -85,17 +85,23 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
      };
    }
  
@@ -60,10 +60,10 @@ index 09219bd..84c0703 100644
    // Terminal bytes when the stream aborts after HTTP 200 was already sent, so the
    // client sees a real error instead of a silently truncated stream.
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 14f3a28..146aecb 100644
+index 0a3b846..2d0e5b9 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
-@@ -61,6 +61,23 @@ function nativeCandidateFieldIsVisible(projection, field) {
+@@ -63,6 +63,23 @@ function nativeCandidateFieldIsVisible(projection, field) {
    });
  }
  
@@ -87,7 +87,7 @@ index 14f3a28..146aecb 100644
  /**
   * Create unified SSE transform stream
   * @param {object} options
-@@ -91,7 +108,8 @@ export function createSSEStream(options = {}) {
+@@ -93,7 +110,8 @@ export function createSSEStream(options = {}) {
      apiKey = null,
      credentials = null,
      nativeJson = false,
@@ -97,7 +97,7 @@ index 14f3a28..146aecb 100644
    } = options;
  
    let buffer = "";
-@@ -134,31 +152,49 @@ export function createSSEStream(options = {}) {
+@@ -142,31 +160,49 @@ export function createSSEStream(options = {}) {
    let completionFlushTimer = null;
    const nativeGeminiCandidates = new Map();
    let nativeGeminiFailureSeen = false;
@@ -153,14 +153,14 @@ index 14f3a28..146aecb 100644
    };
    const captureNativeGeminiLine = (line) => {
      if (line.startsWith("data:")) {
-@@ -166,9 +202,23 @@ export function createSSEStream(options = {}) {
+@@ -174,9 +210,22 @@ export function createSSEStream(options = {}) {
        return;
      }
      if (line.trim() || !nativeGeminiData.length) return;
 -    const parsed = parseSSELine(`data: ${nativeGeminiData.join("\n")}`, sourceFormat);
-+    const payload = nativeGeminiData.join("\n");
-     nativeGeminiData = [];
+-    nativeGeminiData = [];
 -    if (parsed) captureNativeGeminiBody(parsed);
++    const payload = nativeGeminiData.join("\n");
 +    let parsed;
 +    try { parsed = JSON.parse(payload); }
 +    catch {
@@ -178,8 +178,8 @@ index 14f3a28..146aecb 100644
 +    });
    };
  
-   // Usage/logging tail, callable from transform() as well as flush(): a client that
-@@ -532,23 +582,24 @@ export function createSSEStream(options = {}) {
+   // Lane quirk: upstream streams thinking under the OpenRouter aliases
+@@ -578,23 +627,24 @@ export function createSSEStream(options = {}) {
                  return;
                }
                const responses = Array.isArray(nativeResponse) ? nativeResponse : [nativeResponse];
@@ -211,7 +211,7 @@ index 14f3a28..146aecb 100644
                reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
                controller.enqueue(failure);
              } else if (observeNativeFinishReason && !nativeGeminiFailureSeen && (
-@@ -566,6 +617,8 @@ export function createSSEStream(options = {}) {
+@@ -612,6 +662,8 @@ export function createSSEStream(options = {}) {
                const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream ended before a candidate finished", sourceFormat);
                reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
                controller.enqueue(failure);
@@ -220,22 +220,21 @@ index 14f3a28..146aecb 100644
              }
              finalizeStream();
              return;
-@@ -703,13 +756,14 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
+@@ -749,12 +801,13 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
    });
  }
  
--export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null) {
-+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null, onNativeResponseSuccess = null) {
+-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null) {
++export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null, onNativeResponseSuccess = null) {
    return createSSEStream({
      mode: STREAM_MODE.PASSTHROUGH,
-     provider,
      sourceFormat,
      nativeJson,
      nativeResponseProjection,
 +    onNativeResponseSuccess,
+     provider,
      reqLogger,
-     model,
-     connectionId,
+     toolNameMap,
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
 index 0717461..40b62a1 100644
 --- a/tests/unit/gemini-native-stream.test.js
@@ -359,6 +358,3 @@ index 0717461..40b62a1 100644
      ["incomplete JSON", '[{"candidates":['],
      ["unfinished candidate in syntactically valid JSON", JSON.stringify([{ candidates: [{ index: 0, content: { parts: [{ text: "partial" }] } }] }])],
    ])("rejects %s at clean native JSON EOF", async (_name, raw) => {
--- 
-2.55.0
-

@@ -5,15 +5,15 @@ Date: Thu, 22 Oct 2026 23:33:28 +0000
 Subject: [PATCH] Keep ordinary stream EOF independent of usage persistence
 
 ---
- .../handlers/chatCore/streamingHandler.js     | 11 +++++--
- tests/unit/gemini-native-stream.test.js       | 30 +++++++++++++++++++
+ open-sse/handlers/chatCore/streamingHandler.js | 11 +++++++---
+ tests/unit/gemini-native-stream.test.js        | 30 ++++++++++++++++++++++++++
  2 files changed, 38 insertions(+), 3 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index d947420..39cff3e 100644
+index 4cb6f56..bafb215 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
-@@ -114,9 +114,14 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+@@ -117,9 +117,14 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
    }, { id: streamDetailId })).catch(err => {
      console.error("[RequestDetail] Failed to save streaming request:", err.message);
    });

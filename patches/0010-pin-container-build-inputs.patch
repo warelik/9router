@@ -3,14 +3,18 @@ From: Codex <codex@openai.com>
 Date: Sat, 17 Oct 2026 00:00:00 +0000
 Subject: [PATCH] Pin 9router image and npm build inputs
 
+ Dockerfile          |     6 +-
+ npm-shrinkwrap.json | 10213 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 10216 insertions(+), 3 deletions(-)
+
 diff --git a/Dockerfile b/Dockerfile
-index 9309de7..d43fd48 100644
+index 83d4f46..26f71bb 100644
 --- a/Dockerfile
 +++ b/Dockerfile
 @@ -1,5 +1,5 @@
  # syntax=docker/dockerfile:1.7
--ARG NODE_IMAGE=node:22-alpine
-+ARG NODE_IMAGE=node:22-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914
+-ARG NODE_IMAGE=node:22.23.4-alpine
++ARG NODE_IMAGE=node:22.23.4-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914
  ARG ALPINE_MIRROR=dl-cdn.alpinelinux.org
  ARG NPM_REGISTRY=https://registry.npmjs.org/
  ARG APP_VERSION=unknown
@@ -28,7 +32,7 @@ index 9309de7..d43fd48 100644
        --fetch-retry-factor=2 \
 diff --git a/npm-shrinkwrap.json b/npm-shrinkwrap.json
 new file mode 100644
-index 0000000000000000000000000000000000000000..562a6a873f926b1962be48d7cdaf09e2a568ab0b
+index 0000000..562a6a8
 --- /dev/null
 +++ b/npm-shrinkwrap.json
 @@ -0,0 +1,10213 @@

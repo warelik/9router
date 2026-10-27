@@ -5,7 +5,7 @@
   "cutoff_exclusive": "2026-10-13T00:00:00Z",
   "source_tip": "e01983276cb2f9ce05dc167e4d56c2c040559fd6",
   "source_upstream_base": "ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8",
-  "ported_upstream": "87a74e1bda3677193c6f71a7e2100c90311f0689",
+  "ported_upstream": "3a978a631ad65529c06e48ce495092d5bba29f46",
   "groups": [
     "transport-responses-wire",
     "native-gemini-aistudio",

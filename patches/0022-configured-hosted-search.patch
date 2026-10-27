@@ -5,13 +5,13 @@ Date: Thu, 22 Oct 2026 20:37:44 +0000
 Subject: [PATCH] Resolve hosted search from configured model capabilities
 
 ---
- open-sse/providers/capabilities.js            | 11 ++++----
- open-sse/translator/index.js                  |  8 ++++--
- .../unit/openai-responses-web-search.test.js  | 28 +++++++++++++++++++
+ open-sse/providers/capabilities.js             | 11 +++++-----
+ open-sse/translator/index.js                   |  8 +++++---
+ tests/unit/openai-responses-web-search.test.js | 28 ++++++++++++++++++++++++++
  3 files changed, 39 insertions(+), 8 deletions(-)
 
 diff --git a/open-sse/providers/capabilities.js b/open-sse/providers/capabilities.js
-index 1c3764ed..dcf4bdde 100644
+index c57b5f2..90855ec 100644
 --- a/open-sse/providers/capabilities.js
 +++ b/open-sse/providers/capabilities.js
 @@ -53,6 +53,7 @@ export const DEFAULT_CAPABILITIES = {
@@ -22,7 +22,7 @@ index 1c3764ed..dcf4bdde 100644
    tools: true,          // function / tool calling
    reasoning: false,     // thinking / reasoning
    // thinking wire format (only meaningful when reasoning:true). null → derive from transport.format.
-@@ -407,11 +408,11 @@ export const PATTERN_CAPABILITIES = [
+@@ -485,11 +486,11 @@ export const PATTERN_CAPABILITIES = [
    // ── Gemini (all 2.0+ multimodal + google_search grounding, 1M ctx) ─
    { pattern: "*gemini*image*",  caps: { vision: true, imageOutput: true, contextWindow: 1048576 } },
    // Gemini 4 (Argon): no "minimal" tier (400) and no thinkingBudget — LOW/MEDIUM/HIGH only, cannot disable.
@@ -40,18 +40,18 @@ index 1c3764ed..dcf4bdde 100644
    { pattern: "*gemini-2*",      caps: { vision: true, audioInput: true, videoInput: true, search: true, contextWindow: 1048576, maxOutput: 65536 } },
    { pattern: "*gemini*",        caps: { vision: true, search: true, contextWindow: 1048576 } },
 diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
-index ba69ee1a..14460727 100644
+index a91ab87..886c03a 100644
 --- a/open-sse/translator/index.js
 +++ b/open-sse/translator/index.js
-@@ -10,6 +10,7 @@ import { applyThinking, captureThinking, stripThinkingSuffix } from "./concerns/
- import { captureSessionId, captureConversationId } from "../utils/sessionManager.js";
+@@ -11,6 +11,7 @@ import { captureSessionId, captureConversationId } from "../utils/sessionManager
+ import { ensureStreamToolCallIds } from "../utils/streamHelpers.js";
  import { AntigravityExecutor } from "../executors/antigravity.js";
  import { PROVIDERS } from "../providers/index.js";
 +import { getCapabilitiesForModel } from "../providers/capabilities.js";
  import { ROLE, GEMINI_ROLE } from "./schema/roles.js";
  
  // Registry for translators. Lazy-init guards against circular-import order:
-@@ -154,8 +155,9 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+@@ -155,8 +156,9 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
      result = adaptAIStudioStructuredOutput(result);
    }
  
@@ -63,7 +63,7 @@ index ba69ee1a..14460727 100644
    // toolConfig.includeServerSideToolInvocations. Antigravity/Gemini-CLI share the
    // Cloud Code internal API which rejects that combination, and Vertex is
    // unverified, so the flag is consumed without effect for them. The internal
-@@ -164,7 +166,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+@@ -165,7 +167,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
      const wantsWebSearch = result._webSearch === true;
      delete result._webSearch;
      const webSearchEnabled = wantsWebSearch && targetFormat === FORMATS.GEMINI && (provider === "gemini" || provider === "aistudio")
@@ -73,7 +73,7 @@ index ba69ee1a..14460727 100644
        result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
        result.toolConfig = {
 diff --git a/tests/unit/openai-responses-web-search.test.js b/tests/unit/openai-responses-web-search.test.js
-index 35a92824..aef21c1d 100644
+index 35a9282..aef21c1 100644
 --- a/tests/unit/openai-responses-web-search.test.js
 +++ b/tests/unit/openai-responses-web-search.test.js
 @@ -5,6 +5,7 @@ import { FORMATS } from "../../open-sse/translator/formats.js";

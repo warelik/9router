@@ -6,11 +6,11 @@ Subject: [PATCH] Provide real crypto to native route fixtures and preserve raw
  upstream errors
 
 ---
- open-sse/utils/antigravityNative.js             |  8 ++++++--
- ...ntigravity-native-disabled-functions.test.js |  3 +++
- tests/unit/antigravity-native-gemini.test.js    |  3 +++
- .../unit/antigravity-native-json-output.test.js |  3 +++
- tests/unit/gemini-native-entry-contract.test.js | 17 +++++++++++++++++
+ open-sse/utils/antigravityNative.js                     |  8 ++++++--
+ .../unit/antigravity-native-disabled-functions.test.js  |  3 +++
+ tests/unit/antigravity-native-gemini.test.js            |  3 +++
+ tests/unit/antigravity-native-json-output.test.js       |  3 +++
+ tests/unit/gemini-native-entry-contract.test.js         | 17 +++++++++++++++++
  5 files changed, 32 insertions(+), 2 deletions(-)
 
 diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
@@ -138,5 +138,3 @@ index da74666..e6cea34 100644
  it("loads the real client-key accessor for every supported credential location", () => {
    for (const [headers, query, expected] of [
      [{ Authorization: "Bearer bearer-fixture", "x-goog-api-key": "ignored" }, "?key=ignored", "bearer-fixture"],
--- 
-2.43.0

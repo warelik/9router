@@ -5,12 +5,12 @@ Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Scope Gemini turn signatures to authenticated conversations
 
 ---
- .../handlers/chatCore/nonStreamingHandler.js  |  1 +
- open-sse/services/thoughtSignatureStore.js    | 14 +++++++++----
- .../translator/request/openai-to-gemini.js    |  2 +-
- .../translator/response/gemini-to-openai.js   |  2 +-
- ...eam-translator-history-regressions.test.js |  2 +-
- tests/unit/gemini-turn-signature.test.js      | 21 ++++++++++++++-----
+ open-sse/handlers/chatCore/nonStreamingHandler.js   |  1 +
+ open-sse/services/thoughtSignatureStore.js          | 14 ++++++++++----
+ open-sse/translator/request/openai-to-gemini.js     |  2 +-
+ open-sse/translator/response/gemini-to-openai.js    |  2 +-
+ ...ownstream-translator-history-regressions.test.js |  2 +-
+ tests/unit/gemini-turn-signature.test.js            | 21 ++++++++++++++++-----
  6 files changed, 30 insertions(+), 12 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
@@ -138,5 +138,3 @@ index 455c36f..5cfcbcd 100644
    it("replays the provider's signature (on the answer part) when the client echoes reasoning + answer", () => {
      const sig = "real-signature-1";
      const { reasoning, content } = turn([ask("q1")], [
--- 
-2.43.0

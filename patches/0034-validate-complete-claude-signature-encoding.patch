@@ -6,13 +6,13 @@ Subject: [PATCH] Validate both complete Claude signature encodings before
  forwarding
 
 ---
- open-sse/translator/formats/claude.js         | 12 +++--
- open-sse/utils/claudeSignature.js             | 37 +++++++++----
- .../claude-signature-versioned-form.test.js   | 53 ++++++++++++++++++-
+ open-sse/translator/formats/claude.js              | 12 +++--
+ open-sse/utils/claudeSignature.js                  | 37 ++++++++++-----
+ tests/unit/claude-signature-versioned-form.test.js | 53 +++++++++++++++++++++-
  3 files changed, 85 insertions(+), 17 deletions(-)
 
 diff --git a/open-sse/translator/formats/claude.js b/open-sse/translator/formats/claude.js
-index 7e0d0452..2cb820d3 100644
+index 8d8adab..4713c04 100644
 --- a/open-sse/translator/formats/claude.js
 +++ b/open-sse/translator/formats/claude.js
 @@ -4,7 +4,7 @@ import { ROLE, CLAUDE_BLOCK } from "../schema/index.js";
@@ -24,7 +24,7 @@ index 7e0d0452..2cb820d3 100644
  import { PROVIDERS } from "../../providers/index.js";
  import { getCapabilitiesForModel } from "../../providers/capabilities.js";
  import { isDeepSeekModel } from "../../providers/models/helpers.js";
-@@ -282,9 +282,10 @@ export function normalizeClaudePassthrough(body, model = "") {
+@@ -288,9 +288,10 @@ export function normalizeClaudePassthrough(body, model = "") {
        const kept = [];
        for (const block of msg.content) {
          if (block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING) {
@@ -37,7 +37,7 @@ index 7e0d0452..2cb820d3 100644
            }
            continue;
          }
-@@ -634,9 +635,10 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
+@@ -640,9 +641,10 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
              if (isThinking) {
                if (!String(block.thinking ?? "").trim()) continue;
                if (isClaudeNative) {
@@ -51,7 +51,7 @@ index 7e0d0452..2cb820d3 100644
                } else if (deepSeekServed) {
                  hasKeptThinking = true;
 diff --git a/open-sse/utils/claudeSignature.js b/open-sse/utils/claudeSignature.js
-index 1f541825..0b865e30 100644
+index 1f54182..0b865e3 100644
 --- a/open-sse/utils/claudeSignature.js
 +++ b/open-sse/utils/claudeSignature.js
 @@ -8,7 +8,7 @@ const MAX_CLAUDE_SIGNATURE_LEN = 32 * 1024 * 1024;
@@ -110,7 +110,7 @@ index 1f541825..0b865e30 100644
 +  return normalizeClaudeSignature(rawSignature) !== null;
 +}
 diff --git a/tests/unit/claude-signature-versioned-form.test.js b/tests/unit/claude-signature-versioned-form.test.js
-index ad682605..f53e10bb 100644
+index ad68260..f53e10b 100644
 --- a/tests/unit/claude-signature-versioned-form.test.js
 +++ b/tests/unit/claude-signature-versioned-form.test.js
 @@ -1,5 +1,5 @@

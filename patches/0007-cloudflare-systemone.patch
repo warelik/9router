@@ -7,17 +7,16 @@ Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
 Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
 Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
 ---
- open-sse/handlers/systemoneCore.js           | 19 +++++
+ open-sse/handlers/systemoneCore.js           | 19 +++++++
  open-sse/providers/registry/cloudflare-ai.js |  1 +
- tests/unit/systemone-core.test.js            | 83 ++++++++++++++++++++
+ tests/unit/systemone-core.test.js            | 83 ++++++++++++++++++++++++++++
  3 files changed, 103 insertions(+)
- create mode 100644 tests/unit/systemone-core.test.js
 
 diff --git a/open-sse/handlers/systemoneCore.js b/open-sse/handlers/systemoneCore.js
-index d61241bf..7e7c7d1c 100644
+index e84b36a..c9edcfe 100644
 --- a/open-sse/handlers/systemoneCore.js
 +++ b/open-sse/handlers/systemoneCore.js
-@@ -8,6 +8,9 @@ import { generateSessionId } from "../executors/opencode-zen.js";
+@@ -27,6 +27,9 @@ export function buildSystemoneUrl(override, cfg) {
   * Core System One (Jev) handler — native decision payload pass-through.
   * URL/headers come from the registry's systemoneConfig; body and JSON response
   * are forwarded untouched (decision models have no chat translation layer).
@@ -27,7 +26,7 @@ index d61241bf..7e7c7d1c 100644
   *
   * @returns {Promise<{ success: boolean, response: Response, usage?: object, status?: number, error?: string }>}
   */
-@@ -94,6 +97,22 @@ export async function handleSystemoneCore({
+@@ -113,6 +116,22 @@ export async function handleSystemoneCore({
      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
    }
  
@@ -51,7 +50,7 @@ index d61241bf..7e7c7d1c 100644
  
    const usage = responseBody?.usage;
 diff --git a/open-sse/providers/registry/cloudflare-ai.js b/open-sse/providers/registry/cloudflare-ai.js
-index d998c924..d1ab31a4 100644
+index d998c92..d1ab31a 100644
 --- a/open-sse/providers/registry/cloudflare-ai.js
 +++ b/open-sse/providers/registry/cloudflare-ai.js
 @@ -58,6 +58,7 @@ export default {
@@ -64,7 +63,7 @@ index d998c924..d1ab31a4 100644
  };
 diff --git a/tests/unit/systemone-core.test.js b/tests/unit/systemone-core.test.js
 new file mode 100644
-index 00000000..80299c61
+index 0000000..80299c6
 --- /dev/null
 +++ b/tests/unit/systemone-core.test.js
 @@ -0,0 +1,83 @@

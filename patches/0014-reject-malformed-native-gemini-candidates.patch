@@ -6,11 +6,11 @@ Subject: [PATCH] Reject malformed native Gemini candidates before account
  success
 
 ---
- .../handlers/chatCore/nonStreamingHandler.js  |  5 +--
- open-sse/utils/stream.js                      | 24 +++--------
- open-sse/utils/streamHelpers.js               | 24 +++++++++++
- tests/unit/gemini-native-core.test.js         | 17 +++++++-
- tests/unit/gemini-native-stream.test.js       | 40 +++++++++++++++++++
+ open-sse/handlers/chatCore/nonStreamingHandler.js |  5 ++-
+ open-sse/utils/stream.js                          | 24 +++-----------
+ open-sse/utils/streamHelpers.js                   | 24 ++++++++++++++
+ tests/unit/gemini-native-core.test.js             | 17 +++++++++-
+ tests/unit/gemini-native-stream.test.js           | 40 +++++++++++++++++++++++
  5 files changed, 87 insertions(+), 23 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
@@ -37,22 +37,22 @@ index 4837011..c699b4a 100644
        appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
        return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, message);
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 146aecb..81ee6d5 100644
+index 2d0e5b9..e7aeda8 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
-@@ -2,7 +2,10 @@ import { translateResponse, initState } from "../translator/index.js";
- import { FORMATS } from "../translator/formats.js";
+@@ -5,7 +5,10 @@ import { HTTP_STATUS } from "../config/runtimeConfig.js";
+ import { liftReasoningAliases } from "../translator/concerns/reasoning.js";
  import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
  import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
--import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, buildStreamErrorBytes } from "./streamHelpers.js";
+-import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, ensureStreamToolCallIds, buildStreamErrorBytes } from "./streamHelpers.js";
 +import {
-+  parseSSELine, hasValuableContent, fixInvalidId, formatSSE, buildStreamErrorBytes,
++  parseSSELine, hasValuableContent, fixInvalidId, formatSSE, ensureStreamToolCallIds, buildStreamErrorBytes,
 +  isValidNativeGeminiResponse,
 +} from "./streamHelpers.js";
- import { HTTP_STATUS } from "../config/runtimeConfig.js";
  import { restoreToolNames } from "./opencodeFingerprint.js";
  import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
-@@ -61,23 +64,6 @@ function nativeCandidateFieldIsVisible(projection, field) {
+ import { dbg, isDebugEnabled } from "./debugLog.js";
+@@ -63,23 +66,6 @@ function nativeCandidateFieldIsVisible(projection, field) {
    });
  }
  
@@ -76,7 +76,7 @@ index 146aecb..81ee6d5 100644
  /**
   * Create unified SSE transform stream
   * @param {object} options
-@@ -167,7 +153,7 @@ export function createSSEStream(options = {}) {
+@@ -175,7 +161,7 @@ export function createSSEStream(options = {}) {
      const extracted = extractUsage(parsed);
      if (extracted) usage = mergeUsage(usage, extracted);
      const response = parsed.response || parsed;
@@ -86,10 +86,10 @@ index 146aecb..81ee6d5 100644
        nativeGeminiErrorSeen = true;
      }
 diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
-index 3742ae5..32f6577 100644
+index e455f72..e68493e 100644
 --- a/open-sse/utils/streamHelpers.js
 +++ b/open-sse/utils/streamHelpers.js
-@@ -4,6 +4,30 @@ import { SSE_DONE } from "./sseConstants.js";
+@@ -5,6 +5,30 @@ import { SSE_DONE } from "./sseConstants.js";
  
  const sharedEncoder = new TextEncoder();
  
@@ -238,6 +238,3 @@ index 40b62a1..7f4643a 100644
    it.each([FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY])("builds a native numeric abort error without DONE for %s", source => {
      const output = new TextDecoder().decode(buildStreamErrorBytes(504, "stream stall timeout", source));
      expect(JSON.parse(output.trim().slice(5))).toEqual({ error: { code: 504, message: "stream stall timeout" } });
--- 
-2.55.0
-

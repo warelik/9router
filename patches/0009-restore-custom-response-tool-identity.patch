@@ -9,10 +9,10 @@ Subject: [PATCH] Restore custom response tool identity
  2 files changed, 33 insertions(+), 1 deletion(-)
 
 diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
-index 3fcdc1c..b7e7066 100644
+index 8ba5db9..239ecd9 100644
 --- a/open-sse/utils/opencodeFingerprint.js
 +++ b/open-sse/utils/opencodeFingerprint.js
-@@ -302,7 +302,15 @@ export function restoreToolNames(payload, map) {
+@@ -455,7 +455,15 @@ export function restoreToolNames(payload, map) {
      if (typeof item.namespace === "string" && item.namespace) return item;
      const resolved = resolveToolName(item.name, map);
      if (resolved.descriptor) {
@@ -29,7 +29,7 @@ index 3fcdc1c..b7e7066 100644
      }
      return resolved.name === item.name ? item : { ...item, name: resolved.name };
    };
-@@ -314,6 +322,14 @@ export function restoreToolNames(payload, map) {
+@@ -467,6 +475,14 @@ export function restoreToolNames(payload, map) {
        if (resolved.descriptor) {
          put("name", resolved.descriptor.name);
          put("namespace", resolved.descriptor.namespace);
@@ -71,6 +71,3 @@ index 98995a2..7efe3e8 100644
  for (const [format, provider] of [[FORMATS.GEMINI, "gemini"], [FORMATS.GEMINI, "aistudio"], [FORMATS.ANTIGRAVITY, "antigravity"]]) {
    describe(`${provider} namespace SSE roundtrip`, () => {
      for (const [name, type, args] of [["read", "function_call", { title: "record", count: 3 }], ["patch", "custom_tool_call", { input: "RAW_PATCH" }]]) {
--- 
-2.43.0
-

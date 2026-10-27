@@ -6,13 +6,13 @@ Subject: [PATCH] Centralize existing portable collaboration type
  discriminators
 
 ---
- .../concerns/portableCollaboration.js         | 29 ++++++++++---------
- open-sse/translator/schema/blocks.js          | 12 +++++++-
- open-sse/translator/schema/index.js           |  2 +-
+ .../translator/concerns/portableCollaboration.js   | 29 +++++++++++-----------
+ open-sse/translator/schema/blocks.js               | 12 ++++++++-
+ open-sse/translator/schema/index.js                |  2 +-
  3 files changed, 27 insertions(+), 16 deletions(-)
 
 diff --git a/open-sse/translator/concerns/portableCollaboration.js b/open-sse/translator/concerns/portableCollaboration.js
-index 9de159113b32885848f3516c7c8f4ceeead058b3..00b6043062914ddd7504e4f002359acb141097b0 100644
+index 9de1591..00b6043 100644
 --- a/open-sse/translator/concerns/portableCollaboration.js
 +++ b/open-sse/translator/concerns/portableCollaboration.js
 @@ -1,18 +1,19 @@
@@ -96,10 +96,10 @@ index 9de159113b32885848f3516c7c8f4ceeead058b3..00b6043062914ddd7504e4f002359acb
      return item;
    });
 diff --git a/open-sse/translator/schema/blocks.js b/open-sse/translator/schema/blocks.js
-index 31ced5f0eec0ac109dca613bd5a33470244d1634..dc2b09109dece637ca5906f240a42036cbf91acd 100644
+index 3cd9ab1..cbaf40a 100644
 --- a/open-sse/translator/schema/blocks.js
 +++ b/open-sse/translator/schema/blocks.js
-@@ -25,9 +25,10 @@ export const CLAUDE_BLOCK = {
+@@ -31,9 +31,10 @@ export const CLAUDE_BLOCK = {
    WEB_SEARCH_TOOL_RESULT: "web_search_tool_result",
  };
  
@@ -111,7 +111,7 @@ index 31ced5f0eec0ac109dca613bd5a33470244d1634..dc2b09109dece637ca5906f240a42036
    FUNCTION_CALL: "function_call",
    FUNCTION_CALL_OUTPUT: "function_call_output",
    CUSTOM_TOOL_CALL: "custom_tool_call",
-@@ -36,11 +37,20 @@ export const RESPONSES_ITEM = {
+@@ -42,11 +43,20 @@ export const RESPONSES_ITEM = {
    REASONING: "reasoning",
    OUTPUT_TEXT: "output_text",
    INPUT_TEXT: "input_text",
@@ -133,18 +133,15 @@ index 31ced5f0eec0ac109dca613bd5a33470244d1634..dc2b09109dece637ca5906f240a42036
  export const VALID_OPENAI_CONTENT_TYPES = [
    OPENAI_BLOCK.TEXT, OPENAI_BLOCK.IMAGE_URL, OPENAI_BLOCK.IMAGE, OPENAI_BLOCK.INPUT_AUDIO, OPENAI_BLOCK.AUDIO_URL, OPENAI_BLOCK.FILE,
 diff --git a/open-sse/translator/schema/index.js b/open-sse/translator/schema/index.js
-index 3fada8c9080b751e0cd008cb173a1a996c225c66..6cacd21de95f1c28fa3383b6bfdaab2e878f157a 100644
+index be51a9b..835be17 100644
 --- a/open-sse/translator/schema/index.js
 +++ b/open-sse/translator/schema/index.js
 @@ -1,7 +1,7 @@
  // Translator schema barrel — pure data enums (roles, blocks). No logic here.
  export { ROLE, GEMINI_ROLE } from "./roles.js";
  export {
--  OPENAI_BLOCK, CLAUDE_BLOCK, RESPONSES_ITEM,
-+  OPENAI_BLOCK, CLAUDE_BLOCK, RESPONSES_ITEM, RESPONSES_TOOL,
+-  OPENAI_BLOCK, CLAUDE_BLOCK, COMMANDCODE_BLOCK, RESPONSES_ITEM,
++  OPENAI_BLOCK, CLAUDE_BLOCK, COMMANDCODE_BLOCK, RESPONSES_ITEM, RESPONSES_TOOL,
    VALID_OPENAI_CONTENT_TYPES, VALID_OPENAI_MESSAGE_TYPES,
  } from "./blocks.js";
- export { OPENAI_FINISH, CLAUDE_STOP, GEMINI_FINISH } from "./finishReasons.js";
--- 
-2.43.0
-
+ export { OPENAI_FINISH, CLAUDE_STOP, GEMINI_FINISH, RESPONSES_STATUS, RESPONSES_INCOMPLETE_REASON } from "./finishReasons.js";

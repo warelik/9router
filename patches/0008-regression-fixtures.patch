@@ -8,29 +8,15 @@ Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
 Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
 Port adaptation: retain the current upstream image mediaType and make the generated Mavis session id snapshot field deterministic.
 ---
- tests/translator/bugs-gemini-cursor-commandcode.test.js | 2 +-
- tests/translator/golden-url-header.test.js              | 9 ++++++++-
- tests/unit/cli-connect.test.js                          | 2 ++
- 3 files changed, 11 insertions(+), 2 deletions(-)
+ tests/translator/golden-url-header.test.js | 9 ++++++++-
+ tests/unit/cli-connect.test.js             | 2 ++
+ 2 files changed, 10 insertions(+), 1 deletion(-)
 
-diff --git a/tests/translator/bugs-gemini-cursor-commandcode.test.js b/tests/translator/bugs-gemini-cursor-commandcode.test.js
-index 58e39274..1bb6c78a 100644
---- a/tests/translator/bugs-gemini-cursor-commandcode.test.js
-+++ b/tests/translator/bugs-gemini-cursor-commandcode.test.js
-@@ -74,7 +74,7 @@ describe("OpenAI → CommandCode", () => {
-     expect(JSON.stringify(out)).not.toContain("[image omitted]");
-     expect(out.params.messages[0].content).toEqual([
-       { type: "text", text: "look" },
--      { type: "image", image: "data:image/png;base64,BBBB", mimeType: "image/png" },
-+      { type: "image", image: "data:image/png;base64,BBBB", mimeType: "image/png", mediaType: "image/png" },
-     ]);
-   });
- });
 diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
-index 7137903a..b93f530c 100644
+index 8b745cc..49eb9df 100644
 --- a/tests/translator/golden-url-header.test.js
 +++ b/tests/translator/golden-url-header.test.js
-@@ -64,7 +64,14 @@ describe("GOLDEN buildHeaders (default executor providers)", () => {
+@@ -68,7 +68,14 @@ describe("GOLDEN buildHeaders (default executor providers)", () => {
          oauth: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : OAUTH_CRED, true))),
          nonStream: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, false))),
        };
@@ -47,7 +33,7 @@ index 7137903a..b93f530c 100644
    }
  });
 diff --git a/tests/unit/cli-connect.test.js b/tests/unit/cli-connect.test.js
-index 3695a4b6..7da8ede2 100644
+index 3695a4b..7da8ede 100644
 --- a/tests/unit/cli-connect.test.js
 +++ b/tests/unit/cli-connect.test.js
 @@ -194,10 +194,12 @@ describe("connect run()", () => {

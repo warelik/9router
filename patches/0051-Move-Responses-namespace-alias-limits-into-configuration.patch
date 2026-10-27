@@ -10,10 +10,10 @@ Subject: [PATCH] Move Responses namespace alias limits into configuration
  2 files changed, 11 insertions(+), 3 deletions(-)
 
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index c2d05b9e24d1aa80a64d480df46a30ef0255e9d9..afc5306eb248b962e1c84f36358470210aac092c 100644
+index 94e5f4a..792cced 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
-@@ -95,6 +95,13 @@ export const PORTABLE_COLLABORATION = {
+@@ -100,6 +100,13 @@ export const PORTABLE_COLLABORATION = {
    aliasCollisionBaseLength: 58,
  };
  
@@ -28,7 +28,7 @@ index c2d05b9e24d1aa80a64d480df46a30ef0255e9d9..afc5306eb248b962e1c84f3635847021
  export const RETRY_CONFIG = {
    maxAttempts: 2,
 diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
-index 59f01c09bdb4c55d5f0bd0961afa90cc268b3148..1f2b4a7d3eb7952aaf0e2fc3cf672b5056b70268 100644
+index 59f01c0..1f2b4a7 100644
 --- a/open-sse/translator/request/openai-responses.js
 +++ b/open-sse/translator/request/openai-responses.js
 @@ -7,6 +7,7 @@

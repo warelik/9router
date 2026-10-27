@@ -7,26 +7,22 @@ Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
 Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
 Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
 ---
- open-sse/executors/default.js                 |  26 +-
- open-sse/handlers/chatCore.js                 |  27 +-
- .../handlers/chatCore/sseToJsonHandler.js     |   7 +-
- open-sse/providers/registry/kimi.js           |   3 +
- .../translator/request/openai-responses.js    |  12 +-
- open-sse/utils/responsesStreamHelpers.js      |   3 +-
- tests/unit/kimi-responses-transport.test.js   |  15 +-
- .../opencode-go-transport-routing.test.js     |  50 ++-
- tests/unit/responses-reasoning-wire.test.js   | 414 ++++++++++++++++++
- ...onses-thinking-option-preservation.test.js |  71 +++
- tests/unit/target-format-transport.test.js    | 287 ++++++++++++
- tests/unit/undeclared-responses-sse.test.js   | 206 +++++++++
+ open-sse/executors/default.js                      |  26 +-
+ open-sse/handlers/chatCore.js                      |  27 +-
+ open-sse/handlers/chatCore/sseToJsonHandler.js     |   7 +-
+ open-sse/providers/registry/kimi.js                |   3 +
+ open-sse/translator/request/openai-responses.js    |  12 +-
+ open-sse/utils/responsesStreamHelpers.js           |   3 +-
+ tests/unit/kimi-responses-transport.test.js        |  15 +-
+ tests/unit/opencode-go-transport-routing.test.js   |  50 ++-
+ tests/unit/responses-reasoning-wire.test.js        | 414 +++++++++++++++++++++
+ .../responses-thinking-option-preservation.test.js |  71 ++++
+ tests/unit/target-format-transport.test.js         | 287 ++++++++++++++
+ tests/unit/undeclared-responses-sse.test.js        | 206 ++++++++++
  12 files changed, 1092 insertions(+), 29 deletions(-)
- create mode 100644 tests/unit/responses-reasoning-wire.test.js
- create mode 100644 tests/unit/responses-thinking-option-preservation.test.js
- create mode 100644 tests/unit/target-format-transport.test.js
- create mode 100644 tests/unit/undeclared-responses-sse.test.js
 
 diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
-index cd9fd089..a2961460 100644
+index cd9fd08..a296146 100644
 --- a/open-sse/executors/default.js
 +++ b/open-sse/executors/default.js
 @@ -75,13 +75,37 @@ const REFRESH_GRANTS = Object.fromEntries(
@@ -69,10 +65,10 @@ index cd9fd089..a2961460 100644
      if (transformed && typeof transformed === "object") {
        // quirk: some openai-compatible providers reject Anthropic's client_metadata field
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index e014effa..ef5b0698 100644
+index 68a1350..36df163 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
-@@ -107,14 +107,35 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -108,13 +108,34 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
    // whose wire format has no supported transport (for example MiniMax-M3:
    // OpenAI clients should stay on /chat/completions; other clients can fall
    // back to its declared Claude target).
@@ -102,7 +98,6 @@ index e014effa..ef5b0698 100644
 +  const effectiveTransport = useTransport || resolveTransport(provider, targetFormat);
 +  if (effectiveTransport && credentials) credentials.runtimeTransport = effectiveTransport;
    const stripList = getModelStrip(alias, model);
-   const upstreamModel = getModelUpstreamId(alias, model);
  
    // Inject provider-level thinking config override (only if client hasn't set)
    // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
@@ -112,18 +107,18 @@ index e014effa..ef5b0698 100644
      if (mode === "on" && !body.thinking) {
        console.log("Injecting provider-level thinking config override: on");
 diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
-index fa37c24b..cd953f7e 100644
+index 5a72398..3bcd7f8 100644
 --- a/open-sse/handlers/chatCore/sseToJsonHandler.js
 +++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
-@@ -7,6 +7,7 @@ import { openAICompletionToClaudeMessage } from "../../translator/concerns/claud
- import { PROVIDERS } from "../../config/providers.js";
+@@ -8,6 +8,7 @@ import { PROVIDERS } from "../../config/providers.js";
  import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
  import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
+ import { extractReasoningText } from "../../translator/concerns/reasoning.js";
 +import { upstreamResponseHeaders } from "../../utils/upstreamHeaders.js";
  
  // Responses-API providers (e.g. codex) may emit SSE without content-type + use Responses output shape
  const isResponsesProvider = (p) => PROVIDERS[p]?.format === FORMATS.OPENAI_RESPONSES;
-@@ -227,7 +228,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
+@@ -232,7 +233,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
  
        // Client is Responses API → return as-is
        if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
@@ -132,7 +127,7 @@ index fa37c24b..cd953f7e 100644
        }
  
        // Build client-format response.
-@@ -287,7 +288,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
+@@ -292,7 +293,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
          finalResp = openAICompletionToClaudeMessage(finalResp);
        }
  
@@ -141,7 +136,7 @@ index fa37c24b..cd953f7e 100644
      } catch (err) {
        console.error("[ChatCore] Responses API SSE→JSON failed:", err);
        return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Failed to convert streaming response to JSON");
-@@ -367,7 +368,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
+@@ -372,7 +373,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
          ? openAICompletionToClaudeMessage(parsed)
          : parsed;
  
@@ -151,7 +146,7 @@ index fa37c24b..cd953f7e 100644
      console.error("[ChatCore] Chat Completions SSE→JSON failed:", err);
      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Failed to convert streaming response to JSON");
 diff --git a/open-sse/providers/registry/kimi.js b/open-sse/providers/registry/kimi.js
-index 88f6e386..e90fe5a5 100644
+index 88f6e38..e90fe5a 100644
 --- a/open-sse/providers/registry/kimi.js
 +++ b/open-sse/providers/registry/kimi.js
 @@ -56,6 +56,9 @@ export default {
@@ -165,7 +160,7 @@ index 88f6e386..e90fe5a5 100644
      },
    ],
 diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
-index 5c719fd2..e5c62aec 100644
+index 5c719fd..e5c62ae 100644
 --- a/open-sse/translator/request/openai-responses.js
 +++ b/open-sse/translator/request/openai-responses.js
 @@ -455,7 +455,13 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
@@ -192,7 +187,7 @@ index 5c719fd2..e5c62aec 100644
 +register(FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, (model, body, stream, credentials) =>
 +  openaiToOpenAIResponsesRequest(model, body, stream, credentials, { inferReasoningSummary: false }), null);
 diff --git a/open-sse/utils/responsesStreamHelpers.js b/open-sse/utils/responsesStreamHelpers.js
-index eaacdcd0..6a1e94c2 100644
+index eaacdcd..6a1e94c 100644
 --- a/open-sse/utils/responsesStreamHelpers.js
 +++ b/open-sse/utils/responsesStreamHelpers.js
 @@ -7,6 +7,7 @@ const OPENAI_RESPONSES_TERMINAL_EVENTS = new Set([
@@ -213,7 +208,7 @@ index eaacdcd0..6a1e94c2 100644
  
  const sharedEncoder = new TextEncoder();
 diff --git a/tests/unit/kimi-responses-transport.test.js b/tests/unit/kimi-responses-transport.test.js
-index faffc086..4d80dd8f 100644
+index faffc08..4d80dd8 100644
 --- a/tests/unit/kimi-responses-transport.test.js
 +++ b/tests/unit/kimi-responses-transport.test.js
 @@ -3,8 +3,8 @@
@@ -244,7 +239,7 @@ index faffc086..4d80dd8f 100644
 +  });
  });
 diff --git a/tests/unit/opencode-go-transport-routing.test.js b/tests/unit/opencode-go-transport-routing.test.js
-index 7d65a406..b2fd58c0 100644
+index 7d65a40..b2fd58c 100644
 --- a/tests/unit/opencode-go-transport-routing.test.js
 +++ b/tests/unit/opencode-go-transport-routing.test.js
 @@ -10,8 +10,8 @@
@@ -341,7 +336,7 @@ index 7d65a406..b2fd58c0 100644
  
 diff --git a/tests/unit/responses-reasoning-wire.test.js b/tests/unit/responses-reasoning-wire.test.js
 new file mode 100644
-index 00000000..40cd5125
+index 0000000..40cd512
 --- /dev/null
 +++ b/tests/unit/responses-reasoning-wire.test.js
 @@ -0,0 +1,414 @@
@@ -761,7 +756,7 @@ index 00000000..40cd5125
 +});
 diff --git a/tests/unit/responses-thinking-option-preservation.test.js b/tests/unit/responses-thinking-option-preservation.test.js
 new file mode 100644
-index 00000000..19b385e7
+index 0000000..19b385e
 --- /dev/null
 +++ b/tests/unit/responses-thinking-option-preservation.test.js
 @@ -0,0 +1,71 @@
@@ -838,7 +833,7 @@ index 00000000..19b385e7
 +});
 diff --git a/tests/unit/target-format-transport.test.js b/tests/unit/target-format-transport.test.js
 new file mode 100644
-index 00000000..489a4f28
+index 0000000..489a4f2
 --- /dev/null
 +++ b/tests/unit/target-format-transport.test.js
 @@ -0,0 +1,287 @@
@@ -1131,7 +1126,7 @@ index 00000000..489a4f28
 +});
 diff --git a/tests/unit/undeclared-responses-sse.test.js b/tests/unit/undeclared-responses-sse.test.js
 new file mode 100644
-index 00000000..8a0e19b6
+index 0000000..8a0e19b
 --- /dev/null
 +++ b/tests/unit/undeclared-responses-sse.test.js
 @@ -0,0 +1,206 @@

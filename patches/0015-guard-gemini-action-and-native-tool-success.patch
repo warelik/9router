@@ -5,16 +5,16 @@ Date: Tue, 20 Oct 2026 00:00:00 +0000
 Subject: [PATCH] Guard native Gemini actions and transformed response success
 
 ---
- .../handlers/chatCore/streamingHandler.js     |   9 +-
- open-sse/utils/opencodeFingerprint.js         |  21 ++++
- open-sse/utils/stream.js                      |  86 ++++++++++++--
- src/app/api/v1beta/models/[...path]/route.js  |   4 +
- .../unit/gemini-native-alpha-contract.test.js |  18 +++
- tests/unit/gemini-native-stream.test.js       | 107 ++++++++++++++++++
+ open-sse/handlers/chatCore/streamingHandler.js  |   9 +-
+ open-sse/utils/opencodeFingerprint.js           |  21 +++++
+ open-sse/utils/stream.js                        |  86 ++++++++++++++++---
+ src/app/api/v1beta/models/[...path]/route.js    |   4 +
+ tests/unit/gemini-native-alpha-contract.test.js |  18 ++++
+ tests/unit/gemini-native-stream.test.js         | 107 ++++++++++++++++++++++++
  6 files changed, 231 insertions(+), 14 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index 84c070397dc103b8a684ec1d400df0c1ba280fc7..cc50c76ee0fb0357b2c0bebab1689175ed027510 100644
+index e21a45b..31807c8 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -36,7 +36,11 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
@@ -29,8 +29,8 @@ index 84c070397dc103b8a684ec1d400df0c1ba280fc7..cc50c76ee0fb0357b2c0bebab1689175
 +    );
    }
  
-   return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, sourceFormat, nativeJson, nativeResponseProjection, onNativeResponseSuccess);
-@@ -82,8 +86,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
+   // The passthrough path has no format translation, so the fingerprint's tool
+@@ -85,8 +89,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
      };
    }
  
@@ -41,10 +41,10 @@ index 84c070397dc103b8a684ec1d400df0c1ba280fc7..cc50c76ee0fb0357b2c0bebab1689175
      if (!onRequestSuccess) return;
      Promise.resolve()
 diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
-index b7e7066b448646130c690beab0e2808ac3010083..96456e0ce5eb7717713412f52a2d9b138eefeb15 100644
+index 239ecd9..36c0efb 100644
 --- a/open-sse/utils/opencodeFingerprint.js
 +++ b/open-sse/utils/opencodeFingerprint.js
-@@ -374,6 +374,27 @@ export function restoreToolNames(payload, map) {
+@@ -527,6 +527,27 @@ export function restoreToolNames(payload, map) {
      }));
    }
  
@@ -73,10 +73,10 @@ index b7e7066b448646130c690beab0e2808ac3010083..96456e0ce5eb7717713412f52a2d9b13
    if (Array.isArray(payload.output)) {
      put("output", payload.output.map((item) =>
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 81ee6d5ecb02cc3dd0add2b72a5486427b65fcce..b188bd8b0a5223d914fbf0b14ea11b54fb656e80 100644
+index e7aeda8..07a1847 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
-@@ -105,6 +105,11 @@ export function createSSEStream(options = {}) {
+@@ -107,6 +107,11 @@ export function createSSEStream(options = {}) {
    // Parts/metadata that must not pass through Chat normalization.
    const nativeGeminiPassthrough = mode === STREAM_MODE.PASSTHROUGH &&
      [FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY].includes(sourceFormat);
@@ -88,7 +88,7 @@ index 81ee6d5ecb02cc3dd0add2b72a5486427b65fcce..b188bd8b0a5223d914fbf0b14ea11b54
    const observeNativeFinishReason = nativeCandidateFieldIsVisible(nativeResponseProjection, "finishReason");
    const observeNativeCandidateIndex = nativeCandidateFieldIsVisible(nativeResponseProjection, "index");
  
-@@ -147,11 +152,21 @@ export function createSSEStream(options = {}) {
+@@ -155,11 +160,21 @@ export function createSSEStream(options = {}) {
    let nativeGeminiData = [];
    let nativeGeminiJson = "";
  
@@ -111,7 +111,7 @@ index 81ee6d5ecb02cc3dd0add2b72a5486427b65fcce..b188bd8b0a5223d914fbf0b14ea11b54
      const response = parsed.response || parsed;
      if (parsed.error || response.error) {
        nativeGeminiFailureSeen = true;
-@@ -254,8 +269,12 @@ export function createSSEStream(options = {}) {
+@@ -267,8 +282,12 @@ export function createSSEStream(options = {}) {
      transform(chunk, controller) {
        if (!ttftAt) ttftAt = Date.now();
        const text = decoder.decode(chunk, { stream: true });
@@ -125,7 +125,7 @@ index 81ee6d5ecb02cc3dd0add2b72a5486427b65fcce..b188bd8b0a5223d914fbf0b14ea11b54
  
        const lines = buffer.split("\n");
        buffer = lines.pop() || "";
-@@ -271,6 +290,7 @@ export function createSSEStream(options = {}) {
+@@ -284,6 +303,7 @@ export function createSSEStream(options = {}) {
        }
  
        for (const line of lines) {
@@ -133,7 +133,7 @@ index 81ee6d5ecb02cc3dd0add2b72a5486427b65fcce..b188bd8b0a5223d914fbf0b14ea11b54
          const trimmed = line.trim();
          if (isDebugEnabled && trimmed) {
            sseLineCount++;
-@@ -554,8 +574,51 @@ export function createSSEStream(options = {}) {
+@@ -599,8 +619,51 @@ export function createSSEStream(options = {}) {
        trackPendingRequest(model, provider, connectionId, false);
        try {
          const remaining = decoder.decode();
@@ -185,7 +185,7 @@ index 81ee6d5ecb02cc3dd0add2b72a5486427b65fcce..b188bd8b0a5223d914fbf0b14ea11b54
          if (mode === STREAM_MODE.PASSTHROUGH) {
            if (nativeGeminiPassthrough) {
              if (nativeJson) {
-@@ -588,13 +651,7 @@ export function createSSEStream(options = {}) {
+@@ -633,13 +696,7 @@ export function createSSEStream(options = {}) {
                const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, message, sourceFormat);
                reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
                controller.enqueue(failure);
@@ -200,7 +200,7 @@ index 81ee6d5ecb02cc3dd0add2b72a5486427b65fcce..b188bd8b0a5223d914fbf0b14ea11b54
                if (nativeJson) {
                  controller.error(new Error("Upstream Gemini JSON stream ended before a candidate finished"));
                  finalizeStream();
-@@ -715,6 +772,10 @@ export function createSSEStream(options = {}) {
+@@ -760,6 +817,10 @@ export function createSSEStream(options = {}) {
            streamDoneSent = true;
          }
  
@@ -211,7 +211,7 @@ index 81ee6d5ecb02cc3dd0add2b72a5486427b65fcce..b188bd8b0a5223d914fbf0b14ea11b54
          finalizeStream();
        } catch (error) {
          console.log("Error in flush:", error);
-@@ -724,7 +785,7 @@ export function createSSEStream(options = {}) {
+@@ -769,7 +830,7 @@ export function createSSEStream(options = {}) {
    });
  }
  
@@ -220,7 +220,7 @@ index 81ee6d5ecb02cc3dd0add2b72a5486427b65fcce..b188bd8b0a5223d914fbf0b14ea11b54
    return createSSEStream({
      mode: STREAM_MODE.TRANSLATE,
      targetFormat,
-@@ -738,7 +799,10 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
+@@ -783,7 +844,10 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
      body,
      onStreamComplete,
      apiKey,
@@ -233,7 +233,7 @@ index 81ee6d5ecb02cc3dd0add2b72a5486427b65fcce..b188bd8b0a5223d914fbf0b14ea11b54
  }
  
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index 8ba06fe952171ac0faaf968a6993edcc6324db45..6aa9c0abe995956d1b10c875c34d269084e4d7a8 100644
+index 8ba06fe..6aa9c0a 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -59,6 +59,10 @@ export async function POST(request, { params }) {
@@ -248,7 +248,7 @@ index 8ba06fe952171ac0faaf968a6993edcc6324db45..6aa9c0abe995956d1b10c875c34d2690
  
      let model;
 diff --git a/tests/unit/gemini-native-alpha-contract.test.js b/tests/unit/gemini-native-alpha-contract.test.js
-index 786d167ec9e859dee73fb22458bef03b951475eb..7a4699f7b2642202f7fd149804fd327a1f97b910 100644
+index 786d167..7a4699f 100644
 --- a/tests/unit/gemini-native-alpha-contract.test.js
 +++ b/tests/unit/gemini-native-alpha-contract.test.js
 @@ -65,6 +65,24 @@ describe("native Gemini alpha generation contract", () => {
@@ -277,7 +277,7 @@ index 786d167ec9e859dee73fb22458bef03b951475eb..7a4699f7b2642202f7fd149804fd327a
      const savedError = { error: { code: 404, status: "INTERNAL", message: 'Proxy browser error: Google API returned error: 404 NOT_FOUND {"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}' } };
      mocks.network.mockImplementation(async url => new URL(url).pathname.startsWith("/v1/models/")
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index 7f4643a54e939bcf0ffa2ba980c1b701e61f8ac4..051b599ac8efa4f255323dfdae37b9a5ccc40c18 100644
+index 7f4643a..051b599 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -305,6 +305,113 @@ describe("native stream integration and failure cleanup", () => {
@@ -394,6 +394,3 @@ index 7f4643a54e939bcf0ffa2ba980c1b701e61f8ac4..051b599ac8efa4f255323dfdae37b9a5
    it.each([
      ["JSON terminal candidate", "application/json", JSON.stringify(chunk)],
      ["JSON safety refusal", "application/json", JSON.stringify({ promptFeedback: { blockReason: "SAFETY" } })],
--- 
-2.55.0
-

@@ -21,5 +21,3 @@ index 7b60bd6..6278f8e 100644
 +    await expect(cancelled).resolves.toBe("fixture client cancelled during JSON fence");
    });
  });
--- 
-2.43.0

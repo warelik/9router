@@ -6,12 +6,12 @@ Subject: [PATCH] Preserve nested provider model IDs through both Gemini API
  routes
 
 ---
- src/app/api/v1beta/models/[...path]/route.js | 32 ++++----------------
- tests/unit/gemini-native-api-version.test.js | 23 ++++++++++++++
+ src/app/api/v1beta/models/[...path]/route.js | 32 ++++++----------------------
+ tests/unit/gemini-native-api-version.test.js | 23 ++++++++++++++++++++
  2 files changed, 29 insertions(+), 26 deletions(-)
 
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index 46415895..bf9b54c4 100644
+index 4641589..bf9b54c 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -63,32 +63,12 @@ export async function POST(request, { params }) {
@@ -54,7 +54,7 @@ index 46415895..bf9b54c4 100644
      let body;
      try {
 diff --git a/tests/unit/gemini-native-api-version.test.js b/tests/unit/gemini-native-api-version.test.js
-index fa44646c..4054492f 100644
+index fa44646..4054492 100644
 --- a/tests/unit/gemini-native-api-version.test.js
 +++ b/tests/unit/gemini-native-api-version.test.js
 @@ -119,6 +119,29 @@ describe("Gemini native stable and beta API versions", () => {
