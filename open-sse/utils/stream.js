@@ -41,6 +41,21 @@ const PENDING_COMPLETION_FLUSH_MS = 3000;
 // https://developers.google.com/workspace/drive/api/guides/fields-parameter
 // Require a terminal only when every supplied projection clearly retains it.
 // Unknown selectors remain transparent instead of fabricating a failure.
+function restoreSseEvent(lines, toolNameMap) {
+  const dataIndex = lines.findIndex(line => line.startsWith("data:"));
+  if (!toolNameMap?.size || dataIndex < 0) return lines.join("\n");
+  const payload = lines.filter(line => line.startsWith("data:")).map(line => line.slice(5).replace(/^ /, "")).join("\n");
+  let parsed;
+  try { parsed = JSON.parse(payload); }
+  catch { return lines.join("\n"); }
+  const restored = restoreToolNames(parsed, toolNameMap);
+  if (restored === parsed) return lines.join("\n");
+  return lines.flatMap((line, index) => {
+    if (index === dataIndex) return ["data: " + JSON.stringify(restored)];
+    return line.startsWith("data:") ? [] : [line];
+  }).join("\n");
+}
+
 function nativeCandidateFieldIsVisible(projection, field) {
   return (projection?.masks || []).every(value => {
     const mask = String(value ?? "").replace(/\s/g, "");
@@ -102,6 +117,7 @@ export function createSSEStream(options = {}) {
   } = options;
 
   let buffer = "";
+  let nativeSseEvent = [];
   let pendingTrailingCr = false;
   let usage = null;
   // The client's wire protocol determines termination, regardless of which
@@ -343,6 +359,20 @@ export function createSSEStream(options = {}) {
         // Accounting observes complete lines; the client receives original
         // bytes, including fragmented UTF-8, tool calls and usage-only trailers.
         reqLogger?.appendConvertedChunk?.(text);
+        if (nativeJson) {
+          if (!toolNameMap?.size) controller.enqueue(chunk);
+          return;
+        }
+        if (toolNameMap?.size) {
+          let restored = "";
+          for (const line of lines) {
+            if (line !== "") { nativeSseEvent.push(line); continue; }
+            restored += (nativeSseEvent.length ? restoreSseEvent(nativeSseEvent, toolNameMap) + "\n" : "") + "\n";
+            nativeSseEvent = [];
+          }
+          if (restored) controller.enqueue(sharedEncoder.encode(restored));
+          return;
+        }
         controller.enqueue(chunk);
         return;
       }
@@ -758,8 +788,17 @@ export function createSSEStream(options = {}) {
               const failure = buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream Gemini stream ended before a candidate finished", sourceFormat);
               reqLogger?.appendConvertedChunk?.(decoder.decode(failure));
               controller.enqueue(failure);
-            } else if (!nativeGeminiErrorSeen) {
-              await reportNativeGeminiSuccess();
+            } else {
+              if (toolNameMap?.size) {
+                const tail = nativeJson
+                  ? JSON.stringify(restoreToolNames(JSON.parse(nativeGeminiJson), toolNameMap))
+                  : (nativeSseEvent.length ? restoreSseEvent(nativeSseEvent, toolNameMap) + "\n" : "") + restoreSseEvent([buffer], toolNameMap);
+                if (tail) {
+                  reqLogger?.appendConvertedChunk?.(tail);
+                  controller.enqueue(sharedEncoder.encode(tail));
+                }
+              }
+              if (!nativeGeminiErrorSeen) await reportNativeGeminiSuccess();
             }
             await finalizeStream();
             return;
@@ -769,6 +808,8 @@ export function createSSEStream(options = {}) {
             if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
               output = "data: " + buffer.slice(5);
             }
+            output = restoreSseEvent([output], toolNameMap);
+            if (!output.endsWith("\n")) output += "\n\n";
             reqLogger?.appendConvertedChunk?.(output);
             controller.enqueue(sharedEncoder.encode(output));
           }
