@@ -794,11 +794,12 @@ export function createSSEStream(options = {}) {
               controller.enqueue(failure);
             } else {
               if (toolNameMap?.size) {
+                const sseEvent = buffer
+                  ? restoreSseEvent([...nativeSseEvent, buffer], toolNameMap)
+                  : nativeSseEvent.length ? restoreSseEvent(nativeSseEvent, toolNameMap) : "";
                 const tail = nativeJson
                   ? JSON.stringify(restoreToolNames(JSON.parse(nativeGeminiJson), toolNameMap))
-                  : buffer
-                    ? restoreSseEvent([...nativeSseEvent, buffer], toolNameMap)
-                    : nativeSseEvent.length ? restoreSseEvent(nativeSseEvent, toolNameMap) + "\n" : "";
+                  : sseEvent ? sseEvent + "\n\n" : "";
                 if (tail) {
                   reqLogger?.appendConvertedChunk?.(tail);
                   controller.enqueue(sharedEncoder.encode(tail));

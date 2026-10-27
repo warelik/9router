@@ -633,6 +633,7 @@ describe("native stream integration and failure cleanup", () => {
     const output = await readText(inputStream([encode(raw)])
       .pipeThrough(nativeTransform("aistudio", FORMATS.GEMINI, null, false, null, null, toolNameMap)));
     expect(output).toContain('"id":"call-4"');
+    expect(output.endsWith("\n\n")).toBe(true);
     expect(output).toContain('"name":"original_tool"');
     expect(output).not.toContain("wire_tool");
   });
