@@ -1,17 +1,15 @@
-From 1672141d19ba255bb9060c4c6ab9230620612b4e Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From f1c1822cbd0be6856a06bd4586781bc0eab18a3a Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Thu, 22 Oct 2026 21:33:37 +0000
 Subject: [PATCH] Preserve nested provider model IDs through both Gemini API
- routes
 
 ---
- src/app/api/v1beta/models/[...path]/route.js | 32 ++++++----------------------
- tests/unit/gemini-native-api-version.test.js | 23 ++++++++++++++++++++
+ src/app/api/v1beta/models/[...path]/route.js | 32 ++++----------------
+ tests/unit/gemini-native-api-version.test.js | 23 ++++++++++++++
  2 files changed, 29 insertions(+), 26 deletions(-)
 
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index 4641589..bf9b54c 100644
+index 46415895..bf9b54c4 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -63,32 +63,12 @@ export async function POST(request, { params }) {
@@ -54,7 +52,7 @@ index 4641589..bf9b54c 100644
      let body;
      try {
 diff --git a/tests/unit/gemini-native-api-version.test.js b/tests/unit/gemini-native-api-version.test.js
-index fa44646..4054492 100644
+index fa44646c..4054492f 100644
 --- a/tests/unit/gemini-native-api-version.test.js
 +++ b/tests/unit/gemini-native-api-version.test.js
 @@ -119,6 +119,29 @@ describe("Gemini native stable and beta API versions", () => {
@@ -87,3 +85,6 @@ index fa44646..4054492 100644
    it("the native AUDIO path forwards stable v1 to Google", async () => {
      const input = { contents: [{ parts: [{ text: "Speak" }] }], generationConfig: { responseModalities: ["AUDIO"] } };
      const request = new Request("https://router.test/v1/models/tts-model:generateContent?key=fixture-client-key&fields=candidates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
+-- 
+2.43.0
+

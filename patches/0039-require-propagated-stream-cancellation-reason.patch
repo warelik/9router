@@ -1,16 +1,14 @@
-From 7db34e41423520f2efb513c456fec9b3aca49e4a Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 5b47c1fed13e38d909ace74289c619911871c082 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Require propagation of the explicit upstream stream
- cancellation reason
 
 ---
  tests/unit/antigravity-native-json-output.test.js | 2 +-
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/tests/unit/antigravity-native-json-output.test.js b/tests/unit/antigravity-native-json-output.test.js
-index 7b60bd6..6278f8e 100644
+index 7b60bd65..6278f8e8 100644
 --- a/tests/unit/antigravity-native-json-output.test.js
 +++ b/tests/unit/antigravity-native-json-output.test.js
 @@ -596,6 +596,6 @@ describe("native Gemini JSON output through public Antigravity route", () => {
@@ -21,3 +19,6 @@ index 7b60bd6..6278f8e 100644
 +    await expect(cancelled).resolves.toBe("fixture client cancelled during JSON fence");
    });
  });
+-- 
+2.43.0
+

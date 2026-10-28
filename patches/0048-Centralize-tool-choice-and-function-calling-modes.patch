@@ -1,19 +1,18 @@
-From abdadc267da25effecbcabea1e6e0adc20970c8b Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 23c8e0d795281f1975553017792e17180436eeef Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Centralize tool-choice and function-calling modes
 
 ---
- open-sse/executors/antigravity.js               |  5 +++--
- open-sse/translator/request/openai-to-gemini.js | 23 ++++++++++++++---------
- open-sse/translator/schema/blocks.js            | 10 +++++++++-
- open-sse/translator/schema/index.js             |  4 +++-
- tests/unit/chat-to-gemini-contract.test.js      | 14 ++++++++++++++
+ open-sse/executors/antigravity.js             |  5 ++--
+ .../translator/request/openai-to-gemini.js    | 23 +++++++++++--------
+ open-sse/translator/schema/blocks.js          | 10 +++++++-
+ open-sse/translator/schema/index.js           |  4 +++-
+ tests/unit/chat-to-gemini-contract.test.js    | 14 +++++++++++
  5 files changed, 43 insertions(+), 13 deletions(-)
 
 diff --git a/open-sse/executors/antigravity.js b/open-sse/executors/antigravity.js
-index 5acfcba..03c835c 100644
+index 5acfcba0..03c835c0 100644
 --- a/open-sse/executors/antigravity.js
 +++ b/open-sse/executors/antigravity.js
 @@ -3,6 +3,7 @@ import { BaseExecutor } from "./base.js";
@@ -43,7 +42,7 @@ index 5acfcba..03c835c 100644
  
      // Strip blacklisted thinking fields from top-level body (set by thinkingUnified.js at root, not body.request)
 diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
-index 5e2876e..93c6684 100644
+index 5e2876e1..93c6684c 100644
 --- a/open-sse/translator/request/openai-to-gemini.js
 +++ b/open-sse/translator/request/openai-to-gemini.js
 @@ -23,7 +23,12 @@ import {
@@ -104,7 +103,7 @@ index 5e2876e..93c6684 100644
      }
    }
 diff --git a/open-sse/translator/schema/blocks.js b/open-sse/translator/schema/blocks.js
-index fe41f2c..577a3bb 100644
+index fe41f2c7..577a3bba 100644
 --- a/open-sse/translator/schema/blocks.js
 +++ b/open-sse/translator/schema/blocks.js
 @@ -59,8 +59,16 @@ export const RESPONSES_TOOL = {
@@ -126,7 +125,7 @@ index fe41f2c..577a3bb 100644
  // Valid OpenAI block types (used by filterToOpenAIFormat).
  export const VALID_OPENAI_CONTENT_TYPES = [
 diff --git a/open-sse/translator/schema/index.js b/open-sse/translator/schema/index.js
-index 0f5f556..e17f101 100644
+index 0f5f5563..e17f101a 100644
 --- a/open-sse/translator/schema/index.js
 +++ b/open-sse/translator/schema/index.js
 @@ -3,7 +3,9 @@ export { ROLE, GEMINI_ROLE } from "./roles.js";
@@ -141,7 +140,7 @@ index 0f5f556..e17f101 100644
  export { OPENAI_FINISH, CLAUDE_STOP, GEMINI_FINISH, RESPONSES_STATUS, RESPONSES_INCOMPLETE_REASON } from "./finishReasons.js";
  export { CLAUDE_EVENT, CLAUDE_DELTA, RESPONSES_EVENT, RESPONSES_EVENT_PREFIX } from "./streamEvents.js";
 diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
-index 2d27dac..a9bb197 100644
+index 2d27dac8..a9bb1971 100644
 --- a/tests/unit/chat-to-gemini-contract.test.js
 +++ b/tests/unit/chat-to-gemini-contract.test.js
 @@ -24,6 +24,11 @@ vi.mock("@/lib/db/helpers/kvStore.js", () => ({
@@ -172,3 +171,6 @@ index 2d27dac..a9bb197 100644
    const tools = [{ type: "function", function: { name: "pick_me", parameters: { type: "object", properties: {} } } }];
    const modeOf = (out) => (out.toolConfig || out.request?.toolConfig)?.functionCallingConfig?.mode;
    const namesOf = (out) => (out.toolConfig || out.request?.toolConfig)?.functionCallingConfig?.allowedFunctionNames;
+-- 
+2.43.0
+

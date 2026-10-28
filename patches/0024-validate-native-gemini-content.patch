@@ -1,18 +1,16 @@
-From 7cffdd77a4dfe3eff93ad8ebcd72290e1b4023a2 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 67315b67586ea6dbab1cd745cff6a95356186543 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Thu, 22 Oct 2026 20:56:09 +0000
 Subject: [PATCH] Validate native Gemini candidate content before account
- success
 
 ---
- open-sse/utils/streamHelpers.js              | 17 +++++++++++++----
- tests/unit/antigravity-native-gemini.test.js | 13 +++++++++++++
- tests/unit/gemini-native-stream.test.js      | 22 ++++++++++++++++++++++
+ open-sse/utils/streamHelpers.js              | 17 +++++++++++----
+ tests/unit/antigravity-native-gemini.test.js | 13 ++++++++++++
+ tests/unit/gemini-native-stream.test.js      | 22 ++++++++++++++++++++
  3 files changed, 48 insertions(+), 4 deletions(-)
 
 diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
-index e68493e..dc91f4a 100644
+index e68493e6..dc91f4a3 100644
 --- a/open-sse/utils/streamHelpers.js
 +++ b/open-sse/utils/streamHelpers.js
 @@ -22,10 +22,19 @@ export function isValidNativeGeminiResponse(response, projection = null) {
@@ -40,7 +38,7 @@ index e68493e..dc91f4a 100644
  }
  
 diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
-index 3d2c9a0..1ec2e53 100644
+index 3d2c9a00..1ec2e53a 100644
 --- a/tests/unit/antigravity-native-gemini.test.js
 +++ b/tests/unit/antigravity-native-gemini.test.js
 @@ -264,6 +264,19 @@ describe("native Gemini through Antigravity", () => {
@@ -64,7 +62,7 @@ index 3d2c9a0..1ec2e53 100644
      const original = nativeBody();
      const before = structuredClone(original);
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index 17f2e92..eed6196 100644
+index 17f2e92f..eed61962 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -34,6 +34,28 @@ const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nat
@@ -96,3 +94,6 @@ index 17f2e92..eed6196 100644
    it.each(["gemini", "aistudio", "future-native-provider"])("does not append Chat DONE or mutate Parts/usage through %s", async provider => {
      const original = frame(chunk) + frame(lateUsage);
      const bytes = encode(original);
+-- 
+2.43.0
+

@@ -1,21 +1,19 @@
-From b0ec9fd2bba74f3b203c8f93f97b8112f408ae6f Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 7e97a38e4e31cc3e75603d3e7b6468a7f81f1d2a Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Split native SSE events on bare CR and share the provider
- thinking budget
 
 ---
- open-sse/config/runtimeConfig.js                |  1 +
- open-sse/handlers/chatCore.js                   |  4 +-
- open-sse/translator/concerns/thinkingUnified.js |  3 +-
- open-sse/utils/stream.js                        | 23 ++++++++-
- tests/translator/thinking-unified.test.js       | 17 +++++++
- tests/unit/gemini-native-stream.test.js         | 62 +++++++++++++++++++++++++
+ open-sse/config/runtimeConfig.js              |  1 +
+ open-sse/handlers/chatCore.js                 |  4 +-
+ .../translator/concerns/thinkingUnified.js    |  3 +-
+ open-sse/utils/stream.js                      | 23 ++++++-
+ tests/translator/thinking-unified.test.js     | 17 +++++
+ tests/unit/gemini-native-stream.test.js       | 62 +++++++++++++++++++
  6 files changed, 105 insertions(+), 5 deletions(-)
 
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index 3a98a9b..2622627 100644
+index 3a98a9bd..26226277 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
 @@ -69,6 +69,7 @@ export const GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS = envMs("GEMINI_NATIVE_TTS_FETCH
@@ -27,7 +25,7 @@ index 3a98a9b..2622627 100644
  export const TOKEN_SAVER_HEADER = "x-9router-token-saver";
  
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index e3aa5d5..22bc1aa 100644
+index e3aa5d53..22bc1aa3 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
 @@ -12,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
@@ -49,7 +47,7 @@ index e3aa5d5..22bc1aa 100644
        body = { ...body, thinking: { type: "disabled" } };
      } else if (!body.reasoning_effort) {
 diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
-index 10fbe88..01f0cc6 100644
+index f481e5a8..2a7a70f2 100644
 --- a/open-sse/translator/concerns/thinkingUnified.js
 +++ b/open-sse/translator/concerns/thinkingUnified.js
 @@ -6,6 +6,7 @@ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
@@ -60,7 +58,7 @@ index 10fbe88..01f0cc6 100644
  
  // Map a target wire-format to its native thinking format (when capability has none).
  const FORMAT_TO_NATIVE = {
-@@ -489,7 +490,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
+@@ -484,7 +485,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
    if (!override && explicit) return body;
    const mode = providerThinking?.mode;
    const intent = override || (!mode || mode === "auto" ? null
@@ -70,7 +68,7 @@ index 10fbe88..01f0cc6 100644
      : { mode: "level", level: mode });
    if (!intent) return body;
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 094ebb7..79550bb 100644
+index 094ebb78..79550bb4 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -101,6 +101,7 @@ export function createSSEStream(options = {}) {
@@ -118,7 +116,7 @@ index 094ebb7..79550bb 100644
          if (observeNativeGeminiTransform) {
            if (buffer.trim()) captureNativeGeminiLine(buffer);
 diff --git a/tests/translator/thinking-unified.test.js b/tests/translator/thinking-unified.test.js
-index cd7c391..40ae798 100644
+index cd7c3910..40ae7985 100644
 --- a/tests/translator/thinking-unified.test.js
 +++ b/tests/translator/thinking-unified.test.js
 @@ -5,7 +5,9 @@ import {
@@ -151,7 +149,7 @@ index cd7c391..40ae798 100644
 +  });
 +});
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index 4890a3c..5ecae0c 100644
+index 4890a3c9..5ecae0cf 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -335,6 +335,68 @@ describe("native Gemini SSE preserves provider payload and follows the client pr
@@ -223,3 +221,6 @@ index 4890a3c..5ecae0c 100644
  });
  
  describe("native response projections preserve requested data without inventing completion failures", () => {
+-- 
+2.43.0
+

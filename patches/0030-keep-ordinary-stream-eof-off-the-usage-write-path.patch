@@ -1,16 +1,15 @@
-From 9481ba4711892b43e7653ce5870b1a33c16d63a7 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 1bed21de2f8863d590a390b32f0e3fd10ef70fb6 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Thu, 22 Oct 2026 23:33:28 +0000
 Subject: [PATCH] Keep ordinary stream EOF independent of usage persistence
 
 ---
- open-sse/handlers/chatCore/streamingHandler.js | 11 +++++++---
- tests/unit/gemini-native-stream.test.js        | 30 ++++++++++++++++++++++++++
+ .../handlers/chatCore/streamingHandler.js     | 11 +++++--
+ tests/unit/gemini-native-stream.test.js       | 30 +++++++++++++++++++
  2 files changed, 38 insertions(+), 3 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index 4cb6f56..bafb215 100644
+index 1677fdf0..28bb1880 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -117,9 +117,14 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
@@ -32,7 +31,7 @@ index 4cb6f56..bafb215 100644
    const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete: completeStream, onNativeResponseSuccess: deferNativeGeminiSuccess ? reportRequestSuccess : null, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
  
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index 0f1f1c3..2321dfe 100644
+index 0f1f1c33..2321dfe2 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -38,6 +38,36 @@ const nativeTransform = (provider, source = FORMATS.GEMINI, complete = null, nat
@@ -72,3 +71,6 @@ index 0f1f1c3..2321dfe 100644
    it("waits for the failed account update before exposing native EOF", async () => {
      for (const nativeJson of [false, true]) {
        let releaseAccount;
+-- 
+2.43.0
+

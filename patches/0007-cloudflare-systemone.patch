@@ -1,19 +1,17 @@
-From d739d9c55cd80497d2da9cd338e15fb0f7502f54 Mon Sep 17 00:00:00 2001
+From 7de67b03abd48175766036bc2a9f69a146feac75 Mon Sep 17 00:00:00 2001
 From: Overlay Migration <overlay-migration@example.invalid>
 Date: Fri, 16 Oct 2026 08:36:03 +0000
-Subject: [PATCH 7/8] 0007 cloudflare-systemone
+Subject: [PATCH] [PATCH 7/8] 0007 cloudflare-systemone
 
-Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
-Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
-Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
 ---
- open-sse/handlers/systemoneCore.js           | 19 +++++++
+ open-sse/handlers/systemoneCore.js           | 19 +++++
  open-sse/providers/registry/cloudflare-ai.js |  1 +
- tests/unit/systemone-core.test.js            | 83 ++++++++++++++++++++++++++++
+ tests/unit/systemone-core.test.js            | 83 ++++++++++++++++++++
  3 files changed, 103 insertions(+)
+ create mode 100644 tests/unit/systemone-core.test.js
 
 diff --git a/open-sse/handlers/systemoneCore.js b/open-sse/handlers/systemoneCore.js
-index e84b36a..c9edcfe 100644
+index e84b36ad..c9edcfe7 100644
 --- a/open-sse/handlers/systemoneCore.js
 +++ b/open-sse/handlers/systemoneCore.js
 @@ -27,6 +27,9 @@ export function buildSystemoneUrl(override, cfg) {
@@ -50,7 +48,7 @@ index e84b36a..c9edcfe 100644
  
    const usage = responseBody?.usage;
 diff --git a/open-sse/providers/registry/cloudflare-ai.js b/open-sse/providers/registry/cloudflare-ai.js
-index d998c92..d1ab31a 100644
+index d998c924..d1ab31a4 100644
 --- a/open-sse/providers/registry/cloudflare-ai.js
 +++ b/open-sse/providers/registry/cloudflare-ai.js
 @@ -58,6 +58,7 @@ export default {
@@ -63,7 +61,7 @@ index d998c92..d1ab31a 100644
  };
 diff --git a/tests/unit/systemone-core.test.js b/tests/unit/systemone-core.test.js
 new file mode 100644
-index 0000000..80299c6
+index 00000000..80299c61
 --- /dev/null
 +++ b/tests/unit/systemone-core.test.js
 @@ -0,0 +1,83 @@
@@ -150,3 +148,6 @@ index 0000000..80299c6
 +    expect(fetchMock.mock.calls[0][0]).toBe("https://v1m.ir/v1/systemone");
 +  });
 +});
+-- 
+2.43.0
+

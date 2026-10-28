@@ -1,4 +1,4 @@
-From f99d73d04dbd6e2c38df92526276d7bc99190bec Mon Sep 17 00:00:00 2001
+From 45966e7c4693c1f47600824719894fd91dc0ec75 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Wed, 28 Oct 2026 09:46:33 +0000
 Subject: [PATCH] Load real session identity in native harnesses
@@ -91,5 +91,5 @@ index e6cea348..3ea37ec9 100644
      getModelInfo: async model => { const i = model.indexOf("/"); return { provider: i < 0 ? "gemini" : model.slice(0, i), model: i < 0 ? model : model.slice(i + 1) }; },
      stripModelContextMarker: model => ({ model, contextMarker: null }),
 -- 
-2.55.0
+2.43.0
 

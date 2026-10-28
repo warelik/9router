@@ -1,17 +1,16 @@
-From 28a596478dd912a94c30bcc0c2fbce09c51e80c7 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 042ce808ca0f69eeafddf4a7ce5700e583babeb6 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Thu, 22 Oct 2026 15:10:11 +0000
 Subject: [PATCH] Distinguish namespaced function and custom aliases
 
 ---
- .../translator/concerns/portableCollaboration.js   |  7 +-
- open-sse/translator/request/openai-responses.js    | 43 +++++++------
- tests/unit/openai-responses-namespaces.test.js     | 75 ++++++++++++++++++++++
+ .../concerns/portableCollaboration.js         |  7 +-
+ .../translator/request/openai-responses.js    | 43 ++++++-----
+ .../unit/openai-responses-namespaces.test.js  | 75 +++++++++++++++++++
  3 files changed, 102 insertions(+), 23 deletions(-)
 
 diff --git a/open-sse/translator/concerns/portableCollaboration.js b/open-sse/translator/concerns/portableCollaboration.js
-index 00b6043..9cc6da4 100644
+index 00b60430..9cc6da40 100644
 --- a/open-sse/translator/concerns/portableCollaboration.js
 +++ b/open-sse/translator/concerns/portableCollaboration.js
 @@ -38,12 +38,13 @@ export function preparePortableCollaboration(body) {
@@ -32,7 +31,7 @@ index 00b6043..9cc6da4 100644
      return alias;
    };
 diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
-index 8bf93aa..e59f8be 100644
+index 8bf93aaa..e59f8be6 100644
 --- a/open-sse/translator/request/openai-responses.js
 +++ b/open-sse/translator/request/openai-responses.js
 @@ -14,7 +14,7 @@ import {
@@ -148,7 +147,7 @@ index 8bf93aa..e59f8be 100644
    }
    if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
 diff --git a/tests/unit/openai-responses-namespaces.test.js b/tests/unit/openai-responses-namespaces.test.js
-index 7efe3e8..645f7eb 100644
+index 7efe3e87..645f7eb2 100644
 --- a/tests/unit/openai-responses-namespaces.test.js
 +++ b/tests/unit/openai-responses-namespaces.test.js
 @@ -28,6 +28,7 @@ const fixture = () => ({
@@ -247,3 +246,6 @@ index 7efe3e8..645f7eb 100644
    it("flattens collaboration declarations and drops encrypted only from the listed message schemas", () => {
      const body = collaborationBody();
      const before = JSON.stringify(body);
+-- 
+2.43.0
+

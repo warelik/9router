@@ -1,6 +1,5 @@
-From 89ed8c00ac9cfbaaf70473a81b18ca0e69879fae Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From adc39d4783eacabfe1552ed3f8e075b8075be45a Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Reuse shared unspecified Gemini finish reason
 
@@ -11,7 +10,7 @@ Subject: [PATCH] Reuse shared unspecified Gemini finish reason
  3 files changed, 8 insertions(+), 1 deletion(-)
 
 diff --git a/open-sse/translator/schema/finishReasons.js b/open-sse/translator/schema/finishReasons.js
-index d0cc624..9143e9c 100644
+index d0cc6244..9143e9cf 100644
 --- a/open-sse/translator/schema/finishReasons.js
 +++ b/open-sse/translator/schema/finishReasons.js
 @@ -32,6 +32,7 @@ export const RESPONSES_INCOMPLETE_REASON = {
@@ -23,7 +22,7 @@ index d0cc624..9143e9c 100644
    MAX_TOKENS: "MAX_TOKENS",
    SAFETY: "SAFETY",
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 733be6e..ec0ae9e 100644
+index 733be6e4..ec0ae9e6 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -1,5 +1,6 @@
@@ -43,7 +42,7 @@ index 733be6e..ec0ae9e 100644
          nativeGeminiAnyFinishSeen = true;
        }
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index 5ecae0c..e811e69 100644
+index 5ecae0cf..e811e69e 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -1,4 +1,5 @@
@@ -63,3 +62,6 @@ index 5ecae0c..e811e69 100644
    it.each([
      ["openai", FORMATS.OPENAI, 'data: {"choices":[{"delta":{"content":"fixture"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'],
      ["claude", FORMATS.CLAUDE, 'event: message_stop\ndata: {"type":"message_stop"}\n\n'],
+-- 
+2.43.0
+

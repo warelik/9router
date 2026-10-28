@@ -1,21 +1,22 @@
-From 1b1db23ecb759256df0d5f6f78eef1a0fc8b7a99 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From dc402b2cf3b2e98a3c7444c7d4b8d643eaa84a0b Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Wire AIStudio credential validation and live model discovery
 
 ---
- open-sse/services/aistudioModels.js          |  30 ++++
+ open-sse/services/aistudioModels.js          |  30 +++
  src/app/api/providers/[id]/models/route.js   |   6 +
  src/app/api/providers/[id]/test/testUtils.js |   1 +
  src/app/api/providers/validate/route.js      |   1 +
  src/app/api/v1/models/route.js               |   7 +
- tests/unit/aistudio-discovery.test.js        | 239 +++++++++++++++++++++++++++
+ tests/unit/aistudio-discovery.test.js        | 239 +++++++++++++++++++
  6 files changed, 284 insertions(+)
+ create mode 100644 open-sse/services/aistudioModels.js
+ create mode 100644 tests/unit/aistudio-discovery.test.js
 
 diff --git a/open-sse/services/aistudioModels.js b/open-sse/services/aistudioModels.js
 new file mode 100644
-index 0000000..1681724
+index 00000000..1681724a
 --- /dev/null
 +++ b/open-sse/services/aistudioModels.js
 @@ -0,0 +1,30 @@
@@ -50,7 +51,7 @@ index 0000000..1681724
 +  };
 +}
 diff --git a/src/app/api/providers/[id]/models/route.js b/src/app/api/providers/[id]/models/route.js
-index 609402d..5b00b0e 100644
+index 609402dc..5b00b0e9 100644
 --- a/src/app/api/providers/[id]/models/route.js
 +++ b/src/app/api/providers/[id]/models/route.js
 @@ -9,6 +9,7 @@ import { resolveKiroModels } from "open-sse/services/kiroModels.js";
@@ -74,7 +75,7 @@ index 609402d..5b00b0e 100644
      url: "https://api.meta.ai/v1/models",
      method: "GET",
 diff --git a/src/app/api/providers/[id]/test/testUtils.js b/src/app/api/providers/[id]/test/testUtils.js
-index bbe356f..0f929f9 100644
+index bbe356fe..0f929f9c 100644
 --- a/src/app/api/providers/[id]/test/testUtils.js
 +++ b/src/app/api/providers/[id]/test/testUtils.js
 @@ -798,6 +798,7 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
@@ -86,10 +87,10 @@ index bbe356f..0f929f9 100644
        case "runcrate": {
          const cfg = PROVIDERS[connection.provider];
 diff --git a/src/app/api/providers/validate/route.js b/src/app/api/providers/validate/route.js
-index d0ffce6..a458b14 100644
+index 51398836..807318dd 100644
 --- a/src/app/api/providers/validate/route.js
 +++ b/src/app/api/providers/validate/route.js
-@@ -381,6 +381,7 @@ export async function POST(request) {
+@@ -382,6 +382,7 @@ export async function POST(request) {
            break;
          }
  
@@ -98,7 +99,7 @@ index d0ffce6..a458b14 100644
          case "groq":
          case "xai":
 diff --git a/src/app/api/v1/models/route.js b/src/app/api/v1/models/route.js
-index 83ee968..4d9a694 100644
+index 83ee968e..4d9a694d 100644
 --- a/src/app/api/v1/models/route.js
 +++ b/src/app/api/v1/models/route.js
 @@ -17,6 +17,7 @@ import { resolveCopilotModels } from "open-sse/services/copilotModels.js";
@@ -124,7 +125,7 @@ index 83ee968..4d9a694 100644
        accessToken: conn.accessToken,
 diff --git a/tests/unit/aistudio-discovery.test.js b/tests/unit/aistudio-discovery.test.js
 new file mode 100644
-index 0000000..79e8726
+index 00000000..79e87264
 --- /dev/null
 +++ b/tests/unit/aistudio-discovery.test.js
 @@ -0,0 +1,239 @@
@@ -367,3 +368,6 @@ index 0000000..79e8726
 +    expect(result.some(row => row.id === "aistudio/bridge-model-9")).toBe(false);
 +  });
 +});
+-- 
+2.43.0
+

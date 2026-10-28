@@ -1,20 +1,19 @@
-From c15e4158b3b8789937a4d4a93d633c1b47b64dc7 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From f2493cfa588dcc445aa02caddd4a9450c51c6182 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Scope Gemini turn signatures to authenticated conversations
 
 ---
- open-sse/handlers/chatCore/nonStreamingHandler.js   |  1 +
- open-sse/services/thoughtSignatureStore.js          | 14 ++++++++++----
- open-sse/translator/request/openai-to-gemini.js     |  2 +-
- open-sse/translator/response/gemini-to-openai.js    |  2 +-
- ...ownstream-translator-history-regressions.test.js |  2 +-
- tests/unit/gemini-turn-signature.test.js            | 21 ++++++++++++++++-----
+ .../handlers/chatCore/nonStreamingHandler.js  |  1 +
+ open-sse/services/thoughtSignatureStore.js    | 14 +++++++++----
+ .../translator/request/openai-to-gemini.js    |  2 +-
+ .../translator/response/gemini-to-openai.js   |  2 +-
+ ...eam-translator-history-regressions.test.js |  2 +-
+ tests/unit/gemini-turn-signature.test.js      | 21 ++++++++++++++-----
  6 files changed, 30 insertions(+), 12 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index 67f92db..e21d797 100644
+index 49250964..6f9203b0 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
 @@ -197,6 +197,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
@@ -26,7 +25,7 @@ index 67f92db..e21d797 100644
      }
      if (serverParts.length) {
 diff --git a/open-sse/services/thoughtSignatureStore.js b/open-sse/services/thoughtSignatureStore.js
-index 906cffc..78feb88 100644
+index 906cffc4..78feb884 100644
 --- a/open-sse/services/thoughtSignatureStore.js
 +++ b/open-sse/services/thoughtSignatureStore.js
 @@ -240,14 +240,20 @@ function turnKey(kind, text, scope) {
@@ -55,7 +54,7 @@ index 906cffc..78feb88 100644
      if (sig) return sig;
    }
 diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
-index dd757d4..89b027d 100644
+index dd757d49..89b027d7 100644
 --- a/open-sse/translator/request/openai-to-gemini.js
 +++ b/open-sse/translator/request/openai-to-gemini.js
 @@ -212,7 +212,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
@@ -68,7 +67,7 @@ index dd757d4..89b027d 100644
          // text of this turn must go back verbatim or Gemini 3 rejects the request.
          const serverTurnParts = findGeminiServerPartsForTurn({ reasoning: msg.reasoning_content, content: text, scope: turnScope, sessionId: serverPartsSessionId }, model);
 diff --git a/open-sse/translator/response/gemini-to-openai.js b/open-sse/translator/response/gemini-to-openai.js
-index c2b6b82..1e9da0b 100644
+index c2b6b82d..1e9da0b0 100644
 --- a/open-sse/translator/response/gemini-to-openai.js
 +++ b/open-sse/translator/response/gemini-to-openai.js
 @@ -167,7 +167,7 @@ export function geminiToOpenAIResponse(chunk, state) {
@@ -81,7 +80,7 @@ index c2b6b82..1e9da0b 100644
          state.model
        );
 diff --git a/tests/unit/downstream-translator-history-regressions.test.js b/tests/unit/downstream-translator-history-regressions.test.js
-index c78f4e7..6c895f3 100644
+index c78f4e70..6c895f3d 100644
 --- a/tests/unit/downstream-translator-history-regressions.test.js
 +++ b/tests/unit/downstream-translator-history-regressions.test.js
 @@ -69,7 +69,7 @@ describe("Gemini historical turns retain their own instruction prefix", () => {
@@ -94,7 +93,7 @@ index c78f4e7..6c895f3 100644
        thoughtSignature: `exact-search-signature-${role}`,
        toolCall: { id: `search-${role}`, toolType: "GOOGLE_SEARCH_WEB", args: { queries: [role] } },
 diff --git a/tests/unit/gemini-turn-signature.test.js b/tests/unit/gemini-turn-signature.test.js
-index 455c36f..5cfcbcd 100644
+index 455c36f7..5cfcbcd0 100644
 --- a/tests/unit/gemini-turn-signature.test.js
 +++ b/tests/unit/gemini-turn-signature.test.js
 @@ -24,24 +24,35 @@ const chunk = (parts, finishReason) => ({
@@ -138,3 +137,6 @@ index 455c36f..5cfcbcd 100644
    it("replays the provider's signature (on the answer part) when the client echoes reasoning + answer", () => {
      const sig = "real-signature-1";
      const { reasoning, content } = turn([ask("q1")], [
+-- 
+2.43.0
+

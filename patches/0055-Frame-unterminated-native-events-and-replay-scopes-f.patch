@@ -1,8 +1,7 @@
-From 90a3fa05b2f9f2a3bc44fe7e65d6b6fed4f459cf Mon Sep 17 00:00:00 2001
+From 4664026b33830c914f4b65457e9faf3bfd1f9749 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 27 Oct 2026 06:19:14 +0000
 Subject: [PATCH] Frame unterminated native events and replay scopes from
- canonical history
 
 ---
  .../translator/request/openai-to-gemini.js    |  2 +-
@@ -12,7 +11,7 @@ Subject: [PATCH] Frame unterminated native events and replay scopes from
  4 files changed, 46 insertions(+), 2 deletions(-)
 
 diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
-index 93c6684..b42a48f 100644
+index 93c6684c..b42a48f8 100644
 --- a/open-sse/translator/request/openai-to-gemini.js
 +++ b/open-sse/translator/request/openai-to-gemini.js
 @@ -213,7 +213,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
@@ -25,7 +24,7 @@ index 93c6684..b42a48f 100644
          const turnSig = msg.tool_calls?.length
            ? null
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index bc43f57..47a2b33 100644
+index bc43f570..47a2b33a 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -118,6 +118,7 @@ export function createSSEStream(options = {}) {
@@ -70,7 +69,7 @@ index bc43f57..47a2b33 100644
                    reqLogger?.appendConvertedChunk?.(tail);
                    controller.enqueue(sharedEncoder.encode(tail));
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index d993062..afa094e 100644
+index d993062b..afa094e3 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -622,6 +622,28 @@ describe("native stream integration and failure cleanup", () => {
@@ -103,7 +102,7 @@ index d993062..afa094e 100644
      const toolNameMap = new Map([["wire_tool", "original_tool"]]);
      const response = { candidates: [{ index: 0, content: { role: "model", parts: [
 diff --git a/tests/unit/gemini-turn-signature.test.js b/tests/unit/gemini-turn-signature.test.js
-index 5cfcbcd..5053c4a 100644
+index 5cfcbcd0..5053c4a8 100644
 --- a/tests/unit/gemini-turn-signature.test.js
 +++ b/tests/unit/gemini-turn-signature.test.js
 @@ -149,6 +149,22 @@ describe("signature of a tool-free thinking turn survives the round trip", () =>

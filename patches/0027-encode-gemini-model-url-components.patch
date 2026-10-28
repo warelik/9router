@@ -1,9 +1,7 @@
-From b20f0725ed2acb0fac8bc7407f2a53ca55f577c1 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From c791508afcc49cda4f8f358d19fa0d13ab6af404 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Thu, 22 Oct 2026 22:14:37 +0000
 Subject: [PATCH] Keep Gemini model identifiers inside their authenticated URL
- resource
 
 ---
  open-sse/executors/default.js        |  4 +++-
@@ -11,10 +9,10 @@ Subject: [PATCH] Keep Gemini model identifiers inside their authenticated URL
  2 files changed, 31 insertions(+), 1 deletion(-)
 
 diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
-index bc135e7..0a2124a 100644
+index 1b376bb3..a302efb9 100644
 --- a/open-sse/executors/default.js
 +++ b/open-sse/executors/default.js
-@@ -191,7 +191,9 @@ export class DefaultExecutor extends BaseExecutor {
+@@ -206,7 +206,9 @@ export class DefaultExecutor extends BaseExecutor {
          ? credentials.nativeGeminiRequest.apiVersion : null;
        const baseUrl = nativeVersion
          ? this.config.baseUrl.replace("/v1beta/", `/${nativeVersion}/`) : this.config.baseUrl;
@@ -26,7 +24,7 @@ index bc135e7..0a2124a 100644
        if (credentials?.nativeGeminiPassthrough && Array.isArray(nativeQuery)) {
          for (const [key, value] of nativeQuery) {
 diff --git a/tests/unit/aistudio-provider.test.js b/tests/unit/aistudio-provider.test.js
-index 7c42dbc..a443db6 100644
+index 7c42dbcb..a443db61 100644
 --- a/tests/unit/aistudio-provider.test.js
 +++ b/tests/unit/aistudio-provider.test.js
 @@ -36,6 +36,34 @@ describe("aistudio provider (Gemini wire to the local bridge)", () => {
@@ -64,3 +62,6 @@ index 7c42dbc..a443db6 100644
    it("forwards any model id the bridge serves without a registry list", async () => {
      expect(cfg.passthroughModels ?? true).toBeTruthy();
      const info = await getModelInfoCore(`aistudio/${MODEL}`, {});
+-- 
+2.43.0
+

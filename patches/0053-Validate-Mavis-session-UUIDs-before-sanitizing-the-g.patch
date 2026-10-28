@@ -1,15 +1,15 @@
-From fba99ee3d918191651eb0fa1b61bc56190a2cf8c Mon Sep 17 00:00:00 2001
+From d6cf51ca169a24762fdb455d549d88931d6ad45c Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 27 Oct 2026 03:38:13 +0000
-Subject: [PATCH 53/53] Validate Mavis session UUIDs before sanitizing the
- golden snapshot
+Subject: [PATCH] [PATCH 53/53] Validate Mavis session UUIDs before sanitizing
+ the
 
 ---
  tests/translator/golden-url-header.test.js | 19 +++++++++++--------
  1 file changed, 11 insertions(+), 8 deletions(-)
 
 diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
-index 49eb9df..881eb6a 100644
+index 49eb9dfc..881eb6ab 100644
 --- a/tests/translator/golden-url-header.test.js
 +++ b/tests/translator/golden-url-header.test.js
 @@ -68,14 +68,17 @@ describe("GOLDEN buildHeaders (default executor providers)", () => {

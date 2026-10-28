@@ -1,4 +1,4 @@
-From 8f5b065c9d9afa0bd891d2815db3218e0651f8fe Mon Sep 17 00:00:00 2001
+From 3db8ed33bba753f32b703eeaab35fc9595a1a26a Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 27 Oct 2026 09:38:35 +0000
 Subject: [PATCH] Keep opaque agent messages that carry an image deliverable
@@ -9,7 +9,7 @@ Subject: [PATCH] Keep opaque agent messages that carry an image deliverable
  2 files changed, 9 insertions(+), 1 deletion(-)
 
 diff --git a/open-sse/translator/concerns/portableCollaboration.js b/open-sse/translator/concerns/portableCollaboration.js
-index 84d70d4..6315598 100644
+index 84d70d49..63155983 100644
 --- a/open-sse/translator/concerns/portableCollaboration.js
 +++ b/open-sse/translator/concerns/portableCollaboration.js
 @@ -22,7 +22,7 @@ export function hasUndeliverableAgentMessage(input) {
@@ -22,7 +22,7 @@ index 84d70d4..6315598 100644
  }
  
 diff --git a/tests/unit/openai-responses-agent-messages.test.js b/tests/unit/openai-responses-agent-messages.test.js
-index beb6cef..7d6b9cb 100644
+index beb6cef3..7d6b9cbe 100644
 --- a/tests/unit/openai-responses-agent-messages.test.js
 +++ b/tests/unit/openai-responses-agent-messages.test.js
 @@ -192,6 +192,14 @@ describe("opaque agent_message detection", () => {

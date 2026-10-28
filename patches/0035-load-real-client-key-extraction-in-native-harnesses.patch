@@ -1,19 +1,17 @@
-From 3ef4aa4ab90b183a93fc75383c3ad4372a683ee8 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From a588c4a6253a614614674dbc4d048a933855cd15 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Load real client-key extraction in native route regression
- harnesses
 
 ---
- .../antigravity-native-disabled-functions.test.js   |  7 +++++++
- tests/unit/antigravity-native-gemini.test.js        |  7 +++++++
- tests/unit/antigravity-native-json-output.test.js   |  7 +++++++
- tests/unit/gemini-native-entry-contract.test.js     | 21 +++++++++++++++++++++
+ ...igravity-native-disabled-functions.test.js |  7 +++++++
+ tests/unit/antigravity-native-gemini.test.js  |  7 +++++++
+ .../antigravity-native-json-output.test.js    |  7 +++++++
+ .../unit/gemini-native-entry-contract.test.js | 21 +++++++++++++++++++
  4 files changed, 42 insertions(+)
 
 diff --git a/tests/unit/antigravity-native-disabled-functions.test.js b/tests/unit/antigravity-native-disabled-functions.test.js
-index a3c2fd7..0468535 100644
+index a3c2fd7c..04685353 100644
 --- a/tests/unit/antigravity-native-disabled-functions.test.js
 +++ b/tests/unit/antigravity-native-disabled-functions.test.js
 @@ -210,6 +210,13 @@ function loadPublicNativeRoute() {
@@ -31,7 +29,7 @@ index a3c2fd7..0468535 100644
    vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
    return { context, services };
 diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
-index 1ec2e53..c169367 100644
+index 1ec2e53a..c169367c 100644
 --- a/tests/unit/antigravity-native-gemini.test.js
 +++ b/tests/unit/antigravity-native-gemini.test.js
 @@ -239,6 +239,13 @@ function loadRouteHarness() {
@@ -49,7 +47,7 @@ index 1ec2e53..c169367 100644
    vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
    return { context, services };
 diff --git a/tests/unit/antigravity-native-json-output.test.js b/tests/unit/antigravity-native-json-output.test.js
-index 2fe63a6..3e2dbcb 100644
+index 2fe63a6f..3e2dbcb6 100644
 --- a/tests/unit/antigravity-native-json-output.test.js
 +++ b/tests/unit/antigravity-native-json-output.test.js
 @@ -171,6 +171,13 @@ function loadPublicNativeRoute() {
@@ -67,7 +65,7 @@ index 2fe63a6..3e2dbcb 100644
    vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
    return { context, services };
 diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
-index c0a2016..da74666 100644
+index c0a20165..da746663 100644
 --- a/tests/unit/gemini-native-entry-contract.test.js
 +++ b/tests/unit/gemini-native-entry-contract.test.js
 @@ -82,6 +82,13 @@ function load() {
@@ -105,3 +103,6 @@ index c0a2016..da74666 100644
    it.each(["generateContent", "streamGenerateContent"])("TTS %s waits for EOF and its account update", async action => {
      let releaseAccount;
      const accountUpdated = new Promise(resolve => { releaseAccount = resolve; });
+-- 
+2.43.0
+

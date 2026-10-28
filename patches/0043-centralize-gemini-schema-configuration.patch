@@ -1,17 +1,16 @@
-From d999aab1d6ef3443332d3b68deaf9af0c708b065 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From e53017372560115f84c16d243d938a66456c298a Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Centralize Gemini schema tables
 
 ---
- open-sse/config/runtimeConfig.js           |  7 +++++++
- open-sse/translator/formats/gemini.js      |  9 ++-------
- tests/unit/chat-to-gemini-contract.test.js | 31 ++++++++++++++++++++++++++++++
+ open-sse/config/runtimeConfig.js           |  7 +++++
+ open-sse/translator/formats/gemini.js      |  9 ++-----
+ tests/unit/chat-to-gemini-contract.test.js | 31 ++++++++++++++++++++++
  3 files changed, 40 insertions(+), 7 deletions(-)
 
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index 03ab5db..9823b5a 100644
+index 03ab5dbb..9823b5ad 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
 @@ -78,6 +78,13 @@ export const FILE_EXTENSION_MIME = {
@@ -29,7 +28,7 @@ index 03ab5db..9823b5a 100644
  
  export const PORTABLE_COLLABORATION = {
 diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
-index 105f22a..48f2c61 100644
+index 05a970ab..36d47488 100644
 --- a/open-sse/translator/formats/gemini.js
 +++ b/open-sse/translator/formats/gemini.js
 @@ -3,7 +3,8 @@
@@ -53,7 +52,7 @@ index 105f22a..48f2c61 100644
  function eachChildSchema(node, fn) {
    for (const key of Object.keys(node)) {
      if (SCHEMA_MAP_KEYS.has(key)) {
-@@ -450,7 +447,6 @@ export function cleanJSONSchemaForAntigravity(schema) {
+@@ -521,7 +518,6 @@ export function cleanJSONSchemaForAntigravity(schema) {
    return cleaned;
  }
  
@@ -61,7 +60,7 @@ index 105f22a..48f2c61 100644
  export function lowerProtoSchemaTypes(schema) {
    if (!schema || typeof schema !== "object") return schema;
    if (Array.isArray(schema)) {
-@@ -464,7 +460,6 @@ export function lowerProtoSchemaTypes(schema) {
+@@ -535,7 +531,6 @@ export function lowerProtoSchemaTypes(schema) {
    return schema;
  }
  
@@ -70,7 +69,7 @@ index 105f22a..48f2c61 100644
    if (!schema || typeof schema !== "object" || Array.isArray(schema)) return false;
    for (const key of Object.keys(schema)) {
 diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
-index 6037829..3360b86 100644
+index 60378296..3360b862 100644
 --- a/tests/unit/chat-to-gemini-contract.test.js
 +++ b/tests/unit/chat-to-gemini-contract.test.js
 @@ -36,6 +36,7 @@ import {
@@ -118,3 +117,6 @@ index 6037829..3360b86 100644
    it("isLegacyGeminiSchema accepts proto shapes and rejects non-proto ones", () => {
      expect(isLegacyGeminiSchema({ type: "object", properties: { a: { type: "string" } }, required: ["a"], propertyOrdering: ["a"], enum: undefined })).toBe(true);
      expect(isLegacyGeminiSchema({ type: "array", items: { type: "string" } })).toBe(true);
+-- 
+2.43.0
+

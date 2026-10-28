@@ -1,23 +1,25 @@
-From bb9e3b8700cdc57d273aeac31540505d72df011c Mon Sep 17 00:00:00 2001
+From be5c7fe0359367042e0fb59edf48f31e87595273 Mon Sep 17 00:00:00 2001
 From: Overlay Migration <overlay-migration@example.invalid>
 Date: Fri, 16 Oct 2026 08:36:02 +0000
-Subject: [PATCH 3/8] 0003 native-antigravity
+Subject: [PATCH] [PATCH 3/8] 0003 native-antigravity
 
-Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
-Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
-Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
 ---
- open-sse/executors/antigravity.js                  | 126 ++++-
- open-sse/translator/request/openai-to-gemini.js    |  12 +-
- open-sse/utils/antigravityNative.js                | 491 +++++++++++++++++
- .../antigravity-native-disabled-functions.test.js  | 364 +++++++++++++
- tests/unit/antigravity-native-gemini.test.js       | 579 ++++++++++++++++++++
- tests/unit/antigravity-native-json-output.test.js  | 591 +++++++++++++++++++++
- .../unit/antigravity-native-sdk-heartbeat.test.js  |  38 ++
+ open-sse/executors/antigravity.js             | 126 +++-
+ .../translator/request/openai-to-gemini.js    |  12 +-
+ open-sse/utils/antigravityNative.js           | 491 +++++++++++++++
+ ...igravity-native-disabled-functions.test.js | 364 +++++++++++
+ tests/unit/antigravity-native-gemini.test.js  | 579 +++++++++++++++++
+ .../antigravity-native-json-output.test.js    | 591 ++++++++++++++++++
+ .../antigravity-native-sdk-heartbeat.test.js  |  38 ++
  7 files changed, 2181 insertions(+), 20 deletions(-)
+ create mode 100644 open-sse/utils/antigravityNative.js
+ create mode 100644 tests/unit/antigravity-native-disabled-functions.test.js
+ create mode 100644 tests/unit/antigravity-native-gemini.test.js
+ create mode 100644 tests/unit/antigravity-native-json-output.test.js
+ create mode 100644 tests/unit/antigravity-native-sdk-heartbeat.test.js
 
 diff --git a/open-sse/executors/antigravity.js b/open-sse/executors/antigravity.js
-index c8164e3..bfe6044 100644
+index c8164e3c..bfe60443 100644
 --- a/open-sse/executors/antigravity.js
 +++ b/open-sse/executors/antigravity.js
 @@ -8,6 +8,7 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
@@ -210,7 +212,7 @@ index c8164e3..bfe6044 100644
      if (!credentials.refreshToken) return null;
  
 diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
-index 182abf9..7b36bbf 100644
+index 182abf93..7b36bbfc 100644
 --- a/open-sse/translator/request/openai-to-gemini.js
 +++ b/open-sse/translator/request/openai-to-gemini.js
 @@ -367,11 +367,14 @@ function wrapInCloudCodeEnvelope(model, geminiCLI, credentials = null, isAntigra
@@ -255,7 +257,7 @@ index 182abf9..7b36bbf 100644
  register(FORMATS.OPENAI, FORMATS.ANTIGRAVITY, openaiToAntigravityRequest, null);
 diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
 new file mode 100644
-index 0000000..228e344
+index 00000000..228e3443
 --- /dev/null
 +++ b/open-sse/utils/antigravityNative.js
 @@ -0,0 +1,491 @@
@@ -752,7 +754,7 @@ index 0000000..228e344
 +}
 diff --git a/tests/unit/antigravity-native-disabled-functions.test.js b/tests/unit/antigravity-native-disabled-functions.test.js
 new file mode 100644
-index 0000000..a3c2fd7
+index 00000000..a3c2fd7c
 --- /dev/null
 +++ b/tests/unit/antigravity-native-disabled-functions.test.js
 @@ -0,0 +1,364 @@
@@ -1122,7 +1124,7 @@ index 0000000..a3c2fd7
 +});
 diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
 new file mode 100644
-index 0000000..64764d2
+index 00000000..64764d26
 --- /dev/null
 +++ b/tests/unit/antigravity-native-gemini.test.js
 @@ -0,0 +1,579 @@
@@ -1707,7 +1709,7 @@ index 0000000..64764d2
 +});
 diff --git a/tests/unit/antigravity-native-json-output.test.js b/tests/unit/antigravity-native-json-output.test.js
 new file mode 100644
-index 0000000..2fe63a6
+index 00000000..2fe63a6f
 --- /dev/null
 +++ b/tests/unit/antigravity-native-json-output.test.js
 @@ -0,0 +1,591 @@
@@ -2304,7 +2306,7 @@ index 0000000..2fe63a6
 +});
 diff --git a/tests/unit/antigravity-native-sdk-heartbeat.test.js b/tests/unit/antigravity-native-sdk-heartbeat.test.js
 new file mode 100644
-index 0000000..e3acccd
+index 00000000..e3acccd7
 --- /dev/null
 +++ b/tests/unit/antigravity-native-sdk-heartbeat.test.js
 @@ -0,0 +1,38 @@
@@ -2346,3 +2348,6 @@ index 0000000..e3acccd
 +    expect(text).not.toContain(":\n");
 +  });
 +});
+-- 
+2.43.0
+

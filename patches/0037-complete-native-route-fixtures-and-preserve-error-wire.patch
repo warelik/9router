@@ -1,20 +1,18 @@
-From 816840627ae4db3855fb37c45b2f2117ec5df510 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 9889c97d1f2701589da45338b033aeb4763cab6d Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Provide real crypto to native route fixtures and preserve raw
- upstream errors
 
 ---
- open-sse/utils/antigravityNative.js                     |  8 ++++++--
- .../unit/antigravity-native-disabled-functions.test.js  |  3 +++
- tests/unit/antigravity-native-gemini.test.js            |  3 +++
- tests/unit/antigravity-native-json-output.test.js       |  3 +++
- tests/unit/gemini-native-entry-contract.test.js         | 17 +++++++++++++++++
+ open-sse/utils/antigravityNative.js             |  8 ++++++--
+ ...ntigravity-native-disabled-functions.test.js |  3 +++
+ tests/unit/antigravity-native-gemini.test.js    |  3 +++
+ .../unit/antigravity-native-json-output.test.js |  3 +++
+ tests/unit/gemini-native-entry-contract.test.js | 17 +++++++++++++++++
  5 files changed, 32 insertions(+), 2 deletions(-)
 
 diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
-index 228e344..b987c3d 100644
+index 228e3443..b987c3d8 100644
 --- a/open-sse/utils/antigravityNative.js
 +++ b/open-sse/utils/antigravityNative.js
 @@ -384,9 +384,13 @@ export async function unwrapAntigravityResponse(response, stream, nativeRequest
@@ -34,7 +32,7 @@ index 228e344..b987c3d 100644
      return new Response(body, {
        status: response.status, statusText: response.statusText,
 diff --git a/tests/unit/antigravity-native-disabled-functions.test.js b/tests/unit/antigravity-native-disabled-functions.test.js
-index 0468535..dd39ea3 100644
+index 04685353..dd39ea3b 100644
 --- a/tests/unit/antigravity-native-disabled-functions.test.js
 +++ b/tests/unit/antigravity-native-disabled-functions.test.js
 @@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -55,7 +53,7 @@ index 0468535..dd39ea3 100644
  
    const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
 diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
-index c169367..e26c577 100644
+index c169367c..e26c5778 100644
 --- a/tests/unit/antigravity-native-gemini.test.js
 +++ b/tests/unit/antigravity-native-gemini.test.js
 @@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -76,7 +74,7 @@ index c169367..e26c577 100644
  
    const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
 diff --git a/tests/unit/antigravity-native-json-output.test.js b/tests/unit/antigravity-native-json-output.test.js
-index 3e2dbcb..7b60bd6 100644
+index 3e2dbcb6..7b60bd65 100644
 --- a/tests/unit/antigravity-native-json-output.test.js
 +++ b/tests/unit/antigravity-native-json-output.test.js
 @@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -97,7 +95,7 @@ index 3e2dbcb..7b60bd6 100644
  
    const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
 diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
-index da74666..e6cea34 100644
+index da746663..e6cea348 100644
 --- a/tests/unit/gemini-native-entry-contract.test.js
 +++ b/tests/unit/gemini-native-entry-contract.test.js
 @@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -138,3 +136,6 @@ index da74666..e6cea34 100644
  it("loads the real client-key accessor for every supported credential location", () => {
    for (const [headers, query, expected] of [
      [{ Authorization: "Bearer bearer-fixture", "x-goog-api-key": "ignored" }, "?key=ignored", "bearer-fixture"],
+-- 
+2.43.0
+

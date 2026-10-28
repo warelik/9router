@@ -1,18 +1,16 @@
-From 0f35b8d065956ed99d67fb685b81b55a4dee55dd Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From c98c01a9eb54cdc00e7c9341f97f82954f43310f Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Tue, 20 Oct 2026 00:00:00 +0000
 Subject: [PATCH] Validate native Gemini streams before recording account
- success
 
 ---
- open-sse/handlers/chatCore/streamingHandler.js | 14 ++--
- open-sse/utils/stream.js                       | 89 ++++++++++++++++++++------
- tests/unit/gemini-native-stream.test.js        | 82 +++++++++++++++++++++++-
+ .../handlers/chatCore/streamingHandler.js     | 14 ++-
+ open-sse/utils/stream.js                      | 89 +++++++++++++++----
+ tests/unit/gemini-native-stream.test.js       | 82 ++++++++++++++++-
  3 files changed, 160 insertions(+), 25 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index 21f0348..e21a45b 100644
+index 2b74abdd..45e933c9 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -24,7 +24,7 @@ const CODEX_SOURCE_TO_TARGET = {
@@ -60,7 +58,7 @@ index 21f0348..e21a45b 100644
    // Terminal bytes when the stream aborts after HTTP 200 was already sent, so the
    // client sees a real error instead of a silently truncated stream.
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 0a3b846..2d0e5b9 100644
+index 0a3b846a..2d0e5b99 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -63,6 +63,23 @@ function nativeCandidateFieldIsVisible(projection, field) {
@@ -236,7 +234,7 @@ index 0a3b846..2d0e5b9 100644
      reqLogger,
      toolNameMap,
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index 0717461..40b62a1 100644
+index 0717461c..40b62a17 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -30,7 +30,7 @@ const chunk = {
@@ -358,3 +356,6 @@ index 0717461..40b62a1 100644
      ["incomplete JSON", '[{"candidates":['],
      ["unfinished candidate in syntactically valid JSON", JSON.stringify([{ candidates: [{ index: 0, content: { parts: [{ text: "partial" }] } }] }])],
    ])("rejects %s at clean native JSON EOF", async (_name, raw) => {
+-- 
+2.43.0
+

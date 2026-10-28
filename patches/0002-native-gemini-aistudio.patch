@@ -1,47 +1,55 @@
-From d7c2f4042296a9c6aca713e74dbcc2dafc9ac5a0 Mon Sep 17 00:00:00 2001
+From 23382fcf4a046fb77b01fa4a9269cf1714a8a1dc Mon Sep 17 00:00:00 2001
 From: Overlay Migration <overlay-migration@example.invalid>
 Date: Fri, 16 Oct 2026 08:36:02 +0000
-Subject: [PATCH 2/8] 0002 native-gemini-aistudio
+Subject: [PATCH] [PATCH 2/8] 0002 native-gemini-aistudio
 
-Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
-Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
-Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
 ---
- next.config.mjs                                    |   8 +
- open-sse/executors/base.js                         |   4 +
- open-sse/executors/default.js                      |  35 +-
- open-sse/handlers/chatCore.js                      |  61 ++-
- open-sse/handlers/chatCore/nonStreamingHandler.js  |  61 ++-
- open-sse/handlers/chatCore/streamingHandler.js     |  55 ++-
- open-sse/providers/registry/aistudio.js            |  36 ++
- open-sse/providers/registry/index.js               |   2 +
- open-sse/services/provider.js                      |   9 +
- open-sse/translator/concerns/thinkingUnified.js    |  44 ++-
- open-sse/translator/formats/gemini.js              |  56 +++
- open-sse/translator/index.js                       |  48 ++-
- open-sse/utils/proxyFetch.js                       |   2 +
- open-sse/utils/stream.js                           | 139 ++++++-
- open-sse/utils/streamHandler.js                    |  42 ++-
- open-sse/utils/streamHelpers.js                    |   6 +
- src/app/api/v1/models/[...model]/route.js          |  16 +-
- src/app/api/v1alpha/models/[...path]/route.js      |   2 +
- src/app/api/v1beta/models/[...path]/route.js       |  89 +++--
- src/sse/handlers/chat.js                           |  23 +-
- tests/translator/golden-url-header.test.js         |   2 +
- tests/unit/aistudio-native-response-format.test.js | 191 ++++++++++
- tests/unit/aistudio-provider.test.js               |  50 +++
- tests/unit/gemini-native-alpha-contract.test.js    | 112 ++++++
- tests/unit/gemini-native-api-version.test.js       | 173 +++++++++
- tests/unit/gemini-native-core.test.js              | 409 ++++++++++++++++++++
- tests/unit/gemini-native-endpoint.test.js          |  58 ++-
- tests/unit/gemini-native-entry-contract.test.js    | 238 ++++++++++++
- tests/unit/gemini-native-proxy-abort.test.js       |  80 ++++
- tests/unit/gemini-native-stream.test.js            | 410 +++++++++++++++++++++
- tests/unit/native-public-gemini-rewrite.test.js    |  67 ++++
- 31 files changed, 2445 insertions(+), 83 deletions(-)
+ next.config.mjs                               |   8 +
+ open-sse/executors/base.js                    |   4 +
+ open-sse/executors/default.js                 |  35 +-
+ open-sse/handlers/chatCore.js                 |  61 ++-
+ .../handlers/chatCore/nonStreamingHandler.js  |  61 ++-
+ .../handlers/chatCore/streamingHandler.js     |  53 ++-
+ open-sse/providers/registry/aistudio.js       |  36 ++
+ open-sse/providers/registry/index.js          |   2 +
+ open-sse/services/provider.js                 |   9 +
+ .../translator/concerns/thinkingUnified.js    |  42 ++
+ open-sse/translator/formats/gemini.js         |  56 +++
+ open-sse/translator/index.js                  |  48 +-
+ open-sse/utils/proxyFetch.js                  |   2 +
+ open-sse/utils/stream.js                      | 139 +++++-
+ open-sse/utils/streamHandler.js               |  42 +-
+ open-sse/utils/streamHelpers.js               |   6 +
+ src/app/api/v1/models/[...model]/route.js     |  16 +-
+ src/app/api/v1alpha/models/[...path]/route.js |   2 +
+ src/app/api/v1beta/models/[...path]/route.js  |  89 +++-
+ src/sse/handlers/chat.js                      |  23 +-
+ tests/translator/golden-url-header.test.js    |   2 +
+ .../aistudio-native-response-format.test.js   | 191 ++++++++
+ tests/unit/aistudio-provider.test.js          |  50 +++
+ .../unit/gemini-native-alpha-contract.test.js | 112 +++++
+ tests/unit/gemini-native-api-version.test.js  | 173 ++++++++
+ tests/unit/gemini-native-core.test.js         | 409 +++++++++++++++++
+ tests/unit/gemini-native-endpoint.test.js     |  58 ++-
+ .../unit/gemini-native-entry-contract.test.js | 238 ++++++++++
+ tests/unit/gemini-native-proxy-abort.test.js  |  80 ++++
+ tests/unit/gemini-native-stream.test.js       | 410 ++++++++++++++++++
+ .../unit/native-public-gemini-rewrite.test.js |  67 +++
+ 31 files changed, 2443 insertions(+), 81 deletions(-)
+ create mode 100644 open-sse/providers/registry/aistudio.js
+ create mode 100644 src/app/api/v1alpha/models/[...path]/route.js
+ create mode 100644 tests/unit/aistudio-native-response-format.test.js
+ create mode 100644 tests/unit/aistudio-provider.test.js
+ create mode 100644 tests/unit/gemini-native-alpha-contract.test.js
+ create mode 100644 tests/unit/gemini-native-api-version.test.js
+ create mode 100644 tests/unit/gemini-native-core.test.js
+ create mode 100644 tests/unit/gemini-native-entry-contract.test.js
+ create mode 100644 tests/unit/gemini-native-proxy-abort.test.js
+ create mode 100644 tests/unit/gemini-native-stream.test.js
+ create mode 100644 tests/unit/native-public-gemini-rewrite.test.js
 
 diff --git a/next.config.mjs b/next.config.mjs
-index dd276e6..cfda347 100644
+index dd276e63..cfda3472 100644
 --- a/next.config.mjs
 +++ b/next.config.mjs
 @@ -92,6 +92,14 @@ const nextConfig = {
@@ -60,7 +68,7 @@ index dd276e6..cfda347 100644
          source: "/v1/:path*",
          destination: "/api/v1/:path*"
 diff --git a/open-sse/executors/base.js b/open-sse/executors/base.js
-index 0697c08..5e57627 100644
+index 0697c08b..5e57627c 100644
 --- a/open-sse/executors/base.js
 +++ b/open-sse/executors/base.js
 @@ -168,6 +168,10 @@ export class BaseExecutor {
@@ -75,7 +83,7 @@ index 0697c08..5e57627 100644
          const isConnectTimeout = connectCtrl.signal.aborted && error.name === "AbortError";
          dbg("FETCH", `${this.provider.toUpperCase()} ✖ ${error.name}: ${error.message}${isConnectTimeout ? " (connect timeout)" : ""}`);
 diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
-index a296146..bc135e7 100644
+index 8350b74a..1b376bb3 100644
 --- a/open-sse/executors/default.js
 +++ b/open-sse/executors/default.js
 @@ -8,6 +8,7 @@ import { buildClineHeaders } from "../shared/clineAuth.js";
@@ -86,7 +94,7 @@ index a296146..bc135e7 100644
  import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
  
  // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
-@@ -115,7 +116,10 @@ export class DefaultExecutor extends BaseExecutor {
+@@ -130,7 +131,10 @@ export class DefaultExecutor extends BaseExecutor {
        stripUnsupportedParams(this.provider, model, transformed);
      }
  
@@ -98,7 +106,7 @@ index a296146..bc135e7 100644
    }
  
    applyNousAttribution(model, body, stream, credentials) {
-@@ -180,7 +184,21 @@ export class DefaultExecutor extends BaseExecutor {
+@@ -195,7 +199,21 @@ export class DefaultExecutor extends BaseExecutor {
      }
      // gemini-format: build :streamGenerateContent / :generateContent path
      if (this.config.format === "gemini") {
@@ -121,7 +129,7 @@ index a296146..bc135e7 100644
      }
      // urlSuffix (e.g. ?beta=true) declared per-provider in registry
      if (this.config.urlSuffix) {
-@@ -213,6 +231,19 @@ export class DefaultExecutor extends BaseExecutor {
+@@ -228,6 +246,19 @@ export class DefaultExecutor extends BaseExecutor {
      // Hooks run BEFORE auth so dynamic overlays can't clobber the token.
      for (const hook of desc.hooks || []) HEADER_HOOKS[hook]?.(headers, credentials);
      applyAuth(headers, desc, credentials);
@@ -142,7 +150,7 @@ index a296146..bc135e7 100644
      // anthropic-compatible-* nodes serving a real Claude model sit in front of
      // Anthropic itself (a rotating multi-account proxy, a corporate gateway),
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index 36df163..104bdd1 100644
+index 36df1637..104bdd1b 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
 @@ -162,7 +162,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
@@ -283,7 +291,7 @@ index 36df163..104bdd1 100644
    const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
  
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index 44aae53..ac79c21 100644
+index 38c1b980..d4d35bb8 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
 @@ -14,6 +14,28 @@ import { decloakToolNames } from "../../utils/claudeCloaking.js";
@@ -336,7 +344,7 @@ index 44aae53..ac79c21 100644
      const sseText = await providerResponse.text();
      const parsed = parseSSEToOpenAIResponse(sseText, model);
      if (!parsed) {
-@@ -253,6 +282,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
+@@ -261,6 +290,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
      } catch (err) {
        appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
        console.error(`[ChatCore] Failed to parse JSON from ${provider}:`, err.message);
@@ -344,7 +352,7 @@ index 44aae53..ac79c21 100644
        return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
      }
    }
-@@ -263,6 +293,25 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
+@@ -271,6 +301,25 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
    responseBody = unwrapClineEnvelope(responseBody, provider);
  
    reqLogger.logProviderResponse(providerResponse.status, providerResponse.statusText, providerResponse.headers, responseBody);
@@ -370,7 +378,7 @@ index 44aae53..ac79c21 100644
    if (onRequestSuccess) {
      Promise.resolve()
        .then(onRequestSuccess)
-@@ -288,7 +337,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
+@@ -296,7 +345,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
    const isResponsesResponse = sourceFormat === FORMATS.OPENAI_RESPONSES && translatedResponse?.object === "response";
  
    // Fix finish_reason for tool_calls: some providers return non-standard values (e.g. "other")
@@ -379,7 +387,7 @@ index 44aae53..ac79c21 100644
      const choice = translatedResponse.choices[0];
      const msg = choice.message;
      const hasToolCalls = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
-@@ -298,27 +347,27 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
+@@ -306,27 +355,27 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
    }
  
    // Ensure OpenAI-required fields
@@ -412,18 +420,10 @@ index 44aae53..ac79c21 100644
        if (choice?.message?.reasoning_content && choice.message.content) {
          delete choice.message.reasoning_content;
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index be71395..65e4a9c 100644
+index be713957..0eb9406f 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
-@@ -35,28 +35,20 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
-     return createSSETransformStreamWithLogger(FORMATS.OPENAI_RESPONSES, codexTarget, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
-   }
- 
--  if (needsTranslation(targetFormat, sourceFormat)) {
-+  if (needsTranslation(targetFormat, sourceFormat)) {
-     return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
-   }
- 
+@@ -42,21 +42,13 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
    // The passthrough path has no format translation, so the fingerprint's tool
    // rename map (read -> read_client) has to be handed over explicitly —
    // otherwise the client receives a call to a tool it never declared (#4986).
@@ -523,7 +523,7 @@ index be71395..65e4a9c 100644
  
 diff --git a/open-sse/providers/registry/aistudio.js b/open-sse/providers/registry/aistudio.js
 new file mode 100644
-index 0000000..71b07e5
+index 00000000..71b07e57
 --- /dev/null
 +++ b/open-sse/providers/registry/aistudio.js
 @@ -0,0 +1,36 @@
@@ -564,27 +564,27 @@ index 0000000..71b07e5
 +  passthroughModels: true,
 +};
 diff --git a/open-sse/providers/registry/index.js b/open-sse/providers/registry/index.js
-index 0475939..991afad 100644
+index 41dc6605..10f7e8c1 100644
 --- a/open-sse/providers/registry/index.js
 +++ b/open-sse/providers/registry/index.js
 @@ -139,6 +139,7 @@ import p135 from "./minimax-code-global.js";
  import p136 from "./bedrock.js";
  import p137 from "./bedrock-xai.js";
  import p138 from "./nous.js";
-+import p153 from "./aistudio.js";
++import p154 from "./aistudio.js";
  import p140 from "./deepseek-web.js";
  import p143 from "./gemini-web.js";
  import p144 from "./muse-web.js";
-@@ -285,6 +286,7 @@ export default [
+@@ -286,6 +287,7 @@ export default [
    p136,
    p137,
    p138,
-+  p153,
++  p154,
    p140,
    p143,
    p144,
 diff --git a/open-sse/services/provider.js b/open-sse/services/provider.js
-index 50f0589..a15cb6f 100644
+index 50f0589d..a15cb6fa 100644
 --- a/open-sse/services/provider.js
 +++ b/open-sse/services/provider.js
 @@ -142,6 +142,15 @@ export function getTargetFormat(provider, credentials = null) {
@@ -604,10 +604,10 @@ index 50f0589..a15cb6f 100644
  // Multi-endpoint providers (transport.transports[]) pick the entry matching sourceFormat
  // to avoid lossy translation; falls back to the default transport when no match.
 diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
-index 378a358..6e8695a 100644
+index 15aff89d..6dc7fc14 100644
 --- a/open-sse/translator/concerns/thinkingUnified.js
 +++ b/open-sse/translator/concerns/thinkingUnified.js
-@@ -448,11 +448,53 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
+@@ -452,6 +452,16 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
  
    const fmt = resolveFormat(targetFormat, cleanModel, provider);
    const supportedLevels = getThinkingLevels(provider, cleanModel);
@@ -624,10 +624,8 @@ index 378a358..6e8695a 100644
    // Anthropic's `display` (summarized | omitted) decides whether thinking text
    // comes back at all; keep what the client asked for instead of resetting it.
    // An OpenAI-shaped client's ask arrives via the captured intent instead.
-   const display = typeof body.thinking?.display === "string" ? body.thinking.display : intent?.display;
-   stripAll(body);
--  applyFormat(fmt, body, cfg, caps, supportedLevels, display);
-+  applyFormat(fmt, body, cfg, caps, supportedLevels, display, servesAnthropicClaude(provider, cleanModel));
+@@ -460,3 +470,35 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
+   applyFormat(fmt, body, cfg, caps, supportedLevels, display, cleanModel);
    return body;
  }
 +
@@ -663,10 +661,10 @@ index 378a358..6e8695a 100644
 +  return { ...body, [generationKey]: { ...generation, [thinkingKey]: thinking } };
 +}
 diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
-index 71a71df..ba24aad 100644
+index f73a5aac..b923f046 100644
 --- a/open-sse/translator/formats/gemini.js
 +++ b/open-sse/translator/formats/gemini.js
-@@ -447,6 +447,62 @@ export function cleanJSONSchemaForAntigravity(schema) {
+@@ -518,6 +518,62 @@ export function cleanJSONSchemaForAntigravity(schema) {
    return cleaned;
  }
  
@@ -730,7 +728,7 @@ index 71a71df..ba24aad 100644
  // pointer to functionResponse.parts and reject the request with
  // "The referenced name `#/$defs/...` in function_response.response does not match
 diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
-index 9afde2f..9254800 100644
+index 9afde2f3..92548009 100644
 --- a/open-sse/translator/index.js
 +++ b/open-sse/translator/index.js
 @@ -1,12 +1,13 @@
@@ -799,7 +797,7 @@ index 9afde2f..9254800 100644
  
    // Always normalize to clean OpenAI format when target is OpenAI
 diff --git a/open-sse/utils/proxyFetch.js b/open-sse/utils/proxyFetch.js
-index 5574bcd..eea1f62 100644
+index 5574bcd7..eea1f626 100644
 --- a/open-sse/utils/proxyFetch.js
 +++ b/open-sse/utils/proxyFetch.js
 @@ -361,6 +361,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
@@ -819,7 +817,7 @@ index 5574bcd..eea1f62 100644
        if (proxyOptions?.strictProxy === true) {
          throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 7123de6..62f5c85 100644
+index 7123de6f..62f5c859 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -1,10 +1,11 @@
@@ -1016,7 +1014,7 @@ index 7123de6..62f5c85 100644
      reqLogger,
      toolNameMap,
 diff --git a/open-sse/utils/streamHandler.js b/open-sse/utils/streamHandler.js
-index fce0170..0596763 100644
+index fce01706..05967639 100644
 --- a/open-sse/utils/streamHandler.js
 +++ b/open-sse/utils/streamHandler.js
 @@ -15,11 +15,21 @@ function getTimeString() {
@@ -1130,7 +1128,7 @@ index fce0170..0596763 100644
  }
 -
 diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
-index fd4d084..946e1d2 100644
+index fd4d0847..946e1d25 100644
 --- a/open-sse/utils/streamHelpers.js
 +++ b/open-sse/utils/streamHelpers.js
 @@ -184,6 +184,12 @@ export function formatSSE(data, sourceFormat) {
@@ -1147,7 +1145,7 @@ index fd4d084..946e1d2 100644
      ? formatSSE({ type: "error", error }, FORMATS.CLAUDE)
      : formatSSE({ error }, clientFormat) + SSE_DONE;
 diff --git a/src/app/api/v1/models/[...model]/route.js b/src/app/api/v1/models/[...model]/route.js
-index 77df20f..6a17ea5 100644
+index 77df20f3..6a17ea5e 100644
 --- a/src/app/api/v1/models/[...model]/route.js
 +++ b/src/app/api/v1/models/[...model]/route.js
 @@ -17,12 +17,26 @@ export async function OPTIONS() {
@@ -1180,14 +1178,14 @@ index 77df20f..6a17ea5 100644
      ...options,
 diff --git a/src/app/api/v1alpha/models/[...path]/route.js b/src/app/api/v1alpha/models/[...path]/route.js
 new file mode 100644
-index 0000000..a4a2e71
+index 00000000..a4a2e714
 --- /dev/null
 +++ b/src/app/api/v1alpha/models/[...path]/route.js
 @@ -0,0 +1,2 @@
 +// Alpha generation uses the same native request, auth and streaming handler.
 +export { POST, OPTIONS } from "../../../v1beta/models/[...path]/route.js";
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index 19925a5..8ba06fe 100644
+index 19925a5c..8ba06fe9 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -9,6 +9,9 @@ import { getSettings } from "@/lib/localDb";
@@ -1358,7 +1356,7 @@ index 19925a5..8ba06fe 100644
          statusText: upstreamResponse.statusText,
          headers: corsHeadersFrom(upstreamResponse),
 diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
-index 18e5a01..8b31544 100644
+index 18e5a011..8b315442 100644
 --- a/src/sse/handlers/chat.js
 +++ b/src/sse/handlers/chat.js
 @@ -34,7 +34,7 @@ import { resolveSmartChoice } from "../services/systemoneRouter.js";
@@ -1474,7 +1472,7 @@ index 18e5a01..8b31544 100644
      }
  
 diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
-index d88e67f..8b745cc 100644
+index d88e67f1..8b745cc3 100644
 --- a/tests/translator/golden-url-header.test.js
 +++ b/tests/translator/golden-url-header.test.js
 @@ -21,6 +21,8 @@ const SPECIALIZED = new Set([
@@ -1488,7 +1486,7 @@ index d88e67f..8b745cc 100644
  // Per-process / per-request values: kimi's random device name, minimax's session UUID.
 diff --git a/tests/unit/aistudio-native-response-format.test.js b/tests/unit/aistudio-native-response-format.test.js
 new file mode 100644
-index 0000000..3b54234
+index 00000000..3b542347
 --- /dev/null
 +++ b/tests/unit/aistudio-native-response-format.test.js
 @@ -0,0 +1,191 @@
@@ -1685,7 +1683,7 @@ index 0000000..3b54234
 +});
 diff --git a/tests/unit/aistudio-provider.test.js b/tests/unit/aistudio-provider.test.js
 new file mode 100644
-index 0000000..7c42dbc
+index 00000000..7c42dbcb
 --- /dev/null
 +++ b/tests/unit/aistudio-provider.test.js
 @@ -0,0 +1,50 @@
@@ -1741,7 +1739,7 @@ index 0000000..7c42dbc
 +});
 diff --git a/tests/unit/gemini-native-alpha-contract.test.js b/tests/unit/gemini-native-alpha-contract.test.js
 new file mode 100644
-index 0000000..786d167
+index 00000000..786d167e
 --- /dev/null
 +++ b/tests/unit/gemini-native-alpha-contract.test.js
 @@ -0,0 +1,112 @@
@@ -1859,7 +1857,7 @@ index 0000000..786d167
 +});
 diff --git a/tests/unit/gemini-native-api-version.test.js b/tests/unit/gemini-native-api-version.test.js
 new file mode 100644
-index 0000000..fa44646
+index 00000000..fa44646c
 --- /dev/null
 +++ b/tests/unit/gemini-native-api-version.test.js
 @@ -0,0 +1,173 @@
@@ -2038,7 +2036,7 @@ index 0000000..fa44646
 +});
 diff --git a/tests/unit/gemini-native-core.test.js b/tests/unit/gemini-native-core.test.js
 new file mode 100644
-index 0000000..0f73664
+index 00000000..0f736640
 --- /dev/null
 +++ b/tests/unit/gemini-native-core.test.js
 @@ -0,0 +1,409 @@
@@ -2452,7 +2450,7 @@ index 0000000..0f73664
 +  });
 +});
 diff --git a/tests/unit/gemini-native-endpoint.test.js b/tests/unit/gemini-native-endpoint.test.js
-index 83a8716..27ec128 100644
+index 83a8716c..27ec128b 100644
 --- a/tests/unit/gemini-native-endpoint.test.js
 +++ b/tests/unit/gemini-native-endpoint.test.js
 @@ -1,4 +1,4 @@
@@ -2559,7 +2557,7 @@ index 83a8716..27ec128 100644
        params: Promise.resolve({ path: ["openai", "gpt-4o-mini-tts:generateContent"] }),
 diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
 new file mode 100644
-index 0000000..6e3a47e
+index 00000000..6e3a47e4
 --- /dev/null
 +++ b/tests/unit/gemini-native-entry-contract.test.js
 @@ -0,0 +1,238 @@
@@ -2803,7 +2801,7 @@ index 0000000..6e3a47e
 +});
 diff --git a/tests/unit/gemini-native-proxy-abort.test.js b/tests/unit/gemini-native-proxy-abort.test.js
 new file mode 100644
-index 0000000..ca4ae99
+index 00000000..ca4ae99e
 --- /dev/null
 +++ b/tests/unit/gemini-native-proxy-abort.test.js
 @@ -0,0 +1,80 @@
@@ -2889,7 +2887,7 @@ index 0000000..ca4ae99
 +});
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
 new file mode 100644
-index 0000000..0717461
+index 00000000..0717461c
 --- /dev/null
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -0,0 +1,410 @@
@@ -3305,7 +3303,7 @@ index 0000000..0717461
 +});
 diff --git a/tests/unit/native-public-gemini-rewrite.test.js b/tests/unit/native-public-gemini-rewrite.test.js
 new file mode 100644
-index 0000000..78978a3
+index 00000000..78978a37
 --- /dev/null
 +++ b/tests/unit/native-public-gemini-rewrite.test.js
 @@ -0,0 +1,67 @@
@@ -3376,3 +3374,6 @@ index 0000000..78978a3
 +    expect(rewrite("https://router.test/v1alphabet/models/gemini/gemini-3.5-flash-lite:generateContent")).toBeNull();
 +  });
 +});
+-- 
+2.43.0
+

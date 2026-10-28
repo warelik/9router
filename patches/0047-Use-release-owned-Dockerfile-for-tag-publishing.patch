@@ -1,16 +1,16 @@
-From c8f2d7e184e8f60aecbfecc3ba2f4d530ae936e5 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From eef917c0d858a1fed6722b5b44b26ef52ceefb5a Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Use release-owned Dockerfile for tag publishing
 
 ---
- .github/workflows/docker-publish.yml            | 10 -----
- tests/unit/docker-publish-source-recipe.test.js | 53 +++++++++++++++++++++++++
+ .github/workflows/docker-publish.yml          | 10 ----
+ .../unit/docker-publish-source-recipe.test.js | 53 +++++++++++++++++++
  2 files changed, 53 insertions(+), 10 deletions(-)
+ create mode 100644 tests/unit/docker-publish-source-recipe.test.js
 
 diff --git a/.github/workflows/docker-publish.yml b/.github/workflows/docker-publish.yml
-index 64be9c1..7387d50 100644
+index 64be9c1c..7387d501 100644
 --- a/.github/workflows/docker-publish.yml
 +++ b/.github/workflows/docker-publish.yml
 @@ -152,15 +152,6 @@ jobs:
@@ -39,7 +39,7 @@ index 64be9c1..7387d50 100644
            build-args: |
 diff --git a/tests/unit/docker-publish-source-recipe.test.js b/tests/unit/docker-publish-source-recipe.test.js
 new file mode 100644
-index 0000000..bae2f87
+index 00000000..bae2f872
 --- /dev/null
 +++ b/tests/unit/docker-publish-source-recipe.test.js
 @@ -0,0 +1,53 @@
@@ -96,3 +96,6 @@ index 0000000..bae2f87
 +    }
 +  });
 +});
+-- 
+2.43.0
+

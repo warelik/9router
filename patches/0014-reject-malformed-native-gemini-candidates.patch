@@ -1,20 +1,18 @@
-From e25d79682a6aa9f6c6145ccbf4c997b62ed34dde Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From cc03c0e142b241721610bbe206552ce2433ce595 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Tue, 20 Oct 2026 00:00:00 +0000
 Subject: [PATCH] Reject malformed native Gemini candidates before account
- success
 
 ---
- open-sse/handlers/chatCore/nonStreamingHandler.js |  5 ++-
- open-sse/utils/stream.js                          | 24 +++-----------
- open-sse/utils/streamHelpers.js                   | 24 ++++++++++++++
- tests/unit/gemini-native-core.test.js             | 17 +++++++++-
- tests/unit/gemini-native-stream.test.js           | 40 +++++++++++++++++++++++
+ .../handlers/chatCore/nonStreamingHandler.js  |  5 +--
+ open-sse/utils/stream.js                      | 24 +++--------
+ open-sse/utils/streamHelpers.js               | 24 +++++++++++
+ tests/unit/gemini-native-core.test.js         | 17 +++++++-
+ tests/unit/gemini-native-stream.test.js       | 40 +++++++++++++++++++
  5 files changed, 87 insertions(+), 23 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index 4837011..c699b4a 100644
+index 0ba8fa3d..0f795a27 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
 @@ -6,6 +6,7 @@ import { ollamaBodyToOpenAI } from "../../translator/response/ollama-to-openai.j
@@ -25,7 +23,7 @@ index 4837011..c699b4a 100644
  import { HTTP_STATUS } from "../../config/runtimeConfig.js";
  import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
  import { unwrapClineEnvelope } from "../../shared/clineEnvelope.js";
-@@ -335,9 +336,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
+@@ -343,9 +344,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
  
    reqLogger.logProviderResponse(providerResponse.status, providerResponse.statusText, providerResponse.headers, responseBody);
    if (isNativeGeminiResponse) {
@@ -37,7 +35,7 @@ index 4837011..c699b4a 100644
        appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
        return nativeGeminiErrorResult(providerResponse, HTTP_STATUS.BAD_GATEWAY, message);
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 2d0e5b9..e7aeda8 100644
+index 2d0e5b99..e7aeda80 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -5,7 +5,10 @@ import { HTTP_STATUS } from "../config/runtimeConfig.js";
@@ -86,7 +84,7 @@ index 2d0e5b9..e7aeda8 100644
        nativeGeminiErrorSeen = true;
      }
 diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
-index e455f72..e68493e 100644
+index e455f721..e68493e6 100644
 --- a/open-sse/utils/streamHelpers.js
 +++ b/open-sse/utils/streamHelpers.js
 @@ -5,6 +5,30 @@ import { SSE_DONE } from "./sseConstants.js";
@@ -121,7 +119,7 @@ index e455f72..e68493e 100644
  export function parseSSELine(line, format = null) {
    if (!line) return null;
 diff --git a/tests/unit/gemini-native-core.test.js b/tests/unit/gemini-native-core.test.js
-index 0f73664..4c7d4c7 100644
+index 0f736640..4c7d4c78 100644
 --- a/tests/unit/gemini-native-core.test.js
 +++ b/tests/unit/gemini-native-core.test.js
 @@ -256,6 +256,17 @@ describe("native Gemini requests through real chat core and executor", () => {
@@ -166,7 +164,7 @@ index 0f73664..4c7d4c7 100644
  
      it(`${provider}: unknown native root fields never enter Chat finish, reasoning or usage mutators`, async () => {
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index 40b62a1..7f4643a 100644
+index 40b62a17..7f4643a5 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -305,6 +305,24 @@ describe("native stream integration and failure cleanup", () => {
@@ -238,3 +236,6 @@ index 40b62a1..7f4643a 100644
    it.each([FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY])("builds a native numeric abort error without DONE for %s", source => {
      const output = new TextDecoder().decode(buildStreamErrorBytes(504, "stream stall timeout", source));
      expect(JSON.parse(output.trim().slice(5))).toEqual({ error: { code: 504, message: "stream stall timeout" } });
+-- 
+2.43.0
+

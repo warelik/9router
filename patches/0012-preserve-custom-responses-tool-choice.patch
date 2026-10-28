@@ -1,15 +1,15 @@
-From df8869c550d2265f292337cc12e5523ffe0d585a Mon Sep 17 00:00:00 2001
+From 271b922c6b1223cd56d8eebb21ee0b7fa1497741 Mon Sep 17 00:00:00 2001
 From: OpenAI Codex <noreply@openai.com>
 Date: Tue, 20 Oct 2026 00:00:00 +0000
 Subject: [PATCH] Preserve custom Responses tool choice identity
 
 ---
- open-sse/translator/request/openai-responses.js    | 25 +++++++++--
- ...wnstream-translator-history-regressions.test.js | 50 ++++++++++++++++++++++
+ .../translator/request/openai-responses.js    | 25 ++++++++--
+ ...eam-translator-history-regressions.test.js | 50 +++++++++++++++++++
  2 files changed, 72 insertions(+), 3 deletions(-)
 
 diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
-index 1545b89..8bf93aa 100644
+index 1545b896..8bf93aaa 100644
 --- a/open-sse/translator/request/openai-responses.js
 +++ b/open-sse/translator/request/openai-responses.js
 @@ -295,16 +295,35 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
@@ -52,7 +52,7 @@ index 1545b89..8bf93aa 100644
  
    // Cleanup Responses API specific fields
 diff --git a/tests/unit/downstream-translator-history-regressions.test.js b/tests/unit/downstream-translator-history-regressions.test.js
-index 29d983a..c78f4e7 100644
+index 29d983a8..c78f4e70 100644
 --- a/tests/unit/downstream-translator-history-regressions.test.js
 +++ b/tests/unit/downstream-translator-history-regressions.test.js
 @@ -12,6 +12,7 @@ vi.mock("@/lib/db/helpers/kvStore.js", () => ({
@@ -116,3 +116,6 @@ index 29d983a..c78f4e7 100644
 +    expect(out._customToolNames).toContain("apply_patch");
 +  });
 +});
+-- 
+2.43.0
+

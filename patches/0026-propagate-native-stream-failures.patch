@@ -1,22 +1,20 @@
-From 0162cc9bfc842482c798d3d328b8f52291f2ce3b Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 94c601b5d9c07cc343465334920d27d172f23b21 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Thu, 22 Oct 2026 22:01:50 +0000
 Subject: [PATCH] Propagate native stream failures through every terminal path
- before completion
 
 ---
- open-sse/handlers/chatCore.js                   |   4 +-
- open-sse/handlers/chatCore/streamingHandler.js  |  57 ++++++----
- open-sse/utils/stream.js                        |  95 +++++++++++-----
- open-sse/utils/streamHandler.js                 |  24 +++--
- src/sse/handlers/chat.js                        |  12 +++
- tests/unit/gemini-native-entry-contract.test.js |  20 ++++
- tests/unit/gemini-native-stream.test.js         | 137 +++++++++++++++++++++++-
+ open-sse/handlers/chatCore.js                 |   4 +-
+ .../handlers/chatCore/streamingHandler.js     |  57 +++++---
+ open-sse/utils/stream.js                      |  95 ++++++++----
+ open-sse/utils/streamHandler.js               |  24 ++-
+ src/sse/handlers/chat.js                      |  12 ++
+ .../unit/gemini-native-entry-contract.test.js |  20 +++
+ tests/unit/gemini-native-stream.test.js       | 137 +++++++++++++++++-
  7 files changed, 292 insertions(+), 57 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index 1ae0d7e..e3aa5d5 100644
+index 1ae0d7eb..e3aa5d53 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
 @@ -63,7 +63,7 @@ export function stripContinuityFields(body) {
@@ -38,7 +36,7 @@ index 1ae0d7e..e3aa5d5 100644
    const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
  
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index 31807c8..4cb6f56 100644
+index 2acc9911..1677fdf0 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -92,7 +92,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
@@ -152,7 +150,7 @@ index 31807c8..4cb6f56 100644
  
    return { onStreamComplete, streamDetailId };
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index daab212..163dba3 100644
+index daab2126..163dba3b 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -148,10 +148,18 @@ export function createSSEStream(options = {}) {
@@ -398,7 +396,7 @@ index daab212..163dba3 100644
  
  export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null, credentials = null, nativeResponseProjection = null, onNativeResponseSuccess = null, nativeJson = false) {
 diff --git a/open-sse/utils/streamHandler.js b/open-sse/utils/streamHandler.js
-index 0596763..35f2cb6 100644
+index 05967639..35f2cb68 100644
 --- a/open-sse/utils/streamHandler.js
 +++ b/open-sse/utils/streamHandler.js
 @@ -19,10 +19,12 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
@@ -500,7 +498,7 @@ index 0596763..35f2cb6 100644
    );
  }
 diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
-index fc53451..620480a 100644
+index fc53451b..620480aa 100644
 --- a/src/sse/handlers/chat.js
 +++ b/src/sse/handlers/chat.js
 @@ -450,6 +450,18 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
@@ -523,7 +521,7 @@ index fc53451..620480a 100644
      });
  
 diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
-index 4afe24f..84c907b 100644
+index 4afe24f1..84c907bf 100644
 --- a/tests/unit/gemini-native-entry-contract.test.js
 +++ b/tests/unit/gemini-native-entry-contract.test.js
 @@ -178,6 +178,26 @@ describe("native Gemini endpoint entry contract", () => {
@@ -554,7 +552,7 @@ index 4afe24f..84c907b 100644
        it(`${provider}: ${first} to ${second} fallback preserves signed tool history and native settings`, async () => {
          const original = nativeBody();
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index eed6196..0f1f1c3 100644
+index eed61962..0f1f1c33 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -7,12 +7,16 @@ vi.mock("@/lib/usageDb.js", () => ({
@@ -713,3 +711,6 @@ index eed6196..0f1f1c3 100644
    it.each([null, "invalid", [], { parts: "invalid" }, { parts: [null] }, { parts: [[]] }, { parts: ["invalid"] }].map(content => [content]))(
      "rejects malformed candidate content %j before recording streaming success", async content => {
        const payload = { candidates: [{ index: 0, finishReason: "STOP", content }] };
+-- 
+2.43.0
+

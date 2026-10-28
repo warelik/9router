@@ -1,43 +1,50 @@
-From ae2a1391f301bb965d861d7ef5697d80f17f3178 Mon Sep 17 00:00:00 2001
+From dfeb1f8d51b22ce341f1b5b54455b007b25415db Mon Sep 17 00:00:00 2001
 From: Overlay Migration <overlay-migration@example.invalid>
 Date: Fri, 16 Oct 2026 08:36:03 +0000
-Subject: [PATCH 5/8] 0005 codex-responses-compatibility
+Subject: [PATCH] [PATCH 5/8] 0005 codex-responses-compatibility
 
-Source-base: ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8
-Source-tip: e01983276cb2f9ce05dc167e4d56c2c040559fd6
-Scope: next.config.mjs, open-sse/, src/, tests/ excluding tests/translator/AGENTS.md
 ---
- open-sse/config/runtimeConfig.js                   |   7 +
- open-sse/executors/codex.js                        |  67 +++-
- open-sse/handlers/chatCore.js                      |  17 +-
- open-sse/handlers/chatCore/nonStreamingHandler.js  |  10 +-
- open-sse/handlers/chatCore/streamingHandler.js     |   2 +-
- .../translator/concerns/portableCollaboration.js   |  86 +++++
- open-sse/translator/formats/responsesApi.js        |  84 ++++-
- open-sse/translator/index.js                       |  15 +-
- open-sse/translator/request/openai-responses.js    | 106 ++++++-
- open-sse/translator/response/claude-to-openai.js   |   3 +-
- open-sse/translator/response/gemini-to-openai.js   |  11 +-
- open-sse/translator/response/kiro-to-claude.js     |   3 +-
- open-sse/translator/response/kiro-to-openai.js     |   3 +-
- open-sse/translator/response/openai-responses.js   |  66 ++--
- .../translator/response/openai-to-antigravity.js   |   3 +-
- open-sse/translator/schema/blocks.js               |   1 +
- open-sse/utils/opencodeFingerprint.js              |  62 +++-
- open-sse/utils/stream.js                           |   2 +-
- tests/unit/codex-hosted-search-history.test.js     |  95 ++++++
- tests/unit/codex-sse-error-before-output.test.js   | 148 +++++++++
- tests/unit/kimi-portable-responses-input.test.js   | 318 +++++++++++++++++++
- tests/unit/kiro-namespace-descriptors.test.js      |  40 +++
- tests/unit/openai-responses-agent-messages.test.js | 232 ++++++++++++++
- tests/unit/openai-responses-incomplete.test.js     |  67 ++++
- tests/unit/openai-responses-namespaces.test.js     | 353 +++++++++++++++++++++
- tests/unit/openai-responses-web-search.test.js     | 310 ++++++++++++++++++
- tests/unit/responses-output-index.test.js          |  78 +++++
+ open-sse/config/runtimeConfig.js              |   7 +
+ open-sse/executors/codex.js                   |  67 +++-
+ open-sse/handlers/chatCore.js                 |  17 +-
+ .../handlers/chatCore/nonStreamingHandler.js  |  10 +-
+ .../handlers/chatCore/streamingHandler.js     |   2 +-
+ .../concerns/portableCollaboration.js         |  86 +++++
+ open-sse/translator/formats/responsesApi.js   |  84 ++++-
+ open-sse/translator/index.js                  |  15 +-
+ .../translator/request/openai-responses.js    | 106 +++++-
+ .../translator/response/claude-to-openai.js   |   3 +-
+ .../translator/response/gemini-to-openai.js   |  11 +-
+ .../translator/response/kiro-to-claude.js     |   3 +-
+ .../translator/response/kiro-to-openai.js     |   3 +-
+ .../translator/response/openai-responses.js   |  66 ++--
+ .../response/openai-to-antigravity.js         |   3 +-
+ open-sse/translator/schema/blocks.js          |   1 +
+ open-sse/utils/opencodeFingerprint.js         |  62 ++-
+ open-sse/utils/stream.js                      |   2 +-
+ .../unit/codex-hosted-search-history.test.js  |  95 +++++
+ .../codex-sse-error-before-output.test.js     | 148 ++++++++
+ .../kimi-portable-responses-input.test.js     | 318 ++++++++++++++++
+ tests/unit/kiro-namespace-descriptors.test.js |  40 ++
+ .../openai-responses-agent-messages.test.js   | 232 ++++++++++++
+ .../unit/openai-responses-incomplete.test.js  |  67 ++++
+ .../unit/openai-responses-namespaces.test.js  | 353 ++++++++++++++++++
+ .../unit/openai-responses-web-search.test.js  | 310 +++++++++++++++
+ tests/unit/responses-output-index.test.js     |  78 ++++
  27 files changed, 2123 insertions(+), 66 deletions(-)
+ create mode 100644 open-sse/translator/concerns/portableCollaboration.js
+ create mode 100644 tests/unit/codex-hosted-search-history.test.js
+ create mode 100644 tests/unit/codex-sse-error-before-output.test.js
+ create mode 100644 tests/unit/kimi-portable-responses-input.test.js
+ create mode 100644 tests/unit/kiro-namespace-descriptors.test.js
+ create mode 100644 tests/unit/openai-responses-agent-messages.test.js
+ create mode 100644 tests/unit/openai-responses-incomplete.test.js
+ create mode 100644 tests/unit/openai-responses-namespaces.test.js
+ create mode 100644 tests/unit/openai-responses-web-search.test.js
+ create mode 100644 tests/unit/responses-output-index.test.js
 
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index 4354091..3a98a9b 100644
+index 43540915..3a98a9bd 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
 @@ -72,6 +72,13 @@ export const DEFAULT_MIN_TOKENS = 32000;
@@ -55,7 +62,7 @@ index 4354091..3a98a9b 100644
  export const RETRY_CONFIG = {
    maxAttempts: 2,
 diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
-index f637307..56aae02 100644
+index f637307e..56aae02c 100644
 --- a/open-sse/executors/codex.js
 +++ b/open-sse/executors/codex.js
 @@ -312,6 +312,13 @@ export class CodexExecutor extends BaseExecutor {
@@ -176,7 +183,7 @@ index f637307..56aae02 100644
      }
      // Hosted search cannot run from a Lite input prefix. When switching to
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index b1d2b39..45c5c9e 100644
+index b1d2b396..45c5c9e2 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
 @@ -1,7 +1,9 @@
@@ -225,7 +232,7 @@ index b1d2b39..45c5c9e 100644
        const suffixThinking = {};
        applyThinking(sourceFormat, upstreamModel, suffixThinking, provider);
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index 7042082..4837011 100644
+index 3063b2f4..0ba8fa3d 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
 @@ -97,7 +97,10 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
@@ -265,7 +272,7 @@ index 7042082..4837011 100644
    // Provider responded in OpenAI Chat Completions shape but the client speaks
    // Responses API — convert so tool_calls/text surface as Responses `output`.
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index 65e4a9c..21f0348 100644
+index 0eb9406f..2b74abdd 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -24,7 +24,7 @@ const CODEX_SOURCE_TO_TARGET = {
@@ -279,7 +286,7 @@ index 65e4a9c..21f0348 100644
    const isResponsesProvider = PROVIDERS[provider]?.format === FORMATS.OPENAI_RESPONSES;
 diff --git a/open-sse/translator/concerns/portableCollaboration.js b/open-sse/translator/concerns/portableCollaboration.js
 new file mode 100644
-index 0000000..9de1591
+index 00000000..9de15911
 --- /dev/null
 +++ b/open-sse/translator/concerns/portableCollaboration.js
 @@ -0,0 +1,86 @@
@@ -370,7 +377,7 @@ index 0000000..9de1591
 +  return { body: toolNameMap.size ? rewritten : body, toolNameMap };
 +}
 diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
-index 5454f9f..ca2e59a 100644
+index 5454f9f3..ca2e59a8 100644
 --- a/open-sse/translator/formats/responsesApi.js
 +++ b/open-sse/translator/formats/responsesApi.js
 @@ -26,6 +26,87 @@ export function normalizeResponsesInput(input) {
@@ -472,7 +479,7 @@ index 5454f9f..ca2e59a 100644
      // Fallback: if no type but has role property, treat as message
      const itemType = item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);
 diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
-index def9327..dd505e9 100644
+index def93277..dd505e99 100644
 --- a/open-sse/translator/index.js
 +++ b/open-sse/translator/index.js
 @@ -208,11 +208,24 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
@@ -502,7 +509,7 @@ index def9327..dd505e9 100644
    // if (provider === FORMATS.ANTIGRAVITY && body.userAgent !== FORMATS.ANTIGRAVITY) {
    //   const { cloakedBody, toolNameMap } = AntigravityExecutor.cloakTools(result);
 diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
-index e5c62ae..ddddd41 100644
+index e5c62aec..ddddd41d 100644
 --- a/open-sse/translator/request/openai-responses.js
 +++ b/open-sse/translator/request/openai-responses.js
 @@ -4,10 +4,12 @@
@@ -697,7 +704,7 @@ index e5c62ae..ddddd41 100644
    if (body.input) {
      const out = { ...body, model, stream: true };
 diff --git a/open-sse/translator/response/claude-to-openai.js b/open-sse/translator/response/claude-to-openai.js
-index 42a82a6..3e0906e 100644
+index 42a82a66..3e0906e1 100644
 --- a/open-sse/translator/response/claude-to-openai.js
 +++ b/open-sse/translator/response/claude-to-openai.js
 @@ -5,6 +5,7 @@ import { buildChunk } from "../concerns/chunk.js";
@@ -718,7 +725,7 @@ index 42a82a6..3e0906e 100644
            index: toolCallIndex,
            id: block.id,
 diff --git a/open-sse/translator/response/gemini-to-openai.js b/open-sse/translator/response/gemini-to-openai.js
-index e7e5267..c2b6b82 100644
+index e7e5267d..c2b6b82d 100644
 --- a/open-sse/translator/response/gemini-to-openai.js
 +++ b/open-sse/translator/response/gemini-to-openai.js
 @@ -6,7 +6,8 @@ import { toOpenAIUsage } from "../concerns/usage.js";
@@ -753,7 +760,7 @@ index e7e5267..c2b6b82 100644
      id: callId,
      index: toolCallIndex,
 diff --git a/open-sse/translator/response/kiro-to-claude.js b/open-sse/translator/response/kiro-to-claude.js
-index d9fc0aa..e5cd262 100644
+index d9fc0aab..e5cd2621 100644
 --- a/open-sse/translator/response/kiro-to-claude.js
 +++ b/open-sse/translator/response/kiro-to-claude.js
 @@ -15,6 +15,7 @@
@@ -774,7 +781,7 @@ index d9fc0aa..e5cd262 100644
  
  export function kiroToClaudeResponse(chunk, state) {
 diff --git a/open-sse/translator/response/kiro-to-openai.js b/open-sse/translator/response/kiro-to-openai.js
-index 8e713fd..c0f2f7c 100644
+index 8e713fd7..c0f2f7cf 100644
 --- a/open-sse/translator/response/kiro-to-openai.js
 +++ b/open-sse/translator/response/kiro-to-openai.js
 @@ -10,6 +10,7 @@ import { toOpenAIUsage } from "../concerns/usage.js";
@@ -795,7 +802,7 @@ index 8e713fd..c0f2f7c 100644
  
  export function kiroToOpenAIResponse(chunk, state) {
 diff --git a/open-sse/translator/response/openai-responses.js b/open-sse/translator/response/openai-responses.js
-index 1499a2a..2e5cc35 100644
+index 1499a2a5..2e5cc352 100644
 --- a/open-sse/translator/response/openai-responses.js
 +++ b/open-sse/translator/response/openai-responses.js
 @@ -9,6 +9,7 @@ import { buildUsage } from "../concerns/usage.js";
@@ -1003,7 +1010,7 @@ index 1499a2a..2e5cc35 100644
        }
      });
 diff --git a/open-sse/translator/response/openai-to-antigravity.js b/open-sse/translator/response/openai-to-antigravity.js
-index 506f8e5..a9e11c2 100644
+index 506f8e5c..a9e11c27 100644
 --- a/open-sse/translator/response/openai-to-antigravity.js
 +++ b/open-sse/translator/response/openai-to-antigravity.js
 @@ -1,6 +1,7 @@
@@ -1024,7 +1031,7 @@ index 506f8e5..a9e11c2 100644
          functionCall: {
            name: originalName,
 diff --git a/open-sse/translator/schema/blocks.js b/open-sse/translator/schema/blocks.js
-index 45e9f1a..3cd9ab1 100644
+index 45e9f1a6..3cd9ab1a 100644
 --- a/open-sse/translator/schema/blocks.js
 +++ b/open-sse/translator/schema/blocks.js
 @@ -43,6 +43,7 @@ export const RESPONSES_ITEM = {
@@ -1036,7 +1043,7 @@ index 45e9f1a..3cd9ab1 100644
  };
  
 diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
-index 5ad7bd6..8ba5db9 100644
+index 5ad7bd68..8ba5db90 100644
 --- a/open-sse/utils/opencodeFingerprint.js
 +++ b/open-sse/utils/opencodeFingerprint.js
 @@ -423,6 +423,22 @@ export function takeRenamedToolNames(body) {
@@ -1146,7 +1153,7 @@ index 5ad7bd6..8ba5db9 100644
  
    return out;
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 6b79e23..0a3b846 100644
+index 6b79e23b..0a3b846a 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -494,7 +494,7 @@ export function createSSEStream(options = {}) {
@@ -1160,7 +1167,7 @@ index 6b79e23..0a3b846 100644
            currentOpenAIResponsesEvent = null;
 diff --git a/tests/unit/codex-hosted-search-history.test.js b/tests/unit/codex-hosted-search-history.test.js
 new file mode 100644
-index 0000000..e34ca44
+index 00000000..e34ca443
 --- /dev/null
 +++ b/tests/unit/codex-hosted-search-history.test.js
 @@ -0,0 +1,95 @@
@@ -1261,7 +1268,7 @@ index 0000000..e34ca44
 +});
 diff --git a/tests/unit/codex-sse-error-before-output.test.js b/tests/unit/codex-sse-error-before-output.test.js
 new file mode 100644
-index 0000000..ec622c6
+index 00000000..ec622c63
 --- /dev/null
 +++ b/tests/unit/codex-sse-error-before-output.test.js
 @@ -0,0 +1,148 @@
@@ -1415,7 +1422,7 @@ index 0000000..ec622c6
 +});
 diff --git a/tests/unit/kimi-portable-responses-input.test.js b/tests/unit/kimi-portable-responses-input.test.js
 new file mode 100644
-index 0000000..b7b4464
+index 00000000..b7b44647
 --- /dev/null
 +++ b/tests/unit/kimi-portable-responses-input.test.js
 @@ -0,0 +1,318 @@
@@ -1739,7 +1746,7 @@ index 0000000..b7b4464
 +});
 diff --git a/tests/unit/kiro-namespace-descriptors.test.js b/tests/unit/kiro-namespace-descriptors.test.js
 new file mode 100644
-index 0000000..a7104c8
+index 00000000..a7104c88
 --- /dev/null
 +++ b/tests/unit/kiro-namespace-descriptors.test.js
 @@ -0,0 +1,40 @@
@@ -1785,7 +1792,7 @@ index 0000000..a7104c8
 +});
 diff --git a/tests/unit/openai-responses-agent-messages.test.js b/tests/unit/openai-responses-agent-messages.test.js
 new file mode 100644
-index 0000000..beb6cef
+index 00000000..beb6cef3
 --- /dev/null
 +++ b/tests/unit/openai-responses-agent-messages.test.js
 @@ -0,0 +1,232 @@
@@ -2023,7 +2030,7 @@ index 0000000..beb6cef
 +});
 diff --git a/tests/unit/openai-responses-incomplete.test.js b/tests/unit/openai-responses-incomplete.test.js
 new file mode 100644
-index 0000000..7a7a2bd
+index 00000000..7a7a2bd9
 --- /dev/null
 +++ b/tests/unit/openai-responses-incomplete.test.js
 @@ -0,0 +1,67 @@
@@ -2096,7 +2103,7 @@ index 0000000..7a7a2bd
 +});
 diff --git a/tests/unit/openai-responses-namespaces.test.js b/tests/unit/openai-responses-namespaces.test.js
 new file mode 100644
-index 0000000..98995a2
+index 00000000..98995a2d
 --- /dev/null
 +++ b/tests/unit/openai-responses-namespaces.test.js
 @@ -0,0 +1,353 @@
@@ -2455,7 +2462,7 @@ index 0000000..98995a2
 +});
 diff --git a/tests/unit/openai-responses-web-search.test.js b/tests/unit/openai-responses-web-search.test.js
 new file mode 100644
-index 0000000..5851979
+index 00000000..58519791
 --- /dev/null
 +++ b/tests/unit/openai-responses-web-search.test.js
 @@ -0,0 +1,310 @@
@@ -2771,7 +2778,7 @@ index 0000000..5851979
 +});
 diff --git a/tests/unit/responses-output-index.test.js b/tests/unit/responses-output-index.test.js
 new file mode 100644
-index 0000000..f5b8bfd
+index 00000000..f5b8bfdb
 --- /dev/null
 +++ b/tests/unit/responses-output-index.test.js
 @@ -0,0 +1,78 @@
@@ -2853,3 +2860,6 @@ index 0000000..f5b8bfd
 +    expect(byEvent(calls, "response.output_item.added").map((e) => e.data.output_index)).toEqual([0, 1]);
 +  });
 +});
+-- 
+2.43.0
+

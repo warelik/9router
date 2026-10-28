@@ -1,20 +1,18 @@
-From f2d85e05fcdacf44c86658943005f39a60c1b23d Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 64347807826441ea81b2ba8c6b9f88886ccf3a6a Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Tue, 20 Oct 2026 00:00:00 +0000
 Subject: [PATCH] Align native Gemini authentication aliases across existing
- public routes
 
 ---
- src/app/api/v1beta/models/[...path]/route.js    | 11 +--
- src/dashboardGuard.js                           |  6 +-
- src/sse/services/keyAccess.js                   |  5 +-
- tests/unit/gemini-native-alpha-contract.test.js | 93 ++++++++++++++++++++++++-
- tests/unit/native-public-gemini-rewrite.test.js | 68 +++++++++++++++++-
+ src/app/api/v1beta/models/[...path]/route.js  | 11 +--
+ src/dashboardGuard.js                         |  6 +-
+ src/sse/services/keyAccess.js                 |  5 +-
+ .../unit/gemini-native-alpha-contract.test.js | 93 ++++++++++++++++++-
+ .../unit/native-public-gemini-rewrite.test.js | 68 +++++++++++++-
  5 files changed, 167 insertions(+), 16 deletions(-)
 
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index 6aa9c0a..08b4ab7 100644
+index 6aa9c0ab..08b4ab72 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -12,7 +12,7 @@ import { initTranslators } from "open-sse/translator/index.js";
@@ -43,7 +41,7 @@ index 6aa9c0a..08b4ab7 100644
  
  function normalizeGeminiNativeModel(model) {
 diff --git a/src/dashboardGuard.js b/src/dashboardGuard.js
-index e592d76..a4f783d 100644
+index 49927595..2c65331a 100644
 --- a/src/dashboardGuard.js
 +++ b/src/dashboardGuard.js
 @@ -35,7 +35,7 @@ const PUBLIC_API_PATHS = [
@@ -55,7 +53,7 @@ index e592d76..a4f783d 100644
  
  // Always require JWT token regardless of requireLogin setting
  const ALWAYS_PROTECTED = [
-@@ -145,7 +145,9 @@ function extractApiKey(request) {
+@@ -149,7 +149,9 @@ function extractApiKey(request) {
    if (apiKeyHeader) return apiKeyHeader;
    const googleApiKeyHeader = request.headers.get("x-goog-api-key");
    if (googleApiKeyHeader) return googleApiKeyHeader;
@@ -67,7 +65,7 @@ index e592d76..a4f783d 100644
  
  async function hasValidApiKey(request) {
 diff --git a/src/sse/services/keyAccess.js b/src/sse/services/keyAccess.js
-index 4450fdc..6de0e32 100644
+index 4450fdc7..6de0e321 100644
 --- a/src/sse/services/keyAccess.js
 +++ b/src/sse/services/keyAccess.js
 @@ -41,7 +41,7 @@ const canonicalModel = (provider, model) => lower(`${provider}/${model}`);
@@ -90,7 +88,7 @@ index 4450fdc..6de0e32 100644
      return null;
    }
 diff --git a/tests/unit/gemini-native-alpha-contract.test.js b/tests/unit/gemini-native-alpha-contract.test.js
-index 7a4699f..6db63a9 100644
+index 7a4699f7..6db63a9e 100644
 --- a/tests/unit/gemini-native-alpha-contract.test.js
 +++ b/tests/unit/gemini-native-alpha-contract.test.js
 @@ -3,7 +3,7 @@
@@ -217,7 +215,7 @@ index 7a4699f..6db63a9 100644
      it(`${provider}: the generic executor formats an explicitly resolved alpha version`, () => {
        const executor = new DefaultExecutor(provider);
 diff --git a/tests/unit/native-public-gemini-rewrite.test.js b/tests/unit/native-public-gemini-rewrite.test.js
-index 78978a3..faa3a3d 100644
+index 78978a37..faa3a3d9 100644
 --- a/tests/unit/native-public-gemini-rewrite.test.js
 +++ b/tests/unit/native-public-gemini-rewrite.test.js
 @@ -1,11 +1,27 @@
@@ -310,3 +308,6 @@ index 78978a3..faa3a3d 100644
 +    }
 +  });
 +});
+-- 
+2.43.0
+

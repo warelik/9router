@@ -1,8 +1,7 @@
-From e7e97aae6d57651bb303f14bf0da3e0c3ebcd882 Mon Sep 17 00:00:00 2001
+From 49fabef1a6aa85daaa11f2329c1b8ebc39ba03bb Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 27 Oct 2026 05:50:47 +0000
 Subject: [PATCH] Restore mapped tool names on native Gemini and frame the
- final buffered stream line
 
 ---
  open-sse/utils/stream.js                | 45 +++++++++++++++++++++++--
@@ -10,7 +9,7 @@ Subject: [PATCH] Restore mapped tool names on native Gemini and frame the
  2 files changed, 83 insertions(+), 3 deletions(-)
 
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index ec0ae9e..bc43f57 100644
+index ec0ae9e6..bc43f570 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -41,6 +41,21 @@ const PENDING_COMPLETION_FLUSH_MS = 3000;
@@ -94,7 +93,7 @@ index ec0ae9e..bc43f57 100644
              controller.enqueue(sharedEncoder.encode(output));
            }
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index e811e69..d993062 100644
+index e811e69e..d993062b 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -35,7 +35,7 @@ const chunk = {

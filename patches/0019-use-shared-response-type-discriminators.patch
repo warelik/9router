@@ -1,6 +1,5 @@
-From 7fddfec1c3e355793cab9d1efc7955dbf69408af Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 7fdd9ab48fa0d51e8e81bc271a8d01f264d21fa4 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Tue, 20 Oct 2026 00:00:00 +0000
 Subject: [PATCH] Use shared schema discriminators in Responses normalization
 
@@ -9,7 +8,7 @@ Subject: [PATCH] Use shared schema discriminators in Responses normalization
  1 file changed, 4 insertions(+), 4 deletions(-)
 
 diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
-index 1b63d64..ea75cc1 100644
+index 1b63d644..ea75cc1f 100644
 --- a/open-sse/translator/formats/responsesApi.js
 +++ b/open-sse/translator/formats/responsesApi.js
 @@ -33,16 +33,16 @@ export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
@@ -41,3 +40,6 @@ index 1b63d64..ea75cc1 100644
        const message = normalizeResponsesAgentMessage(item);
        const parts = Array.isArray(message.content)
          ? message.content.filter((c) => c?.type === RESPONSES_ITEM.INPUT_TEXT)
+-- 
+2.43.0
+

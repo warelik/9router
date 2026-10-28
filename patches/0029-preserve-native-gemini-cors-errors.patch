@@ -1,19 +1,17 @@
-From 51e51716c4f1ca7dbd3201449ed4ffbf1f2482b4 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 9c653eb6e17476b3f9ff626ea61fecbbabec5b88 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Thu, 22 Oct 2026 23:14:15 +0000
 Subject: [PATCH] Expose native Gemini error responses with the established
- CORS policy
 
 ---
  src/app/api/v1/models/[...model]/route.js    |  2 +-
- src/app/api/v1beta/models/[...path]/route.js | 13 +++++++++++--
+ src/app/api/v1beta/models/[...path]/route.js | 13 ++++++++++--
  tests/unit/gemini-native-api-version.test.js |  1 +
- tests/unit/gemini-native-endpoint.test.js    | 21 ++++++++++++++++++++-
+ tests/unit/gemini-native-endpoint.test.js    | 21 +++++++++++++++++++-
  4 files changed, 33 insertions(+), 4 deletions(-)
 
 diff --git a/src/app/api/v1/models/[...model]/route.js b/src/app/api/v1/models/[...model]/route.js
-index 6a17ea5..8ffcecc 100644
+index 6a17ea5e..8ffcecc0 100644
 --- a/src/app/api/v1/models/[...model]/route.js
 +++ b/src/app/api/v1/models/[...model]/route.js
 @@ -18,7 +18,7 @@ export async function OPTIONS() {
@@ -26,7 +24,7 @@ index 6a17ea5..8ffcecc 100644
    });
  }
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index 392aac0..203cac0 100644
+index 392aac00..203cac04 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -37,7 +37,7 @@ export async function OPTIONS() {
@@ -57,7 +55,7 @@ index 392aac0..203cac0 100644
  
    try {
 diff --git a/tests/unit/gemini-native-api-version.test.js b/tests/unit/gemini-native-api-version.test.js
-index 9c79c90..732837d 100644
+index 9c79c900..732837d7 100644
 --- a/tests/unit/gemini-native-api-version.test.js
 +++ b/tests/unit/gemini-native-api-version.test.js
 @@ -42,6 +42,7 @@ describe("Gemini native stable and beta API versions", () => {
@@ -69,7 +67,7 @@ index 9c79c90..732837d 100644
  
    // The earlier isolated alias tests missed the existing [...model] directory:
 diff --git a/tests/unit/gemini-native-endpoint.test.js b/tests/unit/gemini-native-endpoint.test.js
-index e45cc66..bde0927 100644
+index e45cc666..bde0927f 100644
 --- a/tests/unit/gemini-native-endpoint.test.js
 +++ b/tests/unit/gemini-native-endpoint.test.js
 @@ -40,7 +40,7 @@ vi.mock("open-sse/utils/proxyFetch.js", () => ({
@@ -107,3 +105,6 @@ index e45cc66..bde0927 100644
    it("lists Gemini TTS models using standard Google model names", async () => {
      const response = await GET();
      const body = await response.json();
+-- 
+2.43.0
+

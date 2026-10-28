@@ -1,17 +1,15 @@
-From 78400d506b828ac78b065579dea5f097101585da Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From d66508aee52ac991151ab98bd0c678cf9acdbdf3 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Fri, 23 Oct 2026 01:25:24 +0000
 Subject: [PATCH] Keep per-request Gemini response continuity in the Zed
- executor
 
 ---
- open-sse/executors/zed.js               |  24 +++++--
- tests/unit/zed-completions-wire.test.js | 117 ++++++++++++++++++++++++++++++++
+ open-sse/executors/zed.js               |  24 ++++-
+ tests/unit/zed-completions-wire.test.js | 117 ++++++++++++++++++++++++
  2 files changed, 136 insertions(+), 5 deletions(-)
 
 diff --git a/open-sse/executors/zed.js b/open-sse/executors/zed.js
-index 5d3a7e7..1233e77 100644
+index 5d3a7e79..1233e772 100644
 --- a/open-sse/executors/zed.js
 +++ b/open-sse/executors/zed.js
 @@ -90,9 +90,16 @@ function buildProviderRequest(provider, model, body, stream, credentials) {
@@ -72,7 +70,7 @@ index 5d3a7e7..1233e77 100644
        response: wrapped,
        url: `${this.config?.llmBaseUrl || "https://cloud.zed.dev"}/completions`,
 diff --git a/tests/unit/zed-completions-wire.test.js b/tests/unit/zed-completions-wire.test.js
-index f8c9b53..88e4787 100644
+index f8c9b53f..88e47879 100644
 --- a/tests/unit/zed-completions-wire.test.js
 +++ b/tests/unit/zed-completions-wire.test.js
 @@ -5,6 +5,13 @@
@@ -210,3 +208,6 @@ index f8c9b53..88e4787 100644
 +    }
 +  });
 +});
+-- 
+2.43.0
+

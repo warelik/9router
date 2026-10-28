@@ -1,26 +1,25 @@
-From ac53f5c21ca5b7fb21263bc324240e98f80c014b Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From f81eb67a1dfa4732c58bf2b017841ecd2fa98aca Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Centralize inline native Gemini configuration
 
 ---
- open-sse/config/runtimeConfig.js                  | 24 +++++++++++++
- open-sse/executors/codex.js                       |  4 +--
- open-sse/executors/default.js                     |  4 +--
- open-sse/handlers/chatCore.js                     | 10 +++---
- open-sse/handlers/chatCore/nonStreamingHandler.js |  4 +--
- open-sse/handlers/chatCore/streamingHandler.js    |  6 ++--
- open-sse/translator/formats/gemini.js             |  4 +--
- open-sse/utils/antigravityNative.js               | 24 ++++++++-----
- open-sse/utils/stream.js                          | 10 +++---
- open-sse/utils/streamHelpers.js                   |  4 +--
- tests/unit/chat-to-gemini-contract.test.js        | 41 +++++++++++++++++++++++
- tests/unit/gemini-native-core.test.js             | 20 +++++++++++
+ open-sse/config/runtimeConfig.js              | 24 +++++++++++
+ open-sse/executors/codex.js                   |  4 +-
+ open-sse/executors/default.js                 |  4 +-
+ open-sse/handlers/chatCore.js                 | 10 ++---
+ .../handlers/chatCore/nonStreamingHandler.js  |  4 +-
+ .../handlers/chatCore/streamingHandler.js     |  6 +--
+ open-sse/translator/formats/gemini.js         |  4 +-
+ open-sse/utils/antigravityNative.js           | 24 +++++++----
+ open-sse/utils/stream.js                      | 10 ++---
+ open-sse/utils/streamHelpers.js               |  4 +-
+ tests/unit/chat-to-gemini-contract.test.js    | 41 +++++++++++++++++++
+ tests/unit/gemini-native-core.test.js         | 20 +++++++++
  12 files changed, 124 insertions(+), 31 deletions(-)
 
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index ee80f28..047ae40 100644
+index ee80f288..047ae407 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
 @@ -1,3 +1,5 @@
@@ -63,7 +62,7 @@ index ee80f28..047ae40 100644
 +export const AISTUDIO_NATIVE_GEMINI_API_VERSION = "v1beta";
 +export const GEMINI_DEFAULT_FILE_MIME_TYPE = "application/octet-stream";
 diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
-index 56aae02..da08244 100644
+index 56aae02c..da082449 100644
 --- a/open-sse/executors/codex.js
 +++ b/open-sse/executors/codex.js
 @@ -9,7 +9,7 @@ import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
@@ -85,7 +84,7 @@ index 56aae02..da08244 100644
              const event = JSON.parse(data);
              if (event?.type === "error" || event?.type === "response.failed") {
 diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
-index 93f8a23..3c8cbaa 100644
+index 13ba909b..eeb87f07 100644
 --- a/open-sse/executors/default.js
 +++ b/open-sse/executors/default.js
 @@ -4,7 +4,7 @@ import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
@@ -97,7 +96,7 @@ index 93f8a23..3c8cbaa 100644
  import { buildClineHeaders } from "../shared/clineAuth.js";
  import { proxyAwareFetch } from "../utils/proxyFetch.js";
  import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
-@@ -188,7 +188,7 @@ export class DefaultExecutor extends BaseExecutor {
+@@ -203,7 +203,7 @@ export class DefaultExecutor extends BaseExecutor {
        // The caller has resolved the provider wire version. Format it without
        // overriding that routing decision for any Gemini-format provider.
        const nativeVersion = credentials?.nativeGeminiPassthrough
@@ -107,7 +106,7 @@ index 93f8a23..3c8cbaa 100644
        const baseUrl = nativeVersion
          ? this.config.baseUrl.replace("/v1beta/", `/${nativeVersion}/`) : this.config.baseUrl;
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index 22bc1aa..7f3e687 100644
+index 22bc1aa3..7f3e687e 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
 @@ -12,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
@@ -151,7 +150,7 @@ index 22bc1aa..7f3e687 100644
        nativeErrorResponse = new Response(providerResponse.clone().body, {
          status: providerResponse.status, statusText: providerResponse.statusText, headers,
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index e21d797..f46bddd 100644
+index 6f9203b0..6c82785b 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
 @@ -7,7 +7,7 @@ import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTrackin
@@ -173,7 +172,7 @@ index e21d797..f46bddd 100644
    headers.set("Access-Control-Allow-Origin", "*");
    const result = createErrorResult(status, message);
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index bafb215..d0ce6a1 100644
+index 28bb1880..15a9136f 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -3,7 +3,7 @@ import { needsTranslation } from "../../translator/index.js";
@@ -204,7 +203,7 @@ index bafb215..d0ce6a1 100644
        clientCancelled,
      }) : null);
 diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
-index 48f2c61..7721a4c 100644
+index 36d47488..81b2712f 100644
 --- a/open-sse/translator/formats/gemini.js
 +++ b/open-sse/translator/formats/gemini.js
 @@ -3,7 +3,7 @@
@@ -226,7 +225,7 @@ index 48f2c61..7721a4c 100644
      parts.push({ fileData: { fileUri: file.file_url, ...(mime ? { mimeType: mime } : {}) } });
    }
 diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
-index b987c3d..6629b3f 100644
+index b987c3d8..6629b3f4 100644
 --- a/open-sse/utils/antigravityNative.js
 +++ b/open-sse/utils/antigravityNative.js
 @@ -1,3 +1,11 @@
@@ -307,7 +306,7 @@ index b987c3d..6629b3f 100644
        return;
      }
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 79550bb..a254fe6 100644
+index 79550bb4..a254fe67 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -1,7 +1,7 @@
@@ -349,7 +348,7 @@ index 79550bb..a254fe6 100644
            controller.enqueue(sharedEncoder.encode(doneOutput));
            streamDoneSent = true;
 diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
-index 07c9284..571d03d 100644
+index 07c9284b..571d03df 100644
 --- a/open-sse/utils/streamHelpers.js
 +++ b/open-sse/utils/streamHelpers.js
 @@ -2,7 +2,7 @@ import { FORMATS } from "../translator/formats.js";
@@ -371,7 +370,7 @@ index 07c9284..571d03d 100644
      // Keep the numeric failure code instead of an OpenAI symbolic error code.
      return sharedEncoder.encode(formatSSE({ error: { code: statusCode, message: error.message } }, clientFormat));
 diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
-index 0b92ab8..2d27dac 100644
+index 0b92ab89..2d27dac8 100644
 --- a/tests/unit/chat-to-gemini-contract.test.js
 +++ b/tests/unit/chat-to-gemini-contract.test.js
 @@ -48,6 +48,19 @@ import {
@@ -430,7 +429,7 @@ index 0b92ab8..2d27dac 100644
  
  describe("Antigravity executor contract on translated Gemini bodies", () => {
 diff --git a/tests/unit/gemini-native-core.test.js b/tests/unit/gemini-native-core.test.js
-index 38c620a..3d8e753 100644
+index 38c620a1..3d8e7538 100644
 --- a/tests/unit/gemini-native-core.test.js
 +++ b/tests/unit/gemini-native-core.test.js
 @@ -1,6 +1,7 @@
@@ -474,3 +473,6 @@ index 38c620a..3d8e753 100644
      it(`${provider}: preserves a projected null wrapper without inventing a failure`, async () => {
        const response = { response: null };
        const succeeded = vi.fn();
+-- 
+2.43.0
+

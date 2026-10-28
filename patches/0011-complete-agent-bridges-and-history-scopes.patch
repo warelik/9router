@@ -1,18 +1,18 @@
-From ab66bf37823b178dea8d96a693f020d6dfe4a894 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 23759d1a1ca33b991a6c68e938dfc94b082fb5b4 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Tue, 20 Oct 2026 00:00:00 +0000
 Subject: [PATCH] Fix mixed agent messages and Gemini instruction-prefix replay
 
 ---
- open-sse/translator/formats/responsesApi.js        |  11 ++-
- open-sse/translator/request/openai-responses.js    |   2 +-
- open-sse/translator/request/openai-to-gemini.js    |  34 ++++---
- ...wnstream-translator-history-regressions.test.js | 103 +++++++++++++++++++++
+ open-sse/translator/formats/responsesApi.js   |  11 +-
+ .../translator/request/openai-responses.js    |   2 +-
+ .../translator/request/openai-to-gemini.js    |  34 +++---
+ ...eam-translator-history-regressions.test.js | 103 ++++++++++++++++++
  4 files changed, 133 insertions(+), 17 deletions(-)
+ create mode 100644 tests/unit/downstream-translator-history-regressions.test.js
 
 diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
-index ca2e59a..1b63d64 100644
+index ca2e59a8..1b63d644 100644
 --- a/open-sse/translator/formats/responsesApi.js
 +++ b/open-sse/translator/formats/responsesApi.js
 @@ -32,7 +32,7 @@ export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
@@ -48,7 +48,7 @@ index ca2e59a..1b63d64 100644
      // Fallback: if no type but has role property, treat as message
      const itemType = item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);
 diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
-index ddddd41..1545b89 100644
+index ddddd41d..1545b896 100644
 --- a/open-sse/translator/request/openai-responses.js
 +++ b/open-sse/translator/request/openai-responses.js
 @@ -101,7 +101,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
@@ -61,7 +61,7 @@ index ddddd41..1545b89 100644
      // Fallback: if no type but has role property, treat as message
      const itemType = item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);
 diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
-index 5ca519c..dd757d4 100644
+index 5ca519ce..dd757d49 100644
 --- a/open-sse/translator/request/openai-to-gemini.js
 +++ b/open-sse/translator/request/openai-to-gemini.js
 @@ -93,6 +93,18 @@ function createToolCallIdUniquifier() {
@@ -137,7 +137,7 @@ index 5ca519c..dd757d4 100644
            ? null
 diff --git a/tests/unit/downstream-translator-history-regressions.test.js b/tests/unit/downstream-translator-history-regressions.test.js
 new file mode 100644
-index 0000000..29d983a
+index 00000000..29d983a8
 --- /dev/null
 +++ b/tests/unit/downstream-translator-history-regressions.test.js
 @@ -0,0 +1,103 @@
@@ -244,3 +244,6 @@ index 0000000..29d983a
 +    expect(isolatedParts).not.toContainEqual(searchPart);
 +  });
 +});
+-- 
+2.43.0
+

@@ -1,38 +1,37 @@
-From 77cc43123e4c03a4b4424262fc4c953a0f710d29 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From c94b7475c335271f4b686eee47cee3cf9df3a28a Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Use shared translator protocol discriminators
 
 ---
- open-sse/executors/antigravity.js                 |  2 +-
- open-sse/executors/codex.js                       | 29 +++++++------
- open-sse/executors/default.js                     |  5 ++-
- open-sse/executors/zed.js                         |  2 +-
- open-sse/handlers/chatCore.js                     |  2 +-
- open-sse/handlers/chatCore/nonStreamingHandler.js | 14 +++---
- open-sse/handlers/chatCore/streamingHandler.js    |  2 +-
- open-sse/providers/registry/aistudio.js           |  4 +-
- open-sse/services/aistudioModels.js               |  4 +-
- open-sse/services/provider.js                     |  3 +-
- open-sse/translator/concerns/thinkingUnified.js   |  5 ++-
- open-sse/translator/concerns/toolCall.js          | 15 ++++---
- open-sse/translator/formats/gemini.js             |  4 +-
- open-sse/translator/index.js                      |  6 ++-
- open-sse/translator/request/openai-responses.js   |  4 +-
- open-sse/translator/request/openai-to-gemini.js   |  4 +-
- open-sse/translator/response/openai-responses.js  |  8 ++--
- open-sse/translator/schema/blocks.js              |  5 +++
- open-sse/translator/schema/index.js               |  1 +
- open-sse/utils/antigravityNative.js               | 16 ++++---
- open-sse/utils/opencodeFingerprint.js             | 16 ++++---
- open-sse/utils/stream.js                          |  2 +-
- tests/unit/codex-hosted-search-history.test.js    |  6 +++
- tests/unit/openai-responses-web-search.test.js    | 52 +++++++++++++++++++++++
+ open-sse/executors/antigravity.js             |  2 +-
+ open-sse/executors/codex.js                   | 29 ++++++-----
+ open-sse/executors/default.js                 |  5 +-
+ open-sse/executors/zed.js                     |  2 +-
+ open-sse/handlers/chatCore.js                 |  2 +-
+ .../handlers/chatCore/nonStreamingHandler.js  | 14 ++---
+ .../handlers/chatCore/streamingHandler.js     |  2 +-
+ open-sse/providers/registry/aistudio.js       |  4 +-
+ open-sse/services/aistudioModels.js           |  4 +-
+ open-sse/services/provider.js                 |  3 +-
+ .../translator/concerns/thinkingUnified.js    |  5 +-
+ open-sse/translator/concerns/toolCall.js      | 15 +++---
+ open-sse/translator/formats/gemini.js         |  4 +-
+ open-sse/translator/index.js                  |  6 ++-
+ .../translator/request/openai-responses.js    |  4 +-
+ .../translator/request/openai-to-gemini.js    |  4 +-
+ .../translator/response/openai-responses.js   |  8 +--
+ open-sse/translator/schema/blocks.js          |  5 ++
+ open-sse/translator/schema/index.js           |  1 +
+ open-sse/utils/antigravityNative.js           | 16 +++---
+ open-sse/utils/opencodeFingerprint.js         | 16 +++---
+ open-sse/utils/stream.js                      |  2 +-
+ .../unit/codex-hosted-search-history.test.js  |  6 +++
+ .../unit/openai-responses-web-search.test.js  | 52 +++++++++++++++++++
  24 files changed, 145 insertions(+), 66 deletions(-)
 
 diff --git a/open-sse/executors/antigravity.js b/open-sse/executors/antigravity.js
-index bfe6044..5acfcba 100644
+index bfe60443..5acfcba0 100644
 --- a/open-sse/executors/antigravity.js
 +++ b/open-sse/executors/antigravity.js
 @@ -433,7 +433,7 @@ export class AntigravityExecutor extends BaseExecutor {
@@ -45,7 +44,7 @@ index bfe6044..5acfcba 100644
      const result = await super.execute(options);
      if (options.credentials?.nativeGeminiPassthrough) {
 diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
-index da08244..67b766b 100644
+index da082449..67b766b2 100644
 --- a/open-sse/executors/codex.js
 +++ b/open-sse/executors/codex.js
 @@ -1,4 +1,5 @@
@@ -132,7 +131,7 @@ index da08244..67b766b 100644
          input.unshift(...prefix);
        }
 diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
-index 3c8cbaa..9e8d87c 100644
+index eeb87f07..3db85f6e 100644
 --- a/open-sse/executors/default.js
 +++ b/open-sse/executors/default.js
 @@ -9,6 +9,7 @@ import { buildClineHeaders } from "../shared/clineAuth.js";
@@ -143,7 +142,7 @@ index 3c8cbaa..9e8d87c 100644
  import { adaptAIStudioStructuredOutput } from "../translator/formats/gemini.js";
  import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
  
-@@ -79,11 +80,11 @@ const REFRESH_GRANTS = Object.fromEntries(
+@@ -94,11 +95,11 @@ const REFRESH_GRANTS = Object.fromEntries(
  
  function isResponsesWire(provider, config, credentials) {
    const runtimeFormat = credentials?.runtimeTransport?.format;
@@ -158,7 +157,7 @@ index 3c8cbaa..9e8d87c 100644
  
  function normalizeResponsesReasoning(body) {
 diff --git a/open-sse/executors/zed.js b/open-sse/executors/zed.js
-index 1233e77..bfe3a2c 100644
+index 1233e772..bfe3a2cc 100644
 --- a/open-sse/executors/zed.js
 +++ b/open-sse/executors/zed.js
 @@ -68,7 +68,7 @@ function buildProviderRequest(provider, model, body, stream, credentials) {
@@ -171,7 +170,7 @@ index 1233e77..bfe3a2c 100644
      // public Gemini API enum the shared translator emits (`OFF`, `CIVIC_INTEGRITY`,
      // `DANGEROUS_CONTENT`). Drop client-side safetySettings for the Zed Google
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index 7f3e687..62b43f4 100644
+index 7f3e687e..62b43f41 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
 @@ -66,7 +66,7 @@ export function stripContinuityFields(body) {
@@ -184,7 +183,7 @@ index 7f3e687..62b43f4 100644
    // Stable per-session color so all lines of one CLI conversation share a tag
    const sessionSeed = (() => {
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index f46bddd..7cecf62 100644
+index 6c82785b..c3dbc3b0 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
 @@ -14,7 +14,7 @@ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, sav
@@ -227,7 +226,7 @@ index f46bddd..7cecf62 100644
      }
      // Same hand-off as the OpenAI-shaped branches above: Claude and Responses clients must not
      // receive a bare chat.completion body.
-@@ -344,7 +344,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
+@@ -352,7 +352,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
      }
      if (responseBody.error) {
        const reportedCode = Number(responseBody.error.code);
@@ -237,7 +236,7 @@ index f46bddd..7cecf62 100644
        const message = typeof responseBody.error.message === "string"
          ? responseBody.error.message : `Native Gemini error from ${provider}`;
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index d0ce6a1..f7803ee 100644
+index 15a9136f..094ae16f 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -67,7 +67,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
@@ -250,7 +249,7 @@ index d0ce6a1..f7803ee 100644
      else console.warn(`[STREAM] ${provider} | ${model} | blocked pipe: ${shortMsg} [${status}]`);
      streamController?.handleError?.(new Error(`upstream non-SSE: ${status}`));
 diff --git a/open-sse/providers/registry/aistudio.js b/open-sse/providers/registry/aistudio.js
-index 71b07e5..2eeed51 100644
+index 71b07e57..2eeed51b 100644
 --- a/open-sse/providers/registry/aistudio.js
 +++ b/open-sse/providers/registry/aistudio.js
 @@ -3,6 +3,8 @@
@@ -272,7 +271,7 @@ index 71b07e5..2eeed51 100644
      auth: {
        apiKey: {
 diff --git a/open-sse/services/aistudioModels.js b/open-sse/services/aistudioModels.js
-index 1681724..cd8ec80 100644
+index 1681724a..cd8ec80c 100644
 --- a/open-sse/services/aistudioModels.js
 +++ b/open-sse/services/aistudioModels.js
 @@ -1,12 +1,12 @@
@@ -291,7 +290,7 @@ index 1681724..cd8ec80 100644
    const res = await proxyAwareFetch(PROVIDERS.aistudio.validateUrl, {
      headers: {
 diff --git a/open-sse/services/provider.js b/open-sse/services/provider.js
-index a15cb6f..c6bcba8 100644
+index a15cb6fa..c6bcba8b 100644
 --- a/open-sse/services/provider.js
 +++ b/open-sse/services/provider.js
 @@ -1,5 +1,6 @@
@@ -311,7 +310,7 @@ index a15cb6f..c6bcba8 100644
      && model.startsWith("gemini-") && !/image|imagen/i.test(model);
  }
 diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
-index f1bc7d3..740ddf9 100644
+index a1934b26..c0502756 100644
 --- a/open-sse/translator/concerns/thinkingUnified.js
 +++ b/open-sse/translator/concerns/thinkingUnified.js
 @@ -7,6 +7,7 @@ import { getThinkingLevels } from "../../providers/thinkingLevels.js";
@@ -322,7 +321,7 @@ index f1bc7d3..740ddf9 100644
  
  // Map a target wire-format to its native thinking format (when capability has none).
  const FORMAT_TO_NATIVE = {
-@@ -459,7 +460,7 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
+@@ -454,7 +455,7 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
    const fmt = resolveFormat(targetFormat, cleanModel, provider);
    const supportedLevels = getThinkingLevels(provider, cleanModel);
    // A translated/native Responses request already owns its wire options; preserve explicit effort and opaque reasoning fields without inventing a summary.
@@ -331,7 +330,7 @@ index f1bc7d3..740ddf9 100644
      const current = body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning) ? body.reasoning : {};
      const rawEffort = body.reasoning_effort ?? current.effort;
      const inferred = cfg.mode === "none" ? "none" : toLevel(cfg);
-@@ -496,7 +497,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
+@@ -491,7 +492,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
  
    // Reuse the capability-aware mapping, without its translated-request output
    // floor or its replacement of client-native options such as includeThoughts.
@@ -341,7 +340,7 @@ index f1bc7d3..740ddf9 100644
    const thinking = { ...clientThinking };
    for (const key of NATIVE_GEMINI_THINKING_KEYS) delete thinking[key];
 diff --git a/open-sse/translator/concerns/toolCall.js b/open-sse/translator/concerns/toolCall.js
-index 95cca8b..51d2372 100644
+index 95cca8b6..51d2372f 100644
 --- a/open-sse/translator/concerns/toolCall.js
 +++ b/open-sse/translator/concerns/toolCall.js
 @@ -1,6 +1,7 @@
@@ -415,7 +414,7 @@ index 95cca8b..51d2372 100644
        }
      }
 diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
-index 7721a4c..7bc6d1e 100644
+index 81b2712f..72ec5393 100644
 --- a/open-sse/translator/formats/gemini.js
 +++ b/open-sse/translator/formats/gemini.js
 @@ -1,7 +1,7 @@
@@ -427,7 +426,7 @@ index 7721a4c..7bc6d1e 100644
  import { isGemini4Model } from "../../providers/capabilities.js";
  import { FILE_EXTENSION_MIME, GEMINI_DEFAULT_FILE_MIME_TYPE, SCHEMA_MAP_KEYS, SCHEMA_ARRAY_KEYS, SCHEMA_SINGLE_KEYS,
    PROTO_SCHEMA_TYPES, LEGACY_PROTO_SCHEMA_KEYS } from "../../config/runtimeConfig.js";
-@@ -568,7 +568,7 @@ export function normalizeGeminiContents(contents, modelOrOptions = null, extraOp
+@@ -639,7 +639,7 @@ export function normalizeGeminiContents(contents, modelOrOptions = null, extraOp
            if (call.id) fr.id = call.id;
            return { functionResponse: fr };
          });
@@ -437,7 +436,7 @@ index 7721a4c..7bc6d1e 100644
      } else {
        out.push({ role: "user", parts: [{ text: "Continue." }] });
 diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
-index 886c03a..f5c7538 100644
+index 886c03ad..f5c75389 100644
 --- a/open-sse/translator/index.js
 +++ b/open-sse/translator/index.js
 @@ -1,4 +1,5 @@
@@ -466,7 +465,7 @@ index 886c03a..f5c7538 100644
      const webSearchEnabled = wantsWebSearch && targetFormat === FORMATS.GEMINI && (provider === "gemini" || provider === "aistudio")
        && getCapabilitiesForModel(provider, stripThinkingSuffix(String(model ?? ""))).serverSideToolInvocations === true;
 diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
-index e59f8be..59f01c0 100644
+index e59f8be6..59f01c09 100644
 --- a/open-sse/translator/request/openai-responses.js
 +++ b/open-sse/translator/request/openai-responses.js
 @@ -243,7 +243,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
@@ -488,7 +487,7 @@ index e59f8be..59f01c0 100644
    if (customToolNames.size > 0) result._customToolNames = [...customToolNames];
    if (namespaceToolMap.size > 0) result._toolNameMap = namespaceToolMap;
 diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
-index 89b027d..5e2876e 100644
+index 89b027d7..5e2876e1 100644
 --- a/open-sse/translator/request/openai-to-gemini.js
 +++ b/open-sse/translator/request/openai-to-gemini.js
 @@ -23,7 +23,7 @@ import {
@@ -510,7 +509,7 @@ index 89b027d..5e2876e 100644
        } else if (choice === "required") {
          result.toolConfig = { functionCallingConfig: { mode: "ANY" } };
 diff --git a/open-sse/translator/response/openai-responses.js b/open-sse/translator/response/openai-responses.js
-index 2e5cc35..9f309b8 100644
+index 2e5cc352..9f309b8b 100644
 --- a/open-sse/translator/response/openai-responses.js
 +++ b/open-sse/translator/response/openai-responses.js
 @@ -8,7 +8,7 @@ import { buildChunk } from "../concerns/chunk.js";
@@ -550,7 +549,7 @@ index 2e5cc35..9f309b8 100644
      const idx = (key && state.respToolChatIndex?.get(key)) ?? Math.max(0, (state.toolCallIndex || 1) - 1);
      const fullArgs = data.item?.arguments;
 diff --git a/open-sse/translator/schema/blocks.js b/open-sse/translator/schema/blocks.js
-index cbaf40a..fe41f2c 100644
+index cbaf40a8..fe41f2c7 100644
 --- a/open-sse/translator/schema/blocks.js
 +++ b/open-sse/translator/schema/blocks.js
 @@ -39,6 +39,7 @@ export const RESPONSES_ITEM = {
@@ -576,7 +575,7 @@ index cbaf40a..fe41f2c 100644
  export const VALID_OPENAI_CONTENT_TYPES = [
    OPENAI_BLOCK.TEXT, OPENAI_BLOCK.IMAGE_URL, OPENAI_BLOCK.IMAGE, OPENAI_BLOCK.INPUT_AUDIO, OPENAI_BLOCK.AUDIO_URL, OPENAI_BLOCK.FILE,
 diff --git a/open-sse/translator/schema/index.js b/open-sse/translator/schema/index.js
-index 835be17..0f5f556 100644
+index 835be17f..0f5f5563 100644
 --- a/open-sse/translator/schema/index.js
 +++ b/open-sse/translator/schema/index.js
 @@ -3,6 +3,7 @@ export { ROLE, GEMINI_ROLE } from "./roles.js";
@@ -588,7 +587,7 @@ index 835be17..0f5f556 100644
  export { OPENAI_FINISH, CLAUDE_STOP, GEMINI_FINISH, RESPONSES_STATUS, RESPONSES_INCOMPLETE_REASON } from "./finishReasons.js";
  export { CLAUDE_EVENT, CLAUDE_DELTA, RESPONSES_EVENT, RESPONSES_EVENT_PREFIX } from "./streamEvents.js";
 diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
-index 6629b3f..5761ed8 100644
+index 6629b3f4..5761ed80 100644
 --- a/open-sse/utils/antigravityNative.js
 +++ b/open-sse/utils/antigravityNative.js
 @@ -4,7 +4,9 @@ import {
@@ -659,7 +658,7 @@ index 6629b3f..5761ed8 100644
    };
    const line = (value, controller) => {
 diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
-index 36c0efb..5588b46 100644
+index 36c0efba..5588b46c 100644
 --- a/open-sse/utils/opencodeFingerprint.js
 +++ b/open-sse/utils/opencodeFingerprint.js
 @@ -1,3 +1,5 @@
@@ -716,7 +715,7 @@ index 36c0efb..5588b46 100644
      if (restored !== item) put("item", restored);
    }
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index a254fe6..733be6e 100644
+index a254fe67..733be6e4 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -194,7 +194,7 @@ export function createSSEStream(options = {}) {
@@ -729,7 +728,7 @@ index a254fe6..733be6e 100644
          error: typeof error.message === "string" ? error.message : "Upstream Gemini stream failed",
        };
 diff --git a/tests/unit/codex-hosted-search-history.test.js b/tests/unit/codex-hosted-search-history.test.js
-index e34ca44..2b486fa 100644
+index e34ca443..2b486faa 100644
 --- a/tests/unit/codex-hosted-search-history.test.js
 +++ b/tests/unit/codex-hosted-search-history.test.js
 @@ -1,3 +1,4 @@
@@ -750,7 +749,7 @@ index e34ca44..2b486fa 100644
      const executor = new CodexExecutor();
      const body = executor.transformRequest("gpt-6.1-sol", {
 diff --git a/tests/unit/openai-responses-web-search.test.js b/tests/unit/openai-responses-web-search.test.js
-index aef21c1..32e9709 100644
+index aef21c1d..32e97091 100644
 --- a/tests/unit/openai-responses-web-search.test.js
 +++ b/tests/unit/openai-responses-web-search.test.js
 @@ -117,6 +117,12 @@ describe("Responses web_search request translation", () => {
@@ -826,3 +825,6 @@ index aef21c1..32e9709 100644
    it("anchors server parts to the turn key when the turn ends on text", async () => {
      const credentials = session();
      const textParts = [
+-- 
+2.43.0
+

@@ -1,18 +1,16 @@
-From d493d9e4b0c8d31082c58965a80954064a4d81c1 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From c079138a8625a0e55b73740db9ece75d8c7dfd18 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Fri, 23 Oct 2026 01:25:24 +0000
 Subject: [PATCH] Validate both complete Claude signature encodings before
- forwarding
 
 ---
- open-sse/translator/formats/claude.js              | 12 +++--
- open-sse/utils/claudeSignature.js                  | 37 ++++++++++-----
- tests/unit/claude-signature-versioned-form.test.js | 53 +++++++++++++++++++++-
+ open-sse/translator/formats/claude.js         | 12 +++--
+ open-sse/utils/claudeSignature.js             | 37 +++++++++----
+ .../claude-signature-versioned-form.test.js   | 53 ++++++++++++++++++-
  3 files changed, 85 insertions(+), 17 deletions(-)
 
 diff --git a/open-sse/translator/formats/claude.js b/open-sse/translator/formats/claude.js
-index 8d8adab..4713c04 100644
+index 8d8adab1..4713c046 100644
 --- a/open-sse/translator/formats/claude.js
 +++ b/open-sse/translator/formats/claude.js
 @@ -4,7 +4,7 @@ import { ROLE, CLAUDE_BLOCK } from "../schema/index.js";
@@ -51,7 +49,7 @@ index 8d8adab..4713c04 100644
                } else if (deepSeekServed) {
                  hasKeptThinking = true;
 diff --git a/open-sse/utils/claudeSignature.js b/open-sse/utils/claudeSignature.js
-index 1f54182..0b865e3 100644
+index 1f541825..0b865e30 100644
 --- a/open-sse/utils/claudeSignature.js
 +++ b/open-sse/utils/claudeSignature.js
 @@ -8,7 +8,7 @@ const MAX_CLAUDE_SIGNATURE_LEN = 32 * 1024 * 1024;
@@ -110,7 +108,7 @@ index 1f54182..0b865e3 100644
 +  return normalizeClaudeSignature(rawSignature) !== null;
 +}
 diff --git a/tests/unit/claude-signature-versioned-form.test.js b/tests/unit/claude-signature-versioned-form.test.js
-index ad68260..f53e10b 100644
+index ad682605..f53e10bb 100644
 --- a/tests/unit/claude-signature-versioned-form.test.js
 +++ b/tests/unit/claude-signature-versioned-form.test.js
 @@ -1,5 +1,5 @@
@@ -185,3 +183,6 @@ index ad68260..f53e10b 100644
    it("keeps a C-form thinking block and adds no placeholder (normalizeClaudePassthrough)", () => {
      const body = historyWith(cForm);
      normalizeClaudePassthrough(body, "claude-opus-5-5");
+-- 
+2.43.0
+

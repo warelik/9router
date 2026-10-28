@@ -1,8 +1,7 @@
-From cbbfb5c3f2dcbb1a768f48a8540d5d0435a0375b Mon Sep 17 00:00:00 2001
+From 02759ce02a808a30fdc0217a099cd1fd7957b1b1 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 27 Oct 2026 08:28:01 +0000
 Subject: [PATCH] Terminate the restored final native SSE event before closing
- the stream
 
 ---
  open-sse/utils/stream.js                | 7 ++++---
@@ -10,7 +9,7 @@ Subject: [PATCH] Terminate the restored final native SSE event before closing
  2 files changed, 5 insertions(+), 3 deletions(-)
 
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 47a2b33..0f2b994 100644
+index 47a2b33a..0f2b994e 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -794,11 +794,12 @@ export function createSSEStream(options = {}) {
@@ -30,7 +29,7 @@ index 47a2b33..0f2b994 100644
                    reqLogger?.appendConvertedChunk?.(tail);
                    controller.enqueue(sharedEncoder.encode(tail));
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index afa094e..35a17d9 100644
+index afa094e3..35a17d9e 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -633,6 +633,7 @@ describe("native stream integration and failure cleanup", () => {

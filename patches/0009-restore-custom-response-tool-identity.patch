@@ -1,4 +1,4 @@
-From 922b47238769ba8c91ad46e4ccc03b6c577a933f Mon Sep 17 00:00:00 2001
+From 35fb845d1baef2c835499c92359d4c64599c85b8 Mon Sep 17 00:00:00 2001
 From: Repair <repair@example.invalid>
 Date: Fri, 16 Oct 2026 18:00:11 +0000
 Subject: [PATCH] Restore custom response tool identity
@@ -9,7 +9,7 @@ Subject: [PATCH] Restore custom response tool identity
  2 files changed, 33 insertions(+), 1 deletion(-)
 
 diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
-index 8ba5db9..239ecd9 100644
+index 8ba5db90..239ecd96 100644
 --- a/open-sse/utils/opencodeFingerprint.js
 +++ b/open-sse/utils/opencodeFingerprint.js
 @@ -455,7 +455,15 @@ export function restoreToolNames(payload, map) {
@@ -45,7 +45,7 @@ index 8ba5db9..239ecd9 100644
          put("name", resolved.name);
        }
 diff --git a/tests/unit/openai-responses-namespaces.test.js b/tests/unit/openai-responses-namespaces.test.js
-index 98995a2..7efe3e8 100644
+index 98995a2d..7efe3e87 100644
 --- a/tests/unit/openai-responses-namespaces.test.js
 +++ b/tests/unit/openai-responses-namespaces.test.js
 @@ -62,6 +62,22 @@ it("restores namespace identity after a chained rename in event and terminal out
@@ -71,3 +71,6 @@ index 98995a2..7efe3e8 100644
  for (const [format, provider] of [[FORMATS.GEMINI, "gemini"], [FORMATS.GEMINI, "aistudio"], [FORMATS.ANTIGRAVITY, "antigravity"]]) {
    describe(`${provider} namespace SSE roundtrip`, () => {
      for (const [name, type, args] of [["read", "function_call", { title: "record", count: 3 }], ["patch", "custom_tool_call", { input: "RAW_PATCH" }]]) {
+-- 
+2.43.0
+

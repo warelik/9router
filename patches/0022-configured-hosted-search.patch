@@ -1,17 +1,16 @@
-From 5d38ac2994f0a79f34db295a06a2a9b6482068ce Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From da9c6605bfebd86ee9fd126f14ce3aaf8a0f50c6 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Thu, 22 Oct 2026 20:37:44 +0000
 Subject: [PATCH] Resolve hosted search from configured model capabilities
 
 ---
- open-sse/providers/capabilities.js             | 11 +++++-----
- open-sse/translator/index.js                   |  8 +++++---
- tests/unit/openai-responses-web-search.test.js | 28 ++++++++++++++++++++++++++
+ open-sse/providers/capabilities.js            | 11 ++++----
+ open-sse/translator/index.js                  |  8 ++++--
+ .../unit/openai-responses-web-search.test.js  | 28 +++++++++++++++++++
  3 files changed, 39 insertions(+), 8 deletions(-)
 
 diff --git a/open-sse/providers/capabilities.js b/open-sse/providers/capabilities.js
-index c57b5f2..90855ec 100644
+index af27afee..a22890be 100644
 --- a/open-sse/providers/capabilities.js
 +++ b/open-sse/providers/capabilities.js
 @@ -53,6 +53,7 @@ export const DEFAULT_CAPABILITIES = {
@@ -22,7 +21,7 @@ index c57b5f2..90855ec 100644
    tools: true,          // function / tool calling
    reasoning: false,     // thinking / reasoning
    // thinking wire format (only meaningful when reasoning:true). null → derive from transport.format.
-@@ -485,11 +486,11 @@ export const PATTERN_CAPABILITIES = [
+@@ -500,11 +501,11 @@ export const PATTERN_CAPABILITIES = [
    // ── Gemini (all 2.0+ multimodal + google_search grounding, 1M ctx) ─
    { pattern: "*gemini*image*",  caps: { vision: true, imageOutput: true, contextWindow: 1048576 } },
    // Gemini 4 (Argon): no "minimal" tier (400) and no thinkingBudget — LOW/MEDIUM/HIGH only, cannot disable.
@@ -40,7 +39,7 @@ index c57b5f2..90855ec 100644
    { pattern: "*gemini-2*",      caps: { vision: true, audioInput: true, videoInput: true, search: true, contextWindow: 1048576, maxOutput: 65536 } },
    { pattern: "*gemini*",        caps: { vision: true, search: true, contextWindow: 1048576 } },
 diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
-index a91ab87..886c03a 100644
+index a91ab875..886c03ad 100644
 --- a/open-sse/translator/index.js
 +++ b/open-sse/translator/index.js
 @@ -11,6 +11,7 @@ import { captureSessionId, captureConversationId } from "../utils/sessionManager
@@ -73,7 +72,7 @@ index a91ab87..886c03a 100644
        result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
        result.toolConfig = {
 diff --git a/tests/unit/openai-responses-web-search.test.js b/tests/unit/openai-responses-web-search.test.js
-index 35a9282..aef21c1 100644
+index 35a92824..aef21c1d 100644
 --- a/tests/unit/openai-responses-web-search.test.js
 +++ b/tests/unit/openai-responses-web-search.test.js
 @@ -5,6 +5,7 @@ import { FORMATS } from "../../open-sse/translator/formats.js";
@@ -118,3 +117,6 @@ index 35a9282..aef21c1 100644
    for (const provider of ["gemini", "aistudio"]) {
      it(`enables googleSearch with server-side invocations for ${provider}`, () => {
        const credentials = {};
+-- 
+2.43.0
+

@@ -1,6 +1,5 @@
-From 8df359ae146c59a84c39b1c35015db122517ffbf Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 74c1e4aaa9697aab265b88a0c77f1a3000af5d84 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Move file MIME types into shared configuration
 
@@ -11,7 +10,7 @@ Subject: [PATCH] Move file MIME types into shared configuration
  3 files changed, 21 insertions(+), 7 deletions(-)
 
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index 2622627..03ab5db 100644
+index 26226277..03ab5dbb 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
 @@ -71,6 +71,13 @@ export const DEFAULT_MAX_TOKENS = 64000;
@@ -29,7 +28,7 @@ index 2622627..03ab5db 100644
  
  export const PORTABLE_COLLABORATION = {
 diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
-index 1f42b11..105f22a 100644
+index 29696e37..05a970ab 100644
 --- a/open-sse/translator/formats/gemini.js
 +++ b/open-sse/translator/formats/gemini.js
 @@ -3,6 +3,7 @@
@@ -55,7 +54,7 @@ index 1f42b11..105f22a 100644
    if (typeof explicit === "string" && explicit.includes("/")) return explicit;
    const ext = typeof filename === "string" ? filename.split(".").pop().toLowerCase() : "";
 diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
-index 6efffa5..6037829 100644
+index 6efffa53..60378296 100644
 --- a/tests/unit/chat-to-gemini-contract.test.js
 +++ b/tests/unit/chat-to-gemini-contract.test.js
 @@ -482,6 +482,19 @@ describe("media content", () => {
@@ -78,3 +77,6 @@ index 6efffa5..6037829 100644
    it("assistant multimodal content keeps its media parts instead of flattening to text", () => {
      const out = o2g({
        messages: [
+-- 
+2.43.0
+

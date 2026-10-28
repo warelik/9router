@@ -1,20 +1,18 @@
-From 20205134775a75c4aae47c49779f72697ccabc94 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 09141a47f06786954a0f2ae80630f5c31c210f9d Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Thu, 22 Oct 2026 22:40:41 +0000
 Subject: [PATCH] Keep native TTS deadlines and account health through body
- completion
 
 ---
- src/app/api/v1beta/models/[...path]/route.js    | 57 ++++++++++++++----
- tests/unit/gemini-native-alpha-contract.test.js |  2 +
- tests/unit/gemini-native-api-version.test.js    |  5 +-
- tests/unit/gemini-native-endpoint.test.js       | 16 ++++-
- tests/unit/gemini-native-entry-contract.test.js | 78 +++++++++++++++++++++++++
+ src/app/api/v1beta/models/[...path]/route.js  | 57 +++++++++++---
+ .../unit/gemini-native-alpha-contract.test.js |  2 +
+ tests/unit/gemini-native-api-version.test.js  |  5 +-
+ tests/unit/gemini-native-endpoint.test.js     | 16 +++-
+ .../unit/gemini-native-entry-contract.test.js | 78 +++++++++++++++++++
  5 files changed, 143 insertions(+), 15 deletions(-)
 
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index bf9b54c..392aac0 100644
+index bf9b54c4..392aac00 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -283,8 +283,13 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
@@ -109,7 +107,7 @@ index bf9b54c..392aac0 100644
        credentials.connectionId,
        upstreamResponse.status,
 diff --git a/tests/unit/gemini-native-alpha-contract.test.js b/tests/unit/gemini-native-alpha-contract.test.js
-index 6db63a9..5904adc 100644
+index 6db63a9e..5904adc6 100644
 --- a/tests/unit/gemini-native-alpha-contract.test.js
 +++ b/tests/unit/gemini-native-alpha-contract.test.js
 @@ -134,6 +134,7 @@ describe("native Gemini alpha generation contract", () => {
@@ -129,7 +127,7 @@ index 6db63a9..5904adc 100644
      expect(mocks.network).toHaveBeenCalledOnce();
  
 diff --git a/tests/unit/gemini-native-api-version.test.js b/tests/unit/gemini-native-api-version.test.js
-index 4054492..9c79c90 100644
+index 4054492f..9c79c900 100644
 --- a/tests/unit/gemini-native-api-version.test.js
 +++ b/tests/unit/gemini-native-api-version.test.js
 @@ -153,6 +153,7 @@ describe("Gemini native stable and beta API versions", () => {
@@ -157,7 +155,7 @@ index 4054492..9c79c90 100644
  
    it("does not change a translated client's configured provider API version", () => {
 diff --git a/tests/unit/gemini-native-endpoint.test.js b/tests/unit/gemini-native-endpoint.test.js
-index 27ec128..e45cc66 100644
+index 27ec128b..e45cc666 100644
 --- a/tests/unit/gemini-native-endpoint.test.js
 +++ b/tests/unit/gemini-native-endpoint.test.js
 @@ -40,7 +40,13 @@ vi.mock("open-sse/utils/proxyFetch.js", () => ({
@@ -198,7 +196,7 @@ index 27ec128..e45cc66 100644
        "second-conn",
        expect.objectContaining({ apiKey: "second-gemini-key" }),
 diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
-index 84c907b..c0a2016 100644
+index 84c907bf..c0a20165 100644
 --- a/tests/unit/gemini-native-entry-contract.test.js
 +++ b/tests/unit/gemini-native-entry-contract.test.js
 @@ -98,9 +98,85 @@ async function call(provider, action, body, options) {
@@ -296,3 +294,6 @@ index 84c907b..c0a2016 100644
    });
  
    it("a foreign-provider request keeps the existing translated route", async () => {
+-- 
+2.43.0
+

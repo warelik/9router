@@ -1,6 +1,5 @@
-From efdbc333429594b3cc5eb83ae390208d93b80d6e Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 41e885061bd9522da5c64b4bc0547c1b5a7e0f97 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Move Responses namespace alias limits into configuration
 
@@ -10,7 +9,7 @@ Subject: [PATCH] Move Responses namespace alias limits into configuration
  2 files changed, 11 insertions(+), 3 deletions(-)
 
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index 94e5f4a..792cced 100644
+index 94e5f4a7..792cced2 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
 @@ -100,6 +100,13 @@ export const PORTABLE_COLLABORATION = {
@@ -28,7 +27,7 @@ index 94e5f4a..792cced 100644
  export const RETRY_CONFIG = {
    maxAttempts: 2,
 diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
-index 59f01c0..1f2b4a7 100644
+index 59f01c09..1f2b4a7d 100644
 --- a/open-sse/translator/request/openai-responses.js
 +++ b/open-sse/translator/request/openai-responses.js
 @@ -7,6 +7,7 @@
@@ -56,3 +55,6 @@ index 59f01c0..1f2b4a7 100644
      }
      reservedNames.add(alias);
      aliasCache.set(identity, alias);
+-- 
+2.43.0
+

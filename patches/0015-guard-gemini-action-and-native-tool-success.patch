@@ -1,20 +1,19 @@
-From 10915dc255e83efa2b83d4ea38cb8420dfb306fc Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 83ea703c967769086b1a033f5762512d228c2641 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Tue, 20 Oct 2026 00:00:00 +0000
 Subject: [PATCH] Guard native Gemini actions and transformed response success
 
 ---
- open-sse/handlers/chatCore/streamingHandler.js  |   9 +-
- open-sse/utils/opencodeFingerprint.js           |  21 +++++
- open-sse/utils/stream.js                        |  86 ++++++++++++++++---
- src/app/api/v1beta/models/[...path]/route.js    |   4 +
- tests/unit/gemini-native-alpha-contract.test.js |  18 ++++
- tests/unit/gemini-native-stream.test.js         | 107 ++++++++++++++++++++++++
+ .../handlers/chatCore/streamingHandler.js     |   9 +-
+ open-sse/utils/opencodeFingerprint.js         |  21 ++++
+ open-sse/utils/stream.js                      |  86 ++++++++++++--
+ src/app/api/v1beta/models/[...path]/route.js  |   4 +
+ .../unit/gemini-native-alpha-contract.test.js |  18 +++
+ tests/unit/gemini-native-stream.test.js       | 107 ++++++++++++++++++
  6 files changed, 231 insertions(+), 14 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index e21a45b..31807c8 100644
+index 45e933c9..2acc9911 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -36,7 +36,11 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
@@ -41,7 +40,7 @@ index e21a45b..31807c8 100644
      if (!onRequestSuccess) return;
      Promise.resolve()
 diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
-index 239ecd9..36c0efb 100644
+index 239ecd96..36c0efba 100644
 --- a/open-sse/utils/opencodeFingerprint.js
 +++ b/open-sse/utils/opencodeFingerprint.js
 @@ -527,6 +527,27 @@ export function restoreToolNames(payload, map) {
@@ -73,7 +72,7 @@ index 239ecd9..36c0efb 100644
    if (Array.isArray(payload.output)) {
      put("output", payload.output.map((item) =>
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index e7aeda8..07a1847 100644
+index e7aeda80..07a1847c 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -107,6 +107,11 @@ export function createSSEStream(options = {}) {
@@ -233,7 +232,7 @@ index e7aeda8..07a1847 100644
  }
  
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index 8ba06fe..6aa9c0a 100644
+index 8ba06fe9..6aa9c0ab 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -59,6 +59,10 @@ export async function POST(request, { params }) {
@@ -248,7 +247,7 @@ index 8ba06fe..6aa9c0a 100644
  
      let model;
 diff --git a/tests/unit/gemini-native-alpha-contract.test.js b/tests/unit/gemini-native-alpha-contract.test.js
-index 786d167..7a4699f 100644
+index 786d167e..7a4699f7 100644
 --- a/tests/unit/gemini-native-alpha-contract.test.js
 +++ b/tests/unit/gemini-native-alpha-contract.test.js
 @@ -65,6 +65,24 @@ describe("native Gemini alpha generation contract", () => {
@@ -277,7 +276,7 @@ index 786d167..7a4699f 100644
      const savedError = { error: { code: 404, status: "INTERNAL", message: 'Proxy browser error: Google API returned error: 404 NOT_FOUND {"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}' } };
      mocks.network.mockImplementation(async url => new URL(url).pathname.startsWith("/v1/models/")
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
-index 7f4643a..051b599 100644
+index 7f4643a5..051b599a 100644
 --- a/tests/unit/gemini-native-stream.test.js
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -305,6 +305,113 @@ describe("native stream integration and failure cleanup", () => {
@@ -394,3 +393,6 @@ index 7f4643a..051b599 100644
    it.each([
      ["JSON terminal candidate", "application/json", JSON.stringify(chunk)],
      ["JSON safety refusal", "application/json", JSON.stringify({ promptFeedback: { blockReason: "SAFETY" } })],
+-- 
+2.43.0
+

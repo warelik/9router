@@ -1,24 +1,23 @@
-From 9887739b33fd042fc7c7c1147de0fdbc4fdf40a1 Mon Sep 17 00:00:00 2001
-From: "github-actions[bot]"
- <41898282+github-actions[bot]@users.noreply.github.com>
+From 60904476aa128c6fad9f8bc4ea4f5b784550ba6d Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
 Date: Sat, 1 Jan 2000 00:00:00 +0000
 Subject: [PATCH] Centralize downstream protocol configuration
 
 ---
- open-sse/config/defaultThinkingSignature.js     |  7 +++++++
- open-sse/config/runtimeConfig.js                | 15 +++++++++++++++
- open-sse/executors/default.js                   |  6 ++----
- open-sse/services/thoughtSignatureStore.js      |  2 +-
- open-sse/translator/concerns/thinkingUnified.js |  7 +++----
- open-sse/translator/formats/responsesApi.js     |  3 ++-
- open-sse/translator/request/openai-to-vertex.js |  7 +------
- open-sse/utils/sseConstants.js                  |  5 ++---
- open-sse/utils/streamHelpers.js                 |  5 +++--
- tests/unit/chat-to-gemini-contract.test.js      | 19 +++++++++++++++++++
+ open-sse/config/defaultThinkingSignature.js   |  7 +++++++
+ open-sse/config/runtimeConfig.js              | 15 +++++++++++++++
+ open-sse/executors/default.js                 |  6 ++----
+ open-sse/services/thoughtSignatureStore.js    |  2 +-
+ .../translator/concerns/thinkingUnified.js    |  7 +++----
+ open-sse/translator/formats/responsesApi.js   |  3 ++-
+ .../translator/request/openai-to-vertex.js    |  7 +------
+ open-sse/utils/sseConstants.js                |  5 ++---
+ open-sse/utils/streamHelpers.js               |  5 +++--
+ tests/unit/chat-to-gemini-contract.test.js    | 19 +++++++++++++++++++
  10 files changed, 55 insertions(+), 21 deletions(-)
 
 diff --git a/open-sse/config/defaultThinkingSignature.js b/open-sse/config/defaultThinkingSignature.js
-index 50975a4..0460b52 100644
+index 50975a43..0460b522 100644
 --- a/open-sse/config/defaultThinkingSignature.js
 +++ b/open-sse/config/defaultThinkingSignature.js
 @@ -10,3 +10,10 @@ export const DEFAULT_THINKING_GEMINI_CLI_SIGNATURE = "CiQBjz1rX/AlslZWMe5RgBt4Tv
@@ -33,7 +32,7 @@ index 50975a4..0460b52 100644
 +
 +export const SERVER_PARTS_PREFIX = "serverparts:";
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index 9823b5a..ee80f28 100644
+index 9823b5ad..ee80f288 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
 @@ -123,3 +123,18 @@ export function resolveRetryEntry(entry) {
@@ -56,7 +55,7 @@ index 9823b5a..ee80f28 100644
 +export const NATIVE_GEMINI_RESPONSE_FIELDS = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
 +export const NATIVE_GEMINI_BRIDGE_FIELDS = new Set(["message", "event", "data", "status", "code", "success", "response"]);
 diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
-index e82aa9b..93f8a23 100644
+index f0006a47..13ba909b 100644
 --- a/open-sse/executors/default.js
 +++ b/open-sse/executors/default.js
 @@ -4,6 +4,7 @@ import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
@@ -67,7 +66,7 @@ index e82aa9b..93f8a23 100644
  import { buildClineHeaders } from "../shared/clineAuth.js";
  import { proxyAwareFetch } from "../utils/proxyFetch.js";
  import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
-@@ -235,10 +236,7 @@ export class DefaultExecutor extends BaseExecutor {
+@@ -250,10 +251,7 @@ export class DefaultExecutor extends BaseExecutor {
      applyAuth(headers, desc, credentials);
      if (credentials?.nativeGeminiPassthrough) {
        const reserved = new Set(Object.keys(headers).map(key => key.toLowerCase()));
@@ -80,7 +79,7 @@ index e82aa9b..93f8a23 100644
          const lower = name.toLowerCase();
          if (!privateHeaders.has(lower) && !reserved.has(lower) && !lower.startsWith("x-forwarded-") && !lower.startsWith("x-9router-") && !lower.startsWith("x-9r-")) {
 diff --git a/open-sse/services/thoughtSignatureStore.js b/open-sse/services/thoughtSignatureStore.js
-index 78feb88..f11fc82 100644
+index 78feb884..f11fc828 100644
 --- a/open-sse/services/thoughtSignatureStore.js
 +++ b/open-sse/services/thoughtSignatureStore.js
 @@ -1,4 +1,5 @@
@@ -98,7 +97,7 @@ index 78feb88..f11fc82 100644
  const isNonEmptyString = (value) => typeof value === "string" && value.length > 0;
  
 diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
-index 01f0cc6..f1bc7d3 100644
+index 2a7a70f2..a1934b26 100644
 --- a/open-sse/translator/concerns/thinkingUnified.js
 +++ b/open-sse/translator/concerns/thinkingUnified.js
 @@ -6,7 +6,7 @@ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
@@ -110,7 +109,7 @@ index 01f0cc6..f1bc7d3 100644
  
  // Map a target wire-format to its native thinking format (when capability has none).
  const FORMAT_TO_NATIVE = {
-@@ -485,8 +485,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
+@@ -480,8 +480,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
    const generation = body[generationKey] || {};
    const thinkingKey = generation.thinking_config ? "thinking_config" : "thinkingConfig";
    const clientThinking = generation[thinkingKey] || {};
@@ -120,7 +119,7 @@ index 01f0cc6..f1bc7d3 100644
    if (!override && explicit) return body;
    const mode = providerThinking?.mode;
    const intent = override || (!mode || mode === "auto" ? null
-@@ -500,7 +499,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
+@@ -495,7 +494,7 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
    const mapped = applyThinking("gemini", model, {}, provider, intent).generationConfig?.thinkingConfig;
    if (!mapped) return body;
    const thinking = { ...clientThinking };
@@ -130,7 +129,7 @@ index 01f0cc6..f1bc7d3 100644
    if (mapped.thinkingBudget !== undefined) thinking.thinkingBudget = mapped.thinkingBudget;
    if (!Object.hasOwn(thinking, "includeThoughts") && !Object.hasOwn(thinking, "include_thoughts") && mapped.includeThoughts !== undefined) {
 diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
-index ea75cc1..fe3d93c 100644
+index ea75cc1f..fe3d93ce 100644
 --- a/open-sse/translator/formats/responsesApi.js
 +++ b/open-sse/translator/formats/responsesApi.js
 @@ -1,4 +1,5 @@
@@ -149,7 +148,7 @@ index ea75cc1..fe3d93c 100644
  // Codex's observed plaintext task carrier (an agent_message encrypted_content part) is converted
  // here to input_text; known OpenAI Fernet ciphertext stays opaque.
 diff --git a/open-sse/translator/request/openai-to-vertex.js b/open-sse/translator/request/openai-to-vertex.js
-index 4572497..7021629 100644
+index 4572497a..70216295 100644
 --- a/open-sse/translator/request/openai-to-vertex.js
 +++ b/open-sse/translator/request/openai-to-vertex.js
 @@ -1,12 +1,7 @@
@@ -167,7 +166,7 @@ index 4572497..7021629 100644
  /**
   * Post-process a Gemini-format body for Vertex AI compatibility:
 diff --git a/open-sse/utils/sseConstants.js b/open-sse/utils/sseConstants.js
-index 220ae33..a7ae516 100644
+index 220ae332..a7ae516d 100644
 --- a/open-sse/utils/sseConstants.js
 +++ b/open-sse/utils/sseConstants.js
 @@ -1,6 +1,5 @@
@@ -180,7 +179,7 @@ index 220ae33..a7ae516 100644
  export const SSE_HEADERS = {
    "Content-Type": "text/event-stream",
 diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
-index ec2c35b..07c9284 100644
+index ec2c35bb..07c9284b 100644
 --- a/open-sse/utils/streamHelpers.js
 +++ b/open-sse/utils/streamHelpers.js
 @@ -2,6 +2,7 @@ import { FORMATS } from "../translator/formats.js";
@@ -203,7 +202,7 @@ index ec2c35b..07c9284 100644
    if (!allowsEmpty && !allowUnrecognized && !nativeFields.some(field => Object.hasOwn(nativeResponse, field)) && !(allowOpaqueExtensions && hasOpaqueExtension)) return false;
    if (nativeResponse.candidates !== undefined) {
 diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
-index 3360b86..0b92ab8 100644
+index 3360b862..0b92ab89 100644
 --- a/tests/unit/chat-to-gemini-contract.test.js
 +++ b/tests/unit/chat-to-gemini-contract.test.js
 @@ -44,7 +44,10 @@ import { storeGeminiThoughtSignature } from "../../open-sse/services/thoughtSign
@@ -240,3 +239,6 @@ index 3360b86..0b92ab8 100644
    });
  });
  
+-- 
+2.43.0
+

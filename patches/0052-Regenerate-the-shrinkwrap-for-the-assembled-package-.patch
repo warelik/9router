@@ -1,15 +1,15 @@
-From fdb8d2fa7ef5347a98146118fee627c20af712f5 Mon Sep 17 00:00:00 2001
+From c7362c2718f2a04781eb43c8d84f2782d35a44ba Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 27 Oct 2026 03:38:13 +0000
-Subject: [PATCH 52/53] Regenerate the shrinkwrap for the assembled package
- manifest
+Subject: [PATCH] [PATCH 52/53] Regenerate the shrinkwrap for the assembled
+ package
 
 ---
  npm-shrinkwrap.json | 1365 +++++++++++++------------------------------
  1 file changed, 402 insertions(+), 963 deletions(-)
 
 diff --git a/npm-shrinkwrap.json b/npm-shrinkwrap.json
-index 562a6a8..92aff8a 100644
+index 562a6a87..92aff8a9 100644
 --- a/npm-shrinkwrap.json
 +++ b/npm-shrinkwrap.json
 @@ -1,12 +1,12 @@
