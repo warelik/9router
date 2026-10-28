@@ -5854,17 +5854,20 @@ def prepare_golden_baseline(app, upstream, upstream_sha):
         ["git", "ls-files", "--error-unmatch", str(relative)], cwd=upstream,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+    committed = None
     if tracked.returncode == 0:
         subprocess.run(["git", "ls-files", "--error-unmatch", str(relative)], cwd=app, check=True)
-        expected = subprocess.check_output(["git", "show", f"HEAD:{relative}"], cwd=upstream)
-        if (upstream / relative).read_bytes() != expected or (app / relative).read_bytes() != expected:
+        committed = subprocess.check_output(["git", "show", f"HEAD:{relative}"], cwd=upstream)
+        if (upstream / relative).read_bytes() != committed or (app / relative).read_bytes() != committed:
             raise ValueError("Tracked URL/header snapshot differs from the exact upstream baseline")
-        return
+        # Upstream's committed snapshot can lag its own version stamps. It is
+        # only a tamper check here: the baseline below is still generated from
+        # the exact clean upstream, never from the patched application.
     fixture = Path("tests/translator/golden-url-header.test.js")
     for manifest in ("package.json", "tests/package.json"):
         if (app / manifest).read_bytes() != (upstream / manifest).read_bytes():
             raise ValueError(f"Cannot share baseline dependencies: {manifest} differs")
-    allowed = {str(fixture)}
+    allowed = {str(fixture), str(relative)}
     if set(run("git", "diff", "--name-only", "HEAD", cwd=upstream).splitlines()) - allowed:
         raise ValueError("Golden baseline checkout contains unrelated changes")
     shutil.copyfile(app / fixture, upstream / fixture)
@@ -5884,7 +5887,8 @@ def prepare_golden_baseline(app, upstream, upstream_sha):
         raise ValueError("Baseline generation modified upstream source")
     snapshot = (upstream / relative).read_bytes()
     destination = app / relative
-    if destination.exists() and destination.read_bytes() != snapshot:
+    if (destination.exists() and destination.read_bytes() != snapshot
+            and destination.read_bytes() != committed):
         raise ValueError("Refusing to replace a different untracked golden snapshot")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(snapshot)

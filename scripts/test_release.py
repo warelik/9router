@@ -407,11 +407,22 @@ class GoldenBaselineTests(unittest.TestCase):
                 relative = "tests/translator/__snapshots__/golden-url-header.test.js.snap"
                 (app / relative).write_bytes(candidate)
                 (upstream / relative).write_bytes(baseline)
-                with (patch.object(release, "run", return_value=OTHER),
+
+                def fake_run(*args, **kwargs):
+                    return OTHER if args[1:3] == ("rev-parse", "HEAD") else ""
+
+                def generated(target_upstream, tests, *, update=False):
+                    (target_upstream / relative).write_bytes(b"generated golden")
+
+                with (patch.object(release, "run", side_effect=fake_run),
                       patch.object(release.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)),
-                      patch.object(release.subprocess, "check_output", return_value=b"official golden")):
+                      patch.object(release.subprocess, "check_output", return_value=b"official golden"),
+                      patch.object(release, "run_vitest", side_effect=generated)):
                     if allowed:
+                        # Exact committed bytes pass the tamper check; the
+                        # baseline is still regenerated from clean upstream.
                         release.prepare_golden_baseline(app, upstream, OTHER)
+                        self.assertEqual((app / relative).read_bytes(), b"generated golden")
                     else:
                         with self.assertRaises(ValueError):
                             release.prepare_golden_baseline(app, upstream, OTHER)
