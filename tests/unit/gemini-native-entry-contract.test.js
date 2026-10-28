@@ -4,6 +4,7 @@ import path from "node:path";
 import vm from "node:vm";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { resolveSessionIdentity } from "../../open-sse/utils/sessionManager.js";
 
 // Real endpoint + handler control flow. Only imported service boundaries are
 // replaced; no database, external fetch, model, or provider account is contacted.
@@ -61,6 +62,7 @@ function load() {
     DEFAULT_HEADROOM_URL: "http://unused.test",
     getComboModels: async () => null,
     getTargetFormat: provider => ["gemini", "aistudio"].includes(provider) ? "gemini" : "openai",
+    resolveSessionIdentity,
     proxyAwareFetch: (...args) => services.fetch(...args),
     getModelInfo: async model => { const i = model.indexOf("/"); return { provider: i < 0 ? "gemini" : model.slice(0, i), model: i < 0 ? model : model.slice(i + 1) }; },
     stripModelContextMarker: model => ({ model, contextMarker: null }),
