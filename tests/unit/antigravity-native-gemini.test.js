@@ -42,6 +42,7 @@ vi.mock("@/lib/db/helpers/kvStore.js", () => ({
 const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
 const { FORMATS } = await import("../../open-sse/translator/formats.js");
 const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
+const { resolveSessionIdentity } = await import("../../open-sse/utils/sessionManager.js");
 const { ANTIGRAVITY_HEADERS } = await import("../../open-sse/config/appConstants.js");
 const { AntigravityExecutor } = await import("../../open-sse/executors/antigravity.js");
 
@@ -220,6 +221,7 @@ function loadRouteHarness() {
     DEFAULT_HEADROOM_URL: "http://unused.test",
     getTargetFormat,
     supportsNativeGemini,
+    resolveSessionIdentity,
     initTranslators: async () => {},
     proxyAwareFetch: (...args) => services.fetch(...args),
     stripModelContextMarker: services.stripModelContextMarker,
