@@ -41,6 +41,7 @@ vi.mock("@/lib/db/helpers/kvStore.js", () => ({
 
 const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
 const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
+const { resolveSessionIdentity } = await import("../../open-sse/utils/sessionManager.js");
 const { ANTIGRAVITY_HEADERS } = await import("../../open-sse/config/appConstants.js");
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
@@ -152,6 +153,7 @@ function loadPublicNativeRoute() {
     DEFAULT_HEADROOM_URL: "http://unused.test",
     getTargetFormat,
     supportsNativeGemini,
+    resolveSessionIdentity,
     initTranslators: async () => {},
     proxyAwareFetch: (...args) => services.fetch(...args),
     stripModelContextMarker: services.stripModelContextMarker,
