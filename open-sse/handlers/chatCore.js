@@ -35,6 +35,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { isMuseCodeSubscription } from "../utils/museCloaking.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -104,9 +105,15 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // translated to the Responses body (`input`) yet POSTed to the default Chat
   // Completions URL, and upstream rejects it: "unknown parameter `input`".
   const modelTargetTransport = modelTargetFormat ? resolveTransport(provider, modelTargetFormat) : null;
-  const useTransport = (!modelSupportedFormats || modelSupportedFormats.includes(sourceFormat))
+  // Muse Code subscriptions are accepted only on Responses, including dynamic
+  // passthrough models that have no registry entry. Pay-as-you-go API keys keep
+  // the ordinary source/model transport selection above.
+  const museCodeTransport = provider === "muse" && isMuseCodeSubscription(credentials)
+    ? resolveTransport(provider, FORMATS.OPENAI_RESPONSES)
+    : null;
+  const useTransport = museCodeTransport || ((!modelSupportedFormats || modelSupportedFormats.includes(sourceFormat))
     ? runtimeTransport
-    : modelTargetTransport;
+    : modelTargetTransport);
   // A source-format-matched endpoint keeps the request lossless. Prefer it
   // over a model-level targetFormat, which is only the fallback for clients
   // whose wire format has no supported transport (for example MiniMax-M3:
