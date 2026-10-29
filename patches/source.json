@@ -75,6 +75,8 @@
     "tests/unit/downstream-translator-history-regressions.test.js",
     "tests/translator/thinking-unified.test.js",
     "tests/unit/aistudio-discovery.test.js",
-    "tests/unit/docker-publish-source-recipe.test.js"
+    "tests/unit/docker-publish-source-recipe.test.js",
+    "tests/unit/muse-cloaking.test.js",
+    "tests/unit/muse-responses-wire.test.js"
   ]
 }
