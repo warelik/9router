@@ -3,6 +3,7 @@ import { OPENAI_TOOL_CHOICE_NONE } from "./schema/index.js";
 import { ensureToolCallIds, fixMissingToolResponses, isGeminiFamilyTarget } from "./concerns/toolCall.js";
 import { prepareClaudeRequest, ensureTrailingUserTurn } from "./formats/claude.js";
 import { cloakClaudeTools, decloakStreamChunk } from "../utils/claudeCloaking.js";
+import { cloakMuseTools, isMuseCodeSubscription } from "../utils/museCloaking.js";
 import { restoreToolNames } from "../utils/opencodeFingerprint.js";
 import { filterToOpenAIFormat } from "./formats/openai.js";
 import { adaptAIStudioStructuredOutput } from "./formats/gemini.js";
@@ -226,6 +227,19 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     }
   }
 
+  // Muse Code subscription attestation rejects builtin names carrying foreign
+  // schemas. Rename client function/custom tools after conversion to Responses;
+  // the shared restorer uses the same per-request map on every response path.
+  if (provider === "muse" && targetFormat === FORMATS.OPENAI_RESPONSES && isMuseCodeSubscription(credentials)) {
+    const { body: cloakedBody, toolNameMap } = cloakMuseTools(result);
+    result = cloakedBody;
+    if (toolNameMap?.size > 0) {
+      const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
+      for (const [key, value] of toolNameMap) merged.set(key, value);
+      result._toolNameMap = merged;
+    }
+  }
+
   if (sourceToolNameMap) {
     const targetMap = result._toolNameMap instanceof Map ? result._toolNameMap : null;
     const merged = new Map();
@@ -252,10 +266,10 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
 // Translate response chunk: target -> openai -> source
 export function translateResponse(targetFormat, sourceFormat, chunk, state) {
   ensureInitialized();
-  // If same format, return as-is — except the tool name may still be cloaked:
-  // translateRequest() suffixes client tools for OAuth-cloaked Claude providers
-  // even when no format conversion is needed, so streamed tool_use blocks must
-  // be decloaked here or the client sees an unknown ("_ide"-suffixed) tool.
+  // If same format, return as-is — except tool names may still be cloaked:
+  // translateRequest() renames client tools for OAuth-cloaked Claude and Muse
+  // Code providers even without format conversion, so streamed calls must be
+  // restored here or the client sees a name it never declared.
   if (sourceFormat === targetFormat) {
     // Same-format (openai→openai) passthrough: the upstream chunk reaches the
     // client as-is. A fragment that opens a new tool-call index without an id

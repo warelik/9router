@@ -18,6 +18,8 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelUpstreamId, PRO
 import { resolveTransport } from "../../open-sse/services/provider.js";
 import { applyThinking } from "../../open-sse/translator/concerns/thinkingUnified.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
+import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.js";
+import { getThinkingLevels } from "../../open-sse/providers/thinkingLevels.js";
 
 // Mirrors the transport selection in open-sse/handlers/chatCore.js so the
 // invariant (body wire === endpoint wire) can be asserted without the full
@@ -53,6 +55,41 @@ describe("Muse Responses wire routing", () => {
     const { targetFormat, useTransport } = selectTransport("muse", "muse-spark-1.3-contributor(xhigh)", FORMATS.OPENAI_RESPONSES);
     expect(targetFormat).toBe(FORMATS.OPENAI_RESPONSES);
     expect(useTransport?.baseUrl).toBe("https://api.meta.ai/v1/responses");
+  });
+});
+
+describe("Muse Wonder registry and documented capabilities", () => {
+  it.each(["muse-wonder-1.0", "muse-wonder-1.0-contributor"])("routes %s through Responses", (model) => {
+    const { targetFormat, useTransport } = selectTransport("muse", model, FORMATS.OPENAI);
+    expect(targetFormat).toBe(FORMATS.OPENAI_RESPONSES);
+    expect(useTransport?.baseUrl).toBe("https://api.meta.ai/v1/responses");
+    expect(getModelSupportedFormats("muse", model)).toEqual([FORMATS.OPENAI_RESPONSES]);
+  });
+
+  it.each(["muse-wonder-1.0", "muse-wonder-1.0-contributor"])("publishes the Meta/models.dev parameters for %s", (model) => {
+    expect(getCapabilitiesForModel("muse", model)).toMatchObject({
+      vision: true,
+      pdf: true,
+      audioInput: true,
+      videoInput: true,
+      search: true,
+      reasoning: true,
+      thinkingFormat: "openai",
+      thinkingCanDisable: false,
+      contextWindow: 1048576,
+      maxOutput: 131072,
+    });
+    expect(getThinkingLevels("muse", model)).toEqual(["minimal", "low", "medium", "high", "xhigh", "max"]);
+  });
+
+  it("keeps Wonder max and clamps unsupported none to minimal", () => {
+    const maxBody = { input: [] };
+    applyThinking(FORMATS.OPENAI_RESPONSES, "muse-wonder-1.0", maxBody, "muse", { mode: "level", level: "max" });
+    expect(maxBody.reasoning).toEqual({ effort: "max", summary: "auto" });
+
+    const noneBody = { input: [] };
+    applyThinking(FORMATS.OPENAI_RESPONSES, "muse-wonder-1.0-contributor", noneBody, "muse", { mode: "none" });
+    expect(noneBody.reasoning).toEqual({ effort: "minimal", summary: "auto" });
   });
 });
 
