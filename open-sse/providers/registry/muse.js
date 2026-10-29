@@ -36,9 +36,9 @@ export default {
     auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["museHeaders"] },
   },
   // Multi-endpoint: Meta accepts Chat Completions and Responses wire formats on
-  // the same key (https://dev.meta.ai/docs/protocols). Muse Spark reasoning
-  // (incl. encrypted_content replay) only round-trips on Responses, so models
-  // pin targetFormat there.
+  // the same key (https://dev.meta.ai/docs/protocols). Muse reasoning (incl.
+  // encrypted_content replay) only round-trips on Responses, so models pin
+  // targetFormat there.
   transports: [
     {
       format: "openai",
@@ -54,6 +54,8 @@ export default {
     },
   ],
   models: [
+    { id: "muse-wonder-1.0", name: "Muse Wonder 1.0", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
+    { id: "muse-wonder-1.0-contributor", name: "Muse Wonder 1.0 Contributor", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
     { id: "muse-spark-1.3", name: "Muse Spark 1.3", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
     { id: "muse-spark-1.2", name: "Muse Spark 1.2", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
     { id: "muse-spark-1.1", name: "Muse Spark 1.1", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },

@@ -189,8 +189,9 @@ describe("model target-format transport selection", () => {
       const sent = JSON.parse(init.body);
       expect(sent.model).toBe(MODEL);
       expect(sent.instructions).toBe("Keep the lookup result intact.");
+      expect(sent.tools[0].name).toBe("lookup_muse");
       expect(sent.input).toEqual(expect.arrayContaining([
-        expect.objectContaining({ type: "function_call", call_id: "call_preserve_7", name: "lookup" }),
+        expect.objectContaining({ type: "function_call", call_id: "call_preserve_7", name: "lookup_muse" }),
         expect.objectContaining({ type: "function_call_output", call_id: "call_preserve_7" }),
       ]));
       expect(result).toMatchObject({ success: false, status: 400 });
@@ -216,6 +217,35 @@ describe("model target-format transport selection", () => {
       expect(result.error).toContain("unknown parameter `input`");
     },
   );
+
+  it("forces even an unregistered Muse Code subscription model onto Responses", async () => {
+    const body = chatBody(false);
+    const options = makeOptions(body, "/v1/chat/completions");
+    options.modelInfo.model = "muse-wonder-full-1.0";
+    body.model = "muse/muse-wonder-full-1.0";
+
+    await handleChatCore(options);
+
+    const [url, init] = proxyAwareFetchMock.mock.calls[0];
+    expect(url).toBe("https://api.meta.ai/v1/responses");
+    expect(init.headers["x-api-version"]).toBe("1.0.0");
+    expect(JSON.parse(init.body).tools[0].name).toBe("lookup_muse");
+  });
+
+  it("keeps an unregistered pay-as-you-go model on its source-matched Chat transport", async () => {
+    const body = chatBody(false);
+    const options = makeOptions(body, "/v1/chat/completions");
+    options.modelInfo.model = "muse-future-1.0";
+    options.credentials = { apiKey: "test-only-payg-key", providerSpecificData: {} };
+    body.model = "muse/muse-future-1.0";
+
+    await handleChatCore(options);
+
+    const [url, init] = proxyAwareFetchMock.mock.calls[0];
+    expect(url).toBe("https://api.meta.ai/v1/chat/completions");
+    expect(init.headers["x-api-version"]).toBeUndefined();
+    expect(JSON.parse(init.body).tools[0].function.name).toBe("lookup");
+  });
 
   it.each([
     {
