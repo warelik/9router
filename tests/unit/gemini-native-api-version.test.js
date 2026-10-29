@@ -1,6 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { readdirSync, existsSync } from "node:fs";
 import { DefaultExecutor } from "../../open-sse/executors/default.js";
+import { isolateDataDir } from "../helpers/isolatedDataDir.js";
 
 const mocks = vi.hoisted(() => ({ handleChat: vi.fn(), proxyAwareFetch: vi.fn(), getProviderCredentials: vi.fn(), buildModelsList: vi.fn() }));
 vi.mock("../../src/app/api/v1/models/route.js", () => ({ buildModelsList: mocks.buildModelsList }));
@@ -19,6 +20,8 @@ vi.mock("@/sse/services/auth.js", () => ({
 }));
 vi.mock("@/lib/localDb", () => ({ getSettings: async () => ({ requireApiKey: true }) }));
 vi.mock("open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: mocks.proxyAwareFetch }));
+const restoreDataDir = isolateDataDir();
+afterAll(() => restoreDataDir());
 const stable = await import("../../src/app/api/v1/models/[...model]/route.js");
 const beta = await import("../../src/app/api/v1beta/models/[...path]/route.js");
 const MODEL = "gemini-3.5-flash-lite";

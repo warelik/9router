@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { isolateDataDir } from "../helpers/isolatedDataDir.js";
 
 const mocks = vi.hoisted(() => ({
   handleChat: vi.fn(),
@@ -39,6 +40,8 @@ vi.mock("open-sse/utils/proxyFetch.js", () => ({
   },
 }));
 
+const restoreDataDir = isolateDataDir();
+afterAll(() => restoreDataDir());
 const { GET } = await import("../../src/app/api/v1beta/models/route.js");
 const { POST: nativePOST, OPTIONS } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
 const responses = [];
