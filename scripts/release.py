@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -52,6 +53,8 @@ DISPOSITION_PROPOSAL_EVIDENCE = re.compile(
 SHARED_POLICY_VALIDATION_MARKER = re.compile(r"<!-- fork-policy-validation:v1 (\{[^\n]*\}) -->")
 SHARED_POLICY_USED_MARKER = re.compile(r"<!-- fork-policy-used:v1 (\{[^\n]*\}) -->")
 SHARED_POLICY_JOB = "Validate Policy In The Credential-Free Sandbox"
+REVIEW_MODES = {"bot", "owner", "none"}
+OWNER_ACCEPTANCE_AUTHORIZATION_SHA256 = "3343e4d2dfc5a06b529fe32b352bfc0b798539c8454d02f60d9cae3ccd5cc7b0"
 RELEASE_TAG_PATTERN = re.compile(
     r"build-(?P<version>\d+\.\d+\.\d+)-(?P<upstream>[0-9a-f]{12})-"
     r"(?P<patchset>[0-9a-f]{12})(?:-r(?P<recipe>[0-9a-f]{12}))?\Z")
@@ -449,6 +452,50 @@ def owner_token(repo):
     if user.get("login") != repo.split("/")[0] or user.get("type") != "User":
         raise ValueError("Codex task requests must use the repository owner's existing authorization")
     return token
+
+
+def review_mode():
+    mode = os.environ.get("FORK_REVIEW_MODE", "bot").strip().lower()
+    if mode not in REVIEW_MODES:
+        raise ValueError("FORK_REVIEW_MODE must be bot, owner or none")
+    return mode
+
+
+def _owner_acceptance_body(repo, pr, request, scope, review_sha, base_sha, candidate_id):
+    value = {
+        "schema": 1,
+        "authorization_sha256": OWNER_ACCEPTANCE_AUTHORIZATION_SHA256,
+        "repository": repo,
+        "pr": pr,
+        "request_id": request["id"],
+        "scope": scope,
+        "review_sha": review_sha,
+        "base_sha": base_sha,
+        "candidate_id": candidate_id,
+    }
+    return ("<!-- machine-maintenance-owner-acceptance:v1 "
+            + json.dumps(value, separators=(",", ":")) + " -->")
+
+
+def _ensure_owner_acceptance(repo, comments, pr, request, scope, review_sha, base_sha, candidate_id):
+    if review_mode() != "none":
+        return False
+    body = _owner_acceptance_body(repo, pr, request, scope, review_sha, base_sha, candidate_id)
+    owner = repo.split("/", 1)[0]
+    if any(comment.get("body") == body
+           and comment.get("user", {}).get("login") == owner
+           and comment.get("user", {}).get("type") == "User" for comment in comments):
+        return False
+    requested_at = datetime.fromisoformat(request["created_at"].replace("Z", "+00:00"))
+    if requested_at.tzinfo is None:
+        raise ValueError("Native review request timestamp needs a timezone")
+    wait = (requested_at.astimezone(timezone.utc) + timedelta(seconds=1)
+            - datetime.now(timezone.utc)).total_seconds()
+    if wait > 0:
+        time.sleep(wait + 0.1)
+    api(f"repos/{repo}/issues/{pr}/comments", method="POST", token=owner_token(repo),
+        data={"body": body})
+    return True
 
 
 def _owner_native_reader(repo):
@@ -1691,8 +1738,10 @@ def shared_review_text(candidate, scope, review_sha, base_sha, candidate_id, kno
     carried = ("Carried unresolved findings from prior exact-source reviews (data):\n```json\n"
                + json.dumps(list(known_findings), ensure_ascii=False, sort_keys=True, indent=2)
                + "\n```\n") if known_findings else ""
+    trigger = (os.environ.get("FORK_REVIEW_TRIGGER", "@codex review").strip()
+               if review_mode() in {"bot", "owner"} else "")
     body = (
-        "@codex review\n\n" + common + details +
+        ((trigger + "\n\n") if trigger else "") + common + details +
         "Return the COMPLETE actionable finding list in one response, all priorities together including "
         "P0/P1/P2/P3 and unlabelled defects. Ignore optional optimization and style. Wait for both independent "
         "review scopes before repairs; do not modify source, run tests, install dependencies, build, publish, "
@@ -1722,6 +1771,10 @@ def evaluate_shared_review(repo, lifecycle, candidate, scope, pr_number, review_
         request = _native_review_request(
             repo, comments, pr_number, candidate, scope, review_sha, base_sha,
             lifecycle, create=False, expected_request_id=request.get("id"))
+    if _ensure_owner_acceptance(
+            repo, comments, pr_number, request, scope, review_sha, base_sha,
+            lifecycle.candidate_identity(candidate)):
+        comments = pages(f"repos/{repo}/issues/{pr_number}/comments")
     reviews = pages(f"repos/{repo}/pulls/{pr_number}/reviews")
     inline = pages(f"repos/{repo}/pulls/{pr_number}/comments")
     resolved = _resolve_native_review_commits(repo, reviews + inline + comments)

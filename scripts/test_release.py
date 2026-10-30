@@ -56,6 +56,48 @@ class ReviewPolicyTests(unittest.TestCase):
     def test_unresolvable_prefix_is_not_a_review(self):
         self.assertFalse(self.gate(comments=[receipt()], resolve=lambda _: None))
 
+    def test_review_mode_none_uses_exact_owner_acceptance_without_a_trigger(self):
+        candidate = {
+            "upstream_sha": HEAD, "application_sha": HEAD, "configuration_sha": OTHER,
+            "patchset_sha256": "c" * 64, "recipe_sha256": "d" * 64, "platform": "linux/amd64",
+        }
+        request = {"id": 42, "created_at": REQUESTED}
+        with patch.dict(release.os.environ, {"FORK_REVIEW_MODE": "none"}):
+            self.assertNotIn(
+                "@codex review",
+                release.shared_review_text(candidate, "full", HEAD, OTHER, "e" * 64))
+            with patch.object(release, "owner_token", return_value="owner-token"), \
+                    patch.object(release, "api", return_value={"id": 43}) as api:
+                self.assertTrue(release._ensure_owner_acceptance(
+                    "warelik/9router", [], 7, request, "full", HEAD, OTHER, "e" * 64))
+            body = api.call_args.kwargs["data"]["body"]
+            self.assertIn('"candidate_id":"' + "e" * 64 + '"', body)
+            self.assertIn('"request_id":42', body)
+            with patch.object(release, "api") as duplicate:
+                self.assertFalse(release._ensure_owner_acceptance(
+                    "warelik/9router",
+                    [{"body": body, "user": {"login": "warelik", "type": "User"}}],
+                    7, request, "full", HEAD, OTHER, "e" * 64))
+            duplicate.assert_not_called()
+
+    def test_review_mode_bot_keeps_the_configured_trigger(self):
+        candidate = {
+            "upstream_sha": HEAD, "application_sha": HEAD, "configuration_sha": OTHER,
+            "patchset_sha256": "c" * 64, "recipe_sha256": "d" * 64, "platform": "linux/amd64",
+        }
+        with patch.dict(release.os.environ, {
+                "FORK_REVIEW_MODE": "bot", "FORK_REVIEW_TRIGGER": "@reviewer review"}):
+            self.assertTrue(release.shared_review_text(
+                candidate, "delta", HEAD, OTHER, "e" * 64).startswith("@reviewer review\n\n"))
+            with patch.object(release, "api") as api:
+                self.assertFalse(release._ensure_owner_acceptance(
+                    "warelik/9router", [], 7, {"id": 42, "created_at": REQUESTED},
+                    "delta", HEAD, OTHER, "e" * 64))
+            api.assert_not_called()
+        with patch.dict(release.os.environ, {"FORK_REVIEW_MODE": "sometimes"}), \
+                self.assertRaisesRegex(ValueError, "FORK_REVIEW_MODE"):
+            release.review_mode()
+
     def test_edited_native_summary_is_accepted_after_request(self):
         self.assertTrue(self.gate(comments=[native_state()]))
 
