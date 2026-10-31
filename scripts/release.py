@@ -3579,7 +3579,8 @@ def _sanitized_repair_identity(repo, config_sha):
             "repair_head": pull.get("head", {}).get("sha"), "repair_state": state}
 
 
-def _transition_review_candidates(repo, config_sha, lifecycle, *, accepted_baseline=None):
+def _transition_review_candidates(repo, config_sha, lifecycle, *, accepted_baseline=None,
+                                  include_accepted=False):
     owner = repo.split("/", 1)[0]
     accepted_candidate_id = None
     if accepted_baseline is not None:
@@ -3771,7 +3772,7 @@ def _transition_review_candidates(repo, config_sha, lifecycle, *, accepted_basel
             full = full_requests[0]
             candidate = full["candidate"]
             candidate_id = lifecycle.candidate_identity(candidate)
-            if candidate_id == accepted_candidate_id:
+            if candidate_id == accepted_candidate_id and not include_accepted:
                 continue
             if candidate_id in seen_full_candidates:
                 raise ValueError("Multiple open full PRs claim one pending candidate identity")
@@ -4738,7 +4739,8 @@ def prepare_shared(directory):
         if baseline_data is None:
             baseline_data = _shared_prepare_baseline(repo, lifecycle, repair)
         pending = _transition_review_candidates(
-            repo, config, lifecycle, accepted_baseline=baseline_data["accepted_candidate"])
+            repo, config, lifecycle, accepted_baseline=baseline_data["accepted_candidate"],
+            include_accepted=True)
         if len(pending) > 1:
             raise ValueError("Multiple open native review pairs match the current config and accepted baseline")
         retained_review = pending[0] if pending else None
@@ -4800,6 +4802,14 @@ def prepare_shared(directory):
     if candidate_id == lifecycle.candidate_identity(accepted_candidate):
         verify_published_release(repo, baseline_release, application_sha, upstream, patchset,
                                  version, recipe)
+        if retained_review and retained_review.get("delta") is not None:
+            reviews = {
+                scope: {"pr": record["pull"]["number"],
+                        "review_sha": record["review_sha"], "base_sha": record["base_sha"]}
+                for scope, record in (("full", retained_review["full"]),
+                                      ("delta", retained_review["delta"]))
+            }
+            _close_shared_reviews(repo, {"reviews": reviews})
         _cleanup_shared_refs(repo, lifecycle)
         output(review_ready=False, ready=False, mode="already-published",
                reason="The exact upstream, patch, recipe, platform and configuration candidate is already published",
