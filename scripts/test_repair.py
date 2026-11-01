@@ -7361,3 +7361,77 @@ class InitialFirstReleaseTests(unittest.TestCase):
                                 REPO, json.loads(json.dumps(recovered)), lifecycle)
                     self.assertIsNone(stored_baseline)
                     self.assertEqual(baseline_writes, [])
+
+    def test_prepare_shared_initial_baseline_none_path_selects_expected_targets(self):
+        """The real prepare_shared path must handle an unpublished baseline."""
+        class StopAfterDelta(Exception):
+            pass
+
+        candidate = {
+            "schema": 1, "repository": REPO, "upstream_sha": UPSTREAM,
+            "application_sha": HEAD, "configuration_sha": CONFIG,
+            "patchset_sha256": "d" * 64, "recipe_sha256": "f" * 64,
+            "platform": release.PLATFORM,
+        }
+        initial_proof = release._initial_baseline_proof(REPO)
+        baseline = {
+            "initial": True, "release": None, "metadata": None,
+            "metadata_sha256": None, "candidate": None,
+            "accepted_baseline": initial_proof, "accepted_candidate": None,
+        }
+        repair = {
+            "state": None, "config_sha": CONFIG, "config_root": release.ROOT,
+            "patch_root": release.ROOT / "patches", "repair_policy": False,
+            "changed": [],
+        }
+        calls = []
+
+        def api(path, **_kwargs):
+            if path == f"repos/{REPO}":
+                return {"default_branch": "downstream"}
+            if path == f"repos/{REPO}/commits/downstream":
+                return {"sha": CONFIG}
+            if path == f"repos/{release.UPSTREAM}/commits/{release.UPSTREAM_BRANCH}":
+                return {"sha": UPSTREAM}
+            raise AssertionError(f"unexpected native API call: {path}")
+
+        def review_pr(repo, target, **kwargs):
+            calls.append((repo, target, kwargs))
+            if len(calls) == 2:
+                raise StopAfterDelta()
+            return {"number": 10}
+
+        with (tempfile.TemporaryDirectory() as directory,
+              patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO,
+                                      "GITHUB_SHA": CONFIG,
+                                      "GITHUB_EVENT_NAME": "workflow_dispatch"}),
+              patch.object(release, "shared_lifecycle", return_value=SimpleNamespace(
+                  candidate_identity=lambda _candidate: "a" * 64)),
+              patch.object(release, "api", side_effect=api),
+              patch.object(release, "_published_release_recovery", return_value=None),
+              patch.object(release, "_shared_repair_candidate", return_value=repair),
+              patch.object(release, "_shared_prepare_baseline", return_value=baseline),
+              patch.object(release, "_initial_empty_base_commit",
+                           return_value=(self.EMPTY_ROOT, {"sha": self.EMPTY_ROOT})),
+              patch.object(release, "_adopted_workflow_candidate", return_value=None),
+              patch.object(release, "_transition_review_candidates", return_value=[]),
+              patch.object(release, "_pending_shared_ref_candidate", return_value=candidate),
+              patch.object(release, "_prepare_source",
+                           return_value=(HEAD, "d" * 64, "0.5.0")),
+              patch.object(release, "_recipe_sha256", return_value="f" * 64),
+              patch.object(release, "_create_review_context_commit",
+                           return_value=("b" * 40, None)),
+              patch.object(release, "_exact_review_pull", return_value=None),
+              patch.object(release, "_closed_policy_pair_has_verified_bundle",
+                           return_value=False),
+              patch.object(release, "_carried_shared_findings", return_value=([], [], [])),
+              patch.object(release, "output"),
+              patch.object(release, "_review_pr", side_effect=review_pr),
+              self.assertRaises(StopAfterDelta)):
+            release.prepare_shared(Path(directory))
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1], Path(directory) / "application")
+        self.assertEqual(calls[1][1], release.ROOT)
+        self.assertEqual(calls[1][2]["head_ref"], f"review/changes-{CONFIG}")
+        self.assertEqual(calls[1][2]["base_sha"], self.EMPTY_ROOT)
