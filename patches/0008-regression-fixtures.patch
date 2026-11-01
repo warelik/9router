@@ -1,0 +1,50 @@
+From 5d8747ad5327d12b36d1ae5ca66defe1e656de55 Mon Sep 17 00:00:00 2001
+From: Overlay Migration <overlay-migration@example.invalid>
+Date: Fri, 16 Oct 2026 09:15:40 +0000
+Subject: [PATCH] [PATCH 8/8] 0008 regression-fixtures
+
+---
+ tests/translator/golden-url-header.test.js | 9 ++++++++-
+ tests/unit/cli-connect.test.js             | 2 ++
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
+index 8b745cc3..49eb9dfc 100644
+--- a/tests/translator/golden-url-header.test.js
++++ b/tests/translator/golden-url-header.test.js
+@@ -68,7 +68,14 @@ describe("GOLDEN buildHeaders (default executor providers)", () => {
+         oauth: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : OAUTH_CRED, true))),
+         nonStream: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, false))),
+       };
+-      expect(snap).toMatchSnapshot();
++      const sessionMatchers = Object.fromEntries(
++        Object.entries(snap)
++          .filter(([, headers]) => typeof headers?.["X-Mavis-Session-Id"] === "string")
++          .map(([kind]) => [kind, {
++            "X-Mavis-Session-Id": expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
++          }])
++      );
++      expect(snap).toMatchSnapshot(sessionMatchers);
+     });
+   }
+ });
+diff --git a/tests/unit/cli-connect.test.js b/tests/unit/cli-connect.test.js
+index 3695a4b6..7da8ede2 100644
+--- a/tests/unit/cli-connect.test.js
++++ b/tests/unit/cli-connect.test.js
+@@ -194,10 +194,12 @@ describe("connect run()", () => {
+   beforeEach(() => {
+     home = fs.mkdtempSync(path.join(os.tmpdir(), "9r-connect-run-"));
+     vi.spyOn(os, "homedir").mockReturnValue(home);
++    vi.stubEnv("XDG_CONFIG_HOME", "");
+     vi.spyOn(console, "log").mockImplementation(() => {});
+   });
+   afterEach(() => {
+     vi.restoreAllMocks();
++    vi.unstubAllEnvs();
+     fs.rmSync(home, { recursive: true, force: true });
+   });
+ 
+-- 
+2.43.0
+

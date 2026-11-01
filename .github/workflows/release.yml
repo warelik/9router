@@ -1,0 +1,637 @@
+name: Upstream Plus Patches
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [downstream]
+    paths: ["patches/**", "scripts/**", ".github/workflows/release.yml"]
+  issue_comment:
+    types: [created, edited]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+env:
+  FORK_REPAIR_MODE: ${{ vars.FORK_REPAIR_MODE || 'escalate' }}
+  FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+  FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
+
+concurrency:
+  group: upstream-plus-patches
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Select One Snapshot And Request Both Reviews
+    if: >-
+      (github.event_name != 'issue_comment' &&
+       github.event_name != 'pull_request_target') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       ((github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+         github.event.comment.user.type == 'Bot') ||
+        (github.event.comment.user.login == github.repository_owner &&
+         github.event.comment.user.type == 'User' &&
+         contains(github.event.comment.body, 'fork-final-retry:v1')))) ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.base.ref == 'downstream' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       startsWith(github.event.pull_request.head.ref, 'repair/'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    outputs:
+      ready: ${{ steps.snapshot.outputs.ready }}
+      review_ready: ${{ steps.snapshot.outputs.review_ready }}
+      sha: ${{ steps.snapshot.outputs.sha }}
+      upstream: ${{ steps.snapshot.outputs.upstream }}
+      patchset: ${{ steps.snapshot.outputs.patchset }}
+      recipe: ${{ steps.snapshot.outputs.recipe }}
+      config_sha: ${{ steps.snapshot.outputs.config_sha }}
+      version: ${{ steps.snapshot.outputs.version }}
+      release: ${{ steps.snapshot.outputs.release }}
+      full_pr: ${{ steps.snapshot.outputs.full_pr }}
+      delta_pr: ${{ steps.snapshot.outputs.delta_pr }}
+      candidate_id: ${{ steps.snapshot.outputs.candidate_id }}
+      context: ${{ steps.snapshot.outputs.context }}
+      mode: ${{ steps.snapshot.outputs.mode }}
+      policy_verified: ${{ steps.snapshot.outputs.policy_verified }}
+      policy_reservation_id: ${{ steps.snapshot.outputs.policy_reservation_id }}
+      initial_decision: ${{ steps.snapshot.outputs.initial_decision }}
+      reuse_run_id: ${{ steps.snapshot.outputs.reuse_run_id }}
+      reuse_run_attempt: ${{ steps.snapshot.outputs.reuse_run_attempt }}
+      repair_pr: ${{ steps.snapshot.outputs.repair_pr }}
+      repair_head: ${{ steps.snapshot.outputs.repair_head }}
+      prepared_run_id: ${{ steps.snapshot.outputs.prepared_run_id }}
+      prepared_run_attempt: ${{ steps.snapshot.outputs.prepared_run_attempt }}
+    steps:
+      - name: Require The Trusted Controller Pin
+        env:
+          TRUSTED_POLICY: ${{ vars.ZED_TRUSTED_POLICY }}
+        run: |
+          [[ "$TRUSTED_POLICY" =~ ^[0-9a-f]{40}$ ]]
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ vars.ZED_TRUSTED_POLICY }}
+          path: trusted
+          persist-credentials: false
+      - name: Read The Trusted Private Module Pin
+        id: private-pin
+        run: |
+          python3 -c 'import json,re; d=json.load(open("trusted/scripts/maintenance.lock.json")); r=d.get("revision", ""); assert re.fullmatch(r"[0-9a-f]{40}", r); print(f"revision={r}")' >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.private-pin.outputs.revision }}
+          path: private-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+      - name: Record The Exact Private Checkout Receipt
+        run: |
+          python3 -c 'import json,pathlib,subprocess; p=pathlib.Path("private-maintenance"); lock=json.loads(pathlib.Path("trusted/scripts/maintenance.lock.json").read_text()); actual=subprocess.check_output(["git","-C",str(p),"rev-parse","HEAD"],text=True).strip(); assert actual==lock["revision"]; (p/".maintenance-source.json").write_text(json.dumps({"repository":lock["repository"],"revision":actual},separators=(",",":"))+"\n")'
+      - name: Select Source And Request The Native Review Pair
+        id: snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/private-maintenance
+          TRUSTED_POLICY: ${{ vars.ZED_TRUSTED_POLICY }}
+          NINEROUTER_SOURCE_ROOT: ${{ github.workspace }}/candidate
+        run: python3 trusted/scripts/release.py prepare-shared "$RUNNER_TEMP/9router-source"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.snapshot.outputs.context != ''
+        with:
+          name: lifecycle-${{ steps.snapshot.outputs.candidate_id }}
+          path: ${{ steps.snapshot.outputs.context }}
+          if-no-files-found: error
+          retention-days: 7
+      - name: Report The Actual State
+        if: always()
+        env:
+          READY: ${{ steps.snapshot.outputs.ready }}
+          MODE: ${{ steps.snapshot.outputs.mode }}
+          REASON: ${{ steps.snapshot.outputs.reason }}
+          SOURCE_SHA: ${{ steps.snapshot.outputs.sha }}
+          VERSION: ${{ steps.snapshot.outputs.version }}
+          FULL_PR: ${{ steps.snapshot.outputs.full_pr }}
+          DELTA_PR: ${{ steps.snapshot.outputs.delta_pr }}
+        run: |
+          {
+            echo "### Upstream plus patches"
+            printf '%s\n' "- State: ${MODE:-stopped before a decision}"
+            printf '%s\n' "- Review accepted: ${READY:-false}"
+            if [ -n "$SOURCE_SHA" ]; then printf '%s\n' "- Application: $VERSION at $SOURCE_SHA"; fi
+            if [ -n "$FULL_PR" ]; then printf '%s\n' "- Full review PR: #$FULL_PR"; fi
+            if [ -n "$DELTA_PR" ]; then printf '%s\n' "- Delta review PR: #$DELTA_PR"; fi
+            if [ -n "$REASON" ]; then printf '%s\n' "- Detail: $REASON"; fi
+            echo "- GitHub never deploys; the VPS recipe consumes verified releases"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  policy-check:
+    name: Validate Policy In The Credential-Free Sandbox
+    needs: prepare
+    if: >-
+      needs.prepare.outputs.review_ready == 'true' &&
+      needs.prepare.outputs.prepared_run_id == github.run_id &&
+      needs.prepare.outputs.policy_verified != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Reject A Job-Only Rerun Before Policy Tests
+        env:
+          PREPARED_RUN_ID: ${{ needs.prepare.outputs.prepared_run_id }}
+          PREPARED_RUN_ATTEMPT: ${{ needs.prepare.outputs.prepared_run_attempt }}
+          POLICY_RESERVATION_ID: ${{ needs.prepare.outputs.policy_reservation_id }}
+        run: |
+          test "$PREPARED_RUN_ID" = "$GITHUB_RUN_ID"
+          test "$PREPARED_RUN_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+          [[ "$POLICY_RESERVATION_ID" =~ ^[1-9][0-9]*$ ]]
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ vars.ZED_TRUSTED_POLICY }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.config_sha }}
+          path: candidate
+          persist-credentials: false
+      - name: Read The Candidate Private Module Pin
+        id: private-pin
+        run: |
+          python3 -c 'import json,re; d=json.load(open("candidate/scripts/maintenance.lock.json")); r=d.get("revision", ""); assert re.fullmatch(r"[0-9a-f]{40}", r); print(f"revision={r}")' >> "$GITHUB_OUTPUT"
+      - name: Read The Trusted Baseline Private Module Pin
+        id: baseline-private-pin
+        run: |
+          python3 -c 'import json,re; d=json.load(open("trusted/scripts/maintenance.lock.json")); r=d.get("revision", ""); assert re.fullmatch(r"[0-9a-f]{40}", r); print(f"revision={r}")' >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.private-pin.outputs.revision }}
+          path: private-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+      - name: Checkout The Trusted Baseline Private Module
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.private-pin.outputs.revision != steps.baseline-private-pin.outputs.revision
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.baseline-private-pin.outputs.revision }}
+          path: private-maintenance-baseline
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+      - name: Record The Exact Private Checkout Receipt
+        run: |
+          python3 -c 'import json,pathlib,subprocess; p=pathlib.Path("private-maintenance"); lock=json.loads(pathlib.Path("candidate/scripts/maintenance.lock.json").read_text()); actual=subprocess.check_output(["git","-C",str(p),"rev-parse","HEAD"],text=True).strip(); assert actual==lock["revision"]; (p/".maintenance-source.json").write_text(json.dumps({"repository":lock["repository"],"revision":actual},separators=(",",":"))+"\n")'
+      - name: Record The Exact Trusted Baseline Private Checkout Receipt
+        if: steps.private-pin.outputs.revision != steps.baseline-private-pin.outputs.revision
+        run: |
+          python3 -c 'import json,pathlib,subprocess; p=pathlib.Path("private-maintenance-baseline"); lock=json.loads(pathlib.Path("trusted/scripts/maintenance.lock.json").read_text()); actual=subprocess.check_output(["git","-C",str(p),"rev-parse","HEAD"],text=True).strip(); assert actual==lock["revision"]; (p/".maintenance-source.json").write_text(json.dumps({"repository":lock["repository"],"revision":actual},separators=(",",":"))+"\n")'
+      - name: Install The Pinned Policy YAML Parser
+        run: |
+          parser_dir="$RUNNER_TEMP/9router-policy-parser"
+          requirements="$RUNNER_TEMP/9router-policy-requirements.txt"
+          mkdir -m 700 "$parser_dir"
+          printf '%s\n' 'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' > "$requirements"
+          python3 -m pip install --isolated --disable-pip-version-check --no-input --no-cache-dir \
+            --only-binary=:all: --no-deps --require-hashes --index-url https://pypi.org/simple \
+            --target "$parser_dir" -r "$requirements"
+          printf 'NINEROUTER_POLICY_PARSER=%s\n' "$parser_dir" >> "$GITHUB_ENV"
+          printf 'PYTHONDONTWRITEBYTECODE=1\n' >> "$GITHUB_ENV"
+      - name: Enforce Trusted Tests And Validate Proposed YAML
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/private-maintenance
+          TMPDIR: ${{ runner.temp }}
+          NINEROUTER_POLICY_BASELINE_MAINTENANCE: ${{ steps.private-pin.outputs.revision == steps.baseline-private-pin.outputs.revision && format('{0}/private-maintenance', github.workspace) || format('{0}/private-maintenance-baseline', github.workspace) }}
+        run: python3 trusted/scripts/release.py check-policy-shared "$GITHUB_WORKSPACE/candidate"
+
+  finalize:
+    name: Recheck Reviews And Authorize One Final Attempt
+    needs: [prepare, policy-check]
+    if: >-
+      always() && needs.prepare.result == 'success' &&
+      needs.prepare.outputs.review_ready == 'true' &&
+      needs.prepare.outputs.prepared_run_id == github.run_id &&
+      (needs.prepare.outputs.policy_verified == 'true' || needs.policy-check.result == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: read
+    outputs:
+      ready: ${{ steps.final.outputs.final_ready }}
+      mode: ${{ steps.final.outputs.mode }}
+      reason: ${{ steps.final.outputs.reason }}
+      reuse_run_id: ${{ steps.final.outputs.reuse_run_id }}
+      reuse_run_attempt: ${{ steps.final.outputs.reuse_run_attempt }}
+      validated_run_id: ${{ steps.final.outputs.validated_run_id }}
+      validated_run_attempt: ${{ steps.final.outputs.validated_run_attempt }}
+      transition_run_id: ${{ steps.final.outputs.transition_run_id }}
+      transition_run_attempt: ${{ steps.final.outputs.transition_run_attempt }}
+    steps:
+      - name: Reject A Job-Only Rerun Before Final Authorization
+        env:
+          PREPARED_RUN_ID: ${{ needs.prepare.outputs.prepared_run_id }}
+          PREPARED_RUN_ATTEMPT: ${{ needs.prepare.outputs.prepared_run_attempt }}
+        run: |
+          test "$PREPARED_RUN_ID" = "$GITHUB_RUN_ID"
+          test "$PREPARED_RUN_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ vars.ZED_TRUSTED_POLICY }}
+          path: trusted
+          persist-credentials: false
+      - name: Read The Trusted Private Module Pin
+        id: private-pin
+        run: |
+          python3 -c 'import json,re; d=json.load(open("trusted/scripts/maintenance.lock.json")); r=d.get("revision", ""); assert re.fullmatch(r"[0-9a-f]{40}", r); print(f"revision={r}")' >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.private-pin.outputs.revision }}
+          path: private-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+      - name: Record The Exact Private Checkout Receipt
+        run: |
+          python3 -c 'import json,pathlib,subprocess; p=pathlib.Path("private-maintenance"); lock=json.loads(pathlib.Path("trusted/scripts/maintenance.lock.json").read_text()); actual=subprocess.check_output(["git","-C",str(p),"rev-parse","HEAD"],text=True).strip(); assert actual==lock["revision"]; (p/".maintenance-source.json").write_text(json.dumps({"repository":lock["repository"],"revision":actual},separators=(",",":"))+"\n")'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: lifecycle-${{ needs.prepare.outputs.candidate_id }}
+          path: lifecycle
+      - name: Recheck Native Pair And Final Attempt History
+        id: final
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/private-maintenance
+          TRUSTED_POLICY: ${{ vars.ZED_TRUSTED_POLICY }}
+        run: python3 trusted/scripts/release.py finalize-shared "$GITHUB_WORKSPACE/lifecycle"
+
+  policy-only:
+    name: Adopt Reviewed Policy Without Rebuilding The Image
+    needs: [prepare, policy-check, finalize]
+    if: >-
+      always() && needs.prepare.result == 'success' &&
+      (needs.policy-check.result == 'success' ||
+       (needs.prepare.outputs.mode == 'policy-current' && needs.prepare.outputs.policy_verified == 'true')) &&
+      needs.finalize.result == 'success' && needs.finalize.outputs.ready == 'true' &&
+      needs.prepare.outputs.prepared_run_id == github.run_id &&
+      needs.finalize.outputs.mode == 'policy-only'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Reject A Job-Only Rerun Before Policy Adoption
+        env:
+          PREPARED_RUN_ID: ${{ needs.prepare.outputs.prepared_run_id }}
+          PREPARED_RUN_ATTEMPT: ${{ needs.prepare.outputs.prepared_run_attempt }}
+        run: |
+          test "$PREPARED_RUN_ID" = "$GITHUB_RUN_ID"
+          test "$PREPARED_RUN_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ vars.ZED_TRUSTED_POLICY }}
+          path: trusted
+          persist-credentials: false
+      - name: Read The Trusted Private Module Pin
+        id: private-pin
+        run: |
+          python3 -c 'import json,re; d=json.load(open("trusted/scripts/maintenance.lock.json")); r=d.get("revision", ""); assert re.fullmatch(r"[0-9a-f]{40}", r); print(f"revision={r}")' >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.private-pin.outputs.revision }}
+          path: private-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+      - name: Record The Exact Private Checkout Receipt
+        run: |
+          python3 -c 'import json,pathlib,subprocess; p=pathlib.Path("private-maintenance"); lock=json.loads(pathlib.Path("trusted/scripts/maintenance.lock.json").read_text()); actual=subprocess.check_output(["git","-C",str(p),"rev-parse","HEAD"],text=True).strip(); assert actual==lock["revision"]; (p/".maintenance-source.json").write_text(json.dumps({"repository":lock["repository"],"revision":actual},separators=(",",":"))+"\n")'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: lifecycle-${{ needs.prepare.outputs.candidate_id }}
+          path: lifecycle
+      - name: Recheck And Adopt The Policy-Only Candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/private-maintenance
+          TRUSTED_POLICY: ${{ vars.ZED_TRUSTED_POLICY }}
+        run: python3 trusted/scripts/release.py policy-only-shared "$GITHUB_WORKSPACE/lifecycle"
+
+  test:
+    name: Test The Historical Application Contracts
+    needs: [prepare, finalize]
+    if: >-
+      always() && !cancelled() &&
+      needs.prepare.result == 'success' && needs.finalize.result == 'success' &&
+      needs.prepare.outputs.review_ready == 'true' &&
+      needs.finalize.outputs.ready == 'true' && needs.finalize.outputs.mode == 'application' &&
+      needs.prepare.outputs.prepared_run_id == github.run_id &&
+      needs.finalize.outputs.validated_run_id == github.run_id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
+      UPSTREAM_DIR: ${{ github.workspace }}/upstream
+      NINEROUTER_SOURCE_ROOT: ${{ github.workspace }}/candidate-config
+    steps:
+      - name: Reject A Job-Only Rerun Before Application Tests
+        env:
+          PREPARED_RUN_ID: ${{ needs.prepare.outputs.prepared_run_id }}
+          PREPARED_RUN_ATTEMPT: ${{ needs.prepare.outputs.prepared_run_attempt }}
+          AUTHORIZED_RUN_ID: ${{ needs.finalize.outputs.validated_run_id }}
+          AUTHORIZED_RUN_ATTEMPT: ${{ needs.finalize.outputs.validated_run_attempt }}
+        run: |
+          test "$PREPARED_RUN_ID" = "$GITHUB_RUN_ID"
+          test "$PREPARED_RUN_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+          test "$AUTHORIZED_RUN_ID" = "$GITHUB_RUN_ID"
+          test "$AUTHORIZED_RUN_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          path: app
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ vars.ZED_TRUSTED_POLICY }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.config_sha }}
+          path: candidate-config
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: decolua/9router
+          ref: ${{ needs.prepare.outputs.upstream }}
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Install Application And Test Dependencies
+        working-directory: app
+        run: |
+          npm exec --yes --package=npm@11.20.0 -- npm install --no-audit --no-fund
+          npm exec --yes --package=npm@11.20.0 -- npm --prefix tests install --no-audit --no-fund
+      - name: Run Every Preserved Regression File
+        run: python3 trusted/scripts/release.py test "$GITHUB_WORKSPACE/app"
+
+  build:
+    name: Build And Smoke Test One Container
+    needs: [prepare, finalize, test]
+    if: >-
+      always() && !cancelled() &&
+      needs.prepare.result == 'success' && needs.finalize.result == 'success' &&
+      needs.prepare.outputs.review_ready == 'true' && needs.finalize.outputs.ready == 'true' &&
+      needs.finalize.outputs.mode == 'application' && needs.test.result == 'success' &&
+      needs.prepare.outputs.prepared_run_id == github.run_id &&
+      needs.finalize.outputs.validated_run_id == github.run_id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      IMAGE_TAG: 9router-reviewed:${{ needs.prepare.outputs.sha }}
+      APP_VERSION: ${{ needs.prepare.outputs.version }}
+      CANDIDATE_SHA: ${{ needs.prepare.outputs.sha }}
+      UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
+      PATCHSET_SHA256: ${{ needs.prepare.outputs.patchset }}
+      CONFIG_SHA: ${{ needs.prepare.outputs.config_sha }}
+      RECIPE_SHA256: ${{ needs.prepare.outputs.recipe }}
+      CANDIDATE_ID: ${{ needs.prepare.outputs.candidate_id }}
+      FULL_REVIEW_PR: ${{ needs.prepare.outputs.full_pr }}
+      DELTA_REVIEW_PR: ${{ needs.prepare.outputs.delta_pr }}
+    steps:
+      - name: Reject A Job-Only Rerun Before Container Build
+        env:
+          PREPARED_RUN_ID: ${{ needs.prepare.outputs.prepared_run_id }}
+          PREPARED_RUN_ATTEMPT: ${{ needs.prepare.outputs.prepared_run_attempt }}
+          AUTHORIZED_RUN_ID: ${{ needs.finalize.outputs.validated_run_id }}
+          AUTHORIZED_RUN_ATTEMPT: ${{ needs.finalize.outputs.validated_run_attempt }}
+        run: |
+          test "$PREPARED_RUN_ID" = "$GITHUB_RUN_ID"
+          test "$PREPARED_RUN_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+          test "$AUTHORIZED_RUN_ID" = "$GITHUB_RUN_ID"
+          test "$AUTHORIZED_RUN_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ vars.ZED_TRUSTED_POLICY }}
+          path: trusted
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build From The Immutable Remote Git Context
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: https://github.com/${{ github.repository }}.git#${{ needs.prepare.outputs.sha }}
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_TAG }}
+          build-args: APP_VERSION=${{ env.APP_VERSION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.CANDIDATE_SHA }}
+            org.opencontainers.image.version=${{ env.APP_VERSION }}
+            io.9router.upstream.revision=${{ env.UPSTREAM_SHA }}
+            io.9router.patches.sha256=${{ env.PATCHSET_SHA256 }}
+          outputs: type=docker,dest=${{ runner.temp }}/9router-image.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
+      - name: Load And Check Runtime Health And Version
+        run: |
+          set -euo pipefail
+          docker load --input "$RUNNER_TEMP/9router-image.tar"
+          docker run --detach --name 9router-smoke --security-opt=no-new-privileges:true \
+            --publish 127.0.0.1::20128 \
+            --env INITIAL_PASSWORD="$(openssl rand -hex 24)" \
+            --env JWT_SECRET="$(openssl rand -hex 32)" \
+            "$IMAGE_TAG"
+          port=$(docker port 9router-smoke 20128/tcp | cut -d: -f2)
+          healthy=false
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent "http://127.0.0.1:$port/api/health" > "$RUNNER_TEMP/health.json"; then
+              if python3 -c 'import json,sys; assert json.load(open(sys.argv[1])).get("ok") is True' "$RUNNER_TEMP/health.json"; then
+                healthy=true
+                break
+              fi
+            fi
+            sleep 2
+          done
+          test "$healthy" = true
+          curl --fail --silent "http://127.0.0.1:$port/api/version" > "$RUNNER_TEMP/version.json"
+          python3 -c 'import json,os,sys; assert json.load(open(sys.argv[1]))["currentVersion"] == os.environ["APP_VERSION"]' "$RUNNER_TEMP/version.json"
+      - name: Show Smoke Logs And Remove Only The Test Container
+        if: always()
+        run: |
+          docker logs 9router-smoke 2>&1 || true
+          docker rm --force 9router-smoke || true
+      - name: Package The Verified Image
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          gzip -n -c "$RUNNER_TEMP/9router-image.tar" > "$RUNNER_TEMP/release/9router-image.tar.gz"
+          python3 trusted/scripts/release.py provenance "$RUNNER_TEMP/release/9router-image.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reviewed-${{ needs.prepare.outputs.candidate_id }}
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Verify The Artifact And Publish Without Deploying
+    needs: [prepare, finalize, build]
+    if: >-
+      always() && needs.prepare.outputs.review_ready == 'true' &&
+      needs.finalize.result == 'success' && needs.finalize.outputs.ready == 'true' &&
+      needs.prepare.outputs.prepared_run_id == github.run_id &&
+      (((needs.finalize.outputs.mode == 'workflow-transition' ||
+         needs.finalize.outputs.mode == 'workflow-transition-recovery') &&
+        needs.finalize.outputs.transition_run_id == github.run_id &&
+        needs.finalize.outputs.transition_run_attempt == github.run_attempt) ||
+       needs.finalize.outputs.mode == 'already-validated' || needs.build.result == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Reject A Job-Only Rerun Before Workflow Adoption
+        if: >-
+          needs.finalize.outputs.mode == 'workflow-transition' ||
+          needs.finalize.outputs.mode == 'workflow-transition-recovery'
+        env:
+          PREPARED_RUN_ID: ${{ needs.prepare.outputs.prepared_run_id }}
+          PREPARED_RUN_ATTEMPT: ${{ needs.prepare.outputs.prepared_run_attempt }}
+          TRANSITION_RUN_ID: ${{ needs.finalize.outputs.transition_run_id }}
+          TRANSITION_RUN_ATTEMPT: ${{ needs.finalize.outputs.transition_run_attempt }}
+        run: |
+          test "$PREPARED_RUN_ID" = "$GITHUB_RUN_ID"
+          test "$PREPARED_RUN_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+          test "$TRANSITION_RUN_ID" = "$GITHUB_RUN_ID"
+          test "$TRANSITION_RUN_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ vars.ZED_TRUSTED_POLICY }}
+          path: trusted
+          persist-credentials: false
+      - name: Read The Trusted Private Module Pin
+        id: private-pin
+        run: |
+          python3 -c 'import json,re; d=json.load(open("trusted/scripts/maintenance.lock.json")); r=d.get("revision", ""); assert re.fullmatch(r"[0-9a-f]{40}", r); print(f"revision={r}")' >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.private-pin.outputs.revision }}
+          path: private-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+      - name: Record The Exact Private Checkout Receipt
+        run: |
+          python3 -c 'import json,pathlib,subprocess; p=pathlib.Path("private-maintenance"); lock=json.loads(pathlib.Path("trusted/scripts/maintenance.lock.json").read_text()); actual=subprocess.check_output(["git","-C",str(p),"rev-parse","HEAD"],text=True).strip(); assert actual==lock["revision"]; (p/".maintenance-source.json").write_text(json.dumps({"repository":lock["repository"],"revision":actual},separators=(",",":"))+"\n")'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: lifecycle-${{ needs.prepare.outputs.candidate_id }}
+          path: lifecycle
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: needs.finalize.outputs.mode == 'application'
+        with:
+          name: reviewed-${{ needs.prepare.outputs.candidate_id }}
+          path: release
+          run-id: ${{ needs.finalize.outputs.validated_run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: >-
+          needs.finalize.outputs.mode == 'already-validated' &&
+          needs.prepare.outputs.mode != 'published-recovery'
+        with:
+          name: reviewed-${{ needs.prepare.outputs.candidate_id }}
+          path: release
+          run-id: ${{ needs.finalize.outputs.validated_run_id }}
+          github-token: ${{ github.token }}
+      - name: Publish Only This Verified Candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/private-maintenance
+          TRUSTED_POLICY: ${{ vars.ZED_TRUSTED_POLICY }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.sha }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
+          PATCHSET_SHA256: ${{ needs.prepare.outputs.patchset }}
+          CONFIG_SHA: ${{ needs.prepare.outputs.config_sha }}
+          RECIPE_SHA256: ${{ needs.prepare.outputs.recipe }}
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          CANDIDATE_ID: ${{ needs.prepare.outputs.candidate_id }}
+          REPAIR_HEAD: ${{ needs.prepare.outputs.repair_head }}
+          VALIDATED_RUN_ID: ${{ needs.finalize.outputs.validated_run_id }}
+          VALIDATED_RUN_ATTEMPT: ${{ needs.finalize.outputs.validated_run_attempt }}
+          FINAL_MODE: ${{ needs.finalize.outputs.mode }}
+          TRANSITION_RUN_ID: ${{ needs.finalize.outputs.transition_run_id }}
+          TRANSITION_RUN_ATTEMPT: ${{ needs.finalize.outputs.transition_run_attempt }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          cp "$GITHUB_WORKSPACE/lifecycle/shared-context.json" "$GITHUB_WORKSPACE/release/shared-context.json"
+          python3 trusted/scripts/release.py publish-shared "$GITHUB_WORKSPACE/release"
+
+  repair:
+    name: Request A Machine Repair For The Actual Failure
+    needs: [prepare, policy-check, finalize, policy-only, test, build, publish]
+    if: >-
+      always() && contains(needs.*.result, 'failure') &&
+      (needs.prepare.outputs.prepared_run_attempt == '' ||
+       needs.prepare.outputs.prepared_run_attempt == github.run_attempt)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ vars.ZED_TRUSTED_POLICY }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+      - name: Fetch The Exact Candidate Configuration For Repair Worktree
+        run: |
+          test "$(git -C candidate rev-parse HEAD)" = "$GITHUB_SHA"
+          git -C candidate update-ref refs/heads/fork-candidate "$GITHUB_SHA"
+          git -C trusted fetch --no-tags "$GITHUB_WORKSPACE/candidate" refs/heads/fork-candidate
+          test "$(git -C trusted rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          git -C trusted cat-file -e "$GITHUB_SHA^{commit}"
+      - name: Request The Exact Repair Without Republishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
+          CANDIDATE_PR: ${{ needs.prepare.outputs.full_pr }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.sha }}
+          REPAIR_HEAD: ${{ needs.prepare.outputs.repair_head }}
+        run: python3 trusted/scripts/release.py repair "$RUNNER_TEMP/9router-repair"

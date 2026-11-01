@@ -1,0 +1,29 @@
+From 22a9d8475fc23d0ad7ec56a15ec683026e3f2c2c Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Wed, 28 Oct 2026 10:05:03 +0000
+Subject: [PATCH] Stabilize CodeBuddy dynamic headers in the golden harness
+
+---
+ tests/translator/golden-url-header.test.js | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
+index 881eb6ab..f9b3a1fb 100644
+--- a/tests/translator/golden-url-header.test.js
++++ b/tests/translator/golden-url-header.test.js
+@@ -26,7 +26,11 @@ const SPECIALIZED = new Set([
+ ]);
+ 
+ // Per-process / per-request values: kimi's random device name, minimax's session UUID.
+-const VOLATILE_HEADERS = new Set(["x-msh-device-name", "x-mavis-session-id"]);
++const VOLATILE_HEADERS = new Set([
++  "x-msh-device-name", "x-mavis-session-id",
++  // CodeBuddy channel checks mint fresh request/conversation identifiers per call.
++  "x-request-id", "x-conversation-id", "x-conversation-request-id", "x-conversation-message-id",
++]);
+ 
+ // Sanitize header: khử token + field thời gian động (kimi X-Msh-Device-Id) để snapshot ổn định.
+ function sanitize(headers) {
+-- 
+2.55.0
+

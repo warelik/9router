@@ -1,0 +1,49 @@
+From 356bcd62c8e1ffde0a6758662f2f2bda00304dcc Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Wed, 28 Oct 2026 10:07:51 +0000
+Subject: [PATCH] Traverse Gemini type constraints over schema children only
+
+---
+ open-sse/translator/formats/gemini.js | 17 +++++++++--------
+ 1 file changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
+index 72ec5393..6d6eadef 100644
+--- a/open-sse/translator/formats/gemini.js
++++ b/open-sse/translator/formats/gemini.js
+@@ -399,15 +399,16 @@ function ensureArrayItems(obj) {
+ // 1. Schema.items predicate: $type == Type.ARRAY. If type is not "array", items field MUST NOT exist.
+ // 2. Schema.properties / required predicate: $type == Type.OBJECT. If type is not "object", properties and required MUST NOT exist.
+ function enforceTypeConstraints(obj) {
+-  if (!obj || typeof obj !== "object") return;
++  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+ 
+-  for (const value of Object.values(obj)) {
+-    if (value && typeof value === "object") {
+-      enforceTypeConstraints(value);
+-    }
+-  }
++  // Only schema children are constraint targets: a properties map is data
++  // whose keys may themselves be named like keywords.
++  eachChildSchema(obj, enforceTypeConstraints);
+ 
+-  if (obj.type === "array") {
++  // Proto-style schemas carry uppercase type names; recognize their kind
++  // without rewriting the caller's casing.
++  const type = typeof obj.type === "string" ? obj.type.toLowerCase() : obj.type;
++  if (type === "array") {
+     delete obj.properties;
+     delete obj.required;
+     if (!obj.items || typeof obj.items !== "object" || Object.keys(obj.items).length === 0) {
+@@ -426,7 +427,7 @@ function enforceTypeConstraints(obj) {
+     delete obj.items;
+   }
+ 
+-  if (obj.type !== "object") {
++  if (type !== "object") {
+     delete obj.properties;
+     delete obj.required;
+   }
+-- 
+2.55.0
+

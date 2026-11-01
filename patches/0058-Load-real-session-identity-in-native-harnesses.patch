@@ -1,0 +1,95 @@
+From 45966e7c4693c1f47600824719894fd91dc0ec75 Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Wed, 28 Oct 2026 09:46:33 +0000
+Subject: [PATCH] Load real session identity in native harnesses
+
+---
+ tests/unit/antigravity-native-disabled-functions.test.js | 2 ++
+ tests/unit/antigravity-native-gemini.test.js             | 2 ++
+ tests/unit/antigravity-native-json-output.test.js        | 2 ++
+ tests/unit/gemini-native-entry-contract.test.js          | 2 ++
+ 4 files changed, 8 insertions(+)
+
+diff --git a/tests/unit/antigravity-native-disabled-functions.test.js b/tests/unit/antigravity-native-disabled-functions.test.js
+index dd39ea3b..e1ab02ea 100644
+--- a/tests/unit/antigravity-native-disabled-functions.test.js
++++ b/tests/unit/antigravity-native-disabled-functions.test.js
+@@ -40,6 +40,7 @@ vi.mock("@/lib/db/helpers/kvStore.js", () => ({
+ 
+ const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+ const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
++const { resolveSessionIdentity } = await import("../../open-sse/utils/sessionManager.js");
+ const { ANTIGRAVITY_HEADERS } = await import("../../open-sse/config/appConstants.js");
+ 
+ const root = fileURLToPath(new URL("../../", import.meta.url));
+@@ -191,6 +192,7 @@ function loadPublicNativeRoute() {
+     DEFAULT_HEADROOM_URL: "http://unused.test",
+     getTargetFormat,
+     supportsNativeGemini,
++    resolveSessionIdentity,
+     initTranslators: async () => {},
+     proxyAwareFetch: (...args) => services.fetch(...args),
+     stripModelContextMarker: services.stripModelContextMarker,
+diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
+index e26c5778..ff4b8a5b 100644
+--- a/tests/unit/antigravity-native-gemini.test.js
++++ b/tests/unit/antigravity-native-gemini.test.js
+@@ -42,6 +42,7 @@ vi.mock("@/lib/db/helpers/kvStore.js", () => ({
+ const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+ const { FORMATS } = await import("../../open-sse/translator/formats.js");
+ const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
++const { resolveSessionIdentity } = await import("../../open-sse/utils/sessionManager.js");
+ const { ANTIGRAVITY_HEADERS } = await import("../../open-sse/config/appConstants.js");
+ const { AntigravityExecutor } = await import("../../open-sse/executors/antigravity.js");
+ 
+@@ -220,6 +221,7 @@ function loadRouteHarness() {
+     DEFAULT_HEADROOM_URL: "http://unused.test",
+     getTargetFormat,
+     supportsNativeGemini,
++    resolveSessionIdentity,
+     initTranslators: async () => {},
+     proxyAwareFetch: (...args) => services.fetch(...args),
+     stripModelContextMarker: services.stripModelContextMarker,
+diff --git a/tests/unit/antigravity-native-json-output.test.js b/tests/unit/antigravity-native-json-output.test.js
+index 6278f8e8..6bb0a96c 100644
+--- a/tests/unit/antigravity-native-json-output.test.js
++++ b/tests/unit/antigravity-native-json-output.test.js
+@@ -41,6 +41,7 @@ vi.mock("@/lib/db/helpers/kvStore.js", () => ({
+ 
+ const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+ const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
++const { resolveSessionIdentity } = await import("../../open-sse/utils/sessionManager.js");
+ const { ANTIGRAVITY_HEADERS } = await import("../../open-sse/config/appConstants.js");
+ 
+ const root = fileURLToPath(new URL("../../", import.meta.url));
+@@ -152,6 +153,7 @@ function loadPublicNativeRoute() {
+     DEFAULT_HEADROOM_URL: "http://unused.test",
+     getTargetFormat,
+     supportsNativeGemini,
++    resolveSessionIdentity,
+     initTranslators: async () => {},
+     proxyAwareFetch: (...args) => services.fetch(...args),
+     stripModelContextMarker: services.stripModelContextMarker,
+diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
+index e6cea348..3ea37ec9 100644
+--- a/tests/unit/gemini-native-entry-contract.test.js
++++ b/tests/unit/gemini-native-entry-contract.test.js
+@@ -4,6 +4,7 @@ import path from "node:path";
+ import vm from "node:vm";
+ import { createHash } from "node:crypto";
+ import { fileURLToPath } from "node:url";
++import { resolveSessionIdentity } from "../../open-sse/utils/sessionManager.js";
+ 
+ // Real endpoint + handler control flow. Only imported service boundaries are
+ // replaced; no database, external fetch, model, or provider account is contacted.
+@@ -61,6 +62,7 @@ function load() {
+     DEFAULT_HEADROOM_URL: "http://unused.test",
+     getComboModels: async () => null,
+     getTargetFormat: provider => ["gemini", "aistudio"].includes(provider) ? "gemini" : "openai",
++    resolveSessionIdentity,
+     proxyAwareFetch: (...args) => services.fetch(...args),
+     getModelInfo: async model => { const i = model.indexOf("/"); return { provider: i < 0 ? "gemini" : model.slice(0, i), model: i < 0 ? model : model.slice(i + 1) }; },
+     stripModelContextMarker: model => ({ model, contextMarker: null }),
+-- 
+2.43.0
+

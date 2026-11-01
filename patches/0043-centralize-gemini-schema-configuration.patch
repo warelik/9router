@@ -1,0 +1,122 @@
+From e53017372560115f84c16d243d938a66456c298a Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] Centralize Gemini schema tables
+
+---
+ open-sse/config/runtimeConfig.js           |  7 +++++
+ open-sse/translator/formats/gemini.js      |  9 ++-----
+ tests/unit/chat-to-gemini-contract.test.js | 31 ++++++++++++++++++++++
+ 3 files changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
+index 03ab5dbb..9823b5ad 100644
+--- a/open-sse/config/runtimeConfig.js
++++ b/open-sse/config/runtimeConfig.js
+@@ -78,6 +78,13 @@ export const FILE_EXTENSION_MIME = {
+   txt: "text/plain", md: "text/markdown", csv: "text/csv",
+ };
+ 
++export const SCHEMA_MAP_KEYS = new Set(["properties", "$defs", "definitions", "patternProperties", "dependentSchemas"]);
++export const SCHEMA_ARRAY_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
++export const SCHEMA_SINGLE_KEYS = new Set(["items", "additionalProperties", "contains", "not", "if", "then", "else"]);
++export const PROTO_SCHEMA_TYPES = new Set(["OBJECT", "ARRAY", "STRING", "NUMBER", "INTEGER", "BOOLEAN", "NULL"]);
++export const LEGACY_PROTO_SCHEMA_KEYS = new Set(["type", "format", "description", "nullable", "enum", "items", "properties", "required", "propertyOrdering"]);
++
++
+ export const TOKEN_SAVER_HEADER = "x-9router-token-saver";
+ 
+ export const PORTABLE_COLLABORATION = {
+diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
+index 05a970ab..36d47488 100644
+--- a/open-sse/translator/formats/gemini.js
++++ b/open-sse/translator/formats/gemini.js
+@@ -3,7 +3,8 @@
+ import { safeParseJSON } from "../concerns/json.js";
+ import { OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
+ import { isGemini4Model } from "../../providers/capabilities.js";
+-import { FILE_EXTENSION_MIME } from "../../config/runtimeConfig.js";
++import { FILE_EXTENSION_MIME, SCHEMA_MAP_KEYS, SCHEMA_ARRAY_KEYS, SCHEMA_SINGLE_KEYS,
++  PROTO_SCHEMA_TYPES, LEGACY_PROTO_SCHEMA_KEYS } from "../../config/runtimeConfig.js";
+ 
+ // Unsupported JSON Schema constraints that should be removed for Antigravity
+ export const UNSUPPORTED_SCHEMA_CONSTRAINTS = [
+@@ -170,10 +171,6 @@ export function generateProjectId() {
+   return `${adj}-${noun}-${crypto.randomUUID().slice(0, 5)}`;
+ }
+ 
+-const SCHEMA_MAP_KEYS = new Set(["properties", "$defs", "definitions", "patternProperties", "dependentSchemas"]);
+-const SCHEMA_ARRAY_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
+-const SCHEMA_SINGLE_KEYS = new Set(["items", "additionalProperties", "contains", "not", "if", "then", "else"]);
+-
+ function eachChildSchema(node, fn) {
+   for (const key of Object.keys(node)) {
+     if (SCHEMA_MAP_KEYS.has(key)) {
+@@ -521,7 +518,6 @@ export function cleanJSONSchemaForAntigravity(schema) {
+   return cleaned;
+ }
+ 
+-const PROTO_SCHEMA_TYPES = new Set(["OBJECT", "ARRAY", "STRING", "NUMBER", "INTEGER", "BOOLEAN", "NULL"]);
+ export function lowerProtoSchemaTypes(schema) {
+   if (!schema || typeof schema !== "object") return schema;
+   if (Array.isArray(schema)) {
+@@ -535,7 +531,6 @@ export function lowerProtoSchemaTypes(schema) {
+   return schema;
+ }
+ 
+-const LEGACY_PROTO_SCHEMA_KEYS = new Set(["type", "format", "description", "nullable", "enum", "items", "properties", "required", "propertyOrdering"]);
+ export function isLegacyGeminiSchema(schema) {
+   if (!schema || typeof schema !== "object" || Array.isArray(schema)) return false;
+   for (const key of Object.keys(schema)) {
+diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
+index 60378296..3360b862 100644
+--- a/tests/unit/chat-to-gemini-contract.test.js
++++ b/tests/unit/chat-to-gemini-contract.test.js
+@@ -36,6 +36,7 @@ import {
+   convertOpenAIContentToParts,
+   cleanJSONSchemaForAntigravity,
+   isLegacyGeminiSchema,
++  lowerProtoSchemaTypes,
+ } from "../../open-sse/translator/formats/gemini.js";
+ import { AntigravityExecutor } from "../../open-sse/executors/antigravity.js";
+ import { handleChatCore } from "../../open-sse/handlers/chatCore.js";
+@@ -293,6 +294,36 @@ describe("cleanJSONSchemaForAntigravity traversal is schema-position aware", ()
+     expect(cleaned.required).toEqual(schema.required);
+   });
+ 
++  it("proto schema tables normalize types and gate legacy proto shapes", () => {
++    const input = {
++      type: "OBJECT",
++      properties: {
++        name: { type: "STRING" },
++        count: { type: "ARRAY", items: { type: "INTEGER" } },
++      },
++      anyOf: [{ type: "NULL" }],
++    };
++    const lowered = lowerProtoSchemaTypes(input);
++    expect(lowered).toBe(input);
++    expect(lowered).toEqual({
++      type: "object",
++      properties: {
++        name: { type: "string" },
++        count: { type: "array", items: { type: "integer" } },
++      },
++      anyOf: [{ type: "null" }],
++    });
++    expect(isLegacyGeminiSchema({
++      type: "OBJECT",
++      properties: { name: { type: "STRING" } },
++      required: ["name"],
++    })).toBe(true);
++    expect(isLegacyGeminiSchema({
++      type: "OBJECT",
++      anyOf: [{ type: "STRING" }],
++    })).toBe(false);
++  });
++
+   it("isLegacyGeminiSchema accepts proto shapes and rejects non-proto ones", () => {
+     expect(isLegacyGeminiSchema({ type: "object", properties: { a: { type: "string" } }, required: ["a"], propertyOrdering: ["a"], enum: undefined })).toBe(true);
+     expect(isLegacyGeminiSchema({ type: "array", items: { type: "string" } })).toBe(true);
+-- 
+2.43.0
+
