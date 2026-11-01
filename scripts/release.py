@@ -5054,12 +5054,14 @@ def prepare_shared(directory):
     if baseline_data.get("initial") is True:
         delta_sha = repair["config_sha"]
         delta_base = initial_empty_base
-    elif repair["config_sha"] == accepted_candidate["configuration_sha"]:
+    elif (accepted_candidate is not None
+          and repair["config_sha"] == accepted_candidate["configuration_sha"]):
         delta_sha = application_sha
         delta_base = accepted_candidate["application_sha"]
     else:
         delta_sha = repair["config_sha"]
-        delta_base = accepted_candidate["configuration_sha"]
+        delta_base = (accepted_candidate["configuration_sha"]
+                      if accepted_candidate is not None else initial_empty_base)
     delta_head = f"review/changes-{delta_sha}"
     delta_base_ref = f"review-base/{delta_base}"
     existing_full = _exact_review_pull(
@@ -5117,7 +5119,9 @@ def prepare_shared(directory):
             return
         try:
             delta = _review_pr(
-                repo, app if repair["config_sha"] == accepted_candidate["configuration_sha"] else repair["config_root"],
+                repo, app if (accepted_candidate is not None
+                              and repair["config_sha"] == accepted_candidate["configuration_sha"]
+                              ) else repair["config_root"],
                 title=f"Review 9router downstream delta {repair['config_sha'][:12]}",
                 body=(f"Exact downstream delta `{delta_sha}` against last verified source/configuration `{delta_base}`. "
                       f"Candidate config `{repair['config_sha']}`, application `{application_sha}`, identity `{candidate_id}`. "
