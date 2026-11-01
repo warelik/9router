@@ -6943,3 +6943,421 @@ class InitialFirstReleaseTests(unittest.TestCase):
         self.assertEqual(retained[0]["candidate"], candidate)
         self.assertEqual(retained[0]["full"]["request_id"], 11)
         self.assertEqual(retained[0]["delta"]["request_id"], 12)
+
+    def test_initial_published_release_recovery_integrates_real_core_heavy_evidence(self):
+        lifecycle = release.shared_lifecycle()
+        self.assertEqual(lifecycle.API_VERSION, 1)
+        dockerfile = (b"ARG NODE_IMAGE=node:22-alpine@sha256:" + b"1" * 64
+                      + b"\nFROM ${NODE_IMAGE}\n")
+        workflow_bytes = (release.ROOT / ".github/workflows/release.yml").read_bytes()
+        recipe = release._recipe_sha256(
+            dockerfile, workflow_bytes.decode("utf-8"), lifecycle)
+        patchset = "d" * 64
+        candidate = release._candidate_record(
+            REPO, UPSTREAM, HEAD, CONFIG, patchset, recipe)
+        candidate_id = lifecycle.candidate_identity(candidate)
+        full_sha = "3" * 40
+        full_head = f"review/{UPSTREAM}-{candidate_id}"
+        full_base = f"review-base/{UPSTREAM}"
+        delta_head = f"review/changes-{CONFIG}"
+        delta_base_ref = f"review-base/{self.EMPTY_ROOT}"
+        tag = release._release_tag("1.2.3", UPSTREAM, patchset, recipe)
+        published_at = "2026-11-01T10:05:00Z"
+        published_release = {
+            "id": 7, "tag_name": tag, "target_commitish": HEAD,
+            "draft": False, "prerelease": False, "published_at": published_at,
+        }
+        metadata_sha256 = "e" * 64
+        metadata = {
+            "schema": 1, "repository": REPO,
+            "upstream_repository": release.UPSTREAM,
+            "candidate_sha": HEAD, "upstream_sha": UPSTREAM,
+            "config_sha": CONFIG, "patchset_sha256": patchset,
+            "recipe_sha256": recipe, "candidate_id": candidate_id,
+            "version": "1.2.3", "platform": release.PLATFORM,
+            "archive": "9router-image.tar.gz",
+            "image_id": "sha256:" + "1" * 64, "archive_sha256": "2" * 64,
+            "run_id": 500, "run_attempt": 1,
+            "full_review_pr": 1, "delta_review_pr": 2,
+        }
+
+        def content_record(raw):
+            return {
+                "type": "file", "encoding": "base64", "size": len(raw),
+                "sha": hashlib.sha1(
+                    b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest(),
+                "content": release.base64.b64encode(raw).decode("ascii"),
+            }
+
+        owner_user = {"login": "warelik", "type": "User", "id": 1001}
+        bot_user = {"login": "github-actions[bot]", "type": "Bot", "id": 41898282}
+        author_date = "2026-11-01T09:00:00Z"
+        cfg_tree = "1" * 40
+        app_tree = "2" * 40
+        root_commit = {"sha": self.EMPTY_ROOT,
+                       "tree": {"sha": release.EMPTY_TREE_SHA}, "parents": []}
+        config_commit = {
+            "sha": CONFIG, "tree": {"sha": cfg_tree},
+            "parents": [{"sha": self.EMPTY_ROOT}],
+            "message": "Initial 9router configuration\n",
+            "author": {"date": author_date}, "committer": {"date": author_date},
+        }
+        app_commit = {
+            "sha": HEAD, "tree": {"sha": app_tree},
+            "parents": [{"sha": UPSTREAM}],
+            "author": {"date": author_date}, "committer": {"date": author_date},
+        }
+        full_commit = {
+            "sha": full_sha, "tree": {"sha": app_tree},
+            "parents": [{"sha": HEAD}],
+            "message": f"fork-review-context:v1 {candidate_id}\n",
+            "author": {"date": author_date}, "committer": {"date": author_date},
+        }
+        config_tree_obj = {
+            "sha": cfg_tree, "truncated": False,
+            "tree": [
+                {"path": "patches/0001-init.patch", "mode": "100644", "sha": "5" * 40},
+                {"path": "patches/source.json", "mode": "100644", "sha": "6" * 40},
+            ],
+        }
+        full_pull = {
+            "number": 1, "state": "open", "updated_at": "2026-11-01T09:10:00Z",
+            "user": owner_user,
+            "head": {"ref": full_head, "sha": full_sha, "repo": {"full_name": REPO}},
+            "base": {"ref": full_base, "sha": UPSTREAM, "repo": {"full_name": REPO}},
+        }
+        delta_pull = {
+            "number": 2, "state": "open", "updated_at": "2026-11-01T09:10:00Z",
+            "user": owner_user,
+            "head": {"ref": delta_head, "sha": CONFIG, "repo": {"full_name": REPO}},
+            "base": {"ref": delta_base_ref, "sha": self.EMPTY_ROOT,
+                     "repo": {"full_name": REPO}},
+        }
+        full_req = {
+            "id": 11, "user": owner_user,
+            "created_at": "2026-11-01T09:05:00Z",
+            "updated_at": "2026-11-01T09:05:00Z",
+            "issue_url": f"https://api.github.com/repos/{REPO}/issues/1",
+            "body": release.shared_review_text(
+                candidate, "full", full_sha, UPSTREAM, candidate_id),
+        }
+        full_acc = {
+            "id": 12, "user": owner_user,
+            "created_at": "2026-11-01T09:05:05Z",
+            "updated_at": "2026-11-01T09:05:05Z",
+            "issue_url": f"https://api.github.com/repos/{REPO}/issues/1",
+            "body": release._owner_acceptance_body(
+                REPO, 1, full_req, "full", full_sha, UPSTREAM, candidate_id),
+        }
+        delta_req = {
+            "id": 21, "user": owner_user,
+            "created_at": "2026-11-01T09:05:00Z",
+            "updated_at": "2026-11-01T09:05:00Z",
+            "issue_url": f"https://api.github.com/repos/{REPO}/issues/2",
+            "body": release.shared_review_text(
+                candidate, "delta", CONFIG, self.EMPTY_ROOT, candidate_id),
+        }
+        delta_acc = {
+            "id": 22, "user": owner_user,
+            "created_at": "2026-11-01T09:05:05Z",
+            "updated_at": "2026-11-01T09:05:05Z",
+            "issue_url": f"https://api.github.com/repos/{REPO}/issues/2",
+            "body": release._owner_acceptance_body(
+                REPO, 2, delta_req, "delta", CONFIG, self.EMPTY_ROOT, candidate_id),
+        }
+        policy_marker = {
+            "schema": 1, "candidate_id": candidate_id, "run_id": 500,
+            "run_attempt": 1, "workflow_sha": CONFIG, "trusted_policy_sha": CONFIG,
+        }
+        policy_res_comment = {
+            "id": 31, "user": bot_user,
+            "created_at": "2026-11-01T09:50:10Z",
+            "updated_at": "2026-11-01T09:50:10Z",
+            "issue_url": f"https://api.github.com/repos/{REPO}/issues/2",
+            "body": ("Reserved policy validation.\n"
+                     "<!-- fork-candidate:v1 " + release._candidate_json(candidate) + " -->\n"
+                     "<!-- fork-policy-validation:v1 "
+                     + json.dumps(policy_marker, separators=(",", ":")) + " -->"),
+        }
+        final_marker = {
+            "schema": 1, "candidate_id": candidate_id, "run_id": 500,
+            "run_attempt": 1, "workflow_sha": CONFIG,
+        }
+        policy_used = {
+            "schema": 1, "candidate_id": candidate_id, "source": "native-run",
+            "reservation_id": 31, "run_id": 500, "run_attempt": 1,
+            "workflow_sha": CONFIG, "trusted_policy_sha": CONFIG,
+            "manifest_sha256": None,
+        }
+        final_res_comment = {
+            "id": 32, "user": bot_user,
+            "created_at": "2026-11-01T09:51:00Z",
+            "updated_at": "2026-11-01T09:51:00Z",
+            "issue_url": f"https://api.github.com/repos/{REPO}/issues/2",
+            "body": ("Reserved final 9router validation for one exact native workflow attempt.\n"
+                     "<!-- fork-candidate:v1 " + release._candidate_json(candidate) + " -->\n"
+                     "<!-- fork-final:v1 " + json.dumps(final_marker, separators=(",", ":")) + " -->\n"
+                     "<!-- fork-policy-used:v1 "
+                     + json.dumps(policy_used, ensure_ascii=False, sort_keys=True,
+                                  separators=(",", ":")) + " -->"),
+        }
+        policy_job = {
+            "id": 600, "name": release.SHARED_POLICY_JOB,
+            "status": "completed", "conclusion": "success",
+            "started_at": "2026-11-01T09:50:15Z",
+            "completed_at": "2026-11-01T09:50:45Z",
+            "steps": [{"name": "Validate policy", "status": "completed",
+                       "conclusion": "success",
+                       "started_at": "2026-11-01T09:50:16Z",
+                       "completed_at": "2026-11-01T09:50:44Z"}],
+        }
+        first_heavy = {
+            "id": 601, "name": "Test The Historical Application Contracts",
+            "status": "completed", "conclusion": "success",
+            "started_at": "2026-11-01T09:52:00Z",
+            "completed_at": "2026-11-01T09:58:00Z",
+            "steps": [{"name": "Run tests", "status": "completed",
+                       "conclusion": "success",
+                       "started_at": "2026-11-01T09:52:05Z",
+                       "completed_at": "2026-11-01T09:57:55Z"}],
+        }
+
+        def make_attempt(second_state, run_conclusion="failure"):
+            run_record = {
+                "id": 500, "run_attempt": 1,
+                "path": ".github/workflows/release.yml",
+                "head_sha": CONFIG, "head_branch": "downstream",
+                "event": "workflow_dispatch",
+                "status": "completed", "conclusion": run_conclusion,
+                "created_at": "2026-11-01T09:50:00Z",
+                "updated_at": "2026-11-01T10:06:00Z",
+            }
+            if second_state == "success":
+                second_heavy = {
+                    "id": 602, "name": "Build And Smoke Test One Container",
+                    "status": "completed", "conclusion": "success",
+                    "started_at": "2026-11-01T09:58:10Z",
+                    "completed_at": "2026-11-01T10:04:00Z",
+                    "steps": [{"name": "Build container", "status": "completed",
+                               "conclusion": "success",
+                               "started_at": "2026-11-01T09:58:15Z",
+                               "completed_at": "2026-11-01T10:03:55Z"}],
+                }
+            elif second_state == "incomplete_skipped":
+                second_heavy = {
+                    "id": 602, "name": "Build And Smoke Test One Container",
+                    "status": "completed", "conclusion": "skipped",
+                    "started_at": "2026-11-01T09:58:10Z",
+                    "completed_at": "2026-11-01T09:58:10Z",
+                    "steps": [],
+                }
+            else:
+                second_heavy = {
+                    "id": 602, "name": "Build And Smoke Test One Container",
+                    "status": "completed", "conclusion": "failure",
+                    "started_at": "2026-11-01T09:58:10Z",
+                    "completed_at": "2026-11-01T10:04:00Z",
+                    "steps": [{"name": "Build container", "status": "completed",
+                               "conclusion": "failure",
+                               "started_at": "2026-11-01T09:58:15Z",
+                               "completed_at": "2026-11-01T10:03:55Z"}],
+                }
+            return run_record, [policy_job, first_heavy, second_heavy]
+
+        stored_baseline = None
+        baseline_writes = []
+        current_run, current_jobs = make_attempt("success", run_conclusion="failure")
+
+        def native_pages(route):
+            if route == f"repos/{REPO}/releases":
+                return [published_release]
+            if route == f"repos/{REPO}/issues/1/comments":
+                return [full_req, full_acc]
+            if route == f"repos/{REPO}/issues/2/comments":
+                return [delta_req, delta_acc, policy_res_comment, final_res_comment]
+            if route in {f"repos/{REPO}/pulls/1/reviews", f"repos/{REPO}/pulls/2/reviews",
+                         f"repos/{REPO}/pulls/1/comments", f"repos/{REPO}/pulls/2/comments"}:
+                return []
+            if route == f"repos/{REPO}/pulls?state=all":
+                return [full_pull, delta_pull]
+            if route == f"repos/{REPO}/issues/comments":
+                return [full_req, full_acc, delta_req, delta_acc,
+                        policy_res_comment, final_res_comment]
+            self.fail(f"Unexpected paginated route: {route}")
+
+        def native_api(path, *, method="GET", data=None, token=None):
+            nonlocal stored_baseline
+            if path == f"repos/{REPO}/actions/variables/FORK_ACCEPTED_BASELINE" and method == "GET":
+                if stored_baseline is None:
+                    raise self._http_error(404, "Not Found")
+                return stored_baseline
+            if path == f"repos/{REPO}/actions/variables" and method == "POST":
+                baseline_writes.append((path, method, data, token))
+                stored_baseline = {
+                    "name": data["name"], "value": data["value"],
+                    "created_at": "2026-11-01T10:10:00Z",
+                    "updated_at": "2026-11-01T10:10:00Z",
+                }
+                return {}
+            if path == f"repos/{REPO}/actions/variables/ZED_TRUSTED_POLICY" and method == "GET":
+                return {
+                    "name": "ZED_TRUSTED_POLICY", "value": CONFIG,
+                    "created_at": "2026-11-01T09:49:00Z",
+                    "updated_at": "2026-11-01T09:49:00Z",
+                }
+            if path == f"repos/{REPO}" and method == "GET":
+                return {"full_name": REPO, "default_branch": "downstream"}
+            if path == f"repos/{REPO}/git/ref/heads/downstream" and method == "GET":
+                return {"ref": "refs/heads/downstream",
+                        "object": {"type": "commit", "sha": CONFIG}}
+            if path == f"repos/{REPO}/commits/downstream" and method == "GET":
+                return {"sha": CONFIG}
+            if path == f"repos/{REPO}/contents/Dockerfile?ref={HEAD}" and method == "GET":
+                return content_record(dockerfile)
+            if path == f"repos/{REPO}/contents/.github/workflows/release.yml?ref={CONFIG}" and method == "GET":
+                return content_record(workflow_bytes)
+            if path == f"repos/{REPO}/git/commits/{CONFIG}" and method == "GET":
+                return config_commit
+            if path == f"repos/{REPO}/git/commits/{self.EMPTY_ROOT}" and method == "GET":
+                return root_commit
+            if path == f"repos/{REPO}/git/commits/{HEAD}" and method == "GET":
+                return app_commit
+            if path == f"repos/{REPO}/git/commits/{full_sha}" and method == "GET":
+                return full_commit
+            if path == f"repos/{REPO}/git/trees/{cfg_tree}?recursive=1" and method == "GET":
+                return config_tree_obj
+            if path == f"repos/{REPO}/compare/{self.EMPTY_ROOT}...{CONFIG}" and method == "GET":
+                return {"status": "ahead",
+                        "merge_base_commit": {"sha": self.EMPTY_ROOT}}
+            if path == f"repos/{REPO}/pulls/1":
+                if method == "PATCH":
+                    full_pull["state"] = data["state"]
+                return full_pull
+            if path == f"repos/{REPO}/pulls/2":
+                if method == "PATCH":
+                    delta_pull["state"] = data["state"]
+                return delta_pull
+            if path == f"repos/{REPO}/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1" and method == "GET":
+                return [full_pull, delta_pull]
+            if path == f"repos/{REPO}/actions/workflows/release.yml/runs?per_page=100&page=1" and method == "GET":
+                return {"total_count": 1, "workflow_runs": [current_run]}
+            if path == f"repos/{REPO}/actions/runs/500/attempts/1" and method == "GET":
+                return current_run
+            if path == f"repos/{REPO}/actions/runs/500/attempts/1/jobs?per_page=100&page=1" and method == "GET":
+                return {"total_count": len(current_jobs), "jobs": current_jobs}
+            if path == f"repos/{REPO}/releases/7" and method == "GET":
+                return published_release
+            if path in {f"repos/{REPO}/git/matching-refs/heads/review",
+                        f"repos/{REPO}/git/matching-refs/heads/repair"} and method == "GET":
+                return []
+            self.fail(f"Unexpected API call: {method} {path}")
+
+        def parse_outputs(output_file):
+            return dict(
+                line.split("=", 1)
+                for line in output_file.read_text(encoding="utf-8").splitlines()
+                if "=" in line
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temp_root = Path(temporary)
+            output_file = temp_root / "github_output.txt"
+            output_file.write_text("", encoding="utf-8")
+            env = {
+                "GITHUB_REPOSITORY": REPO, "GITHUB_SHA": CONFIG,
+                "GITHUB_RUN_ID": "501", "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_OUTPUT": str(output_file),
+                "FORK_REVIEW_MODE": "none",
+                "TRUSTED_POLICY": CONFIG,
+                "VALIDATED_RUN_ID": "500", "VALIDATED_RUN_ATTEMPT": "1",
+            }
+            with (patch.dict(os.environ, env, clear=False),
+                  patch.object(release, "owner_token", return_value="owner-token"),
+                  patch.object(release, "pages", side_effect=native_pages),
+                  patch.object(release, "api", side_effect=native_api),
+                  patch.object(release, "_read_published_provenance",
+                               return_value=(dict(metadata), metadata_sha256)),
+                  patch.object(release, "verify_published_release",
+                               return_value=dict(metadata)),
+                  patch("builtins.print") as printed):
+                recovered = release._published_release_recovery(
+                    REPO, CONFIG, lifecycle)
+                self.assertIsNotNone(recovered)
+                self.assertTrue(recovered["published_recovery"])
+                self.assertTrue(recovered["baseline"]["initial"])
+                self.assertEqual(recovered["baseline"]["accepted_baseline"],
+                                 release._initial_baseline_proof(REPO))
+                self.assertEqual(recovered["recovery_release_id"], 7)
+                self.assertEqual(recovered["recovery_run"],
+                                 {"id": 500, "run_attempt": 1})
+
+                release._write_shared_context(
+                    temp_root / "shared-context.json", recovered)
+                release.finalize_shared(temp_root)
+                outputs = parse_outputs(output_file)
+                self.assertEqual(outputs["final_decision"], "already-validated")
+                self.assertEqual(outputs["final_ready"], "true")
+                self.assertEqual(outputs["mode"], "already-validated")
+                self.assertEqual(outputs["reuse_run_id"], "500")
+                self.assertEqual(outputs["reuse_run_attempt"], "1")
+                self.assertEqual(outputs["validated_run_id"], "500")
+                self.assertEqual(outputs["validated_run_attempt"], "1")
+
+                release._finish_published_recovery(
+                    REPO, json.loads(json.dumps(recovered)), lifecycle)
+
+            expected_publication = {
+                "kind": "github-release", "id": 7,
+                "published_at": published_at,
+                "metadata_sha256": metadata_sha256,
+            }
+            expected_value = release._accepted_baseline_value(
+                REPO, candidate, expected_publication)
+            self.assertEqual(len(baseline_writes), 1)
+            self.assertEqual(baseline_writes[0], (
+                f"repos/{REPO}/actions/variables", "POST",
+                {"name": "FORK_ACCEPTED_BASELINE", "value": expected_value},
+                "owner-token"))
+            self.assertEqual(full_pull["state"], "closed")
+            self.assertEqual(delta_pull["state"], "closed")
+            self.assertTrue(any("Recovered published candidate" in str(call)
+                                for call in printed.call_args_list))
+
+            # Incomplete or failing heavy attempts must never authorize initial recovery.
+            for bad_state, bad_conclusion in (("incomplete_skipped", "success"),
+                                              ("incomplete_skipped", "failure"),
+                                              ("failed", "failure")):
+                with self.subTest(bad_state=bad_state, bad_conclusion=bad_conclusion):
+                    stored_baseline = None
+                    baseline_writes.clear()
+                    full_pull["state"] = "open"
+                    delta_pull["state"] = "open"
+                    current_run, current_jobs = make_attempt(
+                        bad_state, run_conclusion=bad_conclusion)
+                    bad_output = temp_root / f"out_{bad_state}_{bad_conclusion}.txt"
+                    bad_output.write_text("", encoding="utf-8")
+                    bad_env = {**env, "GITHUB_OUTPUT": str(bad_output)}
+                    with (patch.dict(os.environ, bad_env, clear=False),
+                          patch.object(release, "owner_token",
+                                       return_value="owner-token"),
+                          patch.object(release, "pages", side_effect=native_pages),
+                          patch.object(release, "api", side_effect=native_api),
+                          patch.object(release, "_read_published_provenance",
+                                       return_value=(dict(metadata), metadata_sha256)),
+                          patch.object(release, "verify_published_release",
+                                       return_value=dict(metadata))):
+                        with self.assertRaisesRegex(
+                                ValueError, "does not authorize its exact artifact attempt"):
+                            release._published_release_recovery(
+                                REPO, CONFIG, lifecycle)
+                        release.finalize_shared(temp_root)
+                        bad_outputs = parse_outputs(bad_output)
+                        self.assertEqual(bad_outputs["final_decision"], "blocked")
+                        self.assertEqual(bad_outputs["final_ready"], "false")
+                        self.assertEqual(bad_outputs["mode"], "attempt-blocked")
+                        with self.assertRaisesRegex(
+                                ValueError, "no longer verifies the published artifact attempt"):
+                            release._finish_published_recovery(
+                                REPO, json.loads(json.dumps(recovered)), lifecycle)
+                    self.assertIsNone(stored_baseline)
+                    self.assertEqual(baseline_writes, [])
