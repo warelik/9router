@@ -7428,6 +7428,9 @@ class InitialFirstReleaseTests(unittest.TestCase):
               patch.object(release, "output"),
               patch.object(release, "_review_pr", side_effect=review_pr),
               self.assertRaises(StopAfterDelta)):
+            app = Path(directory) / "application"
+            app.mkdir()
+            (app / "Dockerfile").write_bytes(b"FROM scratch\n")
             release.prepare_shared(Path(directory))
 
         self.assertEqual(len(calls), 2)
