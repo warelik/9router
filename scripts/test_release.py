@@ -73,6 +73,11 @@ class ReviewPolicyTests(unittest.TestCase):
                     "warelik/9router", [], 7, request, "full", HEAD, OTHER, "e" * 64))
             sleep.assert_called_once_with(1.1)
             body = api.call_args.kwargs["data"]["body"]
+            payload = body.removeprefix(
+                "<!-- machine-maintenance-owner-acceptance:v1 ").removesuffix(" -->")
+            self.assertEqual(payload, json.dumps(
+                json.loads(payload), ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")))
             self.assertIn('"candidate_id":"' + "e" * 64 + '"', body)
             self.assertIn('"request_id":42', body)
             with patch.object(release, "api") as duplicate, \
