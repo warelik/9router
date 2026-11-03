@@ -61,14 +61,15 @@ function convertSystemToDeveloperRole(body) {
   }
 }
 
-// Strip server-generated item IDs (rs_/fc_/resp_/msg_) from input — avoids 404 with store=false
+// Strip server-generated item IDs from input — avoids invalid replay with store=false.
 function stripStoredItemReferences(body, preserveLitePrefix = false) {
   if (!Array.isArray(body.input)) return;
   body.input = body.input.filter((item) => {
     if (typeof item === "string" && SERVER_ID_PATTERN.test(item)) return false;
     if (item && typeof item === "object" && !Array.isArray(item)) {
       if (item.type === "item_reference") return false;
-      if (typeof item.id === "string" && SERVER_ID_PATTERN.test(item.id)
+      const legacyReasoningId = item.type === RESPONSES_ITEM.REASONING && item.id?.startsWith?.("item_");
+      if (typeof item.id === "string" && (SERVER_ID_PATTERN.test(item.id) || legacyReasoningId)
         && !(preserveLitePrefix && item.role === "developer" && item.id.startsWith("msg_"))) delete item.id;
     }
     return true;
