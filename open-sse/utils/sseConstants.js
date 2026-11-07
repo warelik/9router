@@ -1,5 +1,5 @@
-// Shared SSE primitives (no imports → safe for executors + stream.js)
-export const SSE_DONE = "data: [DONE]\n\n";
+// Shared SSE primitives re-exported from the central runtime config.
+export { SSE_DONE_PAYLOAD, SSE_DONE } from "../config/runtimeConfig.js";
 
 export const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
