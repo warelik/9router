@@ -250,15 +250,24 @@ class ReviewPolicyTests(unittest.TestCase):
                 patch.object(release, "owner_token", return_value="owner-token"), \
                 patch.object(release, "api", side_effect=api_for("ahead")):
             proof = release._accepted_baseline(
-                "warelik/9router", release_record, "1" * 64, metadata_candidate)
+                "warelik/9router", release_record, "1" * 64, metadata_candidate,
+                allow_adopted_ancestor=True)
         self.assertEqual(proof["variable"], variable)
+
+        with patch.object(release, "_read_optional_variable", return_value=(variable, False)), \
+                patch.object(release, "owner_token", return_value="owner-token"), \
+                patch.object(release, "api", side_effect=api_for("ahead")), \
+                self.assertRaisesRegex(ValueError, "checkpoint does not match"):
+            release._accepted_baseline(
+                "warelik/9router", release_record, "1" * 64, metadata_candidate)
 
         with patch.object(release, "_read_optional_variable", return_value=(variable, False)), \
                 patch.object(release, "owner_token", return_value="owner-token"), \
                 patch.object(release, "api", side_effect=api_for("diverged")), \
                 self.assertRaisesRegex(ValueError, "checkpoint does not match"):
             release._accepted_baseline(
-                "warelik/9router", release_record, "1" * 64, metadata_candidate)
+                "warelik/9router", release_record, "1" * 64, metadata_candidate,
+                allow_adopted_ancestor=True)
 
     def test_review_mode_bot_keeps_the_configured_trigger(self):
         candidate = {

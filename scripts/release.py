@@ -1480,7 +1480,8 @@ def _shared_prepare_baseline(repo, lifecycle, repair=None):
         }
     baseline_release, baseline_metadata, metadata_sha256, baseline_candidate = _published_candidate(
         repo, releases, lifecycle)
-    accepted_baseline = _accepted_baseline(repo, baseline_release, metadata_sha256, baseline_candidate)
+    accepted_baseline = _accepted_baseline(repo, baseline_release, metadata_sha256, baseline_candidate,
+                                           allow_adopted_ancestor=True)
     accepted_candidate = _json_object(accepted_baseline["variable"]["value"])["candidate"]
     if repair is not None:
         _validate_regression_manifest(
@@ -1736,7 +1737,7 @@ def _published_release_recovery(repo, current_config, lifecycle):
 
 
 def _accepted_baseline(repo, release, metadata_sha256, candidate, *,
-                       allow_default_configurations=()):
+                       allow_default_configurations=(), allow_adopted_ancestor=False):
     endpoint = f"repos/{repo}/actions/variables/FORK_ACCEPTED_BASELINE"
     variable, is_404 = _read_optional_variable(endpoint, token=owner_token(repo))
     if is_404 or not isinstance(variable, dict) or variable.get("name") != "FORK_ACCEPTED_BASELINE":
@@ -1762,21 +1763,25 @@ def _accepted_baseline(repo, release, metadata_sha256, candidate, *,
     if same_published_product and checkpoint_candidate != metadata_candidate:
         current = api(f"repos/{repo}/commits/downstream")
         checkpoint_config = checkpoint_candidate.get("configuration_sha", "")
-        if SHA.fullmatch(checkpoint_config or "") and SHA.fullmatch(current.get("sha", "")):
-            if current["sha"] == checkpoint_config:
-                accepted_config_is_current = True
-            else:
-                # A policy-only adoption advances the checkpoint configuration
-                # past the published provenance, and the next downstream commit
-                # then moves HEAD beyond it. The checkpoint stays exact while
-                # its configuration remains an ancestor of downstream: the
-                # published product fields above already match, so only a
-                # configuration on the current line can be the delta base.
-                comparison = api(f"repos/{repo}/compare/{checkpoint_config}...{current['sha']}")
-                accepted_config_is_current = (
-                    comparison.get("status") in {"ahead", "identical"}
-                    and (comparison.get("merge_base_commit") or {}).get("sha") == checkpoint_config
-                )
+        accepted_config_is_current = (
+            current.get("sha") == checkpoint_config
+            and SHA.fullmatch(checkpoint_config or "") is not None
+        )
+        if (not accepted_config_is_current and allow_adopted_ancestor
+                and SHA.fullmatch(checkpoint_config or "")
+                and SHA.fullmatch(current.get("sha", ""))):
+            # A policy-only adoption advances the checkpoint configuration
+            # past the published provenance, and the next downstream commit
+            # then moves HEAD beyond it. On the prepare path the checkpoint
+            # stays exact while its configuration remains an ancestor of
+            # downstream: the published product fields above already match,
+            # so only a configuration on the current line can be the delta
+            # base. Recovery callers keep the strict equality above.
+            comparison = api(f"repos/{repo}/compare/{checkpoint_config}...{current['sha']}")
+            accepted_config_is_current = (
+                comparison.get("status") in {"ahead", "identical"}
+                and (comparison.get("merge_base_commit") or {}).get("sha") == checkpoint_config
+            )
         if (current.get("sha") in allowed_default_configurations
                 and SHA.fullmatch(current.get("sha", ""))):
             accepted_config_is_current = True
