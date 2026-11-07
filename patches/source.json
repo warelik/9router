@@ -84,6 +84,7 @@
     "tests/unit/downstream-translator-history-regressions.test.js",
     "tests/unit/muse-cloaking.test.js",
     "tests/unit/muse-foreign-reasoning-retry.test.js",
-    "tests/unit/muse-responses-wire.test.js"
+    "tests/unit/muse-responses-wire.test.js",
+    "tests/unit/provider-pricing-muse-wonder.test.js"
   ]
 }

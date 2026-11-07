@@ -1,0 +1,65 @@
+From 3f7d71e0e5168ea1a9e1a40cdf569685bf7c7d7f Mon Sep 17 00:00:00 2001
+From: t <t@t>
+Date: Sat, 7 Nov 2026 17:24:00 +0000
+Subject: [PATCH] Price Muse Wonder usage instead of silently zero
+
+---
+ open-sse/providers/pricing.js                 |  5 ++++
+ .../unit/provider-pricing-muse-wonder.test.js | 29 +++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+ create mode 100644 tests/unit/provider-pricing-muse-wonder.test.js
+
+diff --git a/open-sse/providers/pricing.js b/open-sse/providers/pricing.js
+index d1e4fc0..20df077 100644
+--- a/open-sse/providers/pricing.js
++++ b/open-sse/providers/pricing.js
+@@ -178,6 +178,11 @@ export const MODEL_PRICING = {
+   "muse-spark-1.1":                { input: 1.25, output: 4.25, cached: 0.15,  reasoning: 4.25,   cache_creation: 0 },
+   "muse-spark-1.3-contributor":    { input: 0.10, output: 0.20, cached: 0.002, reasoning: 0.20,   cache_creation: 0 },
+   "muse-spark-1.2-contributor":    { input: 0.10, output: 0.20, cached: 0.002, reasoning: 0.20,   cache_creation: 0 },
++  // Wonder has no public pay-as-you-go rate; the full variant is subscription
++  // only. Use the published muse-wonder-1.0 API rates so usage costing is
++  // visible instead of silently zero.
++  "muse-wonder-1.0":               { input: 4.00, output: 20.00, cached: 0.20,  reasoning: 20.00,  cache_creation: 0 },
++  "muse-wonder-full-1.0-contributor": { input: 4.00, output: 20.00, cached: 0.20,  reasoning: 20.00,  cache_creation: 0 },
+ 
+   // === OpenRouter fallback ===
+   "auto":                         { input: 2.00,  output: 8.00,  cached: 1.00,  reasoning: 12.00,  cache_creation: 2.00  },
+diff --git a/tests/unit/provider-pricing-muse-wonder.test.js b/tests/unit/provider-pricing-muse-wonder.test.js
+new file mode 100644
+index 0000000..69c37cb
+--- /dev/null
++++ b/tests/unit/provider-pricing-muse-wonder.test.js
+@@ -0,0 +1,29 @@
++import { describe, it, expect } from "vitest";
++import { MODEL_PRICING, getPricingForModel, calculateCostFromTokens } from "../../open-sse/providers/pricing.js";
++
++describe("Muse Wonder pricing", () => {
++  it("includes muse-wonder-1.0 and the full contributor variant", () => {
++    expect(MODEL_PRICING["muse-wonder-1.0"]).toBeDefined();
++    expect(MODEL_PRICING["muse-wonder-full-1.0-contributor"]).toBeDefined();
++  });
++
++  it("uses the published wonder rates (input 4.00, output 20.00, cached 0.20)", () => {
++    expect(MODEL_PRICING["muse-wonder-1.0"]).toMatchObject({ input: 4.00, output: 20.00, cached: 0.20 });
++    expect(MODEL_PRICING["muse-wonder-full-1.0-contributor"]).toMatchObject({ input: 4.00, output: 20.00, cached: 0.20 });
++  });
++
++  it("resolves pricing for the live muse surface ids", () => {
++    expect(getPricingForModel("muse", "muse-wonder-full-1.0-contributor")).not.toBeNull();
++    expect(getPricingForModel("openrouter", "meta/muse-wonder-1.0")).not.toBeNull();
++  });
++
++  it("charges cached input at the cached rate, not the full input rate", () => {
++    const pricing = MODEL_PRICING["muse-wonder-full-1.0-contributor"];
++    const cost = calculateCostFromTokens(
++      { input_tokens: 1_000_000, cached_tokens: 990_000, output_tokens: 10_000 },
++      pricing,
++    );
++    // 10k fresh * 4/M + 990k cached * 0.20/M + 10k out * 20/M
++    expect(cost).toBeCloseTo(0.04 + 0.198 + 0.20, 6);
++  });
++});
+-- 
+2.55.0
+
