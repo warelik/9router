@@ -165,6 +165,55 @@ class ReviewPolicyTests(unittest.TestCase):
         self.assertEqual(result["target_pr_updated_at"], "2026-10-16T10:00:05Z")
         self.assertEqual(evidence["target"]["pr"]["updated_at"], "2026-10-16T10:00:05Z")
 
+    def test_disposition_pull_timestamp_only_change_requires_identical_evidence_inputs(self):
+        def make_pull(updated_at, head_sha=HEAD):
+            return {
+                "number": 7, "state": "open", "updated_at": updated_at,
+                "user": {"login": "warelik", "type": "User"},
+                "head": {"sha": head_sha, "ref": "review/full",
+                         "repo": {"full_name": "warelik/9router"}},
+                "base": {"sha": OTHER, "ref": "review-base/full",
+                         "repo": {"full_name": "warelik/9router"}},
+            }
+
+        before = make_pull("2026-10-16T10:00:00Z")
+        after = make_pull("2026-10-16T10:00:30Z")
+        comments = [{"id": 1, "body": "request"}]
+        inline = [{"id": 2, "body": "finding"}]
+
+        def evidence_with(pull):
+            return {"target": {"pr": pull}, "comments": list(comments),
+                    "reviews": [], "inline": list(inline)}
+
+        def pages_for(current_comments):
+            routes = {
+                "repos/warelik/9router/issues/7/comments": current_comments,
+                "repos/warelik/9router/pulls/7/reviews": [],
+                "repos/warelik/9router/pulls/7/comments": list(inline),
+            }
+            return lambda route: routes[route]
+
+        evidence = evidence_with(before)
+        with patch.object(release, "api", return_value=after), \
+                patch.object(release, "pages", side_effect=pages_for(list(comments))):
+            release._verify_disposition_review_pull("warelik/9router", evidence)
+        self.assertIs(evidence["target"]["pr"], after)
+
+        with patch.object(release, "api", return_value=after), \
+                patch.object(release, "pages",
+                             side_effect=pages_for([{"id": 1, "body": "edited"}])), \
+                self.assertRaisesRegex(ValueError, "Native review PR changed"):
+            release._verify_disposition_review_pull(
+                "warelik/9router", evidence_with(before))
+
+        with patch.object(release, "api",
+                          return_value=make_pull("2026-10-16T10:00:30Z", head_sha=OTHER)), \
+                patch.object(release, "pages") as pages, \
+                self.assertRaisesRegex(ValueError, "Native review PR changed"):
+            release._verify_disposition_review_pull(
+                "warelik/9router", evidence_with(before))
+        pages.assert_not_called()
+
     def test_review_mode_bot_keeps_the_configured_trigger(self):
         candidate = {
             "upstream_sha": HEAD, "application_sha": HEAD, "configuration_sha": OTHER,

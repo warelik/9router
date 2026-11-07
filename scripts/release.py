@@ -3309,10 +3309,20 @@ def _verify_disposition_review_pull(repo, evidence, *, expect_updated=True):
     current = api(f"repos/{repo}/pulls/{number}")
     actual_signature = _history_pull_signature(repo, current)
     expected_signature = _history_pull_signature(repo, expected)
-    if (actual_signature[0] != expected_signature[0]
-            or actual_signature[2:] != expected_signature[2:]
-            or (expect_updated and actual_signature[1] != expected_signature[1])):
+    if actual_signature[0] != expected_signature[0] or actual_signature[2:] != expected_signature[2:]:
         raise ValueError("Native review PR changed while the owner disposition was being verified")
+    if expect_updated and actual_signature[1] != expected_signature[1]:
+        # GitHub moves a pull request's updated_at for its own bookkeeping,
+        # and with a lag after our own acceptance comment, so the bare
+        # timestamp does not prove that the reviewed evidence moved. The
+        # disposition was computed from the exact native comments, reviews
+        # and inline comments; re-read them and accept the fresh snapshot
+        # only when those inputs are byte-identical to the evidence.
+        if (pages(f"repos/{repo}/issues/{number}/comments") != evidence.get("comments")
+                or pages(f"repos/{repo}/pulls/{number}/reviews") != evidence.get("reviews")
+                or pages(f"repos/{repo}/pulls/{number}/comments") != evidence.get("inline")):
+            raise ValueError("Native review PR changed while the owner disposition was being verified")
+        target["pr"] = current
 
 
 def _post_owner_dispositions(repo, pull_number, candidate, dispositions):
