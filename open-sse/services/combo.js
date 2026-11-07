@@ -3,6 +3,7 @@
  */
 
 import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
+import { COMBO_MODEL_WAIT_MS } from "../config/runtimeConfig.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { parseModel } from "./model.js";
@@ -351,6 +352,16 @@ export function isZeroContentResponse(data) {
  * @param {Function|null} [options.resolveSmartChoice=null] - Smart router resolver callback: (body, models) => Promise<{ choice, probabilities, confidence } | null>
  * @returns {Promise<Response>}
  */
+// Sleep that wakes early when the client disconnects, so a combo waiting for
+// a free account never lingers after its caller is gone.
+function sleepAbortable(ms, signal) {
+  if (!(ms > 0)) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener?.("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+  });
+}
+
 export async function handleComboChat({
   body,
   models,
@@ -365,7 +376,12 @@ export async function handleComboChat({
   sessionSticky = true,
   confidenceThreshold = 0.8,
   resolveSmartChoice = null,
+  holdDeadlineAt = null,
+  clientSignal = null,
 }) {
+  // True when at least one member failed on its accounts (not on the request):
+  // only then can waiting for an account to free up change the outcome.
+  let sawAccountFailure = false;
   let rotatedModels = models;
   let activeStickyModel = null;
 
@@ -473,7 +489,13 @@ export async function handleComboChat({
     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
 
     try {
-      const result = await handleSingleModel(body, modelStr);
+      // Within the overall wait deadline each member gets a bounded share, so
+      // one exhausted provider cannot starve the remaining members; the pass
+      // loop below keeps cycling until the deadline itself expires.
+      const holdMs = holdDeadlineAt
+        ? Math.max(0, Math.min(COMBO_MODEL_WAIT_MS, holdDeadlineAt - Date.now()))
+        : undefined;
+      const result = await handleSingleModel(body, modelStr, holdMs);
       
       // Success (2xx). A 2xx is necessary but NOT sufficient: Gemini aborts (e.g.
       // MALFORMED_FUNCTION_CALL) still return 200 and stream empty content, which would
@@ -593,22 +615,19 @@ export async function handleComboChat({
       // request-scoped fault must not evict a healthy account from rotation).
       if (requestScoped) {
         log.warn("COMBO", `Model ${modelStr} rejected the request (${result.status}), trying next`, { status: result.status });
-        lastError = errorText || String(result.status);
+        sawAccountFailure = true;
+      lastError = errorText || String(result.status);
         if (!lastStatus) lastStatus = result.status;
         if (!requestScopedResult) requestScopedResult = result;
         continue;
       }
 
-      // For transient errors (503/502/504), wait for cooldown before falling through
-      // so a briefly-overloaded provider gets a chance to recover rather than being
-      // skipped immediately (fixes: combo falls through on transient 503)
-      if (cooldownMs && cooldownMs > 0 && cooldownMs <= 5000 &&
-          (result.status === 503 || result.status === 502 || result.status === 504)) {
-        log.info("COMBO", `Model ${modelStr} transient ${result.status}, waiting ${cooldownMs}ms before next`);
-        await new Promise(r => setTimeout(r, cooldownMs));
-      }
+      // Transient 502/503/504 move to the next combo model at once. The short account
+      // cooldown only marks the account unavailable (see checkFallbackError and
+      // markAccountUnavailable); it never delays the current request.
 
       // Fallback to next model
+      sawAccountFailure = true;
       lastError = errorText || String(result.status);
       if (!lastStatus) lastStatus = result.status;
       log.warn("COMBO", `Model ${modelStr} failed, trying next`, { status: result.status });
@@ -617,9 +636,25 @@ export async function handleComboChat({
       if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
         clearStickyComboSession(comboName, sessionId);
       }
+      sawAccountFailure = true;
       lastError = error.message || String(error);
       if (!lastStatus) lastStatus = 500;
       log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
+    }
+
+    // Every member failed on account exhaustion (not on the request itself):
+    // wait for the earliest account to free up and pass the member list again
+    // instead of returning 429/503, until the wait deadline expires.
+    if (i === rotatedModels.length - 1 && holdDeadlineAt && sawAccountFailure && !clientSignal?.aborted) {
+      const now = Date.now();
+      if (now < holdDeadlineAt) {
+        let waitMs = earliestRetryAfter ? new Date(earliestRetryAfter).getTime() - now : 1000;
+        waitMs = Math.min(Math.max(waitMs, 250), 2000, holdDeadlineAt - now);
+        log.info("COMBO", `All models busy — waiting ${Math.round(waitMs)}ms before another pass (${Math.round((holdDeadlineAt - now) / 1000)}s left)`);
+        await sleepAbortable(waitMs, clientSignal);
+        earliestRetryAfter = null;
+        i = -1; // restart the member pass
+      }
     }
   }
 
@@ -638,7 +673,10 @@ export async function handleComboChat({
   // the request itself is invalid, but here the providers are simply unavailable
   // or have no active credentials. 503 is more accurate and retryable by clients.
   const allDisabled = lastError && lastError.toLowerCase().includes("no credentials");
-  const status = allDisabled ? 503 : (lastStatus || 503);
+  let status = allDisabled ? 503 : (lastStatus || 503);
+  // The wait deadline was configured and has now expired: report the router's
+  // own 502 rather than relaying an upstream 429/503 to the client.
+  if (holdDeadlineAt && (status === 429 || status === 503)) status = 502;
   const msg = lastError || "All combo models unavailable";
 
   if (earliestRetryAfter) {
