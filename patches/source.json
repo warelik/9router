@@ -77,6 +77,7 @@
     "tests/unit/aistudio-discovery.test.js",
     "tests/unit/docker-publish-source-recipe.test.js",
     "tests/unit/muse-cloaking.test.js",
-    "tests/unit/muse-responses-wire.test.js"
+    "tests/unit/muse-responses-wire.test.js",
+    "tests/translator/parallel-tool-blocks-sequential.test.js"
   ]
 }
