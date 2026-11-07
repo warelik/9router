@@ -3,7 +3,7 @@ import { needsTranslation } from "../../translator/index.js";
 import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } from "../../utils/stream.js";
 import { pipeWithDisconnect } from "../../utils/streamHandler.js";
 import { PROVIDERS } from "../../config/providers.js";
-import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
+import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS, NATIVE_GEMINI_ERROR_STATUSES } from "../../config/runtimeConfig.js";
 import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
 import { buildStreamErrorBytes } from "../../utils/streamHelpers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
@@ -24,7 +24,7 @@ const CODEX_SOURCE_TO_TARGET = {
 /**
  * Determine which SSE transform stream to use based on provider/format.
  */
-function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials }) {
+function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, onNativeResponseSuccess, apiKey, credentials, nativeJson, nativeResponseProjection }) {
   const isDroidCLI = userAgent?.toLowerCase().includes("droid") || userAgent?.toLowerCase().includes("codex-cli");
   // Responses-API providers (e.g. codex) emit Responses SSE → translate into client format
   const isResponsesProvider = PROVIDERS[provider]?.format === FORMATS.OPENAI_RESPONSES;
@@ -36,27 +36,23 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
   }
 
   if (needsTranslation(targetFormat, sourceFormat)) {
-    return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
+    return createSSETransformStreamWithLogger(
+      targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId,
+      body, onStreamComplete, apiKey, customToolNames, credentials,
+      nativeResponseProjection, onNativeResponseSuccess, nativeJson,
+    );
   }
 
   // The passthrough path has no format translation, so the fingerprint's tool
   // rename map (read -> read_client) has to be handed over explicitly —
   // otherwise the client receives a call to a tool it never declared (#4986).
-  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, toolNameMap);
+  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, toolNameMap, sourceFormat, nativeJson, nativeResponseProjection, onNativeResponseSuccess);
 }
 
 /**
  * Handle streaming response — pipe provider SSE through transform stream to client.
  */
-export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, pxpipe, reqTag, log, credentials }) {
-  if (onRequestSuccess) {
-    Promise.resolve()
-      .then(onRequestSuccess)
-      .catch(err => {
-        console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
-      });
-  }
-
+export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, pxpipe, reqTag, log, credentials, nativeResponseProjection }) {
   // When upstream returns HTML/text instead of SSE (e.g. Cloudflare 5xx error
   // page), piping it through the SSE transform stream causes Next.js
   // "failed to pipe response" and crashes the chat router. Read the body,
@@ -71,33 +67,44 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
     const sanitizedTitle = (titleMatch?.[1] || '').replace(/<[^>]*>/g, '').replace(/[\r\n]+/g, ' ').trim().slice(0, 160);
     const shortMsg = sanitizedTitle
       || (bodyText.length < 200 ? bodyText.replace(/<[^>]*>/g, '').trim().slice(0, 160) : `Upstream returned non-SSE response (${upstreamContentType})`);
-    const status = providerResponse.status || 502;
+    const status = providerResponse.status >= HTTP_STATUS.BAD_REQUEST ? providerResponse.status : HTTP_STATUS.BAD_GATEWAY;
     if (log?.errorLine) log.errorLine(reqTag, "✗", `BLOCKED ${status} · ${provider}/${model} · non-SSE (${upstreamContentType})\n    ${shortMsg}`);
     else console.warn(`[STREAM] ${provider} | ${model} | blocked pipe: ${shortMsg} [${status}]`);
     streamController?.handleError?.(new Error(`upstream non-SSE: ${status}`));
     return {
       success: false,
-      response: new Response(JSON.stringify({ error: { message: `[${status}]: ${shortMsg}` } }), {
+      status,
+      error: shortMsg,
+      nativeResponse: sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI,
+      response: new Response(JSON.stringify({ error: {
+        message: `[${status}]: ${shortMsg}`,
+        ...(sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI ? {
+          code: status,
+          status: NATIVE_GEMINI_ERROR_STATUSES[status] || "INTERNAL",
+        } : {}),
+      } }), {
         status,
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', ...upstreamResponseHeaders(providerResponse.headers) },
       }),
     };
   }
 
-  const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials });
+  const deferNativeGeminiSuccess = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
+  const reportRequestSuccess = () => {
+    if (!onRequestSuccess) return;
+    return Promise.resolve()
+      .then(onRequestSuccess)
+      .catch(err => {
+        console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
+      });
+  };
+  if (onRequestSuccess && !deferNativeGeminiSuccess) {
+    reportRequestSuccess();
+  }
 
-  // Terminal bytes when the stream aborts after HTTP 200 was already sent, so the
-  // client sees a real error instead of a silently truncated stream.
-  // Responses passthrough keeps its own response.failed shape; every other client
-  // format gets the OpenAI error frame + [DONE], or `event: error` for Claude.
-  const isResponsesPassthrough = sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES;
-  const onAbortTerminal = isResponsesPassthrough
-    ? buildAbortedResponsesTerminalBytes
-    : (message) => buildStreamErrorBytes(HTTP_STATUS.GATEWAY_TIMEOUT, message, sourceFormat);
-  const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
-  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs);
-
-  saveRequestDetail(buildRequestDetail({
+  const nativeGeminiJson = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI
+    && upstreamContentType.includes("application/json");
+  const initialDetailWrite = saveRequestDetail(buildRequestDetail({
     provider, model, connectionId,
     latency: { ttft: 0, total: Date.now() - requestStartTime },
     tokens: { prompt_tokens: 0, completion_tokens: 0 },
@@ -106,24 +113,64 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
     providerResponse: "[Streaming - raw response not captured]",
     response: { content: "[Streaming in progress...]", thinking: null, type: "streaming" },
     pxpipe,
-    status: "success"
+    status: deferNativeGeminiSuccess ? "pending" : "success",
   }, { id: streamDetailId })).catch(err => {
     console.error("[RequestDetail] Failed to save streaming request:", err.message);
   });
+  const completeStream = (...args) => {
+    const persist = () => onStreamComplete?.(...args);
+    if (deferNativeGeminiSuccess || args[0]?.error) {
+      return initialDetailWrite.then(persist);
+    }
+    initialDetailWrite.then(persist).catch(err => {
+      console.error("[RequestDetail] Failed to complete streaming request:", err?.message || err);
+    });
+  };
+  const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete: completeStream, onNativeResponseSuccess: deferNativeGeminiSuccess ? reportRequestSuccess : null, apiKey, credentials, nativeJson: nativeGeminiJson, nativeResponseProjection });
+
+  // Terminal bytes when the stream aborts after HTTP 200 was already sent, so the
+  // client sees a real error instead of a silently truncated stream.
+  // Responses passthrough keeps its own response.failed shape; every other client
+  // format gets the OpenAI error frame + [DONE], or `event: error` for Claude.
+  const isResponsesPassthrough = sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES;
+  const onAbortTerminal = nativeGeminiJson ? null : isResponsesPassthrough
+    ? buildAbortedResponsesTerminalBytes
+    : (message) => buildStreamErrorBytes(HTTP_STATUS.GATEWAY_TIMEOUT, message, sourceFormat);
+  const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
+  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, nativeGeminiJson,
+    typeof transformStream.finalizeNativeResponse === "function" ? (error, clientCancelled) => transformStream.finalizeNativeResponse({
+      status: clientCancelled ? HTTP_STATUS.CLIENT_CLOSED_REQUEST : HTTP_STATUS.GATEWAY_TIMEOUT,
+      error: error.message,
+      clientCancelled,
+    }) : null);
 
   return {
     success: true,
-    response: new Response(transformedBody, { headers: { ...SSE_HEADERS, ...upstreamResponseHeaders(providerResponse.headers) } })
+    response: new Response(transformedBody, { headers: {
+      ...SSE_HEADERS,
+      ...upstreamResponseHeaders(providerResponse.headers),
+      // Gemini streamGenerateContent also supports native JSON framing when
+      // alt=sse is absent. Its transparent body must keep the upstream media type.
+      ...(sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI && upstreamContentType
+        ? { "Content-Type": providerResponse.headers.get("content-type") }
+        : {}),
+    } })
   };
 }
 
 /**
  * Build onStreamComplete callback for streaming usage tracking.
  */
-export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest, pxpipe, reqTag, log }) {
+export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest, pxpipe, reqTag, log, onRequestFailure }) {
   const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
-  const onStreamComplete = (contentObj, usage, ttftAt) => {
+  const onStreamComplete = async (contentObj, usage, ttftAt) => {
+    const failure = contentObj?.error;
+    if (failure && !failure.clientCancelled && onRequestFailure) {
+      await Promise.resolve().then(() => onRequestFailure(failure)).catch(err => {
+        console.error("[ChatCore] onRequestFailure failed:", err?.message || err);
+      });
+    }
     const latency = {
       ttft: ttftAt ? ttftAt - requestStartTime : Date.now() - requestStartTime,
       total: Date.now() - requestStartTime
@@ -131,7 +178,7 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
     const safeContent = contentObj?.content || "[Empty streaming response]";
     const safeThinking = contentObj?.thinking || null;
 
-    saveRequestDetail(buildRequestDetail({
+    await saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
       latency,
       tokens: usage || { prompt_tokens: 0, completion_tokens: 0 },
@@ -140,14 +187,15 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
       providerResponse: safeContent,
       response: { content: safeContent, thinking: safeThinking, type: "streaming" },
       pxpipe,
-      status: "success"
+      status: failure ? "error" : "success",
     }, { id: streamDetailId })).catch(err => {
       console.error("[RequestDetail] Failed to update streaming content:", err.message);
     });
 
     // Persist stream usage to DB (no console line; the "📊 done" line below is authoritative)
     saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, label: "STREAM USAGE", silent: true });
-    if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency }));
+    if (log?.line) log.line(reqTag, failure ? "✗" : "📊",
+      failure ? `FAILED ${failure.status} · ${failure.error}` : formatDoneLine({ usage, latency }));
   };
 
   return { onStreamComplete, streamDetailId };

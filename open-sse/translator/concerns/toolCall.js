@@ -1,6 +1,7 @@
 // Tool call helper functions for translator
 
 import { FORMATS } from "../formats.js";
+import { CLAUDE_BLOCK, OPENAI_BLOCK, ROLE } from "../schema/index.js";
 
 // Anthropic tool_use.id must match: ^[a-zA-Z0-9_-]+$
 const TOOL_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
@@ -23,22 +24,32 @@ function sanitizeToolId(id) {
   return sanitized.length > 0 ? sanitized : null;
 }
 
+export function isGeminiFamilyTarget(targetFormat, model) {
+  if (targetFormat === FORMATS.GEMINI || targetFormat === FORMATS.GEMINI_CLI || targetFormat === FORMATS.VERTEX) {
+    return true;
+  }
+  if (targetFormat === FORMATS.ANTIGRAVITY) {
+    return !String(model || "").toLowerCase().includes("claude");
+  }
+  return false;
+}
+
 // Ensure all tool_calls have valid id field and arguments is string (some providers require it)
-export function ensureToolCallIds(body) {
+export function ensureToolCallIds(body, { preserveIds = false } = {}) {
   if (!body.messages || !Array.isArray(body.messages)) return body;
 
   for (let i = 0; i < body.messages.length; i++) {
     const msg = body.messages[i];
-    if (msg.role === "assistant" && msg.tool_calls && Array.isArray(msg.tool_calls)) {
+    if (msg.role === ROLE.ASSISTANT && msg.tool_calls && Array.isArray(msg.tool_calls)) {
       for (let j = 0; j < msg.tool_calls.length; j++) {
         const tc = msg.tool_calls[j];
         // Validate or regenerate ID for Anthropic compatibility
-        if (!tc.id || !TOOL_ID_PATTERN.test(tc.id)) {
-          const sanitized = sanitizeToolId(tc.id);
+        if (preserveIds ? !tc.id : (!tc.id || !TOOL_ID_PATTERN.test(tc.id))) {
+          const sanitized = preserveIds ? null : sanitizeToolId(tc.id);
           tc.id = sanitized || generateToolCallId(i, j, tc.function?.name);
         }
         if (!tc.type) {
-          tc.type = "function";
+          tc.type = OPENAI_BLOCK.FUNCTION;
         }
         // Ensure arguments is JSON string, not object
         if (tc.function?.arguments && typeof tc.function.arguments !== "string") {
@@ -48,23 +59,29 @@ export function ensureToolCallIds(body) {
     }
 
     // Validate tool_call_id in tool messages (role: "tool")
-    if (msg.role === "tool" && msg.tool_call_id && !TOOL_ID_PATTERN.test(msg.tool_call_id)) {
-      const sanitized = sanitizeToolId(msg.tool_call_id);
-      msg.tool_call_id = sanitized || generateToolCallId(i, 0);
+    if (msg.role === ROLE.TOOL) {
+      if (preserveIds ? !msg.tool_call_id : (msg.tool_call_id && !TOOL_ID_PATTERN.test(msg.tool_call_id))) {
+        const sanitized = preserveIds ? null : sanitizeToolId(msg.tool_call_id);
+        msg.tool_call_id = sanitized || generateToolCallId(i, 0);
+      }
     }
 
     // Also validate tool_use blocks in content (Claude format)
     if (Array.isArray(msg.content)) {
       for (let k = 0; k < msg.content.length; k++) {
         const block = msg.content[k];
-        if (block.type === "tool_use" && block.id && !TOOL_ID_PATTERN.test(block.id)) {
-          const sanitized = sanitizeToolId(block.id);
-          block.id = sanitized || generateToolCallId(i, k, block.name);
+        if (block.type === CLAUDE_BLOCK.TOOL_USE) {
+          if (preserveIds ? !block.id : (block.id && !TOOL_ID_PATTERN.test(block.id))) {
+            const sanitized = preserveIds ? null : sanitizeToolId(block.id);
+            block.id = sanitized || generateToolCallId(i, k, block.name);
+          }
         }
         // Validate tool_use_id in tool_result blocks
-        if (block.type === "tool_result" && block.tool_use_id && !TOOL_ID_PATTERN.test(block.tool_use_id)) {
-          const sanitized = sanitizeToolId(block.tool_use_id);
-          block.tool_use_id = sanitized || generateToolCallId(i, k);
+        if (block.type === CLAUDE_BLOCK.TOOL_RESULT) {
+          if (preserveIds ? !block.tool_use_id : (block.tool_use_id && !TOOL_ID_PATTERN.test(block.tool_use_id))) {
+            const sanitized = preserveIds ? null : sanitizeToolId(block.tool_use_id);
+            block.tool_use_id = sanitized || generateToolCallId(i, k);
+          }
         }
       }
     }
@@ -75,7 +92,7 @@ export function ensureToolCallIds(body) {
 
 // Get tool_call ids from assistant message (OpenAI format: tool_calls, Claude format: tool_use in content)
 export function getToolCallIds(msg) {
-  if (msg.role !== "assistant") return [];
+  if (msg.role !== ROLE.ASSISTANT) return [];
 
   const ids = [];
 
@@ -89,7 +106,7 @@ export function getToolCallIds(msg) {
   // Claude format: tool_use blocks in content
   if (Array.isArray(msg.content)) {
     for (const block of msg.content) {
-      if (block.type === "tool_use" && block.id) {
+      if (block.type === CLAUDE_BLOCK.TOOL_USE && block.id) {
         ids.push(block.id);
       }
     }
