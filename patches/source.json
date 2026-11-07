@@ -76,6 +76,7 @@
     "tests/translator/thinking-unified.test.js",
     "tests/unit/account-cooldown-division.test.js",
     "tests/unit/aistudio-discovery.test.js",
+    "tests/unit/claude-signature-foreign-opaque.test.js",
     "tests/unit/combo-hold-deadline.test.js",
     "tests/unit/combo-transient-no-sleep.test.js",
     "tests/unit/docker-publish-source-recipe.test.js",
