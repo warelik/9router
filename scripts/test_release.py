@@ -111,6 +111,60 @@ class ReviewPolicyTests(unittest.TestCase):
                 self.assertEqual(skew_sleep.call_count, 1)
                 self.assertAlmostEqual(skew_sleep.call_args.args[0], expected_wait, places=6)
 
+    def test_shared_review_evidence_uses_post_acceptance_pull_snapshot(self):
+        candidate = {
+            "upstream_sha": HEAD, "application_sha": HEAD, "configuration_sha": OTHER,
+        }
+
+        def make_pull(updated_at):
+            return {
+                "number": 7, "state": "open", "updated_at": updated_at,
+                "user": {"login": "warelik", "type": "User"},
+                "head": {"sha": HEAD, "ref": "review/full",
+                         "repo": {"full_name": "warelik/9router"}},
+                "base": {"sha": OTHER, "ref": "review-base/full",
+                         "repo": {"full_name": "warelik/9router"}},
+            }
+
+        before = make_pull("2026-10-16T10:00:00Z")
+        after = make_pull("2026-10-16T10:00:05Z")
+        commits = {HEAD: {"sha": HEAD}, OTHER: {"sha": OTHER}}
+
+        def fake_api(route, **kwargs):
+            if route.startswith("repos/warelik/9router/git/commits/"):
+                return commits[route.rsplit("/", 1)[1]]
+            raise AssertionError(f"unexpected api route: {route}")
+
+        fake_api.pulls = 0
+
+        def counting_api(route, **kwargs):
+            if route == "repos/warelik/9router/pulls/7":
+                result = before if fake_api.pulls == 0 else after
+                fake_api.pulls += 1
+                return result
+            return fake_api(route, **kwargs)
+
+        class Lifecycle:
+            @staticmethod
+            def candidate_identity(candidate):
+                return "e" * 64
+
+            @staticmethod
+            def evaluate_review(target, reviews, inline, comments, resolved):
+                return {"target_pr_updated_at": target["pr"]["updated_at"]}
+
+        with patch.object(release, "api", side_effect=counting_api), \
+                patch.object(release, "pages", return_value=[]), \
+                patch.object(release, "_native_review_request", return_value={"id": 42}), \
+                patch.object(release, "_ensure_owner_acceptance", return_value=True), \
+                patch.object(release, "_resolve_native_review_commits", return_value={}):
+            result, evidence = release.evaluate_shared_review(
+                "warelik/9router", Lifecycle(), candidate, "full", 7, HEAD, OTHER,
+                "review/full", "review-base/full")
+
+        self.assertEqual(result["target_pr_updated_at"], "2026-10-16T10:00:05Z")
+        self.assertEqual(evidence["target"]["pr"]["updated_at"], "2026-10-16T10:00:05Z")
+
     def test_review_mode_bot_keeps_the_configured_trigger(self):
         candidate = {
             "upstream_sha": HEAD, "application_sha": HEAD, "configuration_sha": OTHER,

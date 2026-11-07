@@ -1960,6 +1960,19 @@ def evaluate_shared_review(repo, lifecycle, candidate, scope, pr_number, review_
     reviews = pages(f"repos/{repo}/pulls/{pr_number}/reviews")
     inline = pages(f"repos/{repo}/pulls/{pr_number}/comments")
     resolved = _resolve_native_review_commits(repo, reviews + inline + comments)
+    # _ensure_owner_acceptance may have just posted a comment, which bumps the
+    # PR updated_at; the snapshot taken before that post would then fail the
+    # exact signature re-verification in _verify_disposition_review_pull on
+    # nearly every push run. Re-read the PR so the evidence carries the
+    # post-acceptance signature. Identity (head/base/ref) is unchanged, so
+    # re-verify it before adopting the fresh snapshot.
+    fresh_pull = api(f"repos/{repo}/pulls/{pr_number}")
+    if (fresh_pull.get("number") != pr_number or fresh_pull.get("head", {}).get("sha") != review_sha
+            or fresh_pull.get("base", {}).get("sha") != base_sha
+            or fresh_pull.get("head", {}).get("ref") != head_ref
+            or fresh_pull.get("base", {}).get("ref") != base_ref):
+        raise ValueError("Native review PR identity changed")
+    pull = fresh_pull
     target = {
         "candidate": candidate,
         "scope": scope,
