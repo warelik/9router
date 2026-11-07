@@ -82,6 +82,7 @@
     "tests/unit/docker-publish-source-recipe.test.js",
     "tests/unit/downstream-translator-history-regressions.test.js",
     "tests/unit/muse-cloaking.test.js",
+    "tests/unit/muse-foreign-reasoning-retry.test.js",
     "tests/unit/muse-responses-wire.test.js"
   ]
 }

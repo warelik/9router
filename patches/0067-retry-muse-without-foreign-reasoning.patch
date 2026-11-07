@@ -1,0 +1,414 @@
+From 0f9c034d142dd7c494bf816acdfc72cefa6054ea Mon Sep 17 00:00:00 2001
+From: Antigravity Repair <antigravity@localhost>
+Date: Sat, 7 Nov 2026 13:32:26 +0000
+Subject: [PATCH] Retry Muse without foreign reasoning state
+
+Meta binds Responses reasoning encrypted_content to the caller that issued it. A Muse account switch therefore makes an otherwise valid history fail with 400 "was not issued to this caller".
+
+Keep the first attempt intact so same-account sessions retain full reasoning continuity. Only after that exact rejection, retry once with the encrypted payloads removed, preserving reasoning summaries and the visible/tool history. Remember the rejected payload hashes for the current caller so later turns pre-strip only those hashes and keep new reasoning issued by the current caller.
+
+This complements fill-first account routing: forced fallback or credential re-login no longer has to kill the conversation, while unrelated 400 errors are returned unchanged.
+---
+ open-sse/executors/index.js                   |   3 +
+ open-sse/executors/muse.js                    | 171 ++++++++++++++++
+ .../unit/muse-foreign-reasoning-retry.test.js | 182 ++++++++++++++++++
+ 3 files changed, 356 insertions(+)
+ create mode 100644 open-sse/executors/muse.js
+ create mode 100644 tests/unit/muse-foreign-reasoning-retry.test.js
+
+diff --git a/open-sse/executors/index.js b/open-sse/executors/index.js
+index 9ed15fee..cf7ca340 100644
+--- a/open-sse/executors/index.js
++++ b/open-sse/executors/index.js
+@@ -19,6 +19,7 @@ import { PerplexityWebExecutor } from "./perplexity-web.js";
+ import { DeepSeekWebExecutor } from "./deepseek-web.js";
+ import { GeminiWebExecutor } from "./gemini-web.js";
+ import { MuseWebExecutor } from "./muse-web.js";
++import { MuseExecutor } from "./muse.js";
+ import { VeoAiFreeWebExecutor } from "./veoaifree-web.js";
+ import { UcWebExecutor } from "./uc-web.js";
+ import { ChatGptWebExecutor } from "./chatgpt-web.js";
+@@ -61,6 +62,7 @@ const executors = {
+   "perplexity-web": new PerplexityWebExecutor(),
+   "deepseek-web": new DeepSeekWebExecutor(),
+   "gemini-web": new GeminiWebExecutor(),
++  muse: new MuseExecutor(),
+   "muse-web": new MuseWebExecutor(),
+   "veoaifree-web": new VeoAiFreeWebExecutor(),
+   "veo-free": new VeoAiFreeWebExecutor(), // Alias
+@@ -123,6 +125,7 @@ export { GrokCliExecutor } from "./grok-cli.js";
+ export { PerplexityWebExecutor } from "./perplexity-web.js";
+ export { DeepSeekWebExecutor } from "./deepseek-web.js";
+ export { GeminiWebExecutor } from "./gemini-web.js";
++export { MuseExecutor } from "./muse.js";
+ export { MuseWebExecutor } from "./muse-web.js";
+ export { ChatGptWebExecutor } from "./chatgpt-web.js";
+ export { OllamaLocalExecutor } from "./ollama-local.js";
+diff --git a/open-sse/executors/muse.js b/open-sse/executors/muse.js
+new file mode 100644
+index 00000000..f6e684c1
+--- /dev/null
++++ b/open-sse/executors/muse.js
+@@ -0,0 +1,171 @@
++import { createHash } from "node:crypto";
++
++import { DefaultExecutor } from "./default.js";
++
++const FOREIGN_REASONING_ERROR = "reasoning `encrypted_content` was not issued to this caller";
++const MAX_TRACKED_CALLERS = 64;
++const MAX_TRACKED_HASHES_PER_CALLER = 10000;
++
++function hashValue(value) {
++  return createHash("sha256").update(value).digest("hex");
++}
++
++function encryptedValues(item) {
++  return [
++    item?.encrypted_content,
++    item?.reasoning_encrypted_content,
++    item?.reasoning?.encrypted_content,
++  ].filter((value) => typeof value === "string" && value.length > 0);
++}
++
++function hasSummary(item) {
++  return Array.isArray(item?.summary)
++    && item.summary.some((part) => typeof part?.text === "string" && part.text.length > 0);
++}
++
++function hasContent(item) {
++  return Array.isArray(item?.content) && item.content.length > 0;
++}
++
++/**
++ * Remove caller-bound encrypted reasoning payloads while preserving the rest
++ * of the Responses history. Reasoning items keep their summary/content when
++ * present; items that consisted only of the encrypted continuity blob are
++ * dropped because an anonymous empty reasoning item carries no usable state.
++ *
++ * When incompatibleHashes is provided, only payloads already known to be
++ * rejected for this caller are removed. Without it, every encrypted payload
++ * is removed for the one recovery attempt after Meta has identified a
++ * mismatch.
++ */
++export function sanitizeMuseForeignReasoning(body, incompatibleHashes = null) {
++  if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.input)) {
++    return { body, removedHashes: [] };
++  }
++
++  let changed = false;
++  const removedHashes = [];
++  const input = [];
++
++  for (const item of body.input) {
++    if (!item || typeof item !== "object" || Array.isArray(item)) {
++      input.push(item);
++      continue;
++    }
++
++    const hashes = encryptedValues(item).map(hashValue);
++    if (!hashes.length || (incompatibleHashes && !hashes.some((hash) => incompatibleHashes.has(hash)))) {
++      input.push(item);
++      continue;
++    }
++
++    changed = true;
++    removedHashes.push(...hashes);
++
++    const clean = { ...item };
++    delete clean.encrypted_content;
++    delete clean.reasoning_encrypted_content;
++    if (clean.reasoning && typeof clean.reasoning === "object" && !Array.isArray(clean.reasoning)) {
++      clean.reasoning = { ...clean.reasoning };
++      delete clean.reasoning.encrypted_content;
++    }
++
++    if (item.type !== "reasoning") {
++      input.push(clean);
++      continue;
++    }
++
++    // The id identifies the stored item issued under the previous caller.
++    // Keep only portable summary/content once its encrypted state is removed.
++    delete clean.id;
++    if (hasSummary(clean) || hasContent(clean)) input.push(clean);
++  }
++
++  return {
++    body: changed ? { ...body, input } : body,
++    removedHashes,
++  };
++}
++
++export class MuseExecutor extends DefaultExecutor {
++  constructor() {
++    super("muse");
++    this._foreignReasoningByScope = new Map();
++  }
++
++  _callerScope(args) {
++    const credentials = args?.credentials || {};
++    const secret = credentials.accessToken || credentials.apiKey || "";
++    return secret
++      ? hashValue(String(secret))
++      : (credentials.connectionId || "unknown-caller");
++  }
++
++  _knownForeignHashes(scope) {
++    const known = this._foreignReasoningByScope.get(scope);
++    if (!known) return null;
++    // Refresh LRU position; a session can legitimately run for many turns.
++    this._foreignReasoningByScope.delete(scope);
++    this._foreignReasoningByScope.set(scope, known);
++    return known;
++  }
++
++  _rememberForeignHashes(scope, hashes) {
++    if (!hashes.length) return;
++    let known = this._foreignReasoningByScope.get(scope);
++    if (!known) {
++      known = new Set();
++      this._foreignReasoningByScope.set(scope, known);
++    }
++    for (const hash of hashes) known.add(hash);
++    while (known.size > MAX_TRACKED_HASHES_PER_CALLER) {
++      known.delete(known.values().next().value);
++    }
++
++    while (this._foreignReasoningByScope.size > MAX_TRACKED_CALLERS) {
++      const oldest = this._foreignReasoningByScope.keys().next().value;
++      this._foreignReasoningByScope.delete(oldest);
++    }
++  }
++
++  async execute(args) {
++    const scope = this._callerScope(args);
++    const knownForeignHashes = this._knownForeignHashes(scope);
++    const prepared = knownForeignHashes
++      ? sanitizeMuseForeignReasoning(args.body, knownForeignHashes)
++      : { body: args.body };
++    const first = await super.execute({ ...args, body: prepared.body });
++
++    if (first.response?.status !== 400 || typeof first.response.clone !== "function") {
++      return first;
++    }
++
++    let errorText = "";
++    try {
++      errorText = await first.response.clone().text();
++    } catch {
++      return first;
++    }
++    if (!errorText.includes(FOREIGN_REASONING_ERROR)) return first;
++
++    const sanitized = sanitizeMuseForeignReasoning(prepared.body);
++    if (!sanitized.removedHashes.length) return first;
++
++    this._rememberForeignHashes(scope, sanitized.removedHashes);
++    args.log?.warn?.(
++      "RETRY",
++      `MUSE | foreign reasoning state rejected; retrying without ${sanitized.removedHashes.length} encrypted item(s)`,
++    );
++
++    try {
++      const retry = await super.execute({ ...args, body: sanitized.body });
++      return retry.response?.ok || (retry.response && retry.response.status !== 400)
++        ? retry
++        : first;
++    } catch {
++      return first;
++    }
++  }
++}
++
++export default MuseExecutor;
+diff --git a/tests/unit/muse-foreign-reasoning-retry.test.js b/tests/unit/muse-foreign-reasoning-retry.test.js
+new file mode 100644
+index 00000000..ecfdab43
+--- /dev/null
++++ b/tests/unit/muse-foreign-reasoning-retry.test.js
+@@ -0,0 +1,182 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const fetchMock = vi.fn();
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
++  proxyAwareFetch: (...args) => fetchMock(...args),
++}));
++
++const { MuseExecutor, sanitizeMuseForeignReasoning } = await import("../../open-sse/executors/muse.js");
++const { getExecutor } = await import("../../open-sse/executors/index.js");
++
++const FOREIGN_ERROR = {
++  error: {
++    code: null,
++    message: "reasoning `encrypted_content` was not issued to this caller",
++    param: null,
++    type: "invalid_request_error",
++  },
++};
++
++function response(status, body) {
++  return new Response(JSON.stringify(body), {
++    status,
++    headers: { "content-type": "application/json" },
++  });
++}
++
++function makeBody() {
++  return {
++    model: "muse-wonder-1.0-contributor",
++    stream: false,
++    store: false,
++    include: ["reasoning.encrypted_content"],
++    reasoning: { effort: "high", summary: "auto" },
++    input: [
++      { type: "message", role: "user", content: [{ type: "input_text", text: "first" }] },
++      {
++        type: "reasoning",
++        id: "rs_foreign",
++        status: "completed",
++        summary: [{ type: "summary_text", text: "prior plan" }],
++        encrypted_content: "foreign-blob",
++      },
++      {
++        type: "reasoning",
++        id: "rs_empty",
++        status: "completed",
++        summary: [],
++        encrypted_content: "foreign-empty",
++      },
++      { type: "function_call", call_id: "call_1", name: "lookup", arguments: "{}" },
++      { type: "function_call_output", call_id: "call_1", output: "ok" },
++      { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
++    ],
++  };
++}
++
++function makeArgs(body, overrides = {}) {
++  return {
++    model: "muse-wonder-1.0-contributor",
++    body,
++    stream: false,
++    credentials: {
++      accessToken: "test-only-caller-b",
++      connectionId: "muse-connection-b",
++      providerSpecificData: {},
++      runtimeTransport: {
++        baseUrl: "https://api.meta.ai/v1/responses",
++        format: "openai-responses",
++        headers: {},
++        auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["museHeaders"] },
++      },
++    },
++    providerSessionId: "session-1",
++    log: { debug: vi.fn(), warn: vi.fn() },
++    ...overrides,
++  };
++}
++
++function sentBody(callIndex) {
++  return JSON.parse(fetchMock.mock.calls[callIndex][1].body);
++}
++
++describe("Muse foreign reasoning recovery", () => {
++  beforeEach(() => {
++    fetchMock.mockReset();
++  });
++
++  it("registers the dedicated Muse executor", () => {
++    expect(getExecutor("muse")).toBeInstanceOf(MuseExecutor);
++  });
++
++  it("keeps encrypted reasoning intact on a successful first attempt", async () => {
++    fetchMock.mockResolvedValueOnce(response(200, { id: "resp_ok", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(sentBody(0).input).toEqual(expect.arrayContaining([
++      expect.objectContaining({ type: "reasoning", encrypted_content: "foreign-blob" }),
++    ]));
++  });
++
++  it("retries only after Meta rejects foreign encrypted reasoning", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_retry", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    expect(sentBody(0).input).toEqual(expect.arrayContaining([
++      expect.objectContaining({ encrypted_content: "foreign-blob" }),
++    ]));
++
++    const retryInput = sentBody(1).input;
++    expect(JSON.stringify(retryInput)).not.toContain("foreign-blob");
++    expect(JSON.stringify(retryInput)).not.toContain("foreign-empty");
++    expect(retryInput).toEqual(expect.arrayContaining([
++      {
++        type: "reasoning",
++        status: "completed",
++        summary: [{ type: "summary_text", text: "prior plan" }],
++      },
++      expect.objectContaining({ type: "function_call", call_id: "call_1" }),
++      expect.objectContaining({ type: "function_call_output", call_id: "call_1" }),
++    ]));
++    expect(retryInput.filter((item) => item.type === "reasoning")).toHaveLength(1);
++  });
++
++  it("pre-strips only hashes already rejected for this session and caller", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_retry", status: "completed", output: [] }))
++      .mockResolvedValueOnce(response(200, { id: "resp_next", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    await executor.execute(makeArgs(makeBody()));
++
++    const nextBody = makeBody();
++    nextBody.input.splice(3, 0, {
++      type: "reasoning",
++      id: "rs_current",
++      status: "completed",
++      summary: [{ type: "summary_text", text: "current plan" }],
++      encrypted_content: "current-caller-blob",
++    });
++    const out = await executor.execute(makeArgs(nextBody));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(3);
++    const sent = sentBody(2);
++    expect(JSON.stringify(sent.input)).not.toContain("foreign-blob");
++    expect(sent.input).toEqual(expect.arrayContaining([
++      expect.objectContaining({ type: "reasoning", encrypted_content: "current-caller-blob" }),
++    ]));
++  });
++
++  it("does not retry unrelated 400 errors", async () => {
++    fetchMock.mockResolvedValueOnce(response(400, { error: { message: "unknown parameter" } }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(400);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++  });
++
++  it("sanitizer preserves summaries and drops empty reasoning items", () => {
++    const { body, removedHashes } = sanitizeMuseForeignReasoning(makeBody());
++
++    expect(removedHashes).toHaveLength(2);
++    expect(body.input.filter((item) => item.type === "reasoning")).toEqual([{
++      type: "reasoning",
++      status: "completed",
++      summary: [{ type: "summary_text", text: "prior plan" }],
++    }]);
++  });
++});
+-- 
+2.55.0
+
