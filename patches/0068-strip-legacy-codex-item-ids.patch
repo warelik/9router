@@ -1,0 +1,93 @@
+From 9router-repair-legacy-item-ids Mon Sep 17 00:00:00 2001
+From: 9router development <9router-dev@localhost>
+Date: Tue, 3 Nov 2026 16:10:00 +0000
+Subject: [PATCH] Strip legacy Codex reasoning IDs on replay
+
+Normalize legacy item_ reasoning IDs on Codex replay without changing
+call IDs, encrypted content, ordering, or the Lite developer exception.
+
+---
+diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
+--- a/open-sse/executors/codex.js
++++ b/open-sse/executors/codex.js
+@@ -61,14 +61,15 @@
+   }
+ }
+
+-// Strip server-generated item IDs (rs_/fc_/resp_/msg_) from input — avoids 404 with store=false
++// Strip server-generated item IDs from input — avoids invalid replay with store=false.
+ function stripStoredItemReferences(body, preserveLitePrefix = false) {
+   if (!Array.isArray(body.input)) return;
+   body.input = body.input.filter((item) => {
+     if (typeof item === "string" && SERVER_ID_PATTERN.test(item)) return false;
+     if (item && typeof item === "object" && !Array.isArray(item)) {
+       if (item.type === "item_reference") return false;
+-      if (typeof item.id === "string" && SERVER_ID_PATTERN.test(item.id)
++      const legacyReasoningId = item.type === RESPONSES_ITEM.REASONING && item.id?.startsWith?.("item_");
++      if (typeof item.id === "string" && (SERVER_ID_PATTERN.test(item.id) || legacyReasoningId)
+         && !(preserveLitePrefix && item.role === "developer" && item.id.startsWith("msg_"))) delete item.id;
+     }
+     return true;
+diff --git a/tests/unit/codex-legacy-item-ids.test.js b/tests/unit/codex-legacy-item-ids.test.js
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/codex-legacy-item-ids.test.js
+@@ -0,0 +1,58 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { CodexExecutor } from "../../open-sse/executors/codex.js";
++import * as proxyFetchModule from "../../open-sse/utils/proxyFetch.js";
++
++const credentials = { connectionId: "legacy-item-fixture", accessToken: "fixture-token" };
++const user = { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] };
++afterEach(() => vi.restoreAllMocks());
++
++describe("Codex legacy reasoning IDs", () => {
++  it("removes only legacy reasoning IDs and preserves continuity and order", () => {
++    const encrypted = "opaque-redacted-encrypted-content";
++    const body = new CodexExecutor().transformRequest("gpt-5.5", {
++      model: "gpt-5.5", instructions: "fixture", tools: [], input: [
++        user,
++        { type: "reasoning", id: "item_legacy", summary: [], encrypted_content: encrypted },
++        { type: "reasoning", id: "rs_saved", summary: [], encrypted_content: encrypted },
++        { type: "function_call", id: "item_call", call_id: "call_preserved", name: "tool", arguments: "{}" },
++        { type: "function_call_output", call_id: "call_preserved", output: "ok" },
++      ],
++    }, true, credentials);
++    expect(body.input.map(item => item.type)).toEqual(["message", "reasoning", "reasoning", "function_call", "function_call_output"]);
++    expect(body.input[1].id).toBeUndefined();
++    expect(body.input[2].id).toBeUndefined();
++    expect(body.input[1].encrypted_content).toBe(encrypted);
++    expect(body.input[2].encrypted_content).toBe(encrypted);
++    expect(body.input[3]).toMatchObject({ id: "item_call", call_id: "call_preserved", arguments: "{}" });
++    expect(body.input[4]).toMatchObject({ call_id: "call_preserved", output: "ok" });
++  });
++
++  it("preserves the Lite developer msg ID exception", () => {
++    const body = new CodexExecutor().transformRequest("gpt-6.1-sol", {
++      model: "gpt-6.1-sol", instructions: "", tools: [], input: [
++        { type: "message", role: "developer", id: "msg_lite_prefix", content: [{ type: "input_text", text: "fixture" }] },
++        user,
++      ],
++    }, true, credentials);
++    expect(body.input.some(item => item.id === "msg_lite_prefix")).toBe(true);
++  });
++
++  it("sends normalized reasoning through execute to an ID-validating stub", async () => {
++    const encrypted = "opaque-redacted";
++    const fetch = vi.spyOn(proxyFetchModule, "proxyAwareFetch").mockImplementation(async (_url, options) => {
++      const request = JSON.parse(options.body);
++      const reasoning = request.input.find(item => item.type === "reasoning");
++      expect(reasoning.id).toBeUndefined();
++      expect(reasoning.encrypted_content).toBe(encrypted);
++      return new Response('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n', {
++        status: 200, headers: { "Content-Type": "text/event-stream" },
++      });
++    });
++    const result = await new CodexExecutor().execute({
++      model: "gpt-5.5", stream: true, credentials,
++      body: { model: "gpt-5.5", input: [user, { type: "reasoning", id: "item_legacy", summary: [], encrypted_content: encrypted }] },
++    });
++    expect(fetch).toHaveBeenCalledTimes(1);
++    expect(result.response.status).toBe(200);
++  });
++});
