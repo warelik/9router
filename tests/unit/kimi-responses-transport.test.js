@@ -3,8 +3,8 @@
 // Drives the REAL handleChatCore guard + targetFormat resolution; only the executor's HTTP
 // response is mocked. The assertion target is credentials.runtimeTransport — the field
 // DefaultExecutor.buildUrl/buildHeaders read — so a wrong routing decision shows up as the
-// wrong baseUrl here, same as on the wire. Executor-level cells check URL and auth
-// without any network.
+// wrong baseUrl here, same as on the wire. Executor-level cells check URL, auth and the
+// Responses reasoning shape without any network.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const { executeMock } = vi.hoisted(() => ({
@@ -192,5 +192,16 @@ describe("DefaultExecutor('kimi') on the responses transport", () => {
 
     const oauthHeaders = ex.buildHeaders({ accessToken: "tok-test", runtimeTransport: rt(), providerSpecificData: {} }, true, url, MODELS[0]);
     expect(oauthHeaders.Authorization).toBe("Bearer tok-test");
+  });
+
+  it("emits reasoning.effort (Responses shape) incl. max, never reasoning_effort", () => {
+    const ex = new DefaultExecutor("kimi");
+    const out = ex.transformRequest(MODELS[0], {
+      model: MODELS[0],
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      reasoning_effort: "max",
+    }, true, { runtimeTransport: rt() });
+    expect(out.reasoning?.effort).toBe("max");
+    expect(out.reasoning_effort).toBeUndefined();
   });
 });
