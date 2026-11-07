@@ -1,4 +1,4 @@
-import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS } from "../config/errorConfig.js";
+import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS, RATE_LIMIT_COOLDOWN_DIVISOR } from "../config/errorConfig.js";
 
 /**
  * Calculate exponential backoff cooldown for rate limits (429)
@@ -27,6 +27,12 @@ export function getQuotaCooldown(backoffLevel = 0) {
  * this request, so combo rotation must still try the next member.
  */
 export function checkFallbackError(status, errorText, backoffLevel = 0, provider = null) {
+  // Cooldowns caused by 429/503 responses are scaled down (see
+  // RATE_LIMIT_COOLDOWN_DIVISOR); the backoff level still advances as before,
+  // so the ladder keeps its shape at a third of the durations.
+  const scaleCooldown = (status === 429 || status === 503)
+    ? (ms) => Math.max(1, Math.round(ms / RATE_LIMIT_COOLDOWN_DIVISOR))
+    : (ms) => ms;
   const lowerError = errorText
     ? (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase()
     : "";
@@ -37,11 +43,11 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
     if (rule.text && lowerError && lowerError.includes(rule.text)) {
       if (rule.backoff) {
         const newLevel = Math.min(backoffLevel + 1, BACKOFF_CONFIG.maxLevel);
-        return { shouldFallback: true, cooldownMs: getQuotaCooldown(newLevel), newBackoffLevel: newLevel };
+        return { shouldFallback: true, cooldownMs: scaleCooldown(getQuotaCooldown(newLevel)), newBackoffLevel: newLevel };
       }
       return {
         shouldFallback: true,
-        cooldownMs: rule.cooldownMs,
+        cooldownMs: scaleCooldown(rule.cooldownMs),
         modelScoped: Boolean(rule.modelScoped),
       };
     }
@@ -50,9 +56,9 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
     if (rule.status && rule.status === status) {
       if (rule.backoff) {
         const newLevel = Math.min(backoffLevel + 1, BACKOFF_CONFIG.maxLevel);
-        return { shouldFallback: true, cooldownMs: getQuotaCooldown(newLevel), newBackoffLevel: newLevel };
+        return { shouldFallback: true, cooldownMs: scaleCooldown(getQuotaCooldown(newLevel)), newBackoffLevel: newLevel };
       }
-      return { shouldFallback: true, cooldownMs: rule.cooldownMs };
+      return { shouldFallback: true, cooldownMs: scaleCooldown(rule.cooldownMs) };
     }
   }
 
@@ -71,7 +77,7 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
   }
 
   // Default: transient cooldown for any unmatched error
-  return { shouldFallback: true, cooldownMs: TRANSIENT_COOLDOWN_MS };
+  return { shouldFallback: true, cooldownMs: scaleCooldown(TRANSIENT_COOLDOWN_MS) };
 }
 
 /**
