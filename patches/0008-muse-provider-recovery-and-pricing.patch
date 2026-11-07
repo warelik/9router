@@ -1,0 +1,1941 @@
+From ad3dc8d2c230c4804ac56c1e7c685d1a2848696f Mon Sep 17 00:00:00 2001
+From: downstream <downstream@local>
+Date: Sat, 7 Nov 2026 17:42:46 +0000
+Subject: [PATCH] Muse provider: cloaking, reasoning recovery and pricing
+
+
+Consolidated from the following original patches (file custody by final owner):
+
+- original #61: Cloak Muse Code tools and register Wonder
+- original #67: Retry Muse without foreign reasoning state
+- original #69: Retry Muse without expired reasoning references
+- original #70: Price Muse Wonder usage instead of silently zero
+---
+ open-sse/executors/index.js                   |   3 +
+ open-sse/executors/muse.js                    | 266 +++++++++++++++
+ open-sse/handlers/chatCore.js                 | 123 +++++--
+ open-sse/providers/capabilities.js            |  14 +-
+ open-sse/providers/pricing.js                 |   5 +
+ open-sse/providers/registry/muse.js           |   8 +-
+ open-sse/providers/thinkingLevels.js          |   3 +
+ open-sse/translator/index.js                  | 111 +++++-
+ open-sse/utils/museCloaking.js                |  77 +++++
+ tests/unit/muse-cloaking.test.js              | 271 +++++++++++++++
+ .../unit/muse-foreign-reasoning-retry.test.js | 262 +++++++++++++++
+ tests/unit/muse-responses-wire.test.js        |  37 ++
+ .../unit/provider-pricing-muse-wonder.test.js |  29 ++
+ tests/unit/target-format-transport.test.js    | 317 ++++++++++++++++++
+ 14 files changed, 1485 insertions(+), 41 deletions(-)
+ create mode 100644 open-sse/executors/muse.js
+ create mode 100644 open-sse/utils/museCloaking.js
+ create mode 100644 tests/unit/muse-cloaking.test.js
+ create mode 100644 tests/unit/muse-foreign-reasoning-retry.test.js
+ create mode 100644 tests/unit/provider-pricing-muse-wonder.test.js
+ create mode 100644 tests/unit/target-format-transport.test.js
+
+diff --git a/open-sse/executors/index.js b/open-sse/executors/index.js
+index 9ed15fe..cf7ca34 100644
+--- a/open-sse/executors/index.js
++++ b/open-sse/executors/index.js
+@@ -19,6 +19,7 @@ import { PerplexityWebExecutor } from "./perplexity-web.js";
+ import { DeepSeekWebExecutor } from "./deepseek-web.js";
+ import { GeminiWebExecutor } from "./gemini-web.js";
+ import { MuseWebExecutor } from "./muse-web.js";
++import { MuseExecutor } from "./muse.js";
+ import { VeoAiFreeWebExecutor } from "./veoaifree-web.js";
+ import { UcWebExecutor } from "./uc-web.js";
+ import { ChatGptWebExecutor } from "./chatgpt-web.js";
+@@ -61,6 +62,7 @@ const executors = {
+   "perplexity-web": new PerplexityWebExecutor(),
+   "deepseek-web": new DeepSeekWebExecutor(),
+   "gemini-web": new GeminiWebExecutor(),
++  muse: new MuseExecutor(),
+   "muse-web": new MuseWebExecutor(),
+   "veoaifree-web": new VeoAiFreeWebExecutor(),
+   "veo-free": new VeoAiFreeWebExecutor(), // Alias
+@@ -123,6 +125,7 @@ export { GrokCliExecutor } from "./grok-cli.js";
+ export { PerplexityWebExecutor } from "./perplexity-web.js";
+ export { DeepSeekWebExecutor } from "./deepseek-web.js";
+ export { GeminiWebExecutor } from "./gemini-web.js";
++export { MuseExecutor } from "./muse.js";
+ export { MuseWebExecutor } from "./muse-web.js";
+ export { ChatGptWebExecutor } from "./chatgpt-web.js";
+ export { OllamaLocalExecutor } from "./ollama-local.js";
+diff --git a/open-sse/executors/muse.js b/open-sse/executors/muse.js
+new file mode 100644
+index 0000000..1363d1d
+--- /dev/null
++++ b/open-sse/executors/muse.js
+@@ -0,0 +1,266 @@
++import { createHash } from "node:crypto";
++
++import { DefaultExecutor } from "./default.js";
++
++const FOREIGN_REASONING_ERROR = "reasoning `encrypted_content` was not issued to this caller";
++const EXPIRED_REASONING_REFERENCE = /Referenced reasoning item '([^']+)' was not found or has expired/;
++const MAX_TRACKED_CALLERS = 64;
++const MAX_TRACKED_HASHES_PER_CALLER = 10000;
++
++function hashValue(value) {
++  return createHash("sha256").update(value).digest("hex");
++}
++
++function encryptedValues(item) {
++  return [
++    item?.encrypted_content,
++    item?.reasoning_encrypted_content,
++    item?.reasoning?.encrypted_content,
++  ].filter((value) => typeof value === "string" && value.length > 0);
++}
++
++function hasSummary(item) {
++  return Array.isArray(item?.summary)
++    && item.summary.some((part) => typeof part?.text === "string" && part.text.length > 0);
++}
++
++function hasContent(item) {
++  return Array.isArray(item?.content) && item.content.length > 0;
++}
++
++/**
++ * Remove caller-bound encrypted reasoning payloads while preserving the rest
++ * of the Responses history. Reasoning items keep their summary/content when
++ * present; items that consisted only of the encrypted continuity blob are
++ * dropped because an anonymous empty reasoning item carries no usable state.
++ *
++ * When incompatibleHashes is provided, only payloads already known to be
++ * rejected for this caller are removed. Without it, every encrypted payload
++ * is removed for the one recovery attempt after Meta has identified a
++ * mismatch.
++ */
++export function sanitizeMuseForeignReasoning(body, incompatibleHashes = null) {
++  if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.input)) {
++    return { body, removedHashes: [] };
++  }
++
++  let changed = false;
++  const removedHashes = [];
++  const input = [];
++
++  for (const item of body.input) {
++    if (!item || typeof item !== "object" || Array.isArray(item)) {
++      input.push(item);
++      continue;
++    }
++
++    const hashes = encryptedValues(item).map(hashValue);
++    if (!hashes.length || (incompatibleHashes && !hashes.some((hash) => incompatibleHashes.has(hash)))) {
++      input.push(item);
++      continue;
++    }
++
++    changed = true;
++    removedHashes.push(...hashes);
++
++    const clean = { ...item };
++    delete clean.encrypted_content;
++    delete clean.reasoning_encrypted_content;
++    if (clean.reasoning && typeof clean.reasoning === "object" && !Array.isArray(clean.reasoning)) {
++      clean.reasoning = { ...clean.reasoning };
++      delete clean.reasoning.encrypted_content;
++    }
++
++    if (item.type !== "reasoning") {
++      input.push(clean);
++      continue;
++    }
++
++    // The id identifies the stored item issued under the previous caller.
++    // Keep only portable summary/content once its encrypted state is removed.
++    delete clean.id;
++    if (hasSummary(clean) || hasContent(clean)) input.push(clean);
++  }
++
++  return {
++    body: changed ? { ...body, input } : body,
++    removedHashes,
++  };
++}
++
++/**
++ * Remove reasoning items whose server-side reference Meta no longer holds.
++ * The referenced form carries only an id (plus summary); without the stored
++ * object the caller cannot resolve it, so keep the portable summary/content
++ * when present and drop the id, dropping the item when nothing usable remains.
++ */
++export function dropMuseReasoningReferences(body, referencedIds) {
++  if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.input)
++    || !(referencedIds instanceof Set) || !referencedIds.size) {
++    return { body, removedIds: [] };
++  }
++
++  let changed = false;
++  const removedIds = [];
++  const input = [];
++
++  for (const item of body.input) {
++    if (!item || typeof item !== "object" || Array.isArray(item)
++      || item.type !== "reasoning" || !referencedIds.has(item.id)) {
++      input.push(item);
++      continue;
++    }
++
++    changed = true;
++    removedIds.push(item.id);
++    const clean = { ...item };
++    delete clean.id;
++    if (hasSummary(clean) || hasContent(clean)) input.push(clean);
++  }
++
++  return {
++    body: changed ? { ...body, input } : body,
++    removedIds,
++  };
++}
++
++export class MuseExecutor extends DefaultExecutor {
++  constructor() {
++    super("muse");
++    this._foreignReasoningByScope = new Map();
++    this._expiredReferencesByScope = new Map();
++  }
++
++  _callerScope(args) {
++    const credentials = args?.credentials || {};
++    const secret = credentials.accessToken || credentials.apiKey || "";
++    return secret
++      ? hashValue(String(secret))
++      : (credentials.connectionId || "unknown-caller");
++  }
++
++  _knownForeignHashes(scope) {
++    const known = this._foreignReasoningByScope.get(scope);
++    if (!known) return null;
++    // Refresh LRU position; a session can legitimately run for many turns.
++    this._foreignReasoningByScope.delete(scope);
++    this._foreignReasoningByScope.set(scope, known);
++    return known;
++  }
++
++  _rememberForeignHashes(scope, hashes) {
++    if (!hashes.length) return;
++    let known = this._foreignReasoningByScope.get(scope);
++    if (!known) {
++      known = new Set();
++      this._foreignReasoningByScope.set(scope, known);
++    }
++    for (const hash of hashes) known.add(hash);
++    while (known.size > MAX_TRACKED_HASHES_PER_CALLER) {
++      known.delete(known.values().next().value);
++    }
++
++    while (this._foreignReasoningByScope.size > MAX_TRACKED_CALLERS) {
++      const oldest = this._foreignReasoningByScope.keys().next().value;
++      this._foreignReasoningByScope.delete(oldest);
++    }
++  }
++
++  _knownExpiredReferences(scope) {
++    const known = this._expiredReferencesByScope.get(scope);
++    if (!known) return null;
++    this._expiredReferencesByScope.delete(scope);
++    this._expiredReferencesByScope.set(scope, known);
++    return known;
++  }
++
++  _rememberExpiredReferences(scope, ids) {
++    if (!ids.length) return;
++    let known = this._expiredReferencesByScope.get(scope);
++    if (!known) {
++      known = new Set();
++      this._expiredReferencesByScope.set(scope, known);
++    }
++    for (const id of ids) known.add(id);
++    while (known.size > MAX_TRACKED_HASHES_PER_CALLER) {
++      known.delete(known.values().next().value);
++    }
++
++    while (this._expiredReferencesByScope.size > MAX_TRACKED_CALLERS) {
++      const oldest = this._expiredReferencesByScope.keys().next().value;
++      this._expiredReferencesByScope.delete(oldest);
++    }
++  }
++
++  async execute(args) {
++    const scope = this._callerScope(args);
++    const knownForeignHashes = this._knownForeignHashes(scope);
++    const knownExpiredReferences = this._knownExpiredReferences(scope);
++    let preparedBody = knownForeignHashes
++      ? sanitizeMuseForeignReasoning(args.body, knownForeignHashes).body
++      : args.body;
++    if (knownExpiredReferences) {
++      preparedBody = dropMuseReasoningReferences(preparedBody, knownExpiredReferences).body;
++    }
++    const first = await this._executeRecovering({ ...args, body: preparedBody }, scope, false);
++    return first;
++  }
++
++  async _executeRecovering(args, scope, retried) {
++    const first = await super.execute(args);
++
++    if (retried || first.response?.status !== 400 || typeof first.response.clone !== "function") {
++      return first;
++    }
++
++    let errorText = "";
++    try {
++      errorText = await first.response.clone().text();
++    } catch {
++      return first;
++    }
++
++    const expiredMatch = errorText.match(EXPIRED_REASONING_REFERENCE);
++    if (expiredMatch) {
++      const dropped = dropMuseReasoningReferences(args.body, new Set([expiredMatch[1]]));
++      if (!dropped.removedIds.length) return first;
++
++      this._rememberExpiredReferences(scope, dropped.removedIds);
++      args.log?.warn?.(
++        "RETRY",
++        `MUSE | expired reasoning reference rejected; retrying without ${dropped.removedIds.length} referenced item(s)`,
++      );
++
++      try {
++        const retry = await this._executeRecovering({ ...args, body: dropped.body }, scope, true);
++        return retry.response?.ok || (retry.response && retry.response.status !== 400)
++          ? retry
++          : first;
++      } catch {
++        return first;
++      }
++    }
++
++    if (!errorText.includes(FOREIGN_REASONING_ERROR)) return first;
++
++    const sanitized = sanitizeMuseForeignReasoning(args.body);
++    if (!sanitized.removedHashes.length) return first;
++
++    this._rememberForeignHashes(scope, sanitized.removedHashes);
++    args.log?.warn?.(
++      "RETRY",
++      `MUSE | foreign reasoning state rejected; retrying without ${sanitized.removedHashes.length} encrypted item(s)`,
++    );
++
++    try {
++      const retry = await this._executeRecovering({ ...args, body: sanitized.body }, scope, true);
++      return retry.response?.ok || (retry.response && retry.response.status !== 400)
++        ? retry
++        : first;
++    } catch {
++      return first;
++    }
++  }
++}
++
++export default MuseExecutor;
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index 68a1350..a8f1d5a 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -1,7 +1,9 @@
+-import { detectFormat, getTargetFormat, resolveTransport } from "../services/provider.js";
++import { detectFormat, getTargetFormat, resolveTransport, supportsNativeGemini } from "../services/provider.js";
+ import { translateRequest } from "../translator/index.js";
+-import { applyThinking, extractThinking, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
++import { applyThinking, applyNativeGeminiThinking, extractThinking, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
+ import { FORMATS } from "../translator/formats.js";
++import { toPortableResponsesInput } from "../translator/formats/responsesApi.js";
++import { hasUndeliverableAgentMessage, preparePortableCollaboration } from "../translator/concerns/portableCollaboration.js";
+ import { normalizeClaudePassthrough, anchorClaudeCache } from "../translator/formats/claude.js";
+ import { createStreamController } from "../utils/streamHandler.js";
+ import { refreshWithRetry } from "../services/tokenRefresh.js";
+@@ -10,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
+ import { PROVIDERS } from "../config/providers.js";
+ import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
+ import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
+-import { HTTP_STATUS, TOKEN_SAVER_HEADER } from "../config/runtimeConfig.js";
++import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET, REWRITTEN_RESPONSE_HEADERS, AISTUDIO_NATIVE_GEMINI_API_VERSION, NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES, NATIVE_GEMINI_FIELD_MASK_HEADER_NAME } from "../config/runtimeConfig.js";
+ import { handleBypassRequest } from "../utils/bypassHandler.js";
+ import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+ import { getExecutor } from "../executors/index.js";
+@@ -33,6 +35,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
+ import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
+ import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
+ import { resolveSessionId } from "../utils/sessionManager.js";
++import { isMuseCodeSubscription } from "../utils/museCloaking.js";
+ 
+ /**
+  * Core chat handler - shared between SSE and Worker
+@@ -61,8 +64,10 @@ export function stripContinuityFields(body) {
+   return body;
+ }
+ 
+-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
++export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onRequestFailure, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, serverPartsTenant = null, providerThinking, providerOverrides }) {
++  if (credentials) credentials._geminiServerPartsSessionId = null;
+   const { provider, model } = modelInfo;
++  if (clientSignal?.aborted) return createErrorResult(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+   const requestStartTime = Date.now();
+   // Stable per-session color so all lines of one CLI conversation share a tag
+   const sessionSeed = (() => {
+@@ -100,25 +105,52 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   // translated to the Responses body (`input`) yet POSTed to the default Chat
+   // Completions URL, and upstream rejects it: "unknown parameter `input`".
+   const modelTargetTransport = modelTargetFormat ? resolveTransport(provider, modelTargetFormat) : null;
+-  const useTransport = (!modelSupportedFormats || modelSupportedFormats.includes(sourceFormat))
++  // Muse Code subscriptions are accepted only on Responses, including dynamic
++  // passthrough models that have no registry entry. Pay-as-you-go API keys keep
++  // the ordinary source/model transport selection above.
++  const museCodeTransport = provider === "muse" && isMuseCodeSubscription(credentials)
++    ? resolveTransport(provider, FORMATS.OPENAI_RESPONSES)
++    : null;
++  const useTransport = museCodeTransport || ((!modelSupportedFormats || modelSupportedFormats.includes(sourceFormat))
+     ? runtimeTransport
+-    : modelTargetTransport;
++    : modelTargetTransport);
+   // A source-format-matched endpoint keeps the request lossless. Prefer it
+   // over a model-level targetFormat, which is only the fallback for clients
+   // whose wire format has no supported transport (for example MiniMax-M3:
+   // OpenAI clients should stay on /chat/completions; other clients can fall
+   // back to its declared Claude target).
+-  const targetFormat = useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
+-  if (useTransport && credentials) credentials.runtimeTransport = useTransport;
++  const nativeAntigravity = sourceFormat === FORMATS.GEMINI && provider === "antigravity"
++    && supportsNativeGemini(provider, model);
++  // The executor unwraps Cloud Code responses into Gemini for this source only.
++  // Its global Antigravity format remains in use for OpenAI/Claude/IDE clients.
++  const targetFormat = nativeAntigravity ? FORMATS.GEMINI
++    : useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
++  const nativeGemini = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
++  // A response projection can intentionally hide the native completion field.
++  // Keep this metadata out of the provider body and cache prefix.
++  const nativeResponseProjection = nativeGemini ? {
++    masks: [
++      ...(clientRawRequest?.queryParams || [])
++        .filter(([name]) => NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.includes(name))
++        .map(([, value]) => value),
++      ...Object.entries(clientRawRequest?.headers || {})
++        .filter(([name]) => name.toLowerCase() === NATIVE_GEMINI_FIELD_MASK_HEADER_NAME)
++        .map(([, value]) => value),
++    ],
++  } : null;
++  // When the model guard rejects the source-matched transport, translation
++  // must dispatch to the transport matching its target wire format.
++  const effectiveTransport = useTransport || resolveTransport(provider, targetFormat);
++  if (effectiveTransport && credentials) credentials.runtimeTransport = effectiveTransport;
+   const stripList = getModelStrip(alias, model);
+ 
+   // Inject provider-level thinking config override (only if client hasn't set)
+   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
+-  if (providerThinking?.mode && providerThinking.mode !== "auto") {
++  if (!nativeGemini && providerThinking?.mode && providerThinking.mode !== "auto") {
+     const mode = providerThinking.mode;
+     if (mode === "on" && !body.thinking) {
+       console.log("Injecting provider-level thinking config override: on");
+-      body = { ...body, thinking: { type: "enabled", budget_tokens: 10000 } };
++      body = { ...body, thinking: { type: "enabled", budget_tokens: DEFAULT_PROVIDER_THINKING_BUDGET } };
+     } else if (mode === "off" && !body.thinking) {
+       body = { ...body, thinking: { type: "disabled" } };
+     } else if (!body.reasoning_effort) {
+@@ -141,7 +173,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   const preTranslateRtkLine = formatRtkLog(preTranslateRtk);
+   if (preTranslateRtkLine) console.log(preTranslateRtkLine);
+ 
+-  const clientRequestedStreaming = body.stream === true || sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI;
++  const clientRequestedStreaming = body.stream === true || (body.stream !== false && (sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI));
+   const providerRequiresStreaming = PROVIDERS[provider]?.forceStream === true;
+   let stream = providerRequiresStreaming ? true : (body.stream !== false);
+ 
+@@ -170,15 +202,33 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   const reqLogger = await createRequestLogger(sourceFormat, targetFormat, model);
+   if (clientRawRequest) reqLogger.logClientRawRequest(clientRawRequest.endpoint, clientRawRequest.body, clientRawRequest.headers);
+   reqLogger.logRawRequest(body);
++  // Reject opaque-only tasks before a translator or strict Responses transport drops their payload; readable mixed histories keep the provider's existing contract.
++  if (sourceFormat === FORMATS.OPENAI_RESPONSES
++    && (targetFormat !== FORMATS.OPENAI_RESPONSES || effectiveTransport?.quirks?.portableResponsesInput)
++    && hasUndeliverableAgentMessage(body.input)) {
++    return createErrorResult(HTTP_STATUS.BAD_REQUEST,
++      "This history contains an encrypted Codex agent_message that this provider cannot read. Enable portable collaboration on the parent and start a new child with a plaintext task; existing encrypted task history cannot be recovered by this route.");
++  }
+   log?.debug?.("FORMAT", `${sourceFormat} → ${targetFormat} | stream=${stream}`);
+ 
+   // Native passthrough: CLI tool and provider are the same ecosystem
+   // Skip all translation/normalization — only model and Bearer are swapped
+   const clientTool = detectClientTool(clientRawRequest?.headers || {}, body);
+-  const passthrough = isNativePassthrough(clientTool, provider);
++  const passthrough = nativeGemini || isNativePassthrough(clientTool, provider);
+ 
+   // Expose raw client headers to translators/executors for session-id resolution
+   if (credentials) credentials.rawHeaders = clientRawRequest?.headers || {};
++  if (provider === "antigravity" && credentials) credentials.nativeGeminiPassthrough = nativeAntigravity;
++  if (nativeGemini && credentials) {
++    credentials.nativeGeminiPassthrough = true;
++    credentials.nativeGeminiRequest = {
++      query: clientRawRequest?.queryParams,
++      headers: clientRawRequest?.headers || {},
++      // Client and provider versions are separate routing decisions. The
++      // browser-authenticated AIStudio generation API uses its beta wire.
++      apiVersion: provider === "aistudio" ? AISTUDIO_NATIVE_GEMINI_API_VERSION : clientRawRequest?.apiVersion,
++    };
++  }
+ 
+   // Auto-strip media blocks the model can't read (vision/audio/pdf) before translation.
+   if (!passthrough) {
+@@ -199,6 +249,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   if (passthrough) {
+     log?.debug?.("PASSTHROUGH", `${clientTool} → ${provider} | native lossless`);
+     translatedBody = { ...body, model: stripThinkingSuffix(upstreamModel) };
++    if (nativeGemini) {
++      translatedBody = applyNativeGeminiThinking(upstreamModel, translatedBody, provider, providerThinking);
++      // Routing/action controls belong to the router, not GenerateContent JSON.
++      delete translatedBody.model;
++      delete translatedBody.stream;
++    }
+     if (provider === "codex") {
+       const suffixThinking = {};
+       applyThinking(sourceFormat, upstreamModel, suffixThinking, provider);
+@@ -214,17 +270,32 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+     // Normalize newer Cowork/CC beta shapes (adaptive thinking, mid-conversation system) the API rejects
+     if (clientTool === "claude") normalizeClaudePassthrough(translatedBody, translatedBody.model);
+   } else {
+-    translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool);
++    translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool, serverPartsTenant);
+     if (!translatedBody) {
+       trackPendingRequest(model, provider, connectionId, false, true);
+       return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Failed to translate request for ${sourceFormat} → ${targetFormat}`);
+     }
+     toolNameMap = translatedBody._toolNameMap;
+     delete translatedBody._toolNameMap;
+-    customToolNames = translatedBody._customToolNames;
++    customToolNames = translatedBody._customToolNames ? new Set(translatedBody._customToolNames) : null;
+     delete translatedBody._customToolNames;
+     translatedBody.model = stripThinkingSuffix(upstreamModel);
+     stripContinuityFields(translatedBody);
++    // Strict Responses upstreams (quirks.portableResponsesInput) reject Codex
++    // multi-agent/delegation history items — rewrite them to portable shapes.
++    if (effectiveTransport?.quirks?.portableResponsesInput
++      && targetFormat === FORMATS.OPENAI_RESPONSES
++      && Array.isArray(translatedBody.input)) {
++      translatedBody.input = toPortableResponsesInput(translatedBody.input);
++    }
++  }
++
++  const portableCollaboration = Object.entries(clientRawRequest?.headers || {}).some(
++    ([name, value]) => name.toLowerCase() === PORTABLE_COLLABORATION.header && String(value).toLowerCase() === "true");
++  if (portableCollaboration && sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES) {
++    const prepared = preparePortableCollaboration(translatedBody);
++    translatedBody = prepared.body;
++    if (prepared.toolNameMap.size) toolNameMap = new Map([...(toolNameMap || []), ...prepared.toolNameMap]);
+   }
+ 
+   // Tool normalization: MCP-equivalent built-in dedup (Claude clients) + same-name
+@@ -342,6 +413,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${model} | ${msgCount} msgs`);
+ 
+   const streamController = createStreamController({
++    clientSignal,
+     onDisconnect: (reason) => {
+       trackPendingRequest(model, provider, connectionId, false);
+       if (onDisconnect) onDisconnect(reason);
+@@ -354,6 +426,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+     connectionProxyEnabled: credentials?.providerSpecificData?.connectionProxyEnabled === true,
+     connectionProxyUrl: credentials?.providerSpecificData?.connectionProxyUrl || "",
+     connectionNoProxy: credentials?.providerSpecificData?.connectionNoProxy || "",
++    strictProxy: credentials?.providerSpecificData?.strictProxy === true,
+     vercelRelayUrl: credentials?.providerSpecificData?.vercelRelayUrl || "",
+     // Strict pools must never silently fall back to a direct connection —
+     // honored on the Cursor AgentService h2 path and in proxyFetch (#4333).
+@@ -394,7 +467,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   let providerResponseFormat = targetFormat;
+   try {
+     const result = await executor.execute({
+-      model,
++      model: nativeGemini ? stripThinkingSuffix(upstreamModel) : model,
+       body: translatedBody,
+       stream,
+       credentials,
+@@ -463,7 +536,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+         }
+         try {
+           const retryResult = await executor.execute({
+-            model,
++            model: nativeGemini ? stripThinkingSuffix(upstreamModel) : model,
+             body: translatedBody,
+             stream,
+             credentials,
+@@ -490,6 +563,17 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+ 
+   // Provider returned error
+   if (!providerResponse.ok) {
++    let nativeErrorResponse = null;
++    if (nativeGemini) {
++      const headers = new Headers(providerResponse.headers);
++      // fetch exposes decoded bytes; forwarding compressed-length headers makes
++      // native clients decompress them twice or wait for bytes that cannot arrive.
++      for (const name of REWRITTEN_RESPONSE_HEADERS) headers.delete(name);
++      headers.set("Access-Control-Allow-Origin", "*");
++      nativeErrorResponse = new Response(providerResponse.clone().body, {
++        status: providerResponse.status, statusText: providerResponse.statusText, headers,
++      });
++    }
+     trackPendingRequest(model, provider, connectionId, false, true);
+     const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
+     appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
+@@ -510,10 +594,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+       log.errorLine(reqTag, "✗", `ERROR ${statusCode} · ${provider}/${model} · ${Date.now() - requestStartTime}ms${urlStr}\n    ${errMsg}`);
+     }
+     reqLogger.logError(new Error(message), finalBody || translatedBody);
+-    return createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
++    const result = createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
++    return nativeErrorResponse ? { ...result, response: nativeErrorResponse, nativeResponse: true } : result;
+   }
+ 
+-  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };
++  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, onRequestFailure, pxpipe: pxpipeSummary, reqTag, log, nativeResponseProjection };
+   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
+   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
+ 
+@@ -528,7 +613,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+ 
+   // True non-streaming response
+   if (!stream) {
+-    const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, customToolNames, trackDone, appendLog });
++    const result = await handleNonStreamingResponse({ ...sharedCtx, credentials, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, customToolNames, trackDone, appendLog });
+     streamController.handleComplete();
+     return result;
+   }
+diff --git a/open-sse/providers/capabilities.js b/open-sse/providers/capabilities.js
+index af27afe..f65f5f3 100644
+--- a/open-sse/providers/capabilities.js
++++ b/open-sse/providers/capabilities.js
+@@ -53,6 +53,7 @@ export const DEFAULT_CAPABILITIES = {
+   audioOutput: false,   // generate audio
+   // features
+   search: false,        // built-in web search tool / grounding
++  serverSideToolInvocations: false, // expose hosted-tool calls alongside function calls
+   tools: true,          // function / tool calling
+   reasoning: false,     // thinking / reasoning
+   // thinking wire format (only meaningful when reasoning:true). null → derive from transport.format.
+@@ -500,11 +501,11 @@ export const PATTERN_CAPABILITIES = [
+   // ── Gemini (all 2.0+ multimodal + google_search grounding, 1M ctx) ─
+   { pattern: "*gemini*image*",  caps: { vision: true, imageOutput: true, contextWindow: 1048576 } },
+   // Gemini 4 (Argon): no "minimal" tier (400) and no thinkingBudget — LOW/MEDIUM/HIGH only, cannot disable.
+-  { pattern: "*gemini-4*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
+-  { pattern: "*gemini-3.8*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
+-  { pattern: "*gemini-3.7*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
+-  { pattern: "*gemini-3*pro*",  caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65535 } },
+-  { pattern: "*gemini-3*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
++  { pattern: "*gemini-4*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
++  { pattern: "*gemini-3.8*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
++  { pattern: "*gemini-3.7*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
++  { pattern: "*gemini-3*pro*",  caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65535 } },
++  { pattern: "*gemini-3*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
+   { pattern: "*gemini-2.5*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-budget", thinkingRange: { min: 0, max: 24576 }, contextWindow: 1048576, maxOutput: 65536 } },
+   { pattern: "*gemini-2*",      caps: { vision: true, audioInput: true, videoInput: true, search: true, contextWindow: 1048576, maxOutput: 65536 } },
+   { pattern: "*gemini*",        caps: { vision: true, search: true, contextWindow: 1048576 } },
+@@ -651,7 +652,8 @@ export const PATTERN_CAPABILITIES = [
+   { pattern: "*laguna*",        caps: { reasoning: true, thinkingFormat: "openai", contextWindow: 200000, maxOutput: 32000 } },
+ 
+ 
+-  // ── OpenCode Free Muse Spark (multimodal text+image; OpenAI Responses reasoning supports up to xhigh) ─
++  // ── Muse (Meta): multimodal 1M models; Wonder reasons from minimal through max and cannot disable thinking ─
++  { pattern: "*muse*wonder*",   caps: { vision: true, pdf: true, audioInput: true, videoInput: true, search: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 131072 } },
+   { pattern: "*muse*spark*",    caps: { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 1048576, maxOutput: 131072 } },
+   // ── Others ───────────────────────────────────────────────────────
+   { pattern: "*hunyuan*",       caps: { reasoning: true, thinkingFormat: "hunyuan", contextWindow: 262144, maxOutput: 262144 } },
+diff --git a/open-sse/providers/pricing.js b/open-sse/providers/pricing.js
+index d1e4fc0..20df077 100644
+--- a/open-sse/providers/pricing.js
++++ b/open-sse/providers/pricing.js
+@@ -178,6 +178,11 @@ export const MODEL_PRICING = {
+   "muse-spark-1.1":                { input: 1.25, output: 4.25, cached: 0.15,  reasoning: 4.25,   cache_creation: 0 },
+   "muse-spark-1.3-contributor":    { input: 0.10, output: 0.20, cached: 0.002, reasoning: 0.20,   cache_creation: 0 },
+   "muse-spark-1.2-contributor":    { input: 0.10, output: 0.20, cached: 0.002, reasoning: 0.20,   cache_creation: 0 },
++  // Wonder has no public pay-as-you-go rate; the full variant is subscription
++  // only. Use the published muse-wonder-1.0 API rates so usage costing is
++  // visible instead of silently zero.
++  "muse-wonder-1.0":               { input: 4.00, output: 20.00, cached: 0.20,  reasoning: 20.00,  cache_creation: 0 },
++  "muse-wonder-full-1.0-contributor": { input: 4.00, output: 20.00, cached: 0.20,  reasoning: 20.00,  cache_creation: 0 },
+ 
+   // === OpenRouter fallback ===
+   "auto":                         { input: 2.00,  output: 8.00,  cached: 1.00,  reasoning: 12.00,  cache_creation: 2.00  },
+diff --git a/open-sse/providers/registry/muse.js b/open-sse/providers/registry/muse.js
+index a5f2728..08c9173 100644
+--- a/open-sse/providers/registry/muse.js
++++ b/open-sse/providers/registry/muse.js
+@@ -36,9 +36,9 @@ export default {
+     auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["museHeaders"] },
+   },
+   // Multi-endpoint: Meta accepts Chat Completions and Responses wire formats on
+-  // the same key (https://dev.meta.ai/docs/protocols). Muse Spark reasoning
+-  // (incl. encrypted_content replay) only round-trips on Responses, so models
+-  // pin targetFormat there.
++  // the same key (https://dev.meta.ai/docs/protocols). Muse reasoning (incl.
++  // encrypted_content replay) only round-trips on Responses, so models pin
++  // targetFormat there.
+   transports: [
+     {
+       format: "openai",
+@@ -54,6 +54,8 @@ export default {
+     },
+   ],
+   models: [
++    { id: "muse-wonder-1.0", name: "Muse Wonder 1.0", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
++    { id: "muse-wonder-1.0-contributor", name: "Muse Wonder 1.0 Contributor", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
+     { id: "muse-spark-1.3", name: "Muse Spark 1.3", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
+     { id: "muse-spark-1.2", name: "Muse Spark 1.2", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
+     { id: "muse-spark-1.1", name: "Muse Spark 1.1", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
+diff --git a/open-sse/providers/thinkingLevels.js b/open-sse/providers/thinkingLevels.js
+index 30ff693..b9f1f80 100644
+--- a/open-sse/providers/thinkingLevels.js
++++ b/open-sse/providers/thinkingLevels.js
+@@ -41,6 +41,9 @@ const CLAUDE_NO_XHIGH = ["none", "low", "medium", "high", "max"];
+ 
+ // Model-name pattern overrides (glob, first match wins) — more precise than format default.
+ const PATTERN_THINKING = [
++  // Meta documents the complete minimal..max range for Muse Wonder; reasoning
++  // cannot be disabled (capabilities.js removes "none" from this list).
++  { pattern: "*muse*wonder*", levels: ["minimal", "low", "medium", "high", "xhigh", "max"] },
+   // Gemini 4 (Argon) rejects "minimal" with 400 — LOW is the floor; cannot disable thinking.
+   { pattern: "*gemini-4*", levels: ["low", "medium", "high"] },
+   { pattern: "*claude*4.6*", levels: CLAUDE_NO_XHIGH },
+diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
+index 9afde2f..b6ee45b 100644
+--- a/open-sse/translator/index.js
++++ b/open-sse/translator/index.js
+@@ -1,15 +1,19 @@
+ import { FORMATS } from "./formats.js";
+-import { ensureToolCallIds, fixMissingToolResponses } from "./concerns/toolCall.js";
++import { OPENAI_TOOL_CHOICE_NONE } from "./schema/index.js";
++import { ensureToolCallIds, fixMissingToolResponses, isGeminiFamilyTarget } from "./concerns/toolCall.js";
+ import { prepareClaudeRequest, ensureTrailingUserTurn } from "./formats/claude.js";
+ import { cloakClaudeTools, decloakStreamChunk } from "../utils/claudeCloaking.js";
++import { cloakMuseTools, isMuseCodeSubscription } from "../utils/museCloaking.js";
+ import { restoreToolNames } from "../utils/opencodeFingerprint.js";
+ import { filterToOpenAIFormat } from "./formats/openai.js";
++import { adaptAIStudioStructuredOutput } from "./formats/gemini.js";
+ import { normalizeThinkingConfig } from "../services/provider.js";
+-import { applyThinking, captureThinking } from "./concerns/thinkingUnified.js";
+-import { captureSessionId } from "../utils/sessionManager.js";
++import { applyThinking, captureThinking, stripThinkingSuffix } from "./concerns/thinkingUnified.js";
++import { captureSessionId, captureConversationId } from "../utils/sessionManager.js";
+ import { ensureStreamToolCallIds } from "../utils/streamHelpers.js";
+ import { AntigravityExecutor } from "../executors/antigravity.js";
+ import { PROVIDERS } from "../providers/index.js";
++import { getCapabilitiesForModel } from "../providers/capabilities.js";
+ import { ROLE, GEMINI_ROLE } from "./schema/roles.js";
+ 
+ // Registry for translators. Lazy-init guards against circular-import order:
+@@ -66,11 +70,14 @@ function detectClientLastRole(body) {
+ }
+ 
+ // Translate request: source -> openai -> target
+-export function translateRequest(sourceFormat, targetFormat, model, body, stream = true, credentials = null, provider = null, reqLogger = null, stripList = [], connectionId = null, clientTool = null) {
++export function translateRequest(sourceFormat, targetFormat, model, body, stream = true, credentials = null, provider = null, reqLogger = null, stripList = [], connectionId = null, clientTool = null, serverPartsTenant = null) {
+   ensureInitialized();
+   let result = body;
+   // Role the client actually ended on, before any translator drops an emptied turn.
+   const clientLastRole = detectClientLastRole(body);
++  // The original client may have prohibited all tools; downstream conversion
++  // can drop tool_choice, so the intent is captured before any mutation.
++  const clientDisablesTools = body?.tool_choice === OPENAI_TOOL_CHOICE_NONE;
+ 
+   // Strip explicit content types (opt-in via strip[] in PROVIDER_MODELS entry)
+   stripContentTypes(result, stripList);
+@@ -79,13 +86,15 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+   normalizeThinkingConfig(result);
+ 
+   // Always ensure tool_calls have id (some providers require it)
+-  ensureToolCallIds(result);
+-  
++  const zedDeferred = provider === "zed";
++  const geminiFamily = isGeminiFamilyTarget(targetFormat, model);
++  if (!zedDeferred) ensureToolCallIds(result, { preserveIds: geminiFamily });
++
+   // Kiro performs stricter source-aware reconciliation after session replay.
+   // The generic helper inserts OpenAI `role: tool` messages, which a direct
+   // Claude→Kiro translator cannot consume and which cannot repair partial
+   // parallel tool results.
+-  if (targetFormat !== FORMATS.KIRO) {
++  if (targetFormat !== FORMATS.KIRO && !geminiFamily && !zedDeferred) {
+     fixMissingToolResponses(result);
+   }
+ 
+@@ -97,6 +106,14 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+   const clientSessionId = captureSessionId(result, credentials, connectionId, targetFormat);
+   // Expose to downstream translators (gemini-cli/antigravity envelopes) that run after envelope is stripped
+   if (credentials) credentials._clientSessionId = clientSessionId;
++  const conversationId = captureConversationId(result, credentials);
++  if (credentials) {
++    credentials._geminiServerPartsSessionId = serverPartsTenant && conversationId
++      ? JSON.stringify([serverPartsTenant, conversationId])
++      : null;
++  }
++
++  let sourceToolNameMap = null;
+ 
+   // If same format, skip translation steps
+   if (sourceFormat !== targetFormat) {
+@@ -106,6 +123,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+     const directFn = requestRegistry.get(`${sourceFormat}:${targetFormat}`);
+     if (directFn) {
+       result = directFn(model, result, stream, credentials);
++      if (result._toolNameMap instanceof Map) sourceToolNameMap = result._toolNameMap;
+     } else {
+       // Step 1: source -> openai (if source is not openai)
+       if (sourceFormat !== FORMATS.OPENAI) {
+@@ -116,6 +134,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+           reqLogger?.logOpenAIRequest?.(result);
+         }
+       }
++      if (result._toolNameMap instanceof Map) sourceToolNameMap = result._toolNameMap;
+ 
+       // Step 2: openai -> target (if target is not openai)
+       if (targetFormat !== FORMATS.OPENAI) {
+@@ -135,7 +154,47 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+     targetFormat === FORMATS.KIRO &&
+     (sourceFormat === FORMATS.OPENAI || sourceFormat === FORMATS.CLAUDE);
+   if (!kiroThinkingMappedByTranslator) {
+-    applyThinking(targetFormat, model, result, provider, thinkingIntent);
++    applyThinking(targetFormat, model, result, provider, thinkingIntent, { preserveResponsesOptions: targetFormat === FORMATS.OPENAI_RESPONSES });
++  }
++
++  if (sourceFormat !== targetFormat && targetFormat === FORMATS.GEMINI && provider === "aistudio") {
++    result = adaptAIStudioStructuredOutput(result);
++  }
++
++  // Hosted web_search (Codex Responses tools): supported models on the
++  // generateContent API declare server-side invocations in model capabilities.
++  // Send a googleSearch tool entry plus
++  // toolConfig.includeServerSideToolInvocations. Antigravity/Gemini-CLI share the
++  // Cloud Code internal API which rejects that combination, and Vertex is
++  // unverified, so the flag is consumed without effect for them. The internal
++  // marker must never reach a provider body.
++  if (sourceFormat !== targetFormat && result && typeof result === "object") {
++    const wantsWebSearch = result._webSearch === true && !clientDisablesTools;
++    delete result._webSearch;
++    const webSearchEnabled = wantsWebSearch && targetFormat === FORMATS.GEMINI && (provider === "gemini" || provider === "aistudio")
++      && getCapabilitiesForModel(provider, stripThinkingSuffix(String(model ?? ""))).serverSideToolInvocations === true;
++    if (webSearchEnabled) {
++      result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
++      result.toolConfig = {
++        ...(result.toolConfig && typeof result.toolConfig === "object" && !Array.isArray(result.toolConfig) ? result.toolConfig : {}),
++        includeServerSideToolInvocations: true,
++      };
++    } else if (isGeminiFamilyTarget(targetFormat, model)) {
++      // The replay helper inserts stored server-side parts for any Gemini-family
++      // history, but only a web-search-enabled upstream can accept them. A fallback
++      // target (or a request without the web_search tool) must not receive them.
++      for (const contents of [result.contents, result.request?.contents]) {
++        if (!Array.isArray(contents)) continue;
++        for (const entry of contents) {
++          if (Array.isArray(entry?.parts)) {
++            entry.parts = entry.parts.filter(part => !(part && (part.toolCall || part.toolResponse)));
++          }
++        }
++        for (let i = contents.length - 1; i >= 0; i--) {
++          if (Array.isArray(contents[i]?.parts) && contents[i].parts.length === 0) contents.splice(i, 1);
++        }
++      }
++    }
+   }
+ 
+   // Always normalize to clean OpenAI format when target is OpenAI
+@@ -161,11 +220,37 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+       const { body: cloakedBody, toolNameMap } = cloakClaudeTools(result);
+       result = cloakedBody;
+       if (toolNameMap?.size > 0) {
+-        result._toolNameMap = toolNameMap;
++        const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
++        for (const [key, value] of toolNameMap) merged.set(key, value);
++        result._toolNameMap = merged;
+       }
+     }
+   }
+ 
++  // Muse Code subscription attestation rejects builtin names carrying foreign
++  // schemas. Rename client function/custom tools after conversion to Responses;
++  // the shared restorer uses the same per-request map on every response path.
++  if (provider === "muse" && targetFormat === FORMATS.OPENAI_RESPONSES && isMuseCodeSubscription(credentials)) {
++    const { body: cloakedBody, toolNameMap } = cloakMuseTools(result);
++    result = cloakedBody;
++    if (toolNameMap?.size > 0) {
++      const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
++      for (const [key, value] of toolNameMap) merged.set(key, value);
++      result._toolNameMap = merged;
++    }
++  }
++
++  if (sourceToolNameMap) {
++    const targetMap = result._toolNameMap instanceof Map ? result._toolNameMap : null;
++    const merged = new Map();
++    if (targetMap) for (const [key, value] of targetMap) merged.set(key, value);
++    for (const [key, value] of sourceToolNameMap) {
++      if (value !== null && typeof value === "object") merged.set(key, value);
++      else if (!merged.has(key)) merged.set(key, value);
++    }
++    if (merged.size > 0) result._toolNameMap = merged;
++  }
++
+   // Antigravity cloaking disabled
+   // if (provider === FORMATS.ANTIGRAVITY && body.userAgent !== FORMATS.ANTIGRAVITY) {
+   //   const { cloakedBody, toolNameMap } = AntigravityExecutor.cloakTools(result);
+@@ -181,10 +266,10 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+ // Translate response chunk: target -> openai -> source
+ export function translateResponse(targetFormat, sourceFormat, chunk, state) {
+   ensureInitialized();
+-  // If same format, return as-is — except the tool name may still be cloaked:
+-  // translateRequest() suffixes client tools for OAuth-cloaked Claude providers
+-  // even when no format conversion is needed, so streamed tool_use blocks must
+-  // be decloaked here or the client sees an unknown ("_ide"-suffixed) tool.
++  // If same format, return as-is — except tool names may still be cloaked:
++  // translateRequest() renames client tools for OAuth-cloaked Claude and Muse
++  // Code providers even without format conversion, so streamed calls must be
++  // restored here or the client sees a name it never declared.
+   if (sourceFormat === targetFormat) {
+     // Same-format (openai→openai) passthrough: the upstream chunk reaches the
+     // client as-is. A fragment that opens a new tool-call index without an id
+diff --git a/open-sse/utils/museCloaking.js b/open-sse/utils/museCloaking.js
+new file mode 100644
+index 0000000..28b277c
+--- /dev/null
++++ b/open-sse/utils/museCloaking.js
+@@ -0,0 +1,77 @@
++import { RESPONSES_ITEM, RESPONSES_TOOL } from "../translator/schema/index.js";
++
++// Meta rejects a Muse Code subscription request when a client declaration uses
++// a Muse builtin name with a different schema. Unknown function names are
++// accepted, so keep the client's schema and rename only its wire identifier.
++export const MUSE_TOOL_SUFFIX = "_muse";
++const MAX_TOOL_NAME_LENGTH = 64;
++
++// OAuth connections mint a subscription key; API-key connections are pay as
++// you go and are not subject to the Muse Code client-attestation contract.
++export function isMuseCodeSubscription(credentials) {
++  return Boolean(credentials?.accessToken && !credentials?.apiKey);
++}
++
++function isClientTool(tool) {
++  return (tool?.type === RESPONSES_TOOL.FUNCTION || tool?.type === RESPONSES_TOOL.CUSTOM)
++    && typeof tool?.name === "string" && tool.name.length > 0;
++}
++
++function allocateAlias(name, usedNames) {
++  const base = `${name}${MUSE_TOOL_SUFFIX}`.slice(0, MAX_TOOL_NAME_LENGTH);
++  let alias = base;
++  for (let index = 2; usedNames.has(alias); index += 1) {
++    const suffix = `_${index}`;
++    alias = `${base.slice(0, MAX_TOOL_NAME_LENGTH - suffix.length)}${suffix}`;
++  }
++  usedNames.add(alias);
++  return alias;
++}
++
++/**
++ * Cloak Responses function/custom tools for a Muse Code subscription.
++ * Returns a per-request cloaked → original map for the shared response
++ * restorer. Hosted and namespaced tools keep their protocol-defined names.
++ */
++export function cloakMuseTools(body) {
++  if (!Array.isArray(body?.tools)) return { body, toolNameMap: null };
++
++  const usedNames = new Set(body.tools.map(tool => typeof tool?.name === "string" ? tool.name : null).filter(Boolean));
++  const aliases = new Map();
++  const toolNameMap = new Map();
++  const aliasFor = (name) => {
++    if (!aliases.has(name)) {
++      const alias = allocateAlias(name, usedNames);
++      aliases.set(name, alias);
++      toolNameMap.set(alias, name);
++    }
++    return aliases.get(name);
++  };
++
++  const tools = body.tools.map(tool => isClientTool(tool) ? { ...tool, name: aliasFor(tool.name) } : tool);
++  if (toolNameMap.size === 0) return { body, toolNameMap: null };
++
++  const input = Array.isArray(body.input) ? body.input.map(item => {
++    if ((item?.type === RESPONSES_ITEM.FUNCTION_CALL || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL)
++      && aliases.has(item.name)) {
++      return { ...item, name: aliases.get(item.name) };
++    }
++    return item;
++  }) : body.input;
++
++  const cloakedBody = { ...body, tools, input };
++  const choice = body.tool_choice;
++  if ((choice?.type === RESPONSES_TOOL.FUNCTION || choice?.type === RESPONSES_TOOL.CUSTOM)
++    && aliases.has(choice.name)) {
++    cloakedBody.tool_choice = { ...choice, name: aliases.get(choice.name) };
++  } else if (choice?.type === RESPONSES_TOOL.ALLOWED_TOOLS && Array.isArray(choice.tools)) {
++    cloakedBody.tool_choice = {
++      ...choice,
++      tools: choice.tools.map(tool => isClientTool(tool) && aliases.has(tool.name)
++        ? { ...tool, name: aliases.get(tool.name) }
++        : tool),
++    };
++  }
++
++  return { body: cloakedBody, toolNameMap };
++}
+diff --git a/tests/unit/muse-cloaking.test.js b/tests/unit/muse-cloaking.test.js
+new file mode 100644
+index 0000000..cc1e807
+--- /dev/null
++++ b/tests/unit/muse-cloaking.test.js
+@@ -0,0 +1,271 @@
++import { describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++  saveUsageStats: vi.fn(),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", async importOriginal => ({
++  ...await importOriginal(),
++  buildRequestDetail: () => ({}),
++  extractRequestConfig: (body, stream) => ({ body, stream }),
++  saveUsageStats: () => {},
++  formatDoneLine: () => "",
++}));
++
++import "../translator/registerAll.js";
++import { handleStreamingResponse } from "../../open-sse/handlers/chatCore/streamingHandler.js";
++import { handleNonStreamingResponse } from "../../open-sse/handlers/chatCore/nonStreamingHandler.js";
++import { handleForcedSSEToJson } from "../../open-sse/handlers/chatCore/sseToJsonHandler.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { cloakMuseTools } from "../../open-sse/utils/museCloaking.js";
++import { createStreamController } from "../../open-sse/utils/streamHandler.js";
++
++const MODEL = "muse-wonder-1.0-contributor";
++const OAUTH = { accessToken: "test-only-muse-oauth" };
++
++function nativeRequest() {
++  return {
++    model: MODEL,
++    input: [
++      { type: "function_call", id: "fc_history", call_id: "call_history", name: "read_file", arguments: '{"Path":"before.txt"}' },
++      { type: "function_call_output", call_id: "call_history", output: "previous result" },
++    ],
++    tools: [
++      { type: "function", name: "read_file", description: "client schema", parameters: { type: "object", properties: {} } },
++      { type: "custom", name: "exec", description: "client custom tool" },
++      { type: "web_search" },
++      { type: "namespace", name: "collaboration", tools: [{ type: "function", name: "read_file" }] },
++    ],
++    tool_choice: { type: "function", name: "read_file" },
++  };
++}
++
++function derive() {
++  const result = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, MODEL, nativeRequest(), true, OAUTH, "muse");
++  return { upstreamRequest: result, toolNameMap: result._toolNameMap };
++}
++
++const upstreamName = (map, original) => [...map].find(([, name]) => name === original)?.[0];
++const frame = event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
++const parseEvents = wire => wire.split("\n")
++  .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
++  .map(line => JSON.parse(line.slice(6)));
++
++describe("Muse Code request cloaking", () => {
++  it("renames Responses declarations, history and forced choice without changing hosted tools or call identity", () => {
++    const original = nativeRequest();
++    const snapshot = structuredClone(original);
++    const { upstreamRequest, toolNameMap } = derive();
++    const readAlias = upstreamName(toolNameMap, "read_file");
++
++    expect(readAlias).toBe("read_file_muse");
++    expect(upstreamRequest.tools[0]).toMatchObject({ type: "function", name: readAlias, description: "client schema" });
++    expect(upstreamRequest.tools[1].name).toBe("exec_muse");
++    expect(upstreamRequest.tools[2]).toEqual({ type: "web_search" });
++    expect(upstreamRequest.tools[3]).toEqual(original.tools[3]);
++    expect(upstreamRequest.input[0]).toMatchObject({ type: "function_call", call_id: "call_history", name: readAlias });
++    expect(upstreamRequest.input[1]).toEqual(original.input[1]);
++    expect(upstreamRequest.tool_choice).toEqual({ type: "function", name: readAlias });
++    expect(original).toEqual(snapshot);
++  });
++
++  it("keeps pay-as-you-go API-key declarations uncloaked", () => {
++    const result = translateRequest(
++      FORMATS.OPENAI_RESPONSES,
++      FORMATS.OPENAI_RESPONSES,
++      MODEL,
++      nativeRequest(),
++      true,
++      { apiKey: "test-only-payg-key" },
++      "muse",
++    );
++    expect(result.tools.map(tool => tool.name)).toEqual(nativeRequest().tools.map(tool => tool.name));
++    expect(result.input[0].name).toBe("read_file");
++    expect(result._toolNameMap).toBeUndefined();
++  });
++
++  it("allocates unique bounded aliases and rewrites allowed_tools without mutating hosted entries", () => {
++    const longName = "x".repeat(64);
++    const { body, toolNameMap } = cloakMuseTools({
++      tools: [
++        { type: "function", name: "read_file" },
++        { type: "function", name: "read_file_muse" },
++        { type: "function", name: longName },
++        { type: "web_search" },
++      ],
++      tool_choice: {
++        type: "allowed_tools",
++        tools: [{ type: "function", name: "read_file" }, { type: "web_search" }],
++      },
++    });
++    const aliases = body.tools.slice(0, 3).map(tool => tool.name);
++
++    expect(new Set(aliases).size).toBe(3);
++    expect(aliases.every(name => name.length <= 64)).toBe(true);
++    expect(aliases).not.toContain("read_file");
++    expect(aliases).not.toContain("read_file_muse");
++    expect(aliases).not.toContain(longName);
++    expect(toolNameMap.size).toBe(3);
++    expect(body.tools[3]).toEqual({ type: "web_search" });
++    expect(body.tool_choice.tools[0].name).toBe(aliases[0]);
++    expect(body.tool_choice.tools[1]).toEqual({ type: "web_search" });
++  });
++});
++
++function providerBody(toolNameMap) {
++  return {
++    id: "resp_muse_nonstream",
++    object: "response",
++    status: "completed",
++    output: [{
++      type: "function_call",
++      id: "fc_nonstream",
++      call_id: "call_nonstream",
++      name: upstreamName(toolNameMap, "read_file"),
++      arguments: '{"Path":"now.txt"}',
++    }],
++    usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
++  };
++}
++
++describe("Muse Code non-streaming decloaking", () => {
++  it("restores a native Responses call without changing call id or arguments", async () => {
++    const { toolNameMap } = derive();
++    const upstream = providerBody(toolNameMap);
++    const result = await handleNonStreamingResponse({
++      providerResponse: new Response(JSON.stringify(upstream), { status: 200, headers: { "content-type": "application/json" } }),
++      provider: "muse",
++      model: MODEL,
++      sourceFormat: FORMATS.OPENAI_RESPONSES,
++      targetFormat: FORMATS.OPENAI_RESPONSES,
++      body: nativeRequest(),
++      stream: false,
++      requestStartTime: Date.now(),
++      toolNameMap,
++      reqLogger: { logProviderResponse() {}, logConvertedResponse() {} },
++      trackDone() {},
++      appendLog() {},
++    });
++    const body = await result.response.json();
++    const call = body.output[0];
++
++    expect(call.name).toBe("read_file");
++    expect(call.call_id).toBe("call_nonstream");
++    expect(call.arguments).toBe('{"Path":"now.txt"}');
++  });
++
++  it("restores a Chat call when the client requested JSON but upstream used SSE", async () => {
++    const { toolNameMap } = derive();
++    const item = providerBody(toolNameMap).output[0];
++    const events = [
++      { type: "response.output_item.done", output_index: 0, item },
++      { type: "response.completed", response: { status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } },
++    ];
++    const result = await handleForcedSSEToJson({
++      providerResponse: new Response(events.map(frame).join(""), { headers: { "content-type": "text/event-stream" } }),
++      provider: "muse",
++      model: MODEL,
++      sourceFormat: FORMATS.OPENAI,
++      targetFormat: FORMATS.OPENAI_RESPONSES,
++      body: nativeRequest(),
++      stream: false,
++      requestStartTime: Date.now(),
++      toolNameMap,
++      trackDone() {},
++      appendLog() {},
++    });
++    const body = await result.response.json();
++    const call = body.choices[0].message.tool_calls[0];
++
++    expect(call.function.name).toBe("read_file");
++    expect(call.id).toBe("call_nonstream");
++    expect(call.function.arguments).toBe('{"Path":"now.txt"}');
++  });
++});
++
++function streamEvents(toolNameMap) {
++  const name = upstreamName(toolNameMap, "read_file");
++  const item = { type: "function_call", id: "fc_stream", call_id: "call_stream", name, arguments: '{"Path":"stream.txt"}' };
++  return [
++    { type: "response.created", response: { id: "resp_muse_stream", object: "response", status: "in_progress" } },
++    { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } },
++    { type: "response.output_item.done", output_index: 0, item },
++    {
++      type: "response.completed",
++      response: {
++        id: "resp_muse_stream",
++        object: "response",
++        status: "completed",
++        output: [item],
++        usage: { input_tokens: 9, output_tokens: 4, total_tokens: 13 },
++      },
++    },
++  ];
++}
++
++async function runStream(sourceFormat, fragmented) {
++  const { toolNameMap } = derive();
++  const events = streamEvents(toolNameMap);
++  const bytes = new TextEncoder().encode(events.map(frame).join(""));
++  const chunks = fragmented ? [...bytes].map(byte => Uint8Array.of(byte)) : [bytes];
++  const providerResponse = new Response(new ReadableStream({
++    start(controller) {
++      for (const chunk of chunks) controller.enqueue(chunk);
++      controller.close();
++    },
++  }), { headers: { "content-type": "text/event-stream" } });
++  const result = await handleStreamingResponse({
++    providerResponse,
++    provider: "muse",
++    model: MODEL,
++    sourceFormat,
++    targetFormat: FORMATS.OPENAI_RESPONSES,
++    body: nativeRequest(),
++    stream: true,
++    requestStartTime: Date.now(),
++    toolNameMap,
++    streamController: createStreamController({ provider: "muse", model: MODEL }),
++  });
++  return { raw: await result.response.text(), events, toolNameMap };
++}
++
++describe("Muse Code streaming decloaking", () => {
++  it.each([false, true])("restores every Responses tool item on the passthrough path (fragmented=%s)", async fragmented => {
++    const { raw, events, toolNameMap } = await runStream(FORMATS.OPENAI_RESPONSES, fragmented);
++    const output = parseEvents(raw);
++    const names = output.flatMap(event => [
++      ...(event.item?.type === "function_call" ? [event.item.name] : []),
++      ...(event.response?.output || []).filter(item => item.type === "function_call").map(item => item.name),
++    ]);
++
++    expect(names).toEqual(["read_file", "read_file", "read_file"]);
++    expect(output.find(event => event.type === "response.completed").response.output[0]).toMatchObject({
++      call_id: "call_stream",
++      arguments: '{"Path":"stream.txt"}',
++    });
++    expect(raw).not.toContain(upstreamName(toolNameMap, "read_file"));
++    expect(events).toEqual(streamEvents(toolNameMap));
++  });
++
++  it.each([false, true])("restores translated Chat tool calls (fragmented=%s)", async fragmented => {
++    const { raw, toolNameMap } = await runStream(FORMATS.OPENAI, fragmented);
++    const output = parseEvents(raw);
++    const calls = output.flatMap(event => event.choices || []).flatMap(choice => [
++      ...(choice.delta?.tool_calls || []),
++      ...(choice.message?.tool_calls || []),
++    ]);
++    const named = calls.filter(call => call.function?.name);
++
++    expect(named.length).toBeGreaterThan(0);
++    expect(named.every(call => call.function.name === "read_file")).toBe(true);
++    expect(calls[0].id).toBe("call_stream");
++    expect(raw).not.toContain(upstreamName(toolNameMap, "read_file"));
++  });
++});
+diff --git a/tests/unit/muse-foreign-reasoning-retry.test.js b/tests/unit/muse-foreign-reasoning-retry.test.js
+new file mode 100644
+index 0000000..ab37f41
+--- /dev/null
++++ b/tests/unit/muse-foreign-reasoning-retry.test.js
+@@ -0,0 +1,262 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const fetchMock = vi.fn();
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
++  proxyAwareFetch: (...args) => fetchMock(...args),
++}));
++
++const { MuseExecutor, sanitizeMuseForeignReasoning, dropMuseReasoningReferences } = await import("../../open-sse/executors/muse.js");
++const { getExecutor } = await import("../../open-sse/executors/index.js");
++
++const FOREIGN_ERROR = {
++  error: {
++    code: null,
++    message: "reasoning `encrypted_content` was not issued to this caller",
++    param: null,
++    type: "invalid_request_error",
++  },
++};
++
++const EXPIRED_ERROR = {
++  error: {
++    code: null,
++    message: "Referenced reasoning item 'rs_stale' was not found or has expired.",
++    param: null,
++    type: "invalid_request_error",
++  },
++};
++
++function makeExpiredBody() {
++  return {
++    model: "muse-spark-1.3-contributor",
++    stream: false,
++    store: false,
++    input: [
++      { type: "message", role: "user", content: [{ type: "input_text", text: "first" }] },
++      {
++        type: "reasoning",
++        id: "rs_stale",
++        summary: [{ type: "summary_text", text: "stale plan" }],
++      },
++      {
++        type: "reasoning",
++        id: "rs_current",
++        status: "completed",
++        summary: [{ type: "summary_text", text: "current plan" }],
++        encrypted_content: "current-blob",
++      },
++      { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
++    ],
++  };
++}
++
++function response(status, body) {
++  return new Response(JSON.stringify(body), {
++    status,
++    headers: { "content-type": "application/json" },
++  });
++}
++
++function makeBody() {
++  return {
++    model: "muse-wonder-1.0-contributor",
++    stream: false,
++    store: false,
++    include: ["reasoning.encrypted_content"],
++    reasoning: { effort: "high", summary: "auto" },
++    input: [
++      { type: "message", role: "user", content: [{ type: "input_text", text: "first" }] },
++      {
++        type: "reasoning",
++        id: "rs_foreign",
++        status: "completed",
++        summary: [{ type: "summary_text", text: "prior plan" }],
++        encrypted_content: "foreign-blob",
++      },
++      {
++        type: "reasoning",
++        id: "rs_empty",
++        status: "completed",
++        summary: [],
++        encrypted_content: "foreign-empty",
++      },
++      { type: "function_call", call_id: "call_1", name: "lookup", arguments: "{}" },
++      { type: "function_call_output", call_id: "call_1", output: "ok" },
++      { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
++    ],
++  };
++}
++
++function makeArgs(body, overrides = {}) {
++  return {
++    model: "muse-wonder-1.0-contributor",
++    body,
++    stream: false,
++    credentials: {
++      accessToken: "test-only-caller-b",
++      connectionId: "muse-connection-b",
++      providerSpecificData: {},
++      runtimeTransport: {
++        baseUrl: "https://api.meta.ai/v1/responses",
++        format: "openai-responses",
++        headers: {},
++        auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["museHeaders"] },
++      },
++    },
++    providerSessionId: "session-1",
++    log: { debug: vi.fn(), warn: vi.fn() },
++    ...overrides,
++  };
++}
++
++function sentBody(callIndex) {
++  return JSON.parse(fetchMock.mock.calls[callIndex][1].body);
++}
++
++describe("Muse foreign reasoning recovery", () => {
++  beforeEach(() => {
++    fetchMock.mockReset();
++  });
++
++  it("registers the dedicated Muse executor", () => {
++    expect(getExecutor("muse")).toBeInstanceOf(MuseExecutor);
++  });
++
++  it("keeps encrypted reasoning intact on a successful first attempt", async () => {
++    fetchMock.mockResolvedValueOnce(response(200, { id: "resp_ok", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(sentBody(0).input).toEqual(expect.arrayContaining([
++      expect.objectContaining({ type: "reasoning", encrypted_content: "foreign-blob" }),
++    ]));
++  });
++
++  it("retries only after Meta rejects foreign encrypted reasoning", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_retry", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    expect(sentBody(0).input).toEqual(expect.arrayContaining([
++      expect.objectContaining({ encrypted_content: "foreign-blob" }),
++    ]));
++
++    const retryInput = sentBody(1).input;
++    expect(JSON.stringify(retryInput)).not.toContain("foreign-blob");
++    expect(JSON.stringify(retryInput)).not.toContain("foreign-empty");
++    expect(retryInput).toEqual(expect.arrayContaining([
++      {
++        type: "reasoning",
++        status: "completed",
++        summary: [{ type: "summary_text", text: "prior plan" }],
++      },
++      expect.objectContaining({ type: "function_call", call_id: "call_1" }),
++      expect.objectContaining({ type: "function_call_output", call_id: "call_1" }),
++    ]));
++    expect(retryInput.filter((item) => item.type === "reasoning")).toHaveLength(1);
++  });
++
++  it("pre-strips only hashes already rejected for this session and caller", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_retry", status: "completed", output: [] }))
++      .mockResolvedValueOnce(response(200, { id: "resp_next", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    await executor.execute(makeArgs(makeBody()));
++
++    const nextBody = makeBody();
++    nextBody.input.splice(3, 0, {
++      type: "reasoning",
++      id: "rs_current",
++      status: "completed",
++      summary: [{ type: "summary_text", text: "current plan" }],
++      encrypted_content: "current-caller-blob",
++    });
++    const out = await executor.execute(makeArgs(nextBody));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(3);
++    const sent = sentBody(2);
++    expect(JSON.stringify(sent.input)).not.toContain("foreign-blob");
++    expect(sent.input).toEqual(expect.arrayContaining([
++      expect.objectContaining({ type: "reasoning", encrypted_content: "current-caller-blob" }),
++    ]));
++  });
++
++  it("does not retry unrelated 400 errors", async () => {
++    fetchMock.mockResolvedValueOnce(response(400, { error: { message: "unknown parameter" } }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(400);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++  });
++
++  it("sanitizer preserves summaries and drops empty reasoning items", () => {
++    const { body, removedHashes } = sanitizeMuseForeignReasoning(makeBody());
++
++    expect(removedHashes).toHaveLength(2);
++    expect(body.input.filter((item) => item.type === "reasoning")).toEqual([{
++      type: "reasoning",
++      status: "completed",
++      summary: [{ type: "summary_text", text: "prior plan" }],
++    }]);
++  });
++
++  it("retries without the referenced item after Meta reports it expired", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, EXPIRED_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_retry", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeExpiredBody()));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    const retryInput = sentBody(1).input;
++    expect(JSON.stringify(retryInput)).not.toContain("rs_stale");
++    expect(retryInput).toEqual(expect.arrayContaining([
++      { type: "reasoning", summary: [{ type: "summary_text", text: "stale plan" }] },
++      expect.objectContaining({ type: "reasoning", id: "rs_current", encrypted_content: "current-blob" }),
++    ]));
++  });
++
++  it("pre-strips expired references already rejected for this caller", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, EXPIRED_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_retry", status: "completed", output: [] }))
++      .mockResolvedValueOnce(response(200, { id: "resp_next", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    await executor.execute(makeArgs(makeExpiredBody()));
++    const out = await executor.execute(makeArgs(makeExpiredBody()));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(3);
++    expect(JSON.stringify(sentBody(2).input)).not.toContain("rs_stale");
++    expect(JSON.stringify(sentBody(2).input)).toContain("current-blob");
++  });
++
++  it("reference dropper keeps summaries and removes only named ids", () => {
++    const { body, removedIds } = dropMuseReasoningReferences(
++      makeExpiredBody(),
++      new Set(["rs_stale"]),
++    );
++
++    expect(removedIds).toEqual(["rs_stale"]);
++    expect(body.input.filter((item) => item.type === "reasoning")).toEqual([
++      { type: "reasoning", summary: [{ type: "summary_text", text: "stale plan" }] },
++      expect.objectContaining({ type: "reasoning", id: "rs_current" }),
++    ]);
++  });
++});
+diff --git a/tests/unit/muse-responses-wire.test.js b/tests/unit/muse-responses-wire.test.js
+index 46b828d..bdeef99 100644
+--- a/tests/unit/muse-responses-wire.test.js
++++ b/tests/unit/muse-responses-wire.test.js
+@@ -18,6 +18,8 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelUpstreamId, PRO
+ import { resolveTransport } from "../../open-sse/services/provider.js";
+ import { applyThinking } from "../../open-sse/translator/concerns/thinkingUnified.js";
+ import { FORMATS } from "../../open-sse/translator/formats.js";
++import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.js";
++import { getThinkingLevels } from "../../open-sse/providers/thinkingLevels.js";
+ 
+ // Mirrors the transport selection in open-sse/handlers/chatCore.js so the
+ // invariant (body wire === endpoint wire) can be asserted without the full
+@@ -56,6 +58,41 @@ describe("Muse Responses wire routing", () => {
+   });
+ });
+ 
++describe("Muse Wonder registry and documented capabilities", () => {
++  it.each(["muse-wonder-1.0", "muse-wonder-1.0-contributor"])("routes %s through Responses", (model) => {
++    const { targetFormat, useTransport } = selectTransport("muse", model, FORMATS.OPENAI);
++    expect(targetFormat).toBe(FORMATS.OPENAI_RESPONSES);
++    expect(useTransport?.baseUrl).toBe("https://api.meta.ai/v1/responses");
++    expect(getModelSupportedFormats("muse", model)).toEqual([FORMATS.OPENAI_RESPONSES]);
++  });
++
++  it.each(["muse-wonder-1.0", "muse-wonder-1.0-contributor"])("publishes the Meta/models.dev parameters for %s", (model) => {
++    expect(getCapabilitiesForModel("muse", model)).toMatchObject({
++      vision: true,
++      pdf: true,
++      audioInput: true,
++      videoInput: true,
++      search: true,
++      reasoning: true,
++      thinkingFormat: "openai",
++      thinkingCanDisable: false,
++      contextWindow: 1048576,
++      maxOutput: 131072,
++    });
++    expect(getThinkingLevels("muse", model)).toEqual(["minimal", "low", "medium", "high", "xhigh", "max"]);
++  });
++
++  it("keeps Wonder max and clamps unsupported none to minimal", () => {
++    const maxBody = { input: [] };
++    applyThinking(FORMATS.OPENAI_RESPONSES, "muse-wonder-1.0", maxBody, "muse", { mode: "level", level: "max" });
++    expect(maxBody.reasoning).toEqual({ effort: "max", summary: "auto" });
++
++    const noneBody = { input: [] };
++    applyThinking(FORMATS.OPENAI_RESPONSES, "muse-wonder-1.0-contributor", noneBody, "muse", { mode: "none" });
++    expect(noneBody.reasoning).toEqual({ effort: "minimal", summary: "auto" });
++  });
++});
++
+ describe("Muse Responses thinking wire shape", () => {
+   it("writes reasoning.effort (not top-level reasoning_effort) for the Responses wire", () => {
+     const body = { input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }] };
+diff --git a/tests/unit/provider-pricing-muse-wonder.test.js b/tests/unit/provider-pricing-muse-wonder.test.js
+new file mode 100644
+index 0000000..69c37cb
+--- /dev/null
++++ b/tests/unit/provider-pricing-muse-wonder.test.js
+@@ -0,0 +1,29 @@
++import { describe, it, expect } from "vitest";
++import { MODEL_PRICING, getPricingForModel, calculateCostFromTokens } from "../../open-sse/providers/pricing.js";
++
++describe("Muse Wonder pricing", () => {
++  it("includes muse-wonder-1.0 and the full contributor variant", () => {
++    expect(MODEL_PRICING["muse-wonder-1.0"]).toBeDefined();
++    expect(MODEL_PRICING["muse-wonder-full-1.0-contributor"]).toBeDefined();
++  });
++
++  it("uses the published wonder rates (input 4.00, output 20.00, cached 0.20)", () => {
++    expect(MODEL_PRICING["muse-wonder-1.0"]).toMatchObject({ input: 4.00, output: 20.00, cached: 0.20 });
++    expect(MODEL_PRICING["muse-wonder-full-1.0-contributor"]).toMatchObject({ input: 4.00, output: 20.00, cached: 0.20 });
++  });
++
++  it("resolves pricing for the live muse surface ids", () => {
++    expect(getPricingForModel("muse", "muse-wonder-full-1.0-contributor")).not.toBeNull();
++    expect(getPricingForModel("openrouter", "meta/muse-wonder-1.0")).not.toBeNull();
++  });
++
++  it("charges cached input at the cached rate, not the full input rate", () => {
++    const pricing = MODEL_PRICING["muse-wonder-full-1.0-contributor"];
++    const cost = calculateCostFromTokens(
++      { input_tokens: 1_000_000, cached_tokens: 990_000, output_tokens: 10_000 },
++      pricing,
++    );
++    // 10k fresh * 4/M + 990k cached * 0.20/M + 10k out * 20/M
++    expect(cost).toBeCloseTo(0.04 + 0.198 + 0.20, 6);
++  });
++});
+diff --git a/tests/unit/target-format-transport.test.js b/tests/unit/target-format-transport.test.js
+new file mode 100644
+index 0000000..5dacdb8
+--- /dev/null
++++ b/tests/unit/target-format-transport.test.js
+@@ -0,0 +1,317 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import "../translator/registerAll.js";
++import { handleChatCore } from "../../open-sse/handlers/chatCore.js";
++
++const {
++  proxyAwareFetchMock,
++  createRequestLoggerMock,
++  handleNonStreamingResponseMock,
++  buildOnStreamCompleteMock,
++  handleStreamingResponseMock,
++} = vi.hoisted(() => ({
++  proxyAwareFetchMock: vi.fn(),
++  createRequestLoggerMock: vi.fn(async () => ({
++    logClientRawRequest: vi.fn(),
++    logRawRequest: vi.fn(),
++    logTargetRequest: vi.fn(),
++    logError: vi.fn(),
++  })),
++  handleNonStreamingResponseMock: vi.fn(),
++  buildOnStreamCompleteMock: vi.fn(),
++  handleStreamingResponseMock: vi.fn(),
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
++  default: proxyAwareFetchMock,
++  proxyAwareFetch: proxyAwareFetchMock,
++}));
++
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: createRequestLoggerMock,
++}));
++
++vi.mock("../../open-sse/handlers/chatCore/nonStreamingHandler.js", () => ({
++  handleNonStreamingResponse: handleNonStreamingResponseMock,
++}));
++
++vi.mock("../../open-sse/handlers/chatCore/streamingHandler.js", () => ({
++  buildOnStreamComplete: buildOnStreamCompleteMock,
++  handleStreamingResponse: handleStreamingResponseMock,
++}));
++
++vi.mock("../../open-sse/services/tokenRefresh.js", () => ({
++  refreshWithRetry: vi.fn(),
++}));
++
++vi.mock("../../open-sse/rtk/caveman.js", () => ({ injectCaveman: vi.fn() }));
++vi.mock("../../open-sse/rtk/ponytail.js", () => ({ injectPonytail: vi.fn() }));
++vi.mock("../../open-sse/rtk/index.js", () => ({
++  compressMessages: vi.fn(() => null),
++  formatRtkLog: vi.fn(() => ""),
++}));
++vi.mock("../../open-sse/rtk/headroom.js", () => ({
++  compressWithHeadroom: vi.fn(async () => null),
++  formatHeadroomLog: vi.fn(() => ""),
++  formatHeadroomSizeLog: vi.fn(() => ""),
++  isHeadroomPhantomSavings: vi.fn(() => false),
++}));
++vi.mock("../../open-sse/rtk/pxpipe.js", () => ({
++  compressWithPxpipe: vi.fn(async () => ({ body: null, summary: null })),
++}));
++vi.mock("../../open-sse/translator/concerns/prefetch.js", () => ({
++  prefetchRemoteImages: vi.fn(async () => 0),
++}));
++vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", () => ({
++  buildRequestDetail: vi.fn((detail) => detail),
++  extractRequestConfig: vi.fn((body, stream) => ({ body, stream })),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(() => Promise.resolve()),
++  saveRequestDetail: vi.fn(() => Promise.resolve()),
++}));
++
++const PROVIDER = "muse";
++const MODEL = "muse-spark-1.3-contributor";
++const RESPONSE_ERROR = {
++  error: {
++    message: "[400]: {\"error\":{\"code\":null,\"message\":\"unknown parameter `input`\",\"param\":\"input\",\"type\":\"invalid_request_error\"}}",
++    type: "invalid_request_error",
++    code: "bad_request",
++  },
++};
++
++function makeOptions(body, endpoint) {
++  const streaming = body.stream === true;
++  return {
++    body,
++    modelInfo: { provider: PROVIDER, model: MODEL },
++    credentials: {
++      accessToken: "test-only-muse-oauth-token",
++      connectionId: "test-muse-connection",
++      connectionName: "test Muse",
++      providerSpecificData: {},
++    },
++    clientRawRequest: {
++      endpoint,
++      body,
++      headers: { accept: streaming ? "text/event-stream" : "application/json" },
++    },
++    connectionId: "test-muse-connection",
++    log: {
++      debug: vi.fn(),
++      info: vi.fn(),
++      warn: vi.fn(),
++      error: vi.fn(),
++      errorLine: vi.fn(),
++    },
++  };
++}
++
++function chatBody(stream) {
++  return {
++    model: `${PROVIDER}/${MODEL}`,
++    stream,
++    messages: [
++      { role: "system", content: "Keep the lookup result intact." },
++      { role: "user", content: "Look up item 7." },
++      {
++        role: "assistant",
++        content: null,
++        tool_calls: [{
++          id: "call_preserve_7",
++          type: "function",
++          function: { name: "lookup", arguments: "{\"item\":7}" },
++        }],
++      },
++      { role: "tool", tool_call_id: "call_preserve_7", content: "{\"value\":\"seven\"}" },
++      { role: "user", content: "Summarize the result." },
++    ],
++    tools: [{
++      type: "function",
++      function: {
++        name: "lookup",
++        description: "Look up an item.",
++        parameters: { type: "object", properties: { item: { type: "integer" } } },
++      },
++    }],
++  };
++}
++
++function responsesBody(stream) {
++  return {
++    model: `${PROVIDER}/${MODEL}`,
++    stream,
++    instructions: "Preserve the native Responses request.",
++    input: [{
++      type: "message",
++      role: "user",
++      content: [{ type: "input_text", text: "Say hello." }],
++    }],
++    include: ["reasoning.encrypted_content"],
++    store: false,
++  };
++}
++
++describe("model target-format transport selection", () => {
++  beforeEach(() => {
++    proxyAwareFetchMock.mockReset();
++    proxyAwareFetchMock.mockImplementation(async () => new Response(
++      JSON.stringify(RESPONSE_ERROR),
++      { status: 400, headers: { "content-type": "application/json" } },
++    ));
++    handleNonStreamingResponseMock.mockReset().mockResolvedValue({
++      success: true,
++      responseMode: "json",
++    });
++    buildOnStreamCompleteMock.mockReset().mockReturnValue({
++      onStreamComplete: vi.fn(),
++      streamDetailId: "test-stream-detail",
++    });
++    handleStreamingResponseMock.mockReset().mockResolvedValue({
++      success: true,
++      responseMode: "sse",
++    });
++  });
++
++  it.each([true, false])(
++    "sends chat messages translated to Muse Responses through /responses (stream=%s)",
++    async (stream) => {
++      const body = chatBody(stream);
++      const result = await handleChatCore(makeOptions(body, "/v1/chat/completions"));
++
++      expect(proxyAwareFetchMock).toHaveBeenCalledTimes(1);
++      const [url, init] = proxyAwareFetchMock.mock.calls[0];
++      expect(url).toBe("https://api.meta.ai/v1/responses");
++      expect(init.headers.Authorization).toBe("Bearer test-only-muse-oauth-token");
++      expect(init.headers["x-api-version"]).toBe("1.0.0");
++
++      const sent = JSON.parse(init.body);
++      expect(sent.model).toBe(MODEL);
++      expect(sent.instructions).toBe("Keep the lookup result intact.");
++      expect(sent.tools[0].name).toBe("lookup_muse");
++      expect(sent.input).toEqual(expect.arrayContaining([
++        expect.objectContaining({ type: "function_call", call_id: "call_preserve_7", name: "lookup_muse" }),
++        expect.objectContaining({ type: "function_call_output", call_id: "call_preserve_7" }),
++      ]));
++      expect(result).toMatchObject({ success: false, status: 400 });
++      expect(result.error).toContain("unknown parameter `input`");
++    },
++  );
++
++  it.each([true, false])(
++    "keeps native Responses input and provider fields on /responses (stream=%s)",
++    async (stream) => {
++      const body = responsesBody(stream);
++      const result = await handleChatCore(makeOptions(body, "/v1/responses"));
++
++      expect(proxyAwareFetchMock).toHaveBeenCalledTimes(1);
++      const [url, init] = proxyAwareFetchMock.mock.calls[0];
++      expect(url).toBe("https://api.meta.ai/v1/responses");
++      const sent = JSON.parse(init.body);
++      expect(sent.input).toEqual(body.input);
++      expect(sent.instructions).toBe(body.instructions);
++      expect(sent.include).toEqual(body.include);
++      expect(sent.store).toBe(false);
++      expect(result).toMatchObject({ success: false, status: 400 });
++      expect(result.error).toContain("unknown parameter `input`");
++    },
++  );
++
++  it("forces even an unregistered Muse Code subscription model onto Responses", async () => {
++    const body = chatBody(false);
++    const options = makeOptions(body, "/v1/chat/completions");
++    options.modelInfo.model = "muse-wonder-full-1.0";
++    body.model = "muse/muse-wonder-full-1.0";
++
++    await handleChatCore(options);
++
++    const [url, init] = proxyAwareFetchMock.mock.calls[0];
++    expect(url).toBe("https://api.meta.ai/v1/responses");
++    expect(init.headers["x-api-version"]).toBe("1.0.0");
++    expect(JSON.parse(init.body).tools[0].name).toBe("lookup_muse");
++  });
++
++  it("keeps an unregistered pay-as-you-go model on its source-matched Chat transport", async () => {
++    const body = chatBody(false);
++    const options = makeOptions(body, "/v1/chat/completions");
++    options.modelInfo.model = "muse-future-1.0";
++    options.credentials = { apiKey: "test-only-payg-key", providerSpecificData: {} };
++    body.model = "muse/muse-future-1.0";
++
++    await handleChatCore(options);
++
++    const [url, init] = proxyAwareFetchMock.mock.calls[0];
++    expect(url).toBe("https://api.meta.ai/v1/chat/completions");
++    expect(init.headers["x-api-version"]).toBeUndefined();
++    expect(JSON.parse(init.body).tools[0].function.name).toBe("lookup");
++  });
++
++  it.each([
++    {
++      label: "chat messages",
++      body: chatBody,
++      endpoint: "/v1/chat/completions",
++      sourceFormat: "openai",
++    },
++    {
++      label: "native Responses input",
++      body: responsesBody,
++      endpoint: "/v1/responses",
++      sourceFormat: "openai-responses",
++    },
++  ])("$label receives a valid upstream response (stream=true)", async ({
++    body: makeBody,
++    endpoint,
++    sourceFormat,
++  }) => {
++    proxyAwareFetchMock.mockResolvedValueOnce(new Response(
++      JSON.stringify({ id: "resp_synthetic_success" }),
++      { status: 200, headers: { "content-type": "application/json" } },
++    ));
++
++    const result = await handleChatCore(makeOptions(makeBody(true), endpoint));
++
++    expect(proxyAwareFetchMock.mock.calls[0][0]).toBe("https://api.meta.ai/v1/responses");
++    expect(handleStreamingResponseMock).toHaveBeenCalledWith(expect.objectContaining({
++      sourceFormat,
++      targetFormat: "openai-responses",
++      stream: true,
++    }));
++    expect(result).toEqual({ success: true, responseMode: "sse" });
++  });
++
++  it.each([
++    {
++      label: "chat messages",
++      body: chatBody,
++      endpoint: "/v1/chat/completions",
++      sourceFormat: "openai",
++    },
++    {
++      label: "native Responses input",
++      body: responsesBody,
++      endpoint: "/v1/responses",
++      sourceFormat: "openai-responses",
++    },
++  ])("$label receives a valid upstream response (stream=false)", async ({
++    body: makeBody,
++    endpoint,
++    sourceFormat,
++  }) => {
++    proxyAwareFetchMock.mockResolvedValueOnce(new Response(
++      JSON.stringify({ id: "resp_synthetic_success" }),
++      { status: 200, headers: { "content-type": "application/json" } },
++    ));
++
++    const result = await handleChatCore(makeOptions(makeBody(false), endpoint));
++
++    expect(proxyAwareFetchMock.mock.calls[0][0]).toBe("https://api.meta.ai/v1/responses");
++    expect(handleNonStreamingResponseMock).toHaveBeenCalledWith(expect.objectContaining({
++      sourceFormat,
++      targetFormat: "openai-responses",
++      stream: false,
++    }));
++    expect(result).toEqual({ success: true, responseMode: "json" });
++  });
++});
+-- 
+2.55.0
+

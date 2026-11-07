@@ -1,0 +1,1760 @@
+From 75067283ea0f5a7c8e6a96a066c810c20f5848fc Mon Sep 17 00:00:00 2001
+From: downstream <downstream@local>
+Date: Sat, 7 Nov 2026 17:42:23 +0000
+Subject: [PATCH] Responses transport and portable collaboration
+
+
+Consolidated from the following original patches (file custody by final owner):
+
+- original #01: 0001 transport-responses-wire
+- original #08: 0008 regression-fixtures
+- original #09: Restore custom response tool identity
+- original #11: Fix mixed agent messages and Gemini instruction-prefix replay
+- original #12: Preserve custom Responses tool choice identity
+- original #20: Distinguish namespaced function and custom aliases
+- original #22: Resolve hosted search from configured model capabilities
+- original #30: Keep ordinary stream EOF independent of usage persistence
+- original #53: Validate Mavis session UUIDs before sanitizing the
+- original #57: Keep opaque agent messages that carry an image deliverable
+---
+ .../handlers/chatCore/sseToJsonHandler.js     |   7 +-
+ open-sse/providers/registry/kimi.js           |   3 +
+ .../concerns/portableCollaboration.js         |  89 ++++
+ open-sse/utils/responsesStreamHelpers.js      |   3 +-
+ tests/unit/cli-connect.test.js                |   2 +
+ tests/unit/kimi-responses-transport.test.js   |  15 +-
+ .../openai-responses-agent-messages.test.js   | 240 ++++++++++
+ .../unit/openai-responses-namespaces.test.js  | 444 ++++++++++++++++++
+ .../opencode-go-transport-routing.test.js     |  50 +-
+ tests/unit/responses-reasoning-wire.test.js   | 414 ++++++++++++++++
+ ...onses-thinking-option-preservation.test.js |  71 +++
+ tests/unit/undeclared-responses-sse.test.js   | 206 ++++++++
+ 12 files changed, 1521 insertions(+), 23 deletions(-)
+ create mode 100644 open-sse/translator/concerns/portableCollaboration.js
+ create mode 100644 tests/unit/openai-responses-agent-messages.test.js
+ create mode 100644 tests/unit/openai-responses-namespaces.test.js
+ create mode 100644 tests/unit/responses-reasoning-wire.test.js
+ create mode 100644 tests/unit/responses-thinking-option-preservation.test.js
+ create mode 100644 tests/unit/undeclared-responses-sse.test.js
+
+diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
+index 5a72398..3bcd7f8 100644
+--- a/open-sse/handlers/chatCore/sseToJsonHandler.js
++++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
+@@ -8,6 +8,7 @@ import { PROVIDERS } from "../../config/providers.js";
+ import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
+ import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
+ import { extractReasoningText } from "../../translator/concerns/reasoning.js";
++import { upstreamResponseHeaders } from "../../utils/upstreamHeaders.js";
+ 
+ // Responses-API providers (e.g. codex) may emit SSE without content-type + use Responses output shape
+ const isResponsesProvider = (p) => PROVIDERS[p]?.format === FORMATS.OPENAI_RESPONSES;
+@@ -232,7 +233,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
+ 
+       // Client is Responses API → return as-is
+       if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
+-        return { success: true, response: new Response(JSON.stringify(restoreToolNames(jsonResponse, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
++        return { success: true, response: new Response(JSON.stringify(restoreToolNames(jsonResponse, toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+       }
+ 
+       // Build client-format response.
+@@ -292,7 +293,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
+         finalResp = openAICompletionToClaudeMessage(finalResp);
+       }
+ 
+-      return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalResp, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
++      return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalResp, toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+     } catch (err) {
+       console.error("[ChatCore] Responses API SSE→JSON failed:", err);
+       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Failed to convert streaming response to JSON");
+@@ -372,7 +373,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
+         ? openAICompletionToClaudeMessage(parsed)
+         : parsed;
+ 
+-    return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalBody, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
++    return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalBody, toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+   } catch (err) {
+     console.error("[ChatCore] Chat Completions SSE→JSON failed:", err);
+     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Failed to convert streaming response to JSON");
+diff --git a/open-sse/providers/registry/kimi.js b/open-sse/providers/registry/kimi.js
+index 88f6e38..e90fe5a 100644
+--- a/open-sse/providers/registry/kimi.js
++++ b/open-sse/providers/registry/kimi.js
+@@ -56,6 +56,9 @@ export default {
+     {
+       format: "openai-responses",
+       baseUrl: "https://api.kimi.com/coding/v1/responses",
++      // Strict input: Codex multi-agent/delegation history items must be rewritten
++      // to portable user messages before dispatch.
++      quirks: { portableResponsesInput: true },
+       auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["kimiHeaders"] },
+     },
+   ],
+diff --git a/open-sse/translator/concerns/portableCollaboration.js b/open-sse/translator/concerns/portableCollaboration.js
+new file mode 100644
+index 0000000..6315598
+--- /dev/null
++++ b/open-sse/translator/concerns/portableCollaboration.js
+@@ -0,0 +1,89 @@
++import { createHash } from "node:crypto";
++import { PORTABLE_COLLABORATION } from "../../config/runtimeConfig.js";
++import { FERNET_ENCRYPTED_CONTENT_PREFIX } from "../formats/responsesApi.js";
++import { RESPONSES_ITEM, RESPONSES_TOOL } from "../schema/index.js";
++
++/** True when opaque agent content would leave no readable task after translation. */
++export function hasUndeliverableAgentMessage(input) {
++  return Array.isArray(input) && input.some(item => {
++    if (item?.type !== RESPONSES_ITEM.AGENT_MESSAGE || !Array.isArray(item.content)) return false;
++    const opaque = item.content.some(part => part?.type === RESPONSES_ITEM.ENCRYPTED_CONTENT
++      && typeof part.encrypted_content === "string"
++      && part.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX));
++    if (!opaque) return false;
++    let text = item.content.flatMap(part => {
++      if (part?.type === RESPONSES_ITEM.INPUT_TEXT && typeof part.text === "string") return [part.text];
++      if (part?.type === RESPONSES_ITEM.ENCRYPTED_CONTENT && typeof part.encrypted_content === "string"
++        && !part.encrypted_content.startsWith(FERNET_ENCRYPTED_CONTENT_PREFIX)) return [part.encrypted_content];
++      return [];
++    }).join("\n").trim();
++    if (text.startsWith("Message Type:")) {
++      const lines = text.split(/\r?\n/);
++      while (lines.length && (!lines[0].trim() || /^(Message Type|Task name|Sender):/.test(lines[0].trimStart()))) lines.shift();
++      text = lines.join("\n").replace(/^\s*Payload:[ \t]*/, "");
++    }
++    return text.trim() === "" && !item.content.some(part => part?.type === RESPONSES_ITEM.INPUT_IMAGE);
++  });
++}
++
++export function preparePortableCollaboration(body) {
++  const namespace = PORTABLE_COLLABORATION.namespace;
++  const toolNameMap = new Map();
++  const aliases = new Map();
++  const reserved = new Set();
++  const inputs = Array.isArray(body.input) ? body.input : [];
++  const lists = [body.tools, ...inputs.filter(item => item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS).map(item => item.tools)];
++  for (const tools of lists) for (const tool of Array.isArray(tools) ? tools : []) {
++    if (tool?.type !== RESPONSES_TOOL.NAMESPACE && typeof tool?.name === "string") reserved.add(tool.name);
++  }
++  for (const item of inputs) if (!item?.namespace && typeof item?.name === "string") reserved.add(item.name);
++  const aliasFor = (name, type = RESPONSES_TOOL.FUNCTION) => {
++    const identity = JSON.stringify([namespace, name, type]);
++    if (aliases.has(identity)) return aliases.get(identity);
++    const hash = createHash("sha256").update(identity).digest("hex").slice(0, PORTABLE_COLLABORATION.aliasHashLength);
++    const base = PORTABLE_COLLABORATION.aliasPrefix
++      + String(name).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, PORTABLE_COLLABORATION.aliasNameLength) + "_" + hash;
++    let alias = base;
++    for (let n = 1; reserved.has(alias); n++) alias = base.slice(0, PORTABLE_COLLABORATION.aliasCollisionBaseLength) + "_" + n;
++    reserved.add(alias); aliases.set(identity, alias);
++    toolNameMap.set(alias, { name, namespace, type });
++    return alias;
++  };
++  const rewriteTools = tools => !Array.isArray(tools) ? tools : tools.flatMap(tool => {
++    if (tool?.type !== RESPONSES_TOOL.NAMESPACE || tool.name !== namespace || !Array.isArray(tool.tools)) return [tool];
++    return tool.tools.map(child => {
++      if (child?.type !== RESPONSES_TOOL.FUNCTION && child?.type !== RESPONSES_TOOL.CUSTOM) return child;
++      const description = [tool.description, child.description].filter(text => typeof text === "string" && text).join("\n");
++      const out = { ...child, name: aliasFor(child.name, child.type), ...(description ? { description } : {}) };
++      const message = child.parameters?.properties?.message;
++      if (PORTABLE_COLLABORATION.messageTools.includes(child.name) && message && typeof message === "object" && !Array.isArray(message)) {
++        const { encrypted, ...plainMessage } = message;
++        out.parameters = { ...child.parameters, properties: { ...child.parameters.properties, message: plainMessage } };
++      }
++      return out;
++    });
++  });
++  // Allocate declarations before history so collisions resolve consistently.
++  const tools = rewriteTools(body.tools);
++  const input = inputs.map(item => item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS ? { ...item, tools: rewriteTools(item.tools) } : item);
++  const rewriteChoice = choice => {
++    if (!choice || typeof choice !== "object" || Array.isArray(choice)) return choice;
++    if (choice.namespace === namespace && typeof choice.name === "string") {
++      const { namespace: _, ...rest } = choice;
++      return { ...rest, name: aliasFor(choice.name, choice.type === RESPONSES_TOOL.CUSTOM ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION) };
++    }
++    if (choice.type === RESPONSES_TOOL.ALLOWED_TOOLS && Array.isArray(choice.tools)) return { ...choice, tools: choice.tools.map(rewriteChoice) };
++    return choice;
++  };
++  const rewritten = { ...body };
++  if (Array.isArray(body.tools)) rewritten.tools = tools;
++  if (Array.isArray(body.input)) rewritten.input = input.map(item => {
++    if ((item?.type === RESPONSES_ITEM.FUNCTION_CALL || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL) && item.namespace === namespace && typeof item.name === "string") {
++      const { namespace: _, ...rest } = item;
++      return { ...rest, name: aliasFor(item.name, item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION) };
++    }
++    return item;
++  });
++  if (body.tool_choice) rewritten.tool_choice = rewriteChoice(body.tool_choice);
++  return { body: toolNameMap.size ? rewritten : body, toolNameMap };
++}
+diff --git a/open-sse/utils/responsesStreamHelpers.js b/open-sse/utils/responsesStreamHelpers.js
+index eaacdcd..6a1e94c 100644
+--- a/open-sse/utils/responsesStreamHelpers.js
++++ b/open-sse/utils/responsesStreamHelpers.js
+@@ -7,6 +7,7 @@ const OPENAI_RESPONSES_TERMINAL_EVENTS = new Set([
+   "response.completed",
+   "response.done",
+   "response.failed",
++  "response.incomplete",
+   "error"
+ ]);
+ 
+@@ -20,7 +21,7 @@ export function isOpenAIResponsesTerminalEvent(eventName, chunk) {
+   const type = getOpenAIResponsesEventName(eventName, chunk);
+   if (OPENAI_RESPONSES_TERMINAL_EVENTS.has(type)) return true;
+   const status = chunk?.response?.status;
+-  return status === "completed" || status === "failed";
++  return status === "completed" || status === "failed" || status === "incomplete";
+ }
+ 
+ const sharedEncoder = new TextEncoder();
+diff --git a/tests/unit/cli-connect.test.js b/tests/unit/cli-connect.test.js
+index 3695a4b..7da8ede 100644
+--- a/tests/unit/cli-connect.test.js
++++ b/tests/unit/cli-connect.test.js
+@@ -194,10 +194,12 @@ describe("connect run()", () => {
+   beforeEach(() => {
+     home = fs.mkdtempSync(path.join(os.tmpdir(), "9r-connect-run-"));
+     vi.spyOn(os, "homedir").mockReturnValue(home);
++    vi.stubEnv("XDG_CONFIG_HOME", "");
+     vi.spyOn(console, "log").mockImplementation(() => {});
+   });
+   afterEach(() => {
+     vi.restoreAllMocks();
++    vi.unstubAllEnvs();
+     fs.rmSync(home, { recursive: true, force: true });
+   });
+ 
+diff --git a/tests/unit/kimi-responses-transport.test.js b/tests/unit/kimi-responses-transport.test.js
+index faffc08..4d80dd8 100644
+--- a/tests/unit/kimi-responses-transport.test.js
++++ b/tests/unit/kimi-responses-transport.test.js
+@@ -3,8 +3,8 @@
+ // Drives the REAL handleChatCore guard + targetFormat resolution; only the executor's HTTP
+ // response is mocked. The assertion target is credentials.runtimeTransport — the field
+ // DefaultExecutor.buildUrl/buildHeaders read — so a wrong routing decision shows up as the
+-// wrong baseUrl here, same as on the wire. Executor-level cells check URL and auth
+-// without any network.
++// wrong baseUrl here, same as on the wire. Executor-level cells check URL, auth and the
++// Responses reasoning shape without any network.
+ import { describe, it, expect, vi, beforeEach } from "vitest";
+ 
+ const { executeMock } = vi.hoisted(() => ({
+@@ -193,4 +193,15 @@ describe("DefaultExecutor('kimi') on the responses transport", () => {
+     const oauthHeaders = ex.buildHeaders({ accessToken: "tok-test", runtimeTransport: rt(), providerSpecificData: {} }, true, url, MODELS[0]);
+     expect(oauthHeaders.Authorization).toBe("Bearer tok-test");
+   });
++
++  it("emits reasoning.effort (Responses shape) incl. max, never reasoning_effort", () => {
++    const ex = new DefaultExecutor("kimi");
++    const out = ex.transformRequest(MODELS[0], {
++      model: MODELS[0],
++      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
++      reasoning_effort: "max",
++    }, true, { runtimeTransport: rt() });
++    expect(out.reasoning?.effort).toBe("max");
++    expect(out.reasoning_effort).toBeUndefined();
++  });
+ });
+diff --git a/tests/unit/openai-responses-agent-messages.test.js b/tests/unit/openai-responses-agent-messages.test.js
+new file mode 100644
+index 0000000..7d6b9cb
+--- /dev/null
++++ b/tests/unit/openai-responses-agent-messages.test.js
+@@ -0,0 +1,240 @@
++import { describe, expect, it } from "vitest";
++import "../translator/registerAll.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { convertResponsesApiFormat, normalizeResponsesAgentMessage, toPortableResponsesInput } from "../../open-sse/translator/formats/responsesApi.js";
++import { openaiResponsesToOpenAIRequest } from "../../open-sse/translator/request/openai-responses.js";
++import { hasUndeliverableAgentMessage, preparePortableCollaboration } from "../../open-sse/translator/concerns/portableCollaboration.js";
++
++const FERNET = "gAAAAABrXy-opaque-cipher";
++const REASONING_BLOB = "gAAAAAB_reasoning_opaque_blob";
++
++const headerFor = (type, task, sender) => `Message Type: ${type}\nTask name: ${task}\nSender: ${sender}`;
++
++const agent = (type, author, recipient, payload) => ({
++  type: "agent_message",
++  author,
++  recipient,
++  content: [
++    { type: "input_text", text: headerFor(type, "delivery_probe", author) },
++    { type: "encrypted_content", encrypted_content: payload },
++  ],
++});
++
++const newTask = agent("NEW_TASK", "/root", "/root/delivery_probe", "Reply with exactly DELIVERY_OK.");
++const message = agent("MESSAGE", "/root", "/root/delivery_probe", "Follow-up note.");
++const finalAnswer = agent("FINAL_ANSWER", "/root/delivery_probe", "/root", "Result: DELIVERY_OK.");
++
++const clone = (value) => structuredClone(value);
++const textOf = (msg) => (Array.isArray(msg.content) ? msg.content.map((p) => p.text).join("\n") : msg.content);
++const nativeContents = (out, format) => (format === FORMATS.ANTIGRAVITY ? out.request.contents : out.contents);
++
++describe("normalizeResponsesAgentMessage", () => {
++  it("returns non-agent items as the same object", () => {
++    const item = { type: "function_call", call_id: "c1", name: "x", arguments: "{}" };
++    expect(normalizeResponsesAgentMessage(item)).toBe(item);
++    const msg = { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] };
++    expect(normalizeResponsesAgentMessage(msg)).toBe(msg);
++  });
++
++  it.each([
++    ["NEW_TASK", newTask],
++    ["MESSAGE", message],
++    ["FINAL_ANSWER", finalAnswer],
++  ])("turns a %s plaintext carrier into an exact user message", (_label, item) => {
++    const out = normalizeResponsesAgentMessage(item);
++    expect(out).toEqual({
++      type: "message",
++      role: "user",
++      author: item.author,
++      recipient: item.recipient,
++      content: [
++        { type: "input_text", text: item.content[0].text },
++        { type: "input_text", text: item.content[1].encrypted_content },
++      ],
++    });
++  });
++
++  it("keeps Fernet ciphertext opaque", () => {
++    const out = normalizeResponsesAgentMessage({
++      type: "agent_message",
++      content: [{ type: "encrypted_content", encrypted_content: FERNET }],
++    });
++    expect(out.content).toEqual([{ type: "encrypted_content", encrypted_content: FERNET }]);
++  });
++});
++
++describe("agent_message plaintext task delivery", () => {
++  const cases = [
++    ["NEW_TASK", newTask, "/root", "/root/delivery_probe"],
++    ["MESSAGE", message, "/root", "/root/delivery_probe"],
++    ["FINAL_ANSWER", finalAnswer, "/root/delivery_probe", "/root"],
++  ];
++
++  it.each(cases)("%s header and payload appear exactly once, in order, via convertResponsesApiFormat", (_label, item) => {
++    const body = { model: "m", input: [item] };
++    const before = clone(body);
++    const out = convertResponsesApiFormat(body);
++    expect(out.messages).toEqual([{
++      role: "user",
++      content: [
++        { type: "text", text: item.content[0].text },
++        { type: "text", text: item.content[1].encrypted_content },
++      ],
++    }]);
++    expect(body).toEqual(before);
++  });
++
++  it.each(cases)("%s header and payload appear exactly once via openaiResponsesToOpenAIRequest", (_label, item) => {
++    const body = { model: "m", input: [item] };
++    const before = clone(body);
++    const out = openaiResponsesToOpenAIRequest("m", body, true, {});
++    expect(textOf(out.messages[0])).toBe(`${item.content[0].text}\n${item.content[1].encrypted_content}`);
++    expect(out.messages).toHaveLength(1);
++    expect(body).toEqual(before);
++  });
++
++  it("preserves escaped Unicode, newlines and trailing spaces byte for byte", () => {
++    const tricky = agent("NEW_TASK", "/root", "/root/delivery_probe", "l\u00ednea \u2603  \n\ttab  ");
++    const out = openaiResponsesToOpenAIRequest("m", { model: "m", input: [tricky] }, true, {});
++    expect(textOf(out.messages[0])).toBe(`${tricky.content[0].text}\nl\u00ednea \u2603  \n\ttab  `);
++  });
++
++  it("keeps the agent task after a real tool call and output, before assistant output", () => {
++    const input = [
++      { type: "function_call", call_id: "c1", name: "lookup", arguments: "{}" },
++      { type: "function_call_output", call_id: "c1", output: "ok" },
++      newTask,
++      { type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] },
++    ];
++    const out = convertResponsesApiFormat({ model: "m", input });
++    expect(out.messages.map((m) => m.role)).toEqual(["assistant", "tool", "user", "assistant"]);
++    expect(textOf(out.messages[2])).toContain("DELIVERY_OK");
++  });
++
++  it("keeps ordinary reasoning opaque and attached to the next assistant, never as user text", () => {
++    const input = [
++      newTask,
++      { type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] },
++      { type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] },
++    ];
++    const out = openaiResponsesToOpenAIRequest("m", { model: "m", input }, true, {});
++    const userTexts = out.messages.filter((m) => m.role === "user").map((m) => JSON.stringify(m));
++    expect(userTexts.join("\n")).not.toContain(REASONING_BLOB);
++    const assistant = out.messages.find((m) => m.role === "assistant");
++    expect(assistant.encrypted_content).toBe(REASONING_BLOB);
++  });
++
++  it("keeps a plaintext-only carrier as one user text part through the portable path", () => {
++    const only = { type: "agent_message", content: [{ type: "encrypted_content", encrypted_content: "plain payload" }] };
++    expect(toPortableResponsesInput([only])).toEqual([{
++      type: "message", role: "user", content: [{ type: "input_text", text: "plain payload" }],
++    }]);
++    const out = convertResponsesApiFormat({ model: "m", input: [only] });
++    expect(out.messages).toEqual([{ role: "user", content: [{ type: "text", text: "plain payload" }] }]);
++  });
++
++  it("keeps the existing Fernet portable outcomes unchanged", () => {
++    const mixed = { type: "agent_message", content: [
++      { type: "input_text", text: "kept" },
++      { type: "encrypted_content", encrypted_content: FERNET },
++    ] };
++    expect(toPortableResponsesInput([mixed])).toEqual([{
++      type: "message", role: "user", content: [{ type: "input_text", text: "kept" }],
++    }]);
++    const onlyFernet = { type: "agent_message", content: [{ type: "encrypted_content", encrypted_content: FERNET }] };
++    expect(toPortableResponsesInput([onlyFernet])).toEqual([]);
++  });
++
++  it("does not mutate the caller's body deeply", () => {
++    const body = { model: "m", input: [clone(newTask), clone(message), clone(finalAnswer)] };
++    const before = JSON.stringify(body);
++    openaiResponsesToOpenAIRequest("m", body, true, {});
++    convertResponsesApiFormat(clone(body));
++    toPortableResponsesInput(body.input);
++    expect(JSON.stringify(body)).toBe(before);
++  });
++
++  it("keeps the native Responses pass-through untouched", () => {
++    const body = { model: "m", input: [clone(newTask)] };
++    const before = JSON.stringify(body);
++    const out = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, "m", body, true, {}, "openai");
++    expect(JSON.stringify(out.input)).toBe(JSON.stringify([newTask]));
++    expect(JSON.stringify(body)).toBe(before);
++  });
++
++  it.each([
++    [FORMATS.GEMINI, "gemini"],
++    [FORMATS.GEMINI, "aistudio"],
++    [FORMATS.ANTIGRAVITY, "antigravity"],
++  ])("delivers the task once to native %s/%s contents with thinkingLevel high", (format, provider) => {
++    const body = { model: "gemini-3.8-flash", input: [clone(newTask)], reasoning: { effort: "high" } };
++    const before = JSON.stringify(body);
++    const out = translateRequest(FORMATS.OPENAI_RESPONSES, format, "gemini-3.8-flash", body, true, {}, provider);
++    const contents = nativeContents(out, format);
++    const texts = contents.flatMap((c) => c.parts.map((p) => p.text)).filter(Boolean);
++    expect(texts.filter((t) => t.startsWith("Message Type: NEW_TASK"))).toHaveLength(1);
++    expect(texts.filter((t) => t === "Reply with exactly DELIVERY_OK.")).toHaveLength(1);
++    const generation = format === FORMATS.ANTIGRAVITY ? out.request.generationConfig : out.generationConfig;
++    expect(generation.thinkingConfig.thinkingLevel).toBe("high");
++    expect(JSON.stringify(body)).toBe(before);
++  });
++});
++
++describe("opaque agent_message detection", () => {
++  const opaqueAgent = type => agent(type, "/root", "/root/delivery_probe", FERNET);
++
++  it.each(["NEW_TASK", "MESSAGE", "FINAL_ANSWER"])("flags opaque %s agent messages", type => {
++    expect(hasUndeliverableAgentMessage([opaqueAgent(type)])).toBe(true);
++  });
++
++  it("flags Fernet-only agent content", () => {
++    expect(hasUndeliverableAgentMessage([{ type: "agent_message", content: [{ type: "encrypted_content", encrypted_content: FERNET }] }])).toBe(true);
++  });
++
++  it("keeps an opaque agent message with an image deliverable", () => {
++    const withImage = { type: "agent_message", content: [
++      { type: "input_image", image_url: "data:image/png;base64,AAAA" },
++      { type: "encrypted_content", encrypted_content: FERNET },
++    ] };
++    expect(hasUndeliverableAgentMessage([withImage])).toBe(false);
++  });
++
++  it("ignores plaintext agent messages, ordinary reasoning ciphertext and non-array input", () => {
++    expect(hasUndeliverableAgentMessage([newTask, message, finalAnswer])).toBe(false);
++    expect(hasUndeliverableAgentMessage([{ type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] }])).toBe(false);
++    expect(hasUndeliverableAgentMessage("text")).toBe(false);
++  });
++
++  it("returns the same body and an empty map when no collaboration tools are present", () => {
++    const body = { model: "m", tools: [{ type: "function", name: "read", parameters: { type: "object" } }], input: [clone(newTask)] };
++    const out = preparePortableCollaboration(body);
++    expect(out.body).toBe(body);
++    expect(out.toolNameMap.size).toBe(0);
++  });
++
++  it("keeps readable mixed and plaintext carriers deliverable", () => {
++    const mixed = { type: "agent_message", content: [{ type: "input_text", text: "delegated ask" }, { type: "encrypted_content", encrypted_content: FERNET }] };
++    const plaintext = { type: "agent_message", content: [{ type: "encrypted_content", encrypted_content: "plain task" }, { type: "encrypted_content", encrypted_content: FERNET }] };
++    expect(hasUndeliverableAgentMessage([mixed])).toBe(false);
++    expect(hasUndeliverableAgentMessage([plaintext])).toBe(false);
++  });
++
++  it("requires readable payload beyond the metadata envelope", () => {
++    const envelope = payload => ({ type: "agent_message", content: [
++      { type: "input_text", text: `Message Type: NEW_TASK\nTask name: /root/probe\nSender: /root\n\nPayload:${payload}` },
++      { type: "encrypted_content", encrypted_content: FERNET },
++    ] });
++    expect(hasUndeliverableAgentMessage([envelope("")])).toBe(true);
++    expect(hasUndeliverableAgentMessage([envelope(" Reply READY")])).toBe(false);
++  });
++
++  it("treats a metadata envelope split across input_text parts as metadata only", () => {
++    expect(hasUndeliverableAgentMessage([{ type: "agent_message", content: [
++      { type: "input_text", text: "Message Type: NEW_TASK" },
++      { type: "input_text", text: "Task name: /root/probe" },
++      { type: "input_text", text: "Sender: /root" },
++      { type: "encrypted_content", encrypted_content: FERNET },
++    ] }])).toBe(true);
++  });
++});
+diff --git a/tests/unit/openai-responses-namespaces.test.js b/tests/unit/openai-responses-namespaces.test.js
+new file mode 100644
+index 0000000..645f7eb
+--- /dev/null
++++ b/tests/unit/openai-responses-namespaces.test.js
+@@ -0,0 +1,444 @@
++import { describe, expect, it } from "vitest";
++import "../translator/registerAll.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { RESPONSES_ITEM } from "../../open-sse/translator/schema/index.js";
++import { openaiResponsesToOpenAIRequest } from "../../open-sse/translator/request/openai-responses.js";
++import { restoreToolNames } from "../../open-sse/utils/opencodeFingerprint.js";
++import { createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.js";
++import { translateNonStreamingResponse } from "../../open-sse/handlers/chatCore/nonStreamingHandler.js";
++import { filterUsageForFormat } from "../../open-sse/utils/usageTracking.js";
++import { preparePortableCollaboration } from "../../open-sse/translator/concerns/portableCollaboration.js";
++
++const schema = { type: "object", properties: { title: { type: "string" }, count: { type: "integer" } }, required: ["title", "count"], additionalProperties: false };
++const leaf = () => ({ type: "function", name: "read", description: "Read the selected record.", parameters: schema });
++const fixture = () => ({
++  model: "gemini-3.8-flash",
++  tools: [
++    leaf(),
++    { type: "namespace", name: "alpha", description: "First source.", tools: [leaf(), { type: "custom", name: "patch", description: "Apply raw input.", format: { type: "grammar", syntax: "lark", definition: "start: TEXT" } }] },
++  ],
++  input: [
++    { type: RESPONSES_ITEM.ADDITIONAL_TOOLS, tools: [{ type: "namespace", name: "beta", tools: [leaf()] }] },
++    { type: "message", role: "user", content: [{ type: "input_text", text: "Read alpha, not beta." }] },
++    { type: "function_call", name: "read", namespace: "alpha", call_id: "call_alpha", arguments: '{"title":"record","count":3}' },
++    { type: "function_call_output", call_id: "call_alpha", output: '{"value":"actual"}' },
++    { type: "message", role: "user", content: [{ type: "input_text", text: "Continue." }] },
++  ],
++  tool_choice: { type: "function", name: "read", namespace: "beta" },
++});
++const alias = (map, namespace, name) => [...map].find(([, value]) => value && typeof value === "object" && value.namespace === namespace && value.name === name)?.[0];
++const typedAlias = (map, namespace, name, type) => [...map].find(([, value]) => value && typeof value === "object" && value.namespace === namespace && value.name === name && value.type === type)?.[0];
++
++it("expands namespace declarations without conflating root or equal leaf names", () => {
++  const body = fixture();
++  const translated = openaiResponsesToOpenAIRequest(body.model, body, true, {});
++  expect(translated.tools).toHaveLength(4);
++  const alpha = alias(translated._toolNameMap, "alpha", "read");
++  const beta = alias(translated._toolNameMap, "beta", "read");
++  expect(alpha).toBeTruthy();
++  expect(beta).toBeTruthy();
++  expect(alpha).not.toBe(beta);
++  expect(translated.tools.map(tool => tool.function.name)).toContain("read");
++  expect(new Set(translated.tools.map(tool => tool.function.name)).size).toBe(4);
++  for (const name of [alpha, beta]) expect(name).toMatch(/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/);
++  expect(translated.tools.find(tool => tool.function.name === alpha).function.parameters).toEqual(schema);
++  expect(translated.messages.find(message => message.tool_calls)?.tool_calls[0]).toMatchObject({ id: "call_alpha", function: { name: alpha, arguments: '{"title":"record","count":3}' } });
++  expect(translated.messages.find(message => message.role === "tool")).toMatchObject({ tool_call_id: "call_alpha", content: '{"value":"actual"}' });
++  expect(translated.tool_choice).toEqual({ type: "function", function: { name: beta } });
++  const repeated = openaiResponsesToOpenAIRequest(body.model, fixture(), true, {});
++  expect(alias(repeated._toolNameMap, "alpha", "read")).toBe(alpha);
++  const historyOnly = openaiResponsesToOpenAIRequest(body.model, { input: body.input.filter(item => item.type !== RESPONSES_ITEM.ADDITIONAL_TOOLS) }, true, {});
++  expect(historyOnly.messages.find(message => message.tool_calls).tool_calls[0].function.name).toBe(alpha);
++});
++
++it("keeps same-name namespaced function and custom tools distinct through request mapping and restoration", () => {
++  const makeBody = type => ({
++    model: "m",
++    tools: [{ type: "namespace", name: "automation", tools: [
++      { type: "function", name: "run", parameters: schema },
++      { type: "custom", name: "run", format: { type: "text" } },
++    ] }],
++    input: [
++      { type: "function_call", name: "run", namespace: "automation", call_id: "call_function", arguments: '{"title":"record","count":3}' },
++      { type: "custom_tool_call", name: "run", namespace: "automation", call_id: "call_custom", input: "RAW_INPUT" },
++    ],
++    tool_choice: { type, name: "run", namespace: "automation" },
++  });
++  const translated = openaiResponsesToOpenAIRequest("m", makeBody("custom"), true, {});
++  const functionAlias = typedAlias(translated._toolNameMap, "automation", "run", "function");
++  const customAlias = typedAlias(translated._toolNameMap, "automation", "run", "custom");
++
++  expect(functionAlias).toBeTruthy();
++  expect(customAlias).toBeTruthy();
++  expect(functionAlias).not.toBe(customAlias);
++  expect(translated.tools.map(tool => tool.function.name)).toEqual([functionAlias, customAlias]);
++  expect(translated._toolNameMap.get(functionAlias)).toEqual({ name: "run", namespace: "automation", type: "function" });
++  expect(translated._toolNameMap.get(customAlias)).toEqual({ name: "run", namespace: "automation", type: "custom", format: { type: "text" } });
++  expect(translated.messages[0].tool_calls.map(call => call.function.name)).toEqual([functionAlias, customAlias]);
++  expect(translated.tool_choice).toEqual({ type: "function", function: { name: customAlias } });
++  expect(translated._customToolNames).toContain(customAlias);
++  expect(translated._customToolNames).not.toContain(functionAlias);
++  expect(restoreToolNames({ type: "function_call", name: functionAlias, call_id: "call_function", arguments: "{}" }, translated._toolNameMap)).toEqual({
++    type: "function_call", name: "run", namespace: "automation", call_id: "call_function", arguments: "{}",
++  });
++  expect(restoreToolNames({ type: "function_call", name: customAlias, call_id: "call_custom", arguments: "RAW_INPUT" }, translated._toolNameMap)).toEqual({
++    type: "custom_tool_call", name: "run", namespace: "automation", call_id: "call_custom", input: "RAW_INPUT",
++  });
++
++  const functionChoice = openaiResponsesToOpenAIRequest("m", makeBody("function"), true, {});
++  expect(functionChoice.tool_choice).toEqual({ type: "function", function: { name: typedAlias(functionChoice._toolNameMap, "automation", "run", "function") } });
++});
++
++it("restores namespace identity after a chained rename in event and terminal output", () => {
++  const map = new Map([["provider_name", "wire_name"], ["wire_name", { name: "read", namespace: "alpha", type: "function" }]]);
++  const item = { type: "function_call", name: "provider_name", call_id: "call_1", arguments: "{}" };
++  const payload = { event: "response.output_item.done", data: { type: "response.output_item.done", item, response: { output: [item] } } };
++  const restored = restoreToolNames(payload, map);
++  expect(restored.data.item).toMatchObject({ name: "read", namespace: "alpha", call_id: "call_1", arguments: "{}" });
++  expect(restored.data.response.output[0]).toMatchObject({ name: "read", namespace: "alpha" });
++  expect(payload.data.item.name).toBe("provider_name");
++  expect(restoreToolNames({ type: "function_call", name: "wire_name" }, map)).toMatchObject({ name: "read", namespace: "alpha" });
++});
++
++it("restores custom response call identity from its descriptor", () => {
++  const map = new Map([["wire_patch", { name: "patch", namespace: "alpha", type: "custom" }]]);
++  const item = { type: "function_call", name: "wire_patch", call_id: "call_1", arguments: "RAW_PATCH" };
++  const direct = restoreToolNames(item, map);
++  expect(direct).toEqual({ type: "custom_tool_call", name: "patch", namespace: "alpha", call_id: "call_1", input: "RAW_PATCH" });
++
++  const event = restoreToolNames({
++    type: "response.output_item.done",
++    item,
++    response: { output: [item] },
++  }, map);
++  expect(event.item).toEqual(direct);
++  expect(event.response.output[0]).toEqual(direct);
++  expect(item).toEqual({ type: "function_call", name: "wire_patch", call_id: "call_1", arguments: "RAW_PATCH" });
++});
++
++for (const [format, provider] of [[FORMATS.GEMINI, "gemini"], [FORMATS.GEMINI, "aistudio"], [FORMATS.ANTIGRAVITY, "antigravity"]]) {
++  describe(`${provider} namespace SSE roundtrip`, () => {
++    for (const [name, type, args] of [["read", "function_call", { title: "record", count: 3 }], ["patch", "custom_tool_call", { input: "RAW_PATCH" }]]) {
++      it(`retains the namespace and ${type} identity`, async () => {
++        const translated = translateRequest(FORMATS.OPENAI_RESPONSES, format, "gemini-3.8-flash", fixture(), true, { projectId: "fixture" }, provider);
++        const wireName = alias(translated._toolNameMap, "alpha", name);
++        expect(wireName).toBeTruthy();
++        const native = { candidates: [{ content: { parts: [{ functionCall: { id: "call_wire", name: wireName, args } }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 90, candidatesTokenCount: 10, totalTokenCount: 100 } };
++        const chunk = format === FORMATS.ANTIGRAVITY ? { response: native } : native;
++        const input = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`)); controller.close(); } });
++        const transform = createSSETransformStreamWithLogger(format, FORMATS.OPENAI_RESPONSES, provider, null, translated._toolNameMap, "gemini-3.8-flash", null, null, null, null, translated._customToolNames);
++        const raw = await new Response(input.pipeThrough(transform)).text();
++        const events = raw.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)));
++        const done = events.find(event => event.type === "response.output_item.done");
++        expect(done.item).toMatchObject({ type, name, namespace: "alpha", call_id: "call_wire" });
++        if (type === "custom_tool_call") expect(done.item.input).toBe("RAW_PATCH");
++        else expect(JSON.parse(done.item.arguments)).toEqual(args);
++        const terminal = events.find(event => event.type === "response.completed");
++        expect(terminal.response.output[0]).toMatchObject({ type, name, namespace: "alpha", call_id: "call_wire" });
++      });
++    }
++  });
++}
++
++it("restores are idempotent: an already-projected item keeps leaf and namespace", () => {
++  const map = new Map([
++    ["wire", { name: "read", namespace: "alpha", type: "function" }],
++    ["read", "Read"],
++  ]);
++  const once = restoreToolNames({ type: "function_call", name: "wire", call_id: "c1", arguments: "{}" }, map);
++  expect(once).toMatchObject({ name: "read", namespace: "alpha" });
++  const twice = restoreToolNames(once, map);
++  expect(twice).toMatchObject({ name: "read", namespace: "alpha" });
++  const viaEvent = restoreToolNames({
++    event: "response.output_item.done",
++    data: {
++      type: "response.output_item.done",
++      item: { type: "function_call", name: "wire" },
++      response: { output: [{ type: "function_call", name: "wire" }] },
++    },
++  }, map);
++  expect(viaEvent.data.item).toMatchObject({ name: "read", namespace: "alpha" });
++  expect(viaEvent.data.response.output[0]).toMatchObject({ name: "read", namespace: "alpha" });
++  const twiceEvent = restoreToolNames(viaEvent, map);
++  expect(twiceEvent.data.item).toMatchObject({ name: "read", namespace: "alpha" });
++  expect(twiceEvent.data.response.output[0]).toMatchObject({ name: "read", namespace: "alpha" });
++});
++
++it("keeps namespace/leaf meaning in descriptions and custom grammar hints", () => {
++  const translated = openaiResponsesToOpenAIRequest("gemini-3.8-flash", fixture(), true, {});
++  const alphaAlias = alias(translated._toolNameMap, "alpha", "read");
++  const patchAlias = alias(translated._toolNameMap, "alpha", "patch");
++  const decl = translated.tools.find(t => t.function.name === alphaAlias);
++  expect(decl.function.description).toContain("[alpha.read]");
++  expect(decl.function.description).toContain("Read the selected record.");
++  expect(decl.function.description).toContain("First source.");
++  const patchDecl = translated.tools.find(t => t.function.name === patchAlias);
++  expect(patchDecl.function.description).toContain("Apply raw input.");
++  expect(patchDecl.function.description).toContain("lark");
++  expect(patchDecl.function.description).toContain("start: TEXT");
++  expect(translated._customToolNames).toContain(patchAlias);
++});
++
++for (const [target, provider, credentials] of [
++  [FORMATS.OPENAI, "openai", null],
++  [FORMATS.CLAUDE, "anthropic", { apiKey: "fixture-key" }],
++  [FORMATS.KIRO, "kiro", {}],
++]) {
++  it(`survives target ${target}: namespace descriptors remain in the translated map`, () => {
++    const translated = translateRequest(FORMATS.OPENAI_RESPONSES, target, "gemini-3.8-flash", fixture(), true, credentials, provider);
++    expect(translated._toolNameMap instanceof Map).toBe(true);
++    const alphaAlias = alias(translated._toolNameMap, "alpha", "read");
++    const betaAlias = alias(translated._toolNameMap, "beta", "read");
++    expect(alphaAlias).toBeTruthy();
++    expect(betaAlias).toBeTruthy();
++    expect(translated._toolNameMap.get(alphaAlias)).toEqual({ name: "read", namespace: "alpha", type: "function" });
++  });
++}
++
++it("reserves root names before aliasing: a root tool named like a base alias wins deterministically", () => {
++  const baseline = openaiResponsesToOpenAIRequest("gemini-3.8-flash", fixture(), true, {});
++  const baseAlias = alias(baseline._toolNameMap, "alpha", "read");
++  const imposter = { type: "function", name: baseAlias, description: "Imposter root tool.", parameters: schema };
++  const nsAlpha = () => ({ type: "namespace", name: "alpha", tools: [leaf(), { type: "custom", name: "patch", description: "Apply raw input.", format: { type: "grammar", syntax: "lark", definition: "start: TEXT" } }] });
++  const orderA = fixture();
++  orderA.tools = [leaf(), imposter, nsAlpha()];
++  const orderB = fixture();
++  orderB.tools = [nsAlpha(), leaf(), imposter];
++  const translatedA = openaiResponsesToOpenAIRequest("gemini-3.8-flash", orderA, true, {});
++  const translatedB = openaiResponsesToOpenAIRequest("gemini-3.8-flash", orderB, true, {});
++  const aliasA = alias(translatedA._toolNameMap, "alpha", "read");
++  const aliasB = alias(translatedB._toolNameMap, "alpha", "read");
++  expect(aliasA).toBe(aliasB);
++  expect(aliasA).not.toBe(baseAlias);
++  expect(aliasA).toMatch(/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/);
++  expect(translatedA.tools.map(t => t.function.name)).toContain(baseAlias);
++  expect(translatedA.messages.find(m => m.tool_calls).tool_calls[0].function.name).toBe(aliasA);
++  expect(translatedA._toolNameMap.get(aliasA)).toEqual({ name: "read", namespace: "alpha", type: "function" });
++});
++
++it("ignores nested namespaces, hosted tools, and null children while keeping valid children", () => {
++  const body = fixture();
++  body.tools = [{
++    type: "namespace", name: "gamma", tools: [
++      { type: "namespace", name: "inner", tools: [leaf()] },
++      { type: "request_user_input" },
++      null,
++      leaf(),
++    ],
++  }];
++  const translated = openaiResponsesToOpenAIRequest(body.model, body, true, {});
++  expect(translated.tools).toHaveLength(2);
++  const gammaAlias = alias(translated._toolNameMap, "gamma", "read");
++  const betaAlias = alias(translated._toolNameMap, "beta", "read");
++  expect(gammaAlias).toBeTruthy();
++  expect(betaAlias).toBeTruthy();
++  expect(translated.tools.map(t => t.function.name)).toEqual(expect.arrayContaining([gammaAlias, betaAlias]));
++  expect(alias(translated._toolNameMap, "inner", "read")).toBeUndefined();
++});
++
++const jsonUsageMetadata = { promptTokenCount: 90, candidatesTokenCount: 10, thoughtsTokenCount: 10, cachedContentTokenCount: 40, totalTokenCount: 110 };
++const expectedJsonUsage = { input_tokens: 90, output_tokens: 20, total_tokens: 110, input_tokens_details: { cached_tokens: 40 }, output_tokens_details: { reasoning_tokens: 10 } };
++
++for (const [format, provider] of [[FORMATS.GEMINI, "gemini"], [FORMATS.GEMINI, "aistudio"], [FORMATS.ANTIGRAVITY, "antigravity"]]) {
++  describe(`${provider} namespace non-streaming JSON`, () => {
++    for (const [name, type, args] of [["read", "function_call", { title: "record", count: 3 }], ["patch", "custom_tool_call", { input: "RAW_PATCH" }]]) {
++      it(`retains the namespace and ${type} identity`, async () => {
++        const translated = translateRequest(FORMATS.OPENAI_RESPONSES, format, "gemini-3.8-flash", fixture(), true, { projectId: "fixture" }, provider);
++        const wireName = alias(translated._toolNameMap, "alpha", name);
++        expect(wireName).toBeTruthy();
++        const native = { candidates: [{ content: { role: "model", parts: [{ functionCall: { id: "call_json", name: wireName, args } }] }, finishReason: "STOP" }], usageMetadata: jsonUsageMetadata };
++        const body = format === FORMATS.ANTIGRAVITY ? { response: native } : native;
++        const result = translateNonStreamingResponse(body, format, FORMATS.OPENAI_RESPONSES, new Set(translated._customToolNames || []));
++        const restored = restoreToolNames(result, translated._toolNameMap);
++        const item = restored.output.find(i => i.type === type);
++        expect(item).toMatchObject({ type, name, namespace: "alpha", call_id: "call_json" });
++        if (type === "custom_tool_call") expect(item.input).toBe("RAW_PATCH");
++        else expect(JSON.parse(item.arguments)).toEqual(args);
++        expect(restored.usage).toEqual(expectedJsonUsage);
++        expect(filterUsageForFormat(restored.usage, FORMATS.OPENAI_RESPONSES)).toEqual(expectedJsonUsage);
++      });
++    }
++    it("keeps a generated fallback call_id when the native call omits id", () => {
++      const translated = translateRequest(FORMATS.OPENAI_RESPONSES, format, "gemini-3.8-flash", fixture(), true, { projectId: "fixture" }, provider);
++      const wireName = alias(translated._toolNameMap, "alpha", "read");
++      const native = { candidates: [{ content: { role: "model", parts: [{ functionCall: { name: wireName, args: {} } }] }, finishReason: "STOP" }], usageMetadata: jsonUsageMetadata };
++      const body = format === FORMATS.ANTIGRAVITY ? { response: native } : native;
++      const restored = restoreToolNames(translateNonStreamingResponse(body, format, FORMATS.OPENAI_RESPONSES, new Set(translated._customToolNames || [])), translated._toolNameMap);
++      const item = restored.output.find(i => i.type === "function_call");
++      expect(typeof item.call_id).toBe("string");
++      expect(item.call_id.length).toBeGreaterThan(0);
++      expect(item.call_id).not.toBe("call_json");
++      expect(item).toMatchObject({ name: "read", namespace: "alpha" });
++    });
++  });
++}
++
++const REASONING_BLOB = "gAAAAAB_reasoning_opaque_blob";
++const messageSchema = { type: "object", properties: { message: { type: "string", encrypted: true, description: "Task text." }, note: { type: "string", encrypted: true } }, required: ["message"], additionalProperties: false, strict: true };
++const collaborationTools = () => ({
++  type: "namespace",
++  name: "collaboration",
++  description: "Multi-agent tools.",
++  tools: [
++    { type: "function", name: "spawn_agent", description: "Start a child.", parameters: messageSchema, strict: true, vendorHint: "kept" },
++    { type: "function", name: "wait_agent", description: "Wait.", parameters: { type: "object", properties: { targets: { type: "array", encrypted: true } } } },
++    { type: "custom", name: "send_patch", description: "Raw.", format: { type: "text" } },
++  ],
++});
++const collaborationBody = () => ({
++  model: "gpt-5.5",
++  tools: [
++    { type: "function", name: "read", description: "Root read.", parameters: schema },
++    collaborationTools(),
++    { type: "namespace", name: "alpha", tools: [leaf()] },
++  ],
++  input: [
++    { type: RESPONSES_ITEM.ADDITIONAL_TOOLS, tools: [{ type: "namespace", name: "collaboration", tools: [{ type: "function", name: "followup_task", parameters: { type: "object", properties: { message: { type: "string", encrypted: true } } } }] }] },
++    { type: "function_call", namespace: "collaboration", name: "spawn_agent", call_id: "call_spawn", arguments: '{"message":"Task"}' },
++    { type: "function_call_output", call_id: "call_spawn", output: '{"ok":true}' },
++    { type: "custom_tool_call", namespace: "collaboration", name: "send_patch", call_id: "call_patch", input: "RAW" },
++    { type: "custom_tool_call_output", call_id: "call_patch", output: "done" },
++    { type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] },
++  ],
++  tool_choice: { type: "allowed_tools", mode: "auto", tools: [{ type: "function", name: "spawn_agent", namespace: "collaboration" }] },
++});
++
++describe("portable collaboration preparation", () => {
++  it("keeps same-name function and custom declarations, history, choices, and restored outputs distinct", () => {
++    const body = {
++      model: "m",
++      tools: [{ type: "namespace", name: "collaboration", tools: [
++        { type: "function", name: "run", parameters: schema },
++        { type: "custom", name: "run", format: { type: "text" } },
++      ] }],
++      input: [
++        { type: "function_call", name: "run", namespace: "collaboration", call_id: "call_function", arguments: "{}" },
++        { type: "custom_tool_call", name: "run", namespace: "collaboration", call_id: "call_custom", input: "RAW_INPUT" },
++      ],
++      tool_choice: { type: "allowed_tools", mode: "auto", tools: [
++        { type: "function", name: "run", namespace: "collaboration" },
++        { type: "custom", name: "run", namespace: "collaboration" },
++      ] },
++    };
++    const { body: out, toolNameMap } = preparePortableCollaboration(body);
++    const functionAlias = typedAlias(toolNameMap, "collaboration", "run", "function");
++    const customAlias = typedAlias(toolNameMap, "collaboration", "run", "custom");
++
++    expect(functionAlias).toBeTruthy();
++    expect(customAlias).toBeTruthy();
++    expect(functionAlias).not.toBe(customAlias);
++    expect(out.tools.map(tool => tool.name)).toEqual([functionAlias, customAlias]);
++    expect(out.input.map(item => item.name)).toEqual([functionAlias, customAlias]);
++    expect(out.tool_choice.tools.map(choice => choice.name)).toEqual([functionAlias, customAlias]);
++    expect(toolNameMap.get(functionAlias)).toEqual({ name: "run", namespace: "collaboration", type: "function" });
++    expect(toolNameMap.get(customAlias)).toEqual({ name: "run", namespace: "collaboration", type: "custom" });
++    expect(restoreToolNames({ type: "function_call", name: functionAlias, call_id: "call_function", arguments: "{}" }, toolNameMap)).toEqual({
++      type: "function_call", name: "run", namespace: "collaboration", call_id: "call_function", arguments: "{}",
++    });
++    expect(restoreToolNames({ type: "function_call", name: customAlias, call_id: "call_custom", arguments: "RAW_INPUT" }, toolNameMap)).toEqual({
++      type: "custom_tool_call", name: "run", namespace: "collaboration", call_id: "call_custom", input: "RAW_INPUT",
++    });
++  });
++
++  it("flattens collaboration declarations and drops encrypted only from the listed message schemas", () => {
++    const body = collaborationBody();
++    const before = JSON.stringify(body);
++    const { body: out, toolNameMap } = preparePortableCollaboration(body);
++    expect(JSON.stringify(body)).toBe(before);
++    const spawn = alias(toolNameMap, "collaboration", "spawn_agent");
++    const spawnTool = out.tools.find(tool => tool.name === spawn);
++    expect(spawnTool.description).toBe("Multi-agent tools.\nStart a child.");
++    expect(spawnTool.parameters.properties.message).toEqual({ type: "string", description: "Task text." });
++    expect(spawnTool.parameters.properties.note.encrypted).toBe(true);
++    expect(spawnTool).toMatchObject({ strict: true, vendorHint: "kept" });
++    expect(spawnTool.parameters).toMatchObject({ additionalProperties: false, required: ["message"] });
++    const waitTool = out.tools.find(tool => tool.name === alias(toolNameMap, "collaboration", "wait_agent"));
++    expect(waitTool.parameters.properties.targets.encrypted).toBe(true);
++    expect(toolNameMap.get(alias(toolNameMap, "collaboration", "send_patch"))).toEqual({ name: "send_patch", namespace: "collaboration", type: "custom" });
++    const followup = out.input[0].tools[0];
++    expect(followup.parameters.properties.message).toEqual({ type: "string" });
++  });
++
++  it("rewrites history calls and tool choices while leaving results and reasoning untouched", () => {
++    const body = collaborationBody();
++    const { body: out, toolNameMap } = preparePortableCollaboration(body);
++    const spawn = alias(toolNameMap, "collaboration", "spawn_agent");
++    const patch = alias(toolNameMap, "collaboration", "send_patch");
++    expect(out.input[1]).toEqual({ type: "function_call", name: spawn, call_id: "call_spawn", arguments: '{"message":"Task"}' });
++    expect(out.input[2]).toEqual(body.input[2]);
++    expect(out.input[3]).toEqual({ type: "custom_tool_call", name: patch, call_id: "call_patch", input: "RAW" });
++    expect(out.input[4]).toEqual(body.input[4]);
++    expect(out.input[5]).toEqual(body.input[5]);
++    expect(out.tool_choice.tools[0]).toEqual({ type: "function", name: spawn });
++  });
++
++  it("rewrites a direct namespaced tool_choice", () => {
++    const { body: out, toolNameMap } = preparePortableCollaboration({ model: "m", tools: [collaborationTools()], tool_choice: { type: "function", name: "spawn_agent", namespace: "collaboration" } });
++    expect(out.tool_choice).toEqual({ type: "function", name: alias(toolNameMap, "collaboration", "spawn_agent") });
++  });
++
++  it("keeps other namespaces and root tools unchanged", () => {
++    const body = collaborationBody();
++    const { body: out } = preparePortableCollaboration(body);
++    expect(out.tools[0]).toEqual(body.tools[0]);
++    expect(out.tools.at(-1)).toEqual(body.tools[2]);
++  });
++
++  it("resolves alias collisions with unrelated root tools deterministically", () => {
++    const first = preparePortableCollaboration(collaborationBody());
++    const base = alias(first.toolNameMap, "collaboration", "spawn_agent");
++    const body = collaborationBody();
++    body.tools.push({ type: "function", name: base, parameters: { type: "object" } });
++    const { toolNameMap } = preparePortableCollaboration(body);
++    expect(alias(toolNameMap, "collaboration", "spawn_agent")).toBe(`${base.slice(0, 58)}_1`);
++  });
++
++  it("restores collaboration identity in Responses SSE and terminal output while keeping the reasoning blob", async () => {
++    const { toolNameMap } = preparePortableCollaboration(collaborationBody());
++    const spawn = alias(toolNameMap, "collaboration", "spawn_agent");
++    const reasoning = { type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] };
++    const call = { type: "function_call", name: spawn, call_id: "call_spawn", arguments: '{"message":"Task"}' };
++    const events = [
++      { type: "response.output_item.added", item: call },
++      { type: "response.output_item.done", item: reasoning },
++      { type: "response.output_item.done", item: call },
++      { type: "response.completed", response: { output: [reasoning, call] } },
++    ];
++    const input = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""))); controller.close(); } });
++    const transform = createSSETransformStreamWithLogger(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, "codex", null, toolNameMap, "gpt-5.5", null, null, null, null, null);
++    const raw = await new Response(input.pipeThrough(transform)).text();
++    const out = raw.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)));
++    const added = out.find(event => event.type === "response.output_item.added");
++    expect(added.item).toMatchObject({ name: "spawn_agent", namespace: "collaboration", call_id: "call_spawn" });
++    const done = out.filter(event => event.type === "response.output_item.done");
++    expect(done.find(event => event.item.type === "function_call").item).toMatchObject({ name: "spawn_agent", namespace: "collaboration", call_id: "call_spawn", arguments: '{"message":"Task"}' });
++    expect(done.find(event => event.item.type === "reasoning").item).toEqual(reasoning);
++    const terminal = out.find(event => event.type === "response.completed");
++    expect(terminal.response.output[0]).toEqual(reasoning);
++    expect(terminal.response.output[1]).toMatchObject({ name: "spawn_agent", namespace: "collaboration", call_id: "call_spawn" });
++  });
++
++  it.each(["spawn_agent", "send_message", "followup_task"])("removes encrypted only from %s message schema", tool => {
++    const reasoning = { type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] };
++    const body = {
++      model: "gpt-5.5",
++      tools: [{ type: "namespace", name: "collaboration", tools: [{ type: "function", name: tool, parameters: messageSchema }] }],
++      input: [reasoning],
++    };
++    const { body: out, toolNameMap } = preparePortableCollaboration(body);
++    const flat = out.tools.find(item => item.name === alias(toolNameMap, "collaboration", tool));
++    expect(flat.parameters.properties.message).toEqual({ type: "string", description: "Task text." });
++    expect(flat.parameters.properties.note).toEqual({ type: "string", encrypted: true });
++    expect(out.input[0]).toEqual(reasoning);
++  });
++
++  it("restores terminal non-streaming output and keeps reasoning identical", () => {
++    const { toolNameMap } = preparePortableCollaboration(collaborationBody());
++    const spawn = alias(toolNameMap, "collaboration", "spawn_agent");
++    const reasoning = { type: "reasoning", encrypted_content: REASONING_BLOB, summary: [] };
++    const restored = restoreToolNames({ type: "response", output: [reasoning, { type: "function_call", name: spawn, call_id: "call_spawn", arguments: "{}" }] }, toolNameMap);
++    expect(restored.output[0]).toEqual(reasoning);
++    expect(restored.output[1]).toMatchObject({ name: "spawn_agent", namespace: "collaboration" });
++  });
++});
+diff --git a/tests/unit/opencode-go-transport-routing.test.js b/tests/unit/opencode-go-transport-routing.test.js
+index 7d65a40..b2fd58c 100644
+--- a/tests/unit/opencode-go-transport-routing.test.js
++++ b/tests/unit/opencode-go-transport-routing.test.js
+@@ -10,8 +10,8 @@
+ //   - deepseek × {openai, claude, openai-responses} × {bare, (max)} — the endpoint matrix
+ //     under dispute in #3278/#3332. Bare and suffixed cells must resolve identically.
+ //   - glm/kimi (chat-only) + (max) — regression cells: with the thinking suffix, the guard
+-//     is bypassed on master (suffix isn't stripped before the registry lookup) and these get
+-//     routed to /messages, which the upstream does not serve for them.
++//     must reject unsupported source endpoints, then use the translated target's supported
++//     transport rather than falling through to the provider's chat default implicitly.
+ //   - minimax + (max) + claude — suffix must NOT block a genuinely declared format.
+ import { describe, it, expect, vi, beforeEach } from "vitest";
+ 
+@@ -96,14 +96,18 @@ const RESPONSE_BY_FORMAT = {
+ };
+ 
+ async function route(model, sourceFormat) {
+-  executeMock.mockResolvedValueOnce({
+-    response: new Response(JSON.stringify(RESPONSE_BY_FORMAT[sourceFormat === "openai" ? "openai" : sourceFormat] || RESPONSE_BY_FORMAT.openai), {
+-      status: 200,
+-      headers: { "content-type": "application/json" },
+-    }),
+-    url: ENDPOINTS[sourceFormat] || ENDPOINTS.openai,
+-    headers: {},
+-    transformedBody: null,
++  executeMock.mockImplementationOnce(async ({ credentials }) => {
++    const format = credentials.runtimeTransport?.format || "openai";
++    const url = credentials.runtimeTransport?.baseUrl || ENDPOINTS.openai;
++    return {
++      response: new Response(JSON.stringify(RESPONSE_BY_FORMAT[format] || RESPONSE_BY_FORMAT.openai), {
++        status: 200,
++        headers: { "content-type": "application/json" },
++      }),
++      url,
++      headers: {},
++      transformedBody: null,
++    };
+   });
+ 
+   const credentials = { apiKey: "test-key", providerSpecificData: {} };
+@@ -122,7 +126,12 @@ async function route(model, sourceFormat) {
+   });
+ 
+   const { credentials: creds } = executeMock.mock.calls.at(-1)[0];
+-  return { result, runtimeTransport: creds.runtimeTransport ?? null };
++  const executorResult = await executeMock.mock.results.at(-1).value;
++  return {
++    result,
++    runtimeTransport: creds.runtimeTransport ?? null,
++    effectiveUrl: executorResult.url,
++  };
+ }
+ 
+ describe("opencode-go DeepSeek endpoint matrix (via real handleChatCore)", () => {
+@@ -149,16 +158,21 @@ describe("opencode-go thinking-suffix guard (regression)", () => {
+     vi.clearAllMocks();
+   });
+ 
++  // Keep these original full titles stable: the differential regression gate keys cases by path and full_name.
+   it("does NOT route chat-only glm-5.2(max) to /messages on a claude-format request", async () => {
+-    const { result, runtimeTransport } = await route("glm-5.2(max)", "claude");
++    const { result, runtimeTransport, effectiveUrl } = await route("glm-5.2(max)", "claude");
+     expect(result.success).toBe(true);
+-    expect(runtimeTransport).toBeNull(); // guard must block; falls back to chat/completions
++    expect(runtimeTransport?.format).toBe("openai");
++    expect(effectiveUrl).toBe(ENDPOINTS.openai);
++    expect(effectiveUrl).not.toBe(ENDPOINTS.claude);
+   });
+ 
+   it("does NOT route chat-only kimi-k2.6(max) to /responses on a responses-format request", async () => {
+-    const { result, runtimeTransport } = await route("kimi-k2.6(max)", "openai-responses");
++    const { result, runtimeTransport, effectiveUrl } = await route("kimi-k2.6(max)", "openai-responses");
+     expect(result.success).toBe(true);
+-    expect(runtimeTransport).toBeNull();
++    expect(runtimeTransport?.format).toBe("openai");
++    expect(effectiveUrl).toBe(ENDPOINTS.openai);
++    expect(effectiveUrl).not.toBe(ENDPOINTS["openai-responses"]);
+   });
+ 
+   it("still routes minimax-m3(max) + claude-format client to /messages", async () => {
+@@ -168,9 +182,11 @@ describe("opencode-go thinking-suffix guard (regression)", () => {
+   });
+ 
+   it("does NOT route minimax-m3(max) (no responses support) to /responses", async () => {
+-    const { result, runtimeTransport } = await route("minimax-m3(max)", "openai-responses");
++    const { result, runtimeTransport, effectiveUrl } = await route("minimax-m3(max)", "openai-responses");
+     expect(result.success).toBe(true);
+-    expect(runtimeTransport).toBeNull();
++    expect(runtimeTransport?.format).toBe("openai");
++    expect(effectiveUrl).toBe(ENDPOINTS.openai);
++    expect(effectiveUrl).not.toBe(ENDPOINTS["openai-responses"]);
+   });
+ });
+ 
+diff --git a/tests/unit/responses-reasoning-wire.test.js b/tests/unit/responses-reasoning-wire.test.js
+new file mode 100644
+index 0000000..40cd512
+--- /dev/null
++++ b/tests/unit/responses-reasoning-wire.test.js
+@@ -0,0 +1,414 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import "../translator/registerAll.js";
++import { DefaultExecutor } from "../../open-sse/executors/default.js";
++import { handleChatCore } from "../../open-sse/handlers/chatCore.js";
++
++const {
++  proxyAwareFetchMock,
++  createRequestLoggerMock,
++  handleNonStreamingResponseMock,
++  buildOnStreamCompleteMock,
++  handleStreamingResponseMock,
++} = vi.hoisted(() => ({
++  proxyAwareFetchMock: vi.fn(),
++  createRequestLoggerMock: vi.fn(async () => ({
++    logClientRawRequest: vi.fn(),
++    logRawRequest: vi.fn(),
++    logTargetRequest: vi.fn(),
++    logError: vi.fn(),
++  })),
++  handleNonStreamingResponseMock: vi.fn(),
++  buildOnStreamCompleteMock: vi.fn(),
++  handleStreamingResponseMock: vi.fn(),
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
++  default: proxyAwareFetchMock,
++  proxyAwareFetch: proxyAwareFetchMock,
++}));
++
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: createRequestLoggerMock,
++}));
++
++vi.mock("../../open-sse/handlers/chatCore/nonStreamingHandler.js", () => ({
++  handleNonStreamingResponse: handleNonStreamingResponseMock,
++}));
++
++vi.mock("../../open-sse/handlers/chatCore/streamingHandler.js", () => ({
++  buildOnStreamComplete: buildOnStreamCompleteMock,
++  handleStreamingResponse: handleStreamingResponseMock,
++}));
++
++vi.mock("../../open-sse/services/tokenRefresh.js", () => ({
++  refreshWithRetry: vi.fn(),
++}));
++
++vi.mock("../../open-sse/rtk/caveman.js", () => ({ injectCaveman: vi.fn() }));
++vi.mock("../../open-sse/rtk/ponytail.js", () => ({ injectPonytail: vi.fn() }));
++vi.mock("../../open-sse/rtk/index.js", () => ({
++  compressMessages: vi.fn(() => null),
++  formatRtkLog: vi.fn(() => ""),
++}));
++vi.mock("../../open-sse/rtk/headroom.js", () => ({
++  compressWithHeadroom: vi.fn(async () => null),
++  formatHeadroomLog: vi.fn(() => ""),
++  formatHeadroomSizeLog: vi.fn(() => ""),
++  isHeadroomPhantomSavings: vi.fn(() => false),
++}));
++vi.mock("../../open-sse/rtk/pxpipe.js", () => ({
++  compressWithPxpipe: vi.fn(async () => ({ body: null, summary: null })),
++}));
++vi.mock("../../open-sse/translator/concerns/prefetch.js", () => ({
++  prefetchRemoteImages: vi.fn(async () => 0),
++}));
++vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", () => ({
++  buildRequestDetail: vi.fn((detail) => detail),
++  extractRequestConfig: vi.fn((body, stream) => ({ body, stream })),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(() => Promise.resolve()),
++  saveRequestDetail: vi.fn(() => Promise.resolve()),
++}));
++
++const MUSE = "muse";
++const MUSE_SPARK = "muse-spark-1.3-contributor";
++const RESPONSE_SUCCESS = { id: "resp_test", object: "response", status: "completed", output: [] };
++
++function chatMessages(stream, extra = {}) {
++  return {
++    model: `${MUSE}/${MUSE_SPARK}`,
++    stream,
++    messages: [
++      { role: "system", content: "Use the existing lookup tool." },
++      { role: "user", content: "Find item 7." },
++      {
++        role: "assistant",
++        content: null,
++        reasoning_content: "The item should be looked up.",
++        encrypted_content: "encrypted-prior-reasoning",
++        tool_calls: [{
++          id: "call_lookup_7",
++          type: "function",
++          function: { name: "lookup", arguments: "{\"item\":7}" },
++        }],
++      },
++      { role: "tool", tool_call_id: "call_lookup_7", content: "{\"value\":\"seven\"}" },
++      { role: "user", content: "Summarize it." },
++    ],
++    tools: [{
++      type: "function",
++      function: {
++        name: "lookup",
++        description: "Look up an item.",
++        parameters: { type: "object", properties: { item: { type: "integer" } } },
++      },
++    }],
++    ...extra,
++  };
++}
++
++function museCredentials() {
++  return {
++    apiKey: "test-only-muse-api-key",
++    connectionId: "test-muse-connection",
++    connectionName: "test Muse",
++    providerSpecificData: {},
++  };
++}
++
++function chatCoreOptions(body, providerThinking = null) {
++  const streaming = body.stream === true;
++  return {
++    body,
++    modelInfo: { provider: MUSE, model: MUSE_SPARK },
++    credentials: museCredentials(),
++    clientRawRequest: {
++      endpoint: "/v1/chat/completions",
++      body,
++      headers: { accept: streaming ? "text/event-stream" : "application/json" },
++    },
++    connectionId: "test-muse-connection",
++    providerThinking,
++    log: {
++      debug: vi.fn(),
++      info: vi.fn(),
++      warn: vi.fn(),
++      error: vi.fn(),
++      errorLine: vi.fn(),
++    },
++  };
++}
++
++function transformMuseResponse(body, credentials = { runtimeTransport: { format: "openai-responses" } }) {
++  return new DefaultExecutor(MUSE).transformRequest(MUSE_SPARK, structuredClone(body), true, credentials);
++}
++
++describe("Responses reasoning wire format", () => {
++  beforeEach(() => {
++    proxyAwareFetchMock.mockReset().mockImplementation(async () => new Response(
++      JSON.stringify(RESPONSE_SUCCESS),
++      { status: 200, headers: { "content-type": "application/json" } },
++    ));
++    handleNonStreamingResponseMock.mockReset().mockResolvedValue({
++      success: true,
++      responseMode: "json",
++    });
++    buildOnStreamCompleteMock.mockReset().mockReturnValue({
++      onStreamComplete: vi.fn(),
++      streamDetailId: "test-stream-detail",
++    });
++    handleStreamingResponseMock.mockReset().mockResolvedValue({
++      success: true,
++      responseMode: "sse",
++    });
++  });
++
++  it.each([true, false])(
++    "sends Muse xhigh as Responses reasoning.effort and returns HTTP 200 (stream=%s)",
++    async (stream) => {
++      const result = await handleChatCore(
++        chatCoreOptions(chatMessages(stream), { mode: "xhigh" }),
++      );
++
++      expect(proxyAwareFetchMock).toHaveBeenCalledTimes(1);
++      const [url, init] = proxyAwareFetchMock.mock.calls[0];
++      expect(url).toBe("https://api.meta.ai/v1/responses");
++      expect(init.headers.Authorization).toBe("Bearer test-only-muse-api-key");
++
++      const sent = JSON.parse(init.body);
++      expect(sent.reasoning).toEqual({ effort: "xhigh" });
++      expect(sent).not.toHaveProperty("reasoning_effort");
++      expect(sent.input).toEqual(expect.arrayContaining([
++        expect.objectContaining({
++          type: "reasoning",
++          encrypted_content: "encrypted-prior-reasoning",
++        }),
++        expect.objectContaining({
++          type: "function_call",
++          call_id: "call_lookup_7",
++          name: "lookup",
++        }),
++        expect.objectContaining({
++          type: "function_call_output",
++          call_id: "call_lookup_7",
++        }),
++      ]));
++      expect(result).toEqual({
++        success: true,
++        responseMode: stream ? "sse" : "json",
++      });
++    },
++  );
++
++  it("preserves an explicit medium effort over provider-level xhigh", async () => {
++    const result = await handleChatCore(
++      chatCoreOptions(chatMessages(false, { reasoning_effort: "medium" }), { mode: "xhigh" }),
++    );
++    const sent = JSON.parse(proxyAwareFetchMock.mock.calls[0][1].body);
++
++    expect(sent.reasoning).toEqual({ effort: "medium" });
++    expect(sent).not.toHaveProperty("reasoning_effort");
++    expect(result.success).toBe(true);
++  });
++
++  it("preserves native Responses reasoning keys, input continuity, include, and other fields", () => {
++    const input = [
++      {
++        type: "reasoning",
++        encrypted_content: "native-encrypted-reasoning",
++        summary: [{ type: "summary_text", text: "prior thought" }],
++      },
++      {
++        type: "function_call",
++        call_id: "call_native_1",
++        name: "lookup",
++        arguments: "{\"item\":1}",
++      },
++      { type: "function_call_output", call_id: "call_native_1", output: "one" },
++    ];
++    const body = {
++      model: MUSE_SPARK,
++      input,
++      include: ["reasoning.encrypted_content"],
++      reasoning: { summary: "detailed", context: "all_turns", vendor_extension: "preserve" },
++      reasoning_effort: "medium",
++      metadata: { trace: "keep" },
++      store: false,
++    };
++
++    const out = transformMuseResponse(body);
++
++    expect(out.reasoning).toEqual({
++      summary: "detailed",
++      context: "all_turns",
++      vendor_extension: "preserve",
++      effort: "medium",
++    });
++    expect(out).not.toHaveProperty("reasoning_effort");
++    expect(out.input).toEqual(input);
++    expect(out.include).toEqual(["reasoning.encrypted_content"]);
++    expect(out.metadata).toEqual({ trace: "keep" });
++    expect(out.store).toBe(false);
++  });
++
++  it.each([
++    "minimal",
++    "low",
++    "medium",
++    "high",
++    "xhigh",
++    "max",
++    "ultra",
++    "none",
++    "off",
++    "auto",
++    "future-level",
++  ])("moves Muse effort %s to Responses without changing its value", (effort) => {
++    const out = transformMuseResponse({ model: MUSE_SPARK, input: [], reasoning_effort: effort });
++    expect(out.reasoning.effort).toBe(effort);
++    expect(out).not.toHaveProperty("reasoning_effort");
++  });
++
++  it("does not inject reasoning when no intent is present", () => {
++    const out = transformMuseResponse({
++      model: MUSE_SPARK,
++      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
++      include: ["reasoning.encrypted_content"],
++    });
++
++    expect(out).not.toHaveProperty("reasoning");
++    expect(out).not.toHaveProperty("reasoning_effort");
++  });
++
++  it("preserves max for the standard Muse Spark model that advertises it", () => {
++    const out = new DefaultExecutor(MUSE).transformRequest("muse-spark-1.3", {
++      model: "muse-spark-1.3",
++      input: [],
++      reasoning_effort: "max",
++    }, true, { runtimeTransport: { format: "openai-responses" } });
++
++    expect(out.reasoning).toEqual({ effort: "max" });
++    expect(out).not.toHaveProperty("reasoning_effort");
++  });
++
++  it("forwards explicit none unchanged and returns the upstream 400", async () => {
++    proxyAwareFetchMock.mockResolvedValueOnce(new Response(
++      JSON.stringify({
++        error: {
++          message: "Unsupported reasoning effort: none",
++          type: "invalid_request_error",
++          code: "bad_request",
++        },
++      }),
++      { status: 400, headers: { "content-type": "application/json" } },
++    ));
++
++    const result = await handleChatCore(
++      chatCoreOptions(chatMessages(false, { reasoning_effort: "none" })),
++    );
++
++    expect(proxyAwareFetchMock.mock.calls[0][0]).toBe("https://api.meta.ai/v1/responses");
++    const sent = JSON.parse(proxyAwareFetchMock.mock.calls[0][1].body);
++    expect(sent.reasoning).toEqual({ effort: "none" });
++    expect(sent).not.toHaveProperty("reasoning_effort");
++    expect(result).toMatchObject({ success: false, status: 400 });
++    expect(result.error).toContain("Unsupported reasoning effort: none");
++  });
++
++  it("keeps contributor max intact at the executor boundary and propagates its upstream 400", async () => {
++    proxyAwareFetchMock.mockResolvedValueOnce(new Response(
++      JSON.stringify({
++        error: {
++          message: "Unsupported reasoning effort: max",
++          type: "invalid_request_error",
++          code: "bad_request",
++        },
++      }),
++      { status: 400, headers: { "content-type": "application/json" } },
++    ));
++
++    const result = await new DefaultExecutor(MUSE).execute({
++      model: MUSE_SPARK,
++      body: { model: MUSE_SPARK, input: [], reasoning_effort: "max" },
++      stream: false,
++      credentials: {
++        apiKey: "test-only-muse-api-key",
++        runtimeTransport: {
++          format: "openai-responses",
++          baseUrl: "https://api.meta.ai/v1/responses",
++        },
++      },
++      log: { debug: vi.fn() },
++    });
++
++    expect(proxyAwareFetchMock.mock.calls[0][0]).toBe("https://api.meta.ai/v1/responses");
++    const sent = JSON.parse(proxyAwareFetchMock.mock.calls[0][1].body);
++    expect(sent.reasoning).toEqual({ effort: "max" });
++    expect(sent).not.toHaveProperty("reasoning_effort");
++    expect(result.response.status).toBe(400);
++    expect(await result.response.text()).toContain("Unsupported reasoning effort: max");
++  });
++
++  it("uses provider config Responses format when there is no runtime transport", () => {
++    const executor = new DefaultExecutor("codex");
++    const out = executor.transformRequest("gpt-5.6-sol", {
++      model: "gpt-5.6-sol",
++      input: [],
++      reasoning_effort: "xhigh",
++    }, true, { accessToken: "test-only-codex-token" });
++
++    expect(out.reasoning).toEqual({ effort: "xhigh" });
++    expect(out).not.toHaveProperty("reasoning_effort");
++  });
++
++  it("lets runtime transport format override provider config format", () => {
++    const executor = new DefaultExecutor("codex");
++    const out = executor.transformRequest("gpt-5.6-sol", {
++      model: "gpt-5.6-sol",
++      messages: [{ role: "user", content: "hi" }],
++      reasoning_effort: "xhigh",
++    }, true, { runtimeTransport: { format: "openai" } });
++
++    expect(out.reasoning_effort).toBe("xhigh");
++    expect(out.reasoning).toBeUndefined();
++  });
++
++  it.each([
++    ["chat", "xhigh"],
++    ["chat", "none"],
++    ["responses", "xhigh"],
++    ["responses", "none"],
++  ])("uses the configured OpenAI-compatible %s wire for effort %s", (apiType, effort) => {
++    const provider = "openai-compatible-chat-test";
++    const executor = new DefaultExecutor(provider);
++    const credentials = {
++      apiKey: "test-only-compatible-key",
++      providerSpecificData: {
++        apiType,
++        baseUrl: "https://compatible.example/v1",
++      },
++    };
++    const body = {
++      model: "reasoning-model",
++      messages: [{ role: "user", content: "hi" }],
++      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
++      reasoning_effort: effort,
++    };
++
++    const out = executor.transformRequest("reasoning-model", structuredClone(body), true, credentials);
++
++    if (apiType === "chat") {
++      expect(out.reasoning_effort).toBe(effort);
++      expect(out.reasoning).toBeUndefined();
++      expect(executor.buildUrl("reasoning-model", true, 0, credentials))
++        .toBe("https://compatible.example/v1/chat/completions");
++    } else {
++      expect(out.reasoning).toEqual({ effort });
++      expect(out.reasoning_effort).toBeUndefined();
++      expect(executor.buildUrl("reasoning-model", true, 0, credentials))
++        .toBe("https://compatible.example/v1/responses");
++    }
++  });
++});
+diff --git a/tests/unit/responses-thinking-option-preservation.test.js b/tests/unit/responses-thinking-option-preservation.test.js
+new file mode 100644
+index 0000000..19b385e
+--- /dev/null
++++ b/tests/unit/responses-thinking-option-preservation.test.js
+@@ -0,0 +1,71 @@
++import { describe, expect, it } from "vitest";
++import "../translator/registerAll.js";
++import { applyThinking } from "../../open-sse/translator/concerns/thinkingUnified.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++
++const FORMAT = "openai-responses";
++const MODEL = "muse-spark-1.3-contributor";
++const preserve = { preserveResponsesOptions: true };
++
++describe("applyThinking preserveResponsesOptions", () => {
++  it("keeps native summary and opaque reasoning, include and metadata fields", () => {
++    const body = {
++      reasoning: { effort: "xhigh", summary: "none", vendor: { tier: 2 }, context: "keep" },
++      include: ["reasoning.encrypted_content"],
++      metadata: { run: "r1" },
++    };
++    applyThinking(FORMAT, MODEL, body, "muse", undefined, preserve);
++    expect(body.reasoning).toEqual({ effort: "xhigh", summary: "none", vendor: { tier: 2 }, context: "keep" });
++    expect(body.include).toEqual(["reasoning.encrypted_content"]);
++    expect(body.metadata).toEqual({ run: "r1" });
++    expect(body).not.toHaveProperty("reasoning_effort");
++  });
++
++  it.each(["none", "off", "max", "future-level"])("migrates top-level %s unchanged without a summary", (effort) => {
++    const body = { reasoning_effort: effort };
++    applyThinking(FORMAT, MODEL, body, "muse", undefined, preserve);
++    expect(body.reasoning).toEqual({ effort });
++    expect(body).not.toHaveProperty("reasoning_effort");
++  });
++
++  it("does not invent a summary for a provider-level intent", () => {
++    const body = {};
++    applyThinking(FORMAT, MODEL, body, "muse", { mode: "level", level: "xhigh" }, preserve);
++    expect(body.reasoning).toEqual({ effort: "xhigh" });
++  });
++
++  it("lets a model suffix override an explicit effort", () => {
++    const body = { reasoning: { effort: "low", summary: "none" } };
++    applyThinking(FORMAT, `${MODEL}(high)`, body, "muse", undefined, preserve);
++    expect(body.reasoning).toEqual({ effort: "high", summary: "none" });
++  });
++
++  it("keeps the upstream standalone behavior when the option is off", () => {
++    const body = { reasoning_effort: "xhigh" };
++    applyThinking(FORMAT, MODEL, body, "muse");
++    expect(body.reasoning).toEqual({ effort: "xhigh", summary: "auto" });
++    expect(body).not.toHaveProperty("reasoning_effort");
++  });
++});
++
++describe("translateRequest OpenAI to Responses keeps client reasoning options", () => {
++  const translate = (extra) => {
++    const body = { model: MODEL, messages: [{ role: "user", content: "hi" }], ...extra };
++    const before = JSON.stringify(body);
++    const out = translateRequest(FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, MODEL, body, true, {}, "muse");
++    expect(JSON.stringify(body)).toBe(before);
++    return out;
++  };
++
++  it("retains the client's summary and opaque reasoning keys next to the effort", () => {
++    const out = translate({ reasoning_effort: "medium", reasoning: { summary: "detailed", vendor: "keep" } });
++    expect(out.reasoning).toEqual({ summary: "detailed", vendor: "keep", effort: "medium" });
++    expect(out).not.toHaveProperty("reasoning_effort");
++  });
++
++  it("sends a plain effort without an invented summary", () => {
++    const out = translate({ reasoning_effort: "xhigh" });
++    expect(out.reasoning).toEqual({ effort: "xhigh" });
++  });
++});
+diff --git a/tests/unit/undeclared-responses-sse.test.js b/tests/unit/undeclared-responses-sse.test.js
+new file mode 100644
+index 0000000..8a0e19b
+--- /dev/null
++++ b/tests/unit/undeclared-responses-sse.test.js
+@@ -0,0 +1,206 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import "../translator/registerAll.js";
++
++const {
++  proxyAwareFetchMock,
++  handleNonStreamingResponseMock,
++  handleStreamingResponseMock,
++} = vi.hoisted(() => ({
++  proxyAwareFetchMock: vi.fn(),
++  handleNonStreamingResponseMock: vi.fn(),
++  handleStreamingResponseMock: vi.fn(),
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
++  default: proxyAwareFetchMock,
++  proxyAwareFetch: proxyAwareFetchMock,
++}));
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: vi.fn(async () => ({
++    logClientRawRequest: vi.fn(),
++    logRawRequest: vi.fn(),
++    logTargetRequest: vi.fn(),
++    logError: vi.fn(),
++  })),
++}));
++vi.mock("../../open-sse/handlers/chatCore/nonStreamingHandler.js", () => ({
++  handleNonStreamingResponse: handleNonStreamingResponseMock,
++}));
++vi.mock("../../open-sse/handlers/chatCore/streamingHandler.js", () => ({
++  buildOnStreamComplete: vi.fn(() => ({ onStreamComplete: vi.fn(), streamDetailId: "test-stream" })),
++  handleStreamingResponse: handleStreamingResponseMock,
++}));
++vi.mock("../../open-sse/services/tokenRefresh.js", () => ({ refreshWithRetry: vi.fn() }));
++vi.mock("../../open-sse/rtk/caveman.js", () => ({ injectCaveman: vi.fn() }));
++vi.mock("../../open-sse/rtk/ponytail.js", () => ({ injectPonytail: vi.fn() }));
++vi.mock("../../open-sse/rtk/index.js", () => ({
++  compressMessages: vi.fn(() => null),
++  formatRtkLog: vi.fn(() => ""),
++}));
++vi.mock("../../open-sse/rtk/headroom.js", () => ({
++  compressWithHeadroom: vi.fn(async () => null),
++  formatHeadroomLog: vi.fn(() => ""),
++  formatHeadroomSizeLog: vi.fn(() => ""),
++  isHeadroomPhantomSavings: vi.fn(() => false),
++}));
++vi.mock("../../open-sse/rtk/pxpipe.js", () => ({
++  compressWithPxpipe: vi.fn(async () => ({ body: null, summary: null })),
++}));
++vi.mock("../../open-sse/translator/concerns/prefetch.js", () => ({
++  prefetchRemoteImages: vi.fn(async () => 0),
++}));
++vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", () => ({
++  buildRequestDetail: vi.fn((detail) => detail),
++  extractRequestConfig: vi.fn((body, stream) => ({ body, stream })),
++  saveUsageStats: vi.fn(),
++  formatDoneLine: vi.fn(() => ""),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(() => Promise.resolve()),
++  saveRequestDetail: vi.fn(() => Promise.resolve()),
++  saveRequestUsage: vi.fn(),
++}));
++
++const { FORMATS } = await import("../../open-sse/translator/formats.js");
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++
++const PROVIDER = "muse";
++const MODEL = "muse-spark-1.3-contributor";
++
++function sseResponse(events, headers = {}) {
++  return new Response(events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join(""), {
++    headers: { "content-type": "text/event-stream", ...headers },
++  });
++}
++
++function chatOptions({ stream = false, sourceFormat = FORMATS.OPENAI, endpoint = "/v1/chat/completions" } = {}) {
++  const body = sourceFormat === FORMATS.OPENAI_RESPONSES
++    ? { model: MODEL, stream, input: "hello", store: false, include: ["reasoning.encrypted_content"] }
++    : { model: MODEL, stream, messages: [{ role: "user", content: "hello" }] };
++  return {
++    body,
++    modelInfo: { provider: PROVIDER, model: MODEL },
++    credentials: { accessToken: "test-token", connectionId: "test-connection", providerSpecificData: {} },
++    clientRawRequest: {
++      endpoint,
++      body,
++      headers: { accept: stream ? "text/event-stream" : "application/json" },
++    },
++    sourceFormatOverride: sourceFormat,
++    connectionId: "test-connection",
++    log: {},
++  };
++}
++
++function completedResponsesEvents(output) {
++  return [
++    ["response.created", { response: { id: "resp_test", created_at: 1700000000 } }],
++    ...output.map((item, output_index) => ["response.output_item.done", { output_index, item }]),
++    ["response.completed", { response: { usage: { input_tokens: 11, output_tokens: 5, total_tokens: 16 } } }],
++  ];
++}
++
++describe("Responses upstream SSE for clients that requested JSON", () => {
++  beforeEach(() => {
++    proxyAwareFetchMock.mockReset();
++    handleNonStreamingResponseMock.mockReset().mockResolvedValue({
++      success: true,
++      response: new Response('{"handled":"nonstream"}', { headers: { "content-type": "application/json" } }),
++    });
++    handleStreamingResponseMock.mockReset().mockResolvedValue({ success: true, responseMode: "sse" });
++  });
++
++  it("collects Responses SSE into a chat completion with tools, usage, and safe headers", async () => {
++    proxyAwareFetchMock.mockResolvedValue(sseResponse(completedResponsesEvents([
++      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Found it." }] },
++      { type: "function_call", call_id: "call_lookup_7", name: "lookup", arguments: "{\"item\":7}" },
++    ]), { "retry-after": "3" }));
++
++    const result = await handleChatCore(chatOptions());
++    const body = await result.response.json();
++
++    expect(result.success).toBe(true);
++    expect(body.object).toBe("chat.completion");
++    expect(body.choices[0]).toMatchObject({
++      message: {
++        content: "Found it.",
++        tool_calls: [{
++          id: "call_lookup_7",
++          function: { name: "lookup", arguments: "{\"item\":7}" },
++        }],
++      },
++      finish_reason: "tool_calls",
++    });
++    expect(body.usage).toMatchObject({ prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 });
++    expect(result.response.headers.get("content-type")).toBe("application/json");
++    expect(result.response.headers.get("retry-after")).toBe("3");
++    expect(result.response.headers.get("access-control-allow-origin")).toBe("*");
++    expect(result.response.headers.get("content-length")).toBeNull();
++    expect(handleNonStreamingResponseMock).not.toHaveBeenCalled();
++  });
++
++  it("returns native Responses JSON, including encrypted reasoning output", async () => {
++    proxyAwareFetchMock.mockResolvedValue(sseResponse(completedResponsesEvents([
++      {
++        type: "reasoning",
++        encrypted_content: "opaque-reasoning",
++        summary: [{ type: "summary_text", text: "private" }],
++      },
++      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Done." }] },
++    ])));
++
++    const result = await handleChatCore(chatOptions({
++      sourceFormat: FORMATS.OPENAI_RESPONSES,
++      endpoint: "/v1/responses",
++    }));
++    const body = await result.response.json();
++
++    expect(result.success).toBe(true);
++    expect(body.object).toBe("response");
++    expect(body.status).toBe("completed");
++    expect(body.output[0]).toMatchObject({
++      type: "reasoning",
++      encrypted_content: "opaque-reasoning",
++    });
++    expect(body.usage).toMatchObject({ input_tokens: 11, output_tokens: 5, total_tokens: 16 });
++    expect(handleNonStreamingResponseMock).not.toHaveBeenCalled();
++  });
++
++  it("leaves streaming requests on the streaming path", async () => {
++    proxyAwareFetchMock.mockResolvedValue(sseResponse([]));
++    const result = await handleChatCore(chatOptions({ stream: true }));
++
++    expect(result).toMatchObject({ success: true, responseMode: "sse" });
++    expect(handleStreamingResponseMock).toHaveBeenCalledTimes(1);
++    expect(handleNonStreamingResponseMock).not.toHaveBeenCalled();
++  });
++
++  it("lets an actual JSON upstream body fall through untouched", async () => {
++    const upstream = new Response('{"id":"resp_json","object":"response","status":"completed","output":[]}', {
++      headers: { "content-type": "application/json" },
++    });
++    proxyAwareFetchMock.mockResolvedValue(upstream);
++
++    await handleChatCore(chatOptions());
++
++    expect(handleNonStreamingResponseMock).toHaveBeenCalledTimes(1);
++    const call = handleNonStreamingResponseMock.mock.calls[0][0];
++    expect(call.providerResponse).toBe(upstream);
++    expect(call.providerResponse.bodyUsed).toBe(false);
++  });
++
++  it("propagates an upstream HTTP 400 without trying SSE conversion", async () => {
++    proxyAwareFetchMock.mockResolvedValue(new Response(
++      JSON.stringify({ error: { message: "unknown parameter `input`" } }),
++      { status: 400, headers: { "content-type": "application/json" } },
++    ));
++
++    const result = await handleChatCore(chatOptions());
++
++    expect(result.success).toBe(false);
++    expect(result.status).toBe(400);
++    expect(result.error).toContain("unknown parameter `input`");
++    expect(handleNonStreamingResponseMock).not.toHaveBeenCalled();
++  });
++});
+-- 
+2.55.0
+

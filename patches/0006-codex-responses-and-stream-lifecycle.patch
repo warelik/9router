@@ -1,0 +1,932 @@
+From f0042283fb507a5c4e5a3a50b44a31f3cfb0ec4d Mon Sep 17 00:00:00 2001
+From: downstream <downstream@local>
+Date: Sat, 7 Nov 2026 17:42:35 +0000
+Subject: [PATCH] Codex Responses compatibility and stream lifecycle
+
+
+Consolidated from the following original patches (file custody by final owner):
+
+- original #05: 0005 codex-responses-compatibility
+- original #26: Propagate native stream failures through every terminal path
+- original #40: Split native SSE events on bare CR and share the provider
+- original #68: Strip legacy Codex reasoning IDs on replay
+---
+ open-sse/executors/codex.js                   |  99 +++++++++---
+ .../translator/response/claude-to-openai.js   |   3 +-
+ .../translator/response/kiro-to-openai.js     |   3 +-
+ .../response/openai-to-antigravity.js         |   3 +-
+ open-sse/utils/streamHandler.js               |  60 +++++--
+ tests/translator/thinking-unified.test.js     |  17 ++
+ tests/unit/codex-legacy-item-ids.test.js      |  58 +++++++
+ .../codex-sse-error-before-output.test.js     | 148 ++++++++++++++++++
+ tests/unit/kiro-namespace-descriptors.test.js |  40 +++++
+ .../unit/openai-responses-incomplete.test.js  |  67 ++++++++
+ tests/unit/responses-output-index.test.js     |  78 +++++++++
+ 11 files changed, 542 insertions(+), 34 deletions(-)
+ create mode 100644 tests/unit/codex-legacy-item-ids.test.js
+ create mode 100644 tests/unit/codex-sse-error-before-output.test.js
+ create mode 100644 tests/unit/kiro-namespace-descriptors.test.js
+ create mode 100644 tests/unit/openai-responses-incomplete.test.js
+ create mode 100644 tests/unit/responses-output-index.test.js
+
+diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
+index f637307..b1335a9 100644
+--- a/open-sse/executors/codex.js
++++ b/open-sse/executors/codex.js
+@@ -1,4 +1,5 @@
+ import { BaseExecutor } from "./base.js";
++import { RESPONSES_ITEM, RESPONSES_TOOL, ROLE } from "../translator/schema/index.js";
+ import { CODEX_DEFAULT_INSTRUCTIONS } from "../config/codexInstructions.js";
+ import { PROVIDERS } from "../config/providers.js";
+ import {
+@@ -9,7 +10,7 @@ import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
+ import { fetchImageAsBase64 } from "../translator/concerns/image.js";
+ import { getModelUpstreamId, getProviderModels } from "../config/providerModels.js";
+ import { getThinkingLevels } from "../providers/thinkingLevels.js";
+-import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry } from "../config/runtimeConfig.js";
++import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry, SSE_DONE_PAYLOAD } from "../config/runtimeConfig.js";
+ import { dbg } from "../utils/debugLog.js";
+ import { resolveSessionId } from "../utils/sessionManager.js";
+ import { stripCodexUnsupportedPatterns } from "../utils/codexToolSchema.js";
+@@ -35,7 +36,7 @@ const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
+ 
+ // Hosted tool types that Codex/OpenAI Responses executes server-side
+ const CODEX_HOSTED_TOOL_TYPES = new Set([
+-  "image_generation", "web_search", "web_search_preview", "file_search",
++  "image_generation", RESPONSES_TOOL.WEB_SEARCH, "web_search_preview", "file_search",
+   "computer", "computer_use_preview", "code_interpreter", "mcp", "local_shell",
+   "tool_search"
+ ]);
+@@ -60,14 +61,15 @@ function convertSystemToDeveloperRole(body) {
+   }
+ }
+ 
+-// Strip server-generated item IDs (rs_/fc_/resp_/msg_) from input — avoids 404 with store=false
++// Strip server-generated item IDs from input — avoids invalid replay with store=false.
+ function stripStoredItemReferences(body, preserveLitePrefix = false) {
+   if (!Array.isArray(body.input)) return;
+   body.input = body.input.filter((item) => {
+     if (typeof item === "string" && SERVER_ID_PATTERN.test(item)) return false;
+     if (item && typeof item === "object" && !Array.isArray(item)) {
+       if (item.type === "item_reference") return false;
+-      if (typeof item.id === "string" && SERVER_ID_PATTERN.test(item.id)
++      const legacyReasoningId = item.type === RESPONSES_ITEM.REASONING && item.id?.startsWith?.("item_");
++      if (typeof item.id === "string" && (SERVER_ID_PATTERN.test(item.id) || legacyReasoningId)
+         && !(preserveLitePrefix && item.role === "developer" && item.id.startsWith("msg_"))) delete item.id;
+     }
+     return true;
+@@ -219,7 +221,7 @@ export class CodexExecutor extends BaseExecutor {
+    */
+   buildHeaders(credentials, stream = true, _url = null, model = null, body = null) {
+     const headers = super.buildHeaders(credentials, stream);
+-    if (isCodexResponsesLiteModel(model && getModelUpstreamId("cx", model)) && !body?.tools?.some?.(tool => tool?.type === "web_search")) {
++    if (isCodexResponsesLiteModel(model && getModelUpstreamId("cx", model)) && !body?.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH)) {
+       headers["x-openai-internal-codex-responses-lite"] = "true";
+     }
+     headers["session_id"] = this._currentSessionId || credentials?.connectionId || "default";
+@@ -312,6 +314,13 @@ export class CodexExecutor extends BaseExecutor {
+         result.response = codexSseErrorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, peek.message || CODEX_MODEL_CAPACITY_MESSAGE);
+         return result;
+       }
++      // A terminal error event before any user-visible output is a failed
++      // attempt, not a transient overload — surface it instead of retrying.
++      if (peek.status) {
++        args.log?.warn?.("RETRY", `CODEX | SSE error before output "${peek.message || peek.matched}" → ${peek.status}`);
++        result.response = codexSseErrorResponse(peek.status, peek.message || peek.matched);
++        return result;
++      }
+       if (attempt >= attempts) {
+         args.log?.warn?.("RETRY", `CODEX | SSE overloaded "${peek.matched}" — retries exhausted (${attempt}/${attempts})`);
+         result.response = codexSseErrorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, peek.message || peek.matched);
+@@ -325,16 +334,18 @@ export class CodexExecutor extends BaseExecutor {
+   }
+ 
+   // Peek first N bytes of SSE body to detect upstream transient errors.
+-  // Returns { matched: string|null, message: string|null, accountFallback: boolean, replacementBody: ReadableStream|null }.
++  // Returns { matched: string|null, message: string|null, accountFallback: boolean, status: number|null, replacementBody: ReadableStream|null }.
+   // Caller must use replacementBody when no error matched (original body has been read).
+   async _peekSseTransientError(response) {
+-    if (!response || !response.ok || !response.body) return { matched: null, message: null, accountFallback: false, replacementBody: null };
++    if (!response || !response.ok || !response.body) return { matched: null, message: null, accountFallback: false, status: null, replacementBody: null };
+     const reader = response.body.getReader();
+     const decoder = new TextDecoder();
+     const chunks = [];
+     let text = "";
+     let matched = null;
+     let accountFallback = false;
++    let sseError = null;
++    let lineScanOffset = 0;
+     try {
+       while (text.length < CODEX_SSE_PEEK_BYTES) {
+         const { done, value } = await reader.read();
+@@ -346,16 +357,54 @@ export class CodexExecutor extends BaseExecutor {
+         if (accountHit) { matched = accountHit; accountFallback = true; break; }
+         const retryHit = CODEX_SSE_RETRY_PATTERNS.find(p => lowerText.includes(p));
+         if (retryHit) { matched = retryHit; break; }
+-        if (CODEX_SSE_USER_OUTPUT_PATTERNS.some(p => lowerText.includes(p))) break;
++        // Error events are terminal only while they precede user-visible output;
++        // past that point the stream must reach the client untouched.
++        let outputIdx = -1;
++        for (const pattern of CODEX_SSE_USER_OUTPUT_PATTERNS) {
++          const idx = lowerText.indexOf(pattern);
++          if (idx !== -1 && (outputIdx === -1 || idx < outputIdx)) outputIdx = idx;
++        }
++        const scanEnd = outputIdx === -1 ? text.lastIndexOf("\n") : Math.min(text.lastIndexOf("\n"), outputIdx);
++        while (lineScanOffset <= scanEnd) {
++          const nl = text.indexOf("\n", lineScanOffset);
++          if (nl === -1 || nl > scanEnd) break;
++          const line = text.slice(lineScanOffset, nl);
++          lineScanOffset = nl + 1;
++          if (!line.startsWith("data:")) continue;
++          const data = line.slice(5).trim();
++          if (!data || data === SSE_DONE_PAYLOAD) continue;
++          try {
++            const event = JSON.parse(data);
++            if (event?.type === "error" || event?.type === "response.failed") {
++              const err = event.type === "response.failed" ? event.response?.error : event.error;
++              sseError = {
++                type: event.type,
++                status: (err?.type === "invalid_request_error" || err?.code === "invalid_request_error")
++                  ? HTTP_STATUS.BAD_REQUEST : HTTP_STATUS.BAD_GATEWAY,
++              };
++            }
++          } catch { /* ignore non-JSON SSE data lines */ }
++          if (sseError) break;
++        }
++        if (sseError || outputIdx !== -1) break;
+       }
+     } catch (e) {
+       dbg("CODEX", `peek read error: ${e.message}`);
+     }
+ 
+-    if (matched) {
++    if (matched || sseError) {
+       try { await reader.cancel(); } catch { /* noop */ }
+       try { reader.releaseLock(); } catch { /* noop */ }
+-      return { matched, message: extractSseErrorMessage(text, matched), accountFallback, replacementBody: null };
++      if (matched) {
++        return { matched, message: extractSseErrorMessage(text, matched), accountFallback, status: null, replacementBody: null };
++      }
++      return {
++        matched: sseError.type,
++        message: extractSseErrorMessage(text, sseError.type),
++        accountFallback: false,
++        status: sseError.status,
++        replacementBody: null,
++      };
+     }
+ 
+     reader.releaseLock();
+@@ -379,7 +428,7 @@ export class CodexExecutor extends BaseExecutor {
+         try { upstreamReader?.cancel(reason); } catch { /* noop */ }
+       },
+     });
+-    return { matched: null, message: null, accountFallback: false, replacementBody };
++    return { matched: null, message: null, accountFallback: false, status: null, replacementBody };
+   }
+ 
+   // Parse Codex usage_limit_reached to extract precise resetsAtMs; fallback to default otherwise
+@@ -423,30 +472,36 @@ export class CodexExecutor extends BaseExecutor {
+     // Register hosted search before choosing transport; Lite cannot execute it.
+     const autoWebSearch = body._autoCodexWebSearch === true;
+     delete body._autoCodexWebSearch;
+-    if (autoWebSearch && !body.tools?.some?.(tool => tool?.type === "web_search")) {
+-      body.tools = [...(Array.isArray(body.tools) ? body.tools : []), { type: "web_search" }];
++    // History with hosted web_search_call items requires the tool to be declared;
++    // otherwise upstream answers 200 with a terminal SSE error. The /compact
++    // endpoint was not observed failing this way, so its request is left unchanged.
++    const hasHostedSearchHistory = !this._isCompact && Array.isArray(body.input)
++      && body.input.some(item => item?.type === RESPONSES_ITEM.WEB_SEARCH_CALL);
++    if ((autoWebSearch || hasHostedSearchHistory)
++      && !body.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH)) {
++      body.tools = [...(Array.isArray(body.tools) ? body.tools : []), { type: RESPONSES_TOOL.WEB_SEARCH }];
+     }
+     // Hosted search cannot run from a Lite input prefix. When switching to
+     // regular Responses, move all prefixed tools without duplicating definitions.
+     let convertedLitePrefix = false;
+     if (isCodexResponsesLiteModel(upstreamModel) && Array.isArray(body.input)
+-      && (body.tools?.some?.(tool => tool?.type === "web_search")
+-        || body.input.some(item => item?.type === "additional_tools" && item.tools?.some?.(tool => tool?.type === "web_search")))) {
++      && (body.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH)
++        || body.input.some(item => item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS && item.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH)))) {
+       const tools = Array.isArray(body.tools) ? [...body.tools] : [];
+       const seen = new Set(tools.map(tool => `${tool?.type}:${tool?.name || tool?.function?.name || ""}`));
+       for (const item of body.input) {
+-        if (item?.type !== "additional_tools" || !Array.isArray(item.tools)) continue;
++        if (item?.type !== RESPONSES_ITEM.ADDITIONAL_TOOLS || !Array.isArray(item.tools)) continue;
+         for (const tool of item.tools) {
+           const name = `${tool?.type}:${tool?.name || tool?.function?.name || ""}`;
+           if (!seen.has(name)) { tools.push(tool); seen.add(name); }
+         }
+       }
+       body.tools = tools;
+-      convertedLitePrefix = body.input.some(item => item?.type === "additional_tools");
+-      body.input = body.input.filter(item => item?.type !== "additional_tools");
++      convertedLitePrefix = body.input.some(item => item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS);
++      body.input = body.input.filter(item => item?.type !== RESPONSES_ITEM.ADDITIONAL_TOOLS);
+     }
+     const responsesLite = isCodexResponsesLiteModel(upstreamModel)
+-      && !body.tools?.some?.(tool => tool?.type === "web_search");
++      && !body.tools?.some?.(tool => tool?.type === RESPONSES_TOOL.WEB_SEARCH);
+ 
+     // Ensure input is present and non-empty (Codex API rejects empty input)
+     if (!body.input || (Array.isArray(body.input) && body.input.length === 0)) {
+@@ -482,13 +537,13 @@ export class CodexExecutor extends BaseExecutor {
+     if (responsesLite) {
+       // Codex 0.155 carries tools and instructions as input prefix items.
+       const input = Array.isArray(body.input) ? body.input : [body.input];
+-      const hasLitePrefix = input.some((item) => item?.type === "additional_tools");
++      const hasLitePrefix = input.some((item) => item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS);
+       if (!hasLitePrefix) {
+         const instructions = typeof body.instructions === "string" && body.instructions.trim()
+           ? body.instructions : CODEX_DEFAULT_INSTRUCTIONS;
+-        const prefix = [{ type: "additional_tools", role: "developer", tools: Array.isArray(body.tools) ? body.tools : [] }];
++        const prefix = [{ type: RESPONSES_ITEM.ADDITIONAL_TOOLS, role: ROLE.DEVELOPER, tools: Array.isArray(body.tools) ? body.tools : [] }];
+         if (instructions) {
+-          prefix.push({ type: "message", role: "developer", content: [{ type: "input_text", text: instructions }] });
++          prefix.push({ type: RESPONSES_ITEM.MESSAGE, role: ROLE.DEVELOPER, content: [{ type: RESPONSES_ITEM.INPUT_TEXT, text: instructions }] });
+         }
+         input.unshift(...prefix);
+       }
+diff --git a/open-sse/translator/response/claude-to-openai.js b/open-sse/translator/response/claude-to-openai.js
+index 42a82a6..3e0906e 100644
+--- a/open-sse/translator/response/claude-to-openai.js
++++ b/open-sse/translator/response/claude-to-openai.js
+@@ -5,6 +5,7 @@ import { buildChunk } from "../concerns/chunk.js";
+ import { toOpenAIUsage } from "../concerns/usage.js";
+ import { reasoningDelta } from "../concerns/reasoning.js";
+ import { toOpenAIFinish } from "../concerns/finishReason.js";
++import { resolveToolName } from "../../utils/opencodeFingerprint.js";
+ 
+ // Create OpenAI chunk helper
+ function createChunk(state, delta, finishReason = null) {
+@@ -62,7 +63,7 @@ export function claudeToOpenAIResponse(chunk, state) {
+       } else if (block?.type === CLAUDE_BLOCK.TOOL_USE) {
+         const toolCallIndex = state.toolCallIndex++;
+         // Restore original tool name from mapping (Claude OAuth)
+-        const toolName = state.toolNameMap?.get(block.name) || block.name;
++        const toolName = state.toolNameMap ? resolveToolName(block.name, state.toolNameMap).name : block.name;
+         const toolCall = {
+           index: toolCallIndex,
+           id: block.id,
+diff --git a/open-sse/translator/response/kiro-to-openai.js b/open-sse/translator/response/kiro-to-openai.js
+index 8e713fd..c0f2f7c 100644
+--- a/open-sse/translator/response/kiro-to-openai.js
++++ b/open-sse/translator/response/kiro-to-openai.js
+@@ -10,6 +10,7 @@ import { toOpenAIUsage } from "../concerns/usage.js";
+ import { fallbackToolCallId } from "../concerns/toolCall.js";
+ import { reasoningDelta } from "../concerns/reasoning.js";
+ import { toOpenAIFinish } from "../concerns/finishReason.js";
++import { resolveToolName } from "../../utils/opencodeFingerprint.js";
+ 
+ // Build chunk meta for current kiro state
+ function chunkMeta(state) {
+@@ -25,7 +26,7 @@ function chunkMeta(state) {
+ function restoreToolName(state, name) {
+   const raw = name || "";
+   const map = state?.toolNameMap;
+-  return map && typeof map.get === "function" && map.has(raw) ? map.get(raw) : raw;
++  return resolveToolName(raw, map).name;
+ }
+ 
+ export function kiroToOpenAIResponse(chunk, state) {
+diff --git a/open-sse/translator/response/openai-to-antigravity.js b/open-sse/translator/response/openai-to-antigravity.js
+index 506f8e5..a9e11c2 100644
+--- a/open-sse/translator/response/openai-to-antigravity.js
++++ b/open-sse/translator/response/openai-to-antigravity.js
+@@ -1,6 +1,7 @@
+ import { register } from "../index.js";
+ import { FORMATS } from "../formats.js";
+ import { GEMINI_ROLE, OPENAI_FINISH, GEMINI_FINISH } from "../schema/index.js";
++import { resolveToolName } from "../../utils/opencodeFingerprint.js";
+ import { extractReasoningText } from "../concerns/reasoning.js";
+ 
+ // Convert OpenAI SSE chunk to Antigravity SSE format
+@@ -66,7 +67,7 @@ export function openaiToAntigravityResponse(chunk, state) {
+       let args = {};
+       try { args = JSON.parse(accum.arguments); } catch { /* empty */ }
+       // Restore original tool name if it was prefixed during cloaking
+-      const originalName = state.toolNameMap?.get(accum.name) || accum.name;
++      const originalName = state.toolNameMap ? resolveToolName(accum.name, state.toolNameMap).name : accum.name;
+       parts.push({
+         functionCall: {
+           name: originalName,
+diff --git a/open-sse/utils/streamHandler.js b/open-sse/utils/streamHandler.js
+index fce0170..35f2cb6 100644
+--- a/open-sse/utils/streamHandler.js
++++ b/open-sse/utils/streamHandler.js
+@@ -15,11 +15,23 @@ function getTimeString() {
+  * @param {string} options.provider - Provider name
+  * @param {string} options.model - Model name
+  */
+-export function createStreamController({ onDisconnect, onError, log, provider, model, reqTag = "" } = {}) {
++export function createStreamController({ onDisconnect, onError, log, provider, model, clientSignal, reqTag = "" } = {}) {
+   const abortController = new AbortController();
+   const startTime = Date.now();
+   let disconnected = false;
++  let clientDisconnected = false;
+   let abortTimeout = null;
++  const detachClientAbort = () => clientSignal?.removeEventListener("abort", onClientAbort);
++  const onClientAbort = () => {
++    if (disconnected) return;
++    clientDisconnected = true;
++    disconnected = true;
++    detachClientAbort();
++    abortController.abort(clientSignal.reason);
++    onDisconnect?.({ reason: "client_closed", duration: Date.now() - startTime });
++  };
++  if (clientSignal?.aborted) onClientAbort();
++  else clientSignal?.addEventListener("abort", onClientAbort, { once: true });
+ 
+   // Only abnormal terminations are logged; normal completion is covered by "📊 done".
+   // isError uses errorLine (always shown, ignores LOG_LEVEL) so failures survive quiet levels.
+@@ -35,11 +47,14 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
+     startTime,
+ 
+     isConnected: () => !disconnected,
++    isClientDisconnected: () => clientDisconnected,
+ 
+     // Call when client disconnects
+     handleDisconnect: (reason = "client_closed") => {
+       if (disconnected) return;
++      clientDisconnected = true;
+       disconnected = true;
++      detachClientAbort();
+ 
+       // Debug-only: Responses API has no [DONE] sentinel, so codex/droid close the
+       // socket on every completed request. "📊 done" is the authoritative outcome line.
+@@ -57,6 +72,7 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
+     handleComplete: () => {
+       if (disconnected) return;
+       disconnected = true;
++      detachClientAbort();
+ 
+       if (abortTimeout) {
+         clearTimeout(abortTimeout);
+@@ -68,6 +84,7 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
+     handleError: (error) => {
+       if (disconnected) return;
+       disconnected = true;
++      detachClientAbort();
+ 
+       if (abortTimeout) {
+         clearTimeout(abortTimeout);
+@@ -98,11 +115,16 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
+  *
+  * @param {function} [onAbortTerminal] - Receives a human-readable abort
+  * message and returns terminal SSE bytes to emit downstream.
++ * @param {boolean} [propagateAbortErrors] - Reject interrupted JSON streams
++ * instead of treating transport closure as successful EOF.
+  */
+-export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null) {
++export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, propagateAbortErrors = false, onStreamInterrupted = null) {
+   const reader = transformStream.readable.getReader();
+   const writer = transformStream.writable.getWriter();
+   let terminalEmitted = false;
++  const interrupted = async (error, clientCancelled = false) => {
++    if (onStreamInterrupted) await onStreamInterrupted(error, clientCancelled);
++  };
+ 
+   // Emit a synthesized terminal payload (e.g. Responses response.failed + [DONE]) once
+   const emitTerminal = (controller) => {
+@@ -117,6 +139,15 @@ export function createDisconnectAwareStream(transformStream, streamController, o
+   return new ReadableStream({
+     async pull(controller) {
+       if (!streamController.isConnected()) {
++        await interrupted(new Error("Upstream stream interrupted"), streamController.isClientDisconnected?.() === true);
++        if (propagateAbortErrors) {
++          const error = new Error("Upstream stream interrupted");
++          streamController.handleError(error);
++          reader.cancel().catch(() => {});
++          writer.abort().catch(() => {});
++          controller.error(error);
++          return;
++        }
+         emitTerminal(controller);
+         controller.close();
+         return;
+@@ -139,6 +170,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
+         if (!isControllerClosed) streamController.handleError(error);
+         reader.cancel().catch(() => {});
+         writer.abort().catch(() => {});
++        await interrupted(error, streamController.isClientDisconnected?.() === true);
+ 
+         // Treat network resets / socket hang up / abort as graceful close
+         const msg = error?.message || "";
+@@ -158,7 +190,12 @@ export function createDisconnectAwareStream(transformStream, streamController, o
+         // Graceful close on network/abort, or when a structured terminal is available
+         // (Responses passthrough prefers response.failed + [DONE] over a raw transport error)
+         try {
+-          if (!wasConnected || isNetworkClose || onAbortTerminal) {
++          if (propagateAbortErrors) {
++            // A native JSON stream cannot receive an SSE error trailer. Keep
++            // a transport failure observable instead of closing partial JSON
++            // as though the upstream completed it.
++            controller.error(error);
++          } else if (!wasConnected || isNetworkClose || onAbortTerminal) {
+             emitTerminal(controller);
+             controller.close();
+           } else {
+@@ -168,10 +205,10 @@ export function createDisconnectAwareStream(transformStream, streamController, o
+       }
+     },
+ 
+-    cancel(reason) {
++    async cancel(reason) {
+       streamController.handleDisconnect(reason || "cancelled");
+-      reader.cancel();
+-      writer.abort();
++      await Promise.allSettled([reader.cancel(reason), writer.abort(reason)]);
++      await interrupted(new Error(String(reason || "Client cancelled the stream")), streamController.isClientDisconnected?.() !== false);
+     }
+   });
+ }
+@@ -191,8 +228,10 @@ export function createDisconnectAwareStream(transformStream, streamController, o
+  * @param {Response} providerResponse - Response from provider
+  * @param {TransformStream} transformStream - Transform stream for SSE
+  * @param {object} streamController - Stream controller from createStreamController
++ * @param {boolean} [propagateAbortErrors] - Preserve transport failures for
++ * native JSON framing, which cannot accept an SSE error trailer.
+  */
+-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS) {
++export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, propagateAbortErrors = false, onStreamInterrupted = null) {
+   let stallTimer = null;
+   let chunkCount = 0;
+   let totalBytes = 0;
+@@ -221,6 +260,7 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
+     signal: streamController.signal,
+     startTime: streamController.startTime,
+     isConnected: () => streamController.isConnected(),
++    isClientDisconnected: () => streamController.isClientDisconnected?.() === true,
+     handleComplete: () => { dbg(tag, `complete | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleComplete(); },
+     handleError: (e) => { dbg(tag, `error: ${e?.message} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleError(e); },
+     handleDisconnect: (r) => { dbg(tag, `disconnect: ${r} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleDisconnect(r); },
+@@ -254,7 +294,9 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
+   return createDisconnectAwareStream(
+     { readable: transformedBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
+     wrappedController,
+-    onAbortTerminal ? () => onAbortTerminal(abortMessage) : null
++    onAbortTerminal ? () => onAbortTerminal(abortMessage) : null,
++    propagateAbortErrors,
++    onStreamInterrupted ? (error, clientCancelled) => onStreamInterrupted(
++      new Error(abortMessage === "stream stall timeout" ? abortMessage : error?.message || abortMessage), clientCancelled) : null,
+   );
+ }
+-
+diff --git a/tests/translator/thinking-unified.test.js b/tests/translator/thinking-unified.test.js
+index cd7c391..40ae798 100644
+--- a/tests/translator/thinking-unified.test.js
++++ b/tests/translator/thinking-unified.test.js
+@@ -5,7 +5,9 @@ import {
+   parseSuffix,
+   extractThinking,
+   applyThinking,
++  applyNativeGeminiThinking,
+ } from "../../open-sse/translator/concerns/thinkingUnified.js";
++import { DEFAULT_PROVIDER_THINKING_BUDGET } from "../../open-sse/config/runtimeConfig.js";
+ import { extractReasoningText } from "../../open-sse/translator/concerns/reasoning.js";
+ 
+ const apply = (targetFormat, model, body, provider) => {
+@@ -354,3 +356,18 @@ describe("transport-declared thinkingFormat (Responses endpoints)", () => {
+     expect(out.reasoning_effort).toBe("high");
+   });
+ });
++
++describe("applyNativeGeminiThinking provider default", () => {
++  it("provider mode on fills the shared default budget and keeps includeThoughts", () => {
++    const body = { generationConfig: { thinkingConfig: { includeThoughts: false } } };
++    const out = applyNativeGeminiThinking("gemini-2.5-flash", body, "gemini", { mode: "on" });
++    expect(out.generationConfig.thinkingConfig.thinkingBudget).toBe(DEFAULT_PROVIDER_THINKING_BUDGET);
++    expect(out.generationConfig.thinkingConfig.includeThoughts).toBe(false);
++  });
++
++  it("keeps an explicit client zero thinking budget", () => {
++    const body = { generationConfig: { thinkingConfig: { thinkingBudget: 0 } } };
++    const out = applyNativeGeminiThinking("gemini-2.5-flash", body, "gemini", { mode: "on" });
++    expect(out.generationConfig.thinkingConfig.thinkingBudget).toBe(0);
++  });
++});
+diff --git a/tests/unit/codex-legacy-item-ids.test.js b/tests/unit/codex-legacy-item-ids.test.js
+new file mode 100644
+index 0000000..46510c3
+--- /dev/null
++++ b/tests/unit/codex-legacy-item-ids.test.js
+@@ -0,0 +1,58 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { CodexExecutor } from "../../open-sse/executors/codex.js";
++import * as proxyFetchModule from "../../open-sse/utils/proxyFetch.js";
++
++const credentials = { connectionId: "legacy-item-fixture", accessToken: "fixture-token" };
++const user = { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] };
++afterEach(() => vi.restoreAllMocks());
++
++describe("Codex legacy reasoning IDs", () => {
++  it("removes only legacy reasoning IDs and preserves continuity and order", () => {
++    const encrypted = "opaque-redacted-encrypted-content";
++    const body = new CodexExecutor().transformRequest("gpt-5.5", {
++      model: "gpt-5.5", instructions: "fixture", tools: [], input: [
++        user,
++        { type: "reasoning", id: "item_legacy", summary: [], encrypted_content: encrypted },
++        { type: "reasoning", id: "rs_saved", summary: [], encrypted_content: encrypted },
++        { type: "function_call", id: "item_call", call_id: "call_preserved", name: "tool", arguments: "{}" },
++        { type: "function_call_output", call_id: "call_preserved", output: "ok" },
++      ],
++    }, true, credentials);
++    expect(body.input.map(item => item.type)).toEqual(["message", "reasoning", "reasoning", "function_call", "function_call_output"]);
++    expect(body.input[1].id).toBeUndefined();
++    expect(body.input[2].id).toBeUndefined();
++    expect(body.input[1].encrypted_content).toBe(encrypted);
++    expect(body.input[2].encrypted_content).toBe(encrypted);
++    expect(body.input[3]).toMatchObject({ id: "item_call", call_id: "call_preserved", arguments: "{}" });
++    expect(body.input[4]).toMatchObject({ call_id: "call_preserved", output: "ok" });
++  });
++
++  it("preserves the Lite developer msg ID exception", () => {
++    const body = new CodexExecutor().transformRequest("gpt-6.1-sol", {
++      model: "gpt-6.1-sol", instructions: "", tools: [], input: [
++        { type: "message", role: "developer", id: "msg_lite_prefix", content: [{ type: "input_text", text: "fixture" }] },
++        user,
++      ],
++    }, true, credentials);
++    expect(body.input.some(item => item.id === "msg_lite_prefix")).toBe(true);
++  });
++
++  it("sends normalized reasoning through execute to an ID-validating stub", async () => {
++    const encrypted = "opaque-redacted";
++    const fetch = vi.spyOn(proxyFetchModule, "proxyAwareFetch").mockImplementation(async (_url, options) => {
++      const request = JSON.parse(options.body);
++      const reasoning = request.input.find(item => item.type === "reasoning");
++      expect(reasoning.id).toBeUndefined();
++      expect(reasoning.encrypted_content).toBe(encrypted);
++      return new Response('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n', {
++        status: 200, headers: { "Content-Type": "text/event-stream" },
++      });
++    });
++    const result = await new CodexExecutor().execute({
++      model: "gpt-5.5", stream: true, credentials,
++      body: { model: "gpt-5.5", input: [user, { type: "reasoning", id: "item_legacy", summary: [], encrypted_content: encrypted }] },
++    });
++    expect(fetch).toHaveBeenCalledTimes(1);
++    expect(result.response.status).toBe(200);
++  });
++});
+diff --git a/tests/unit/codex-sse-error-before-output.test.js b/tests/unit/codex-sse-error-before-output.test.js
+new file mode 100644
+index 0000000..ec622c6
+--- /dev/null
++++ b/tests/unit/codex-sse-error-before-output.test.js
+@@ -0,0 +1,148 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++import { CodexExecutor } from "../../open-sse/executors/codex.js";
++import { handleComboChat } from "../../open-sse/services/combo.js";
++import * as proxyFetchModule from "../../open-sse/utils/proxyFetch.js";
++
++const credentials = { connectionId: "fixture", accessToken: "fixture-token" };
++afterEach(() => vi.restoreAllMocks());
++
++function streamFromText(text) {
++  const encoder = new TextEncoder();
++  return new ReadableStream({
++    start(controller) {
++      controller.enqueue(encoder.encode(text));
++      controller.close();
++    },
++  });
++}
++
++function sseResponse(text) {
++  return new Response(streamFromText(text), {
++    status: 200,
++    headers: { "Content-Type": "text/event-stream" },
++  });
++}
++
++const INTERNAL_ERROR_SSE = [
++  "event: error",
++  'data: {"type":"error","error":{"message":"response protection is unavailable","type":"internal_error"}}',
++  "",
++].join("\n");
++
++const INVALID_REQUEST_SSE = [
++  "event: error",
++  'data: {"type":"error","error":{"message":"No tool output found for function call call_1","type":"invalid_request_error"}}',
++  "",
++].join("\n");
++
++const RESPONSE_FAILED_SSE = [
++  "event: response.failed",
++  'data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"upstream exploded"}}}',
++  "",
++].join("\n");
++
++describe("Codex SSE error events before user output", () => {
++  it("maps a terminal internal_error event to 502 with the upstream message", async () => {
++    const peek = await new CodexExecutor()._peekSseTransientError(sseResponse(INTERNAL_ERROR_SSE));
++    expect(peek.status).toBe(502);
++    expect(peek.accountFallback).toBe(false);
++    expect(peek.message).toBe("response protection is unavailable");
++  });
++
++  it("maps an invalid_request_error event to 400", async () => {
++    const peek = await new CodexExecutor()._peekSseTransientError(sseResponse(INVALID_REQUEST_SSE));
++    expect(peek.status).toBe(400);
++    expect(peek.message).toBe("No tool output found for function call call_1");
++  });
++
++  it("maps response.failed with a nested error to 502 and its message", async () => {
++    const peek = await new CodexExecutor()._peekSseTransientError(sseResponse(RESPONSE_FAILED_SSE));
++    expect(peek.status).toBe(502);
++    expect(peek.message).toBe("upstream exploded");
++  });
++
++  it("streams an error that follows user-visible output through untouched", async () => {
++    const text = [
++      "event: response.output_text.delta",
++      'data: {"type":"response.output_text.delta","delta":"OK"}',
++      "",
++      "event: error",
++      'data: {"type":"error","error":{"message":"response protection is unavailable","type":"internal_error"}}',
++      "",
++    ].join("\n");
++    const peek = await new CodexExecutor()._peekSseTransientError(sseResponse(text));
++    expect(peek.matched).toBeNull();
++    expect(peek.status).toBeNull();
++    await expect(new Response(peek.replacementBody).text()).resolves.toBe(text);
++  });
++
++  it("keeps the capacity pattern as account fallback even inside an error event", async () => {
++    const peek = await new CodexExecutor()._peekSseTransientError(sseResponse([
++      "event: error",
++      'data: {"type":"error","error":{"message":"Selected model is at capacity. Please try a different model."}}',
++      "",
++    ].join("\n")));
++    expect(peek.accountFallback).toBe(true);
++    expect(peek.status).toBeNull();
++  });
++
++  it("keeps the overload pattern as a retryable transient match", async () => {
++    const peek = await new CodexExecutor()._peekSseTransientError(sseResponse([
++      "event: error",
++      'data: {"type":"error","error":{"type":"server_is_overloaded","message":"overloaded"}}',
++      "",
++    ].join("\n")));
++    expect(peek.matched).toBe("server_is_overloaded");
++    expect(peek.accountFallback).toBe(false);
++    expect(peek.status).toBeNull();
++  });
++
++  it("execute() turns a terminal SSE error into a JSON error response without retrying", async () => {
++    const fetchMock = vi.spyOn(proxyFetchModule, "proxyAwareFetch")
++      .mockResolvedValue(sseResponse(INTERNAL_ERROR_SSE));
++    const result = await new CodexExecutor().execute({
++      model: "gpt-6.1-sol",
++      body: { model: "gpt-6.1-sol", input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }] },
++      stream: true, credentials,
++    });
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(result.response.status).toBe(502);
++    const json = await result.response.json();
++    expect(json.error.message).toBe("response protection is unavailable");
++  });
++
++  it("a combo falls back to the next model when the first returns 200 + SSE internal_error", async () => {
++    const okSse = [
++      "event: response.output_text.delta",
++      'data: {"type":"response.output_text.delta","delta":"OK"}',
++      "",
++    ].join("\n");
++    const fetchMock = vi.spyOn(proxyFetchModule, "proxyAwareFetch");
++    fetchMock
++      .mockResolvedValueOnce(sseResponse(INTERNAL_ERROR_SSE))
++      .mockResolvedValueOnce(sseResponse(okSse));
++
++    const executor = new CodexExecutor();
++    const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
++    const result = await handleComboChat({
++      body: { model: "combo", input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }] },
++      models: ["codex/gpt-5.5", "codex/gpt-5.6-sol"],
++      handleSingleModel: async (body, modelStr) => {
++        const r = await executor.execute({
++          model: modelStr.split("/")[1],
++          body: { ...body, model: modelStr.split("/")[1] },
++          stream: true, credentials, log,
++        });
++        return r.response;
++      },
++      log,
++    });
++
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    expect(result.ok).toBe(true);
++    expect(log.info.mock.calls.some(c => String(c[1]).includes("codex/gpt-5.6-sol succeeded"))).toBe(true);
++    expect(log.info.mock.calls.some(c => String(c[1]).includes("codex/gpt-5.5 succeeded"))).toBe(false);
++    await expect(result.text()).resolves.toBe(okSse);
++  });
++});
+diff --git a/tests/unit/kiro-namespace-descriptors.test.js b/tests/unit/kiro-namespace-descriptors.test.js
+new file mode 100644
+index 0000000..a7104c8
+--- /dev/null
++++ b/tests/unit/kiro-namespace-descriptors.test.js
+@@ -0,0 +1,40 @@
++import { describe, expect, it } from "vitest";
++import { kiroToOpenAIResponse } from "../../open-sse/translator/response/kiro-to-openai.js";
++import { kiroToClaudeResponse, kiroToClaudeNonStreaming } from "../../open-sse/translator/response/kiro-to-claude.js";
++
++const wire = "alpha_read";
++const descriptorMap = () => new Map([[wire, { name: "read", namespace: "alpha", type: "function" }]]);
++const normalizedChunk = (name, delta = {}, finish = null) => ({
++  id: "chatcmpl-kiro", object: "chat.completion.chunk", created: 1, model: "kiro",
++  choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_kiro", type: "function", function: { name, arguments: '{"title":"x"}' } }], ...delta }, finish_reason: finish }],
++});
++
++describe("Kiro response adapters keep descriptor maps off the wire name", () => {
++  it("raw toolUseEvent yields the string wire alias", () => {
++    const out = kiroToOpenAIResponse({ toolUseEvent: { toolUseId: "call_kiro", name: wire, input: { title: "x" } } }, { toolNameMap: descriptorMap() });
++    const call = out.choices[0].delta.tool_calls[0];
++    expect(call.function.name).toBe(wire);
++    expect(call).toMatchObject({ id: "call_kiro" });
++    expect(call.function.arguments).toBe('{"title":"x"}');
++  });
++
++  it("executor-normalized chunk yields the string wire alias", () => {
++    const out = kiroToOpenAIResponse(normalizedChunk(wire), { toolNameMap: descriptorMap() });
++    expect(out.choices[0].delta.tool_calls[0].function.name).toBe(wire);
++  });
++
++  it("Kiro to Claude streaming and non-streaming yield the string wire alias", () => {
++    const state = { toolNameMap: descriptorMap(), nextBlockIndex: 0 };
++    const events = kiroToClaudeResponse(normalizedChunk(wire), state);
++    const start = events.find(e => e.type === "content_block_start");
++    expect(start.content_block.name).toBe(wire);
++    expect(start.content_block.id).toBe("call_kiro");
++    const message = kiroToClaudeNonStreaming({ _toolNameMap: descriptorMap(), choices: [{ message: { tool_calls: [{ id: "call_kiro", function: { name: wire, arguments: '{"title":"x"}' } }] }, finish_reason: "tool_calls" }] });
++    expect(message.content[0]).toMatchObject({ type: "tool_use", id: "call_kiro", name: wire, input: { title: "x" } });
++  });
++
++  it("plain string map entries still restore the original tool name", () => {
++    const out = kiroToOpenAIResponse(normalizedChunk("wire_plain"), { toolNameMap: new Map([["wire_plain", "original_tool"]]) });
++    expect(out.choices[0].delta.tool_calls[0].function.name).toBe("original_tool");
++  });
++});
+diff --git a/tests/unit/openai-responses-incomplete.test.js b/tests/unit/openai-responses-incomplete.test.js
+new file mode 100644
+index 0000000..7a7a2bd
+--- /dev/null
++++ b/tests/unit/openai-responses-incomplete.test.js
+@@ -0,0 +1,67 @@
++import { describe, expect, it } from "vitest";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.js";
++
++async function run(chunks, format, provider) {
++  const input = chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join("");
++  const stream = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(input)); controller.close(); } });
++  const output = await new Response(stream.pipeThrough(createSSETransformStreamWithLogger(format, FORMATS.OPENAI_RESPONSES, provider, null, null, "gemini-3.8-flash"))).text();
++  return output.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)));
++}
++
++const targets = [
++  [FORMATS.GEMINI, "gemini"],
++  [FORMATS.GEMINI, "aistudio"],
++  [FORMATS.ANTIGRAVITY, "antigravity"],
++];
++const usageMetadata = { promptTokenCount: 90, candidatesTokenCount: 10, thoughtsTokenCount: 10, cachedContentTokenCount: 40, totalTokenCount: 110 };
++const expectedUsage = { input_tokens: 90, output_tokens: 20, total_tokens: 110, input_tokens_details: { cached_tokens: 40 }, output_tokens_details: { reasoning_tokens: 10 } };
++
++for (const [format, provider] of targets) {
++  describe(`${provider} to Responses terminal truth`, () => {
++    for (const [finishReason, expectedReason] of [["MAX_TOKENS", "max_output_tokens"], ["SAFETY", "content_filter"]]) {
++      for (const text of ["", "частичный ответ"]) {
++        it(`${finishReason} with ${text ? "partial text" : "empty text"} is incomplete`, async () => {
++          const response = { candidates: [{ content: { parts: text ? [{ text }] : [] }, finishReason }], usageMetadata };
++          const events = await run([format === FORMATS.ANTIGRAVITY ? { response } : response], format, provider);
++          const terminals = events.filter(event => ["response.completed", "response.incomplete", "response.failed"].includes(event.type));
++          expect(terminals).toHaveLength(1);
++          expect(terminals[0]).toMatchObject({ type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: expectedReason }, error: null, usage: expectedUsage } });
++          expect(events.some(event => event.type === "response.completed")).toBe(false);
++        });
++      }
++    }
++    it("STOP still completes and retains usage", async () => {
++      const response = { candidates: [{ content: { parts: [{ text: "полный ответ" }] }, finishReason: "STOP" }], usageMetadata };
++      const events = await run([format === FORMATS.ANTIGRAVITY ? { response } : response], format, provider);
++      const terminals = events.filter(event => ["response.completed", "response.incomplete", "response.failed"].includes(event.type));
++      expect(terminals).toHaveLength(1);
++      expect(terminals[0]).toMatchObject({ type: "response.completed", response: { status: "completed", usage: expectedUsage } });
++      expect(terminals[0].response.incomplete_details).toBeUndefined();
++    });
++  });
++}
++
++it("direct OpenAI length retains its reason through a late usage trailer", async () => {
++  const events = await run([
++    { id: "fixture", choices: [{ index: 0, delta: { content: "partial" }, finish_reason: null }] },
++    { id: "fixture", choices: [{ index: 0, delta: {}, finish_reason: "length" }] },
++    { choices: [], usage: { prompt_tokens: 90, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 40 }, completion_tokens_details: { reasoning_tokens: 10 } } },
++  ], FORMATS.OPENAI, "openai");
++  const terminals = events.filter(event => ["response.completed", "response.incomplete", "response.failed"].includes(event.type));
++  expect(terminals).toHaveLength(1);
++  expect(terminals[0]).toMatchObject({ type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, usage: expectedUsage } });
++});
++
++it("native Responses incomplete is terminal without an added disconnect failure", async () => {
++  const events = await run([{ type: "response.incomplete", response: { id: "fixture", status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, usage: expectedUsage } }], FORMATS.OPENAI_RESPONSES, "codex");
++  expect(events.filter(event => event.type === "response.incomplete")).toHaveLength(1);
++  expect(events.some(event => event.type === "response.failed")).toBe(false);
++});
++
++it("terminal guard recognizes incomplete event and status fallback", async () => {
++  const { isOpenAIResponsesTerminalEvent } = await import("../../open-sse/utils/responsesStreamHelpers.js");
++  expect(isOpenAIResponsesTerminalEvent("response.incomplete", {})).toBe(true);
++  expect(isOpenAIResponsesTerminalEvent(null, { response: { status: "incomplete" } })).toBe(true);
++  expect(isOpenAIResponsesTerminalEvent(null, { response: { status: "in_progress" } })).toBe(false);
++});
+diff --git a/tests/unit/responses-output-index.test.js b/tests/unit/responses-output-index.test.js
+new file mode 100644
+index 0000000..f5b8bfd
+--- /dev/null
++++ b/tests/unit/responses-output-index.test.js
+@@ -0,0 +1,78 @@
++import { describe, expect, it } from "vitest";
++
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { initState } from "../../open-sse/translator/index.js";
++import { openaiToOpenAIResponsesResponse } from "../../open-sse/translator/response/openai-responses.js";
++
++// Chat -> Responses stream: every output item (reasoning, message, each tool call) must get
++// its own output_index, and response.completed.output must keep all of them in emission order.
++// Regression: reasoning, the message and the first tool call all used index 0, so clients saw a
++// repeated output_item.done index and the reasoning item was overwritten in completed.output.
++function run(chunks) {
++  const state = { ...initState(FORMATS.OPENAI_RESPONSES), targetFormat: FORMATS.OPENAI };
++  const events = [];
++  for (const chunk of chunks) events.push(...openaiToOpenAIResponsesResponse(chunk, state));
++  events.push(...openaiToOpenAIResponsesResponse(null, state));
++  return events;
++}
++
++const chunk = (delta, finish_reason) => ({ id: "chatcmpl-1", choices: [{ index: 0, delta, ...(finish_reason ? { finish_reason } : {}) }] });
++const reasoning = (text) => chunk({ reasoning_content: text });
++const text = (t) => chunk({ content: t });
++const call = (index, id, name, args) => chunk({ tool_calls: [{ index, id, type: "function", function: { name, arguments: args } }] });
++const finish = (reason = "stop") => ({ id: "chatcmpl-1", choices: [{ index: 0, delta: {}, finish_reason: reason }], usage: { prompt_tokens: 5, completion_tokens: 5 } });
++
++const byEvent = (events, name) => events.filter((e) => e.event === name);
++const completed = (events) => byEvent(events, "response.completed")[0].data.response;
++
++function expectConsistentIndices(events) {
++  const added = byEvent(events, "response.output_item.added").map((e) => ({ index: e.data.output_index, id: e.data.item.id }));
++  const done = byEvent(events, "response.output_item.done").map((e) => ({ index: e.data.output_index, id: e.data.item.id }));
++  expect(new Set(added.map((a) => a.index)).size, "output_item.added indices must be unique").toBe(added.length);
++  expect(new Set(done.map((d) => d.index)).size, "output_item.done indices must be unique").toBe(done.length);
++  for (const item of added) {
++    expect(done.find((d) => d.id === item.id)?.index, `done index of ${item.id}`).toBe(item.index);
++  }
++  // Every event that names an item must use the index that item was added with.
++  const indexOf = new Map(added.map((a) => [a.id, a.index]));
++  for (const e of events) {
++    if (e.data?.item_id && e.data.output_index !== undefined) {
++      expect(e.data.output_index, `${e.event} for ${e.data.item_id}`).toBe(indexOf.get(e.data.item_id));
++    }
++  }
++  expect(added.map((a) => a.index)).toEqual(added.map((_, i) => i));
++  return added;
++}
++
++describe("Responses output_index allocation", () => {
++  it("gives reasoning and the following message different indices and keeps both in completed.output", () => {
++    const events = run([reasoning("think"), text("answer"), finish()]);
++    const added = expectConsistentIndices(events);
++    expect(added).toHaveLength(2);
++    expect(completed(events).output.map((o) => o.type)).toEqual(["reasoning", "message"]);
++  });
++
++  it("gives reasoning and the first tool call different indices", () => {
++    const events = run([reasoning("think"), call(0, "call_a", "lookup", "{\"q\":1}"), finish("tool_calls")]);
++    expectConsistentIndices(events);
++    expect(completed(events).output.map((o) => o.type)).toEqual(["reasoning", "function_call"]);
++  });
++
++  it("orders reasoning, message and parallel tool calls by first appearance", () => {
++    const events = run([
++      reasoning("think"), text("let me check"),
++      call(0, "call_a", "lookup", "{}"), call(1, "call_b", "lookup", "{}"),
++      finish("tool_calls"),
++    ]);
++    expectConsistentIndices(events);
++    expect(completed(events).output.map((o) => o.type)).toEqual(["reasoning", "message", "function_call", "function_call"]);
++    expect(completed(events).output.filter((o) => o.type === "function_call").map((o) => o.call_id)).toEqual(["call_a", "call_b"]);
++  });
++
++  it("keeps the old indices for the cases that never collided", () => {
++    const textOnly = run([text("a"), finish()]);
++    expect(byEvent(textOnly, "response.output_item.added")[0].data.output_index).toBe(0);
++    const calls = run([call(0, "call_a", "f", "{}"), call(1, "call_b", "f", "{}"), finish("tool_calls")]);
++    expect(byEvent(calls, "response.output_item.added").map((e) => e.data.output_index)).toEqual([0, 1]);
++  });
++});
+-- 
+2.55.0
+

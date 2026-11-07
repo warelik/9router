@@ -1,8 +1,12 @@
-From 7de67b03abd48175766036bc2a9f69a146feac75 Mon Sep 17 00:00:00 2001
-From: Overlay Migration <overlay-migration@example.invalid>
-Date: Fri, 16 Oct 2026 08:36:03 +0000
-Subject: [PATCH] [PATCH 7/8] 0007 cloudflare-systemone
+From 8469d4ea9d7999bdd8f799ac6f75ffeec5ecd09f Mon Sep 17 00:00:00 2001
+From: downstream <downstream@local>
+Date: Sat, 7 Nov 2026 17:42:51 +0000
+Subject: [PATCH] Cloudflare AI and SystemOne provider
 
+
+Consolidated from the following original patches (file custody by final owner):
+
+- original #07: 0007 cloudflare-systemone
 ---
  open-sse/handlers/systemoneCore.js           | 19 +++++
  open-sse/providers/registry/cloudflare-ai.js |  1 +
@@ -11,7 +15,7 @@ Subject: [PATCH] [PATCH 7/8] 0007 cloudflare-systemone
  create mode 100644 tests/unit/systemone-core.test.js
 
 diff --git a/open-sse/handlers/systemoneCore.js b/open-sse/handlers/systemoneCore.js
-index e84b36ad..c9edcfe7 100644
+index e84b36a..c9edcfe 100644
 --- a/open-sse/handlers/systemoneCore.js
 +++ b/open-sse/handlers/systemoneCore.js
 @@ -27,6 +27,9 @@ export function buildSystemoneUrl(override, cfg) {
@@ -48,7 +52,7 @@ index e84b36ad..c9edcfe7 100644
  
    const usage = responseBody?.usage;
 diff --git a/open-sse/providers/registry/cloudflare-ai.js b/open-sse/providers/registry/cloudflare-ai.js
-index d998c924..d1ab31a4 100644
+index d998c92..d1ab31a 100644
 --- a/open-sse/providers/registry/cloudflare-ai.js
 +++ b/open-sse/providers/registry/cloudflare-ai.js
 @@ -58,6 +58,7 @@ export default {
@@ -61,7 +65,7 @@ index d998c924..d1ab31a4 100644
  };
 diff --git a/tests/unit/systemone-core.test.js b/tests/unit/systemone-core.test.js
 new file mode 100644
-index 00000000..80299c61
+index 0000000..80299c6
 --- /dev/null
 +++ b/tests/unit/systemone-core.test.js
 @@ -0,0 +1,83 @@
@@ -149,5 +153,5 @@ index 00000000..80299c61
 +  });
 +});
 -- 
-2.43.0
+2.55.0
 

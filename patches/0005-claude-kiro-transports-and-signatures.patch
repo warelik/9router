@@ -1,0 +1,1230 @@
+From 43639af092b5bfcef45609cf73ad3fe0937165a4 Mon Sep 17 00:00:00 2001
+From: downstream <downstream@local>
+Date: Sat, 7 Nov 2026 17:42:31 +0000
+Subject: [PATCH] Claude and Kiro transports, thinking streams and signatures
+
+
+Consolidated from the following original patches (file custody by final owner):
+
+- original #06: 0006 claude-thinking-streams
+- original #34: Validate both complete Claude signature encodings before
+- original #63: Keep parallel tool_use blocks sequential
+- original #66: Reject foreign thinking signatures that only share Claude's leading byte
+---
+ open-sse/translator/formats/claude.js         |  12 +-
+ .../translator/response/kiro-to-claude.js     |  92 +++++---
+ .../translator/response/openai-to-claude.js   |  99 +++++---
+ open-sse/utils/claudeCloaking.js              |   6 +-
+ open-sse/utils/claudeSignature.js             | 110 +++++++--
+ .../claude-adaptive-display.test.js           |  70 ++++++
+ .../parallel-tool-blocks-sequential.test.js   | 136 +++++++++++
+ tests/unit/claude-same-format-stream.test.js  | 217 ++++++++++++++++++
+ .../claude-signature-foreign-opaque.test.js   |  69 ++++++
+ .../claude-signature-versioned-form.test.js   | 138 +++++++++++
+ 10 files changed, 860 insertions(+), 89 deletions(-)
+ create mode 100644 tests/translator/claude-adaptive-display.test.js
+ create mode 100644 tests/translator/parallel-tool-blocks-sequential.test.js
+ create mode 100644 tests/unit/claude-same-format-stream.test.js
+ create mode 100644 tests/unit/claude-signature-foreign-opaque.test.js
+ create mode 100644 tests/unit/claude-signature-versioned-form.test.js
+
+diff --git a/open-sse/translator/formats/claude.js b/open-sse/translator/formats/claude.js
+index 8d8adab..4713c04 100644
+--- a/open-sse/translator/formats/claude.js
++++ b/open-sse/translator/formats/claude.js
+@@ -4,7 +4,7 @@ import { ROLE, CLAUDE_BLOCK } from "../schema/index.js";
+ import { adjustMaxTokens } from "./maxTokens.js";
+ import { applyCloaking } from "../../utils/claudeCloaking.js";
+ import { resolveSessionId } from "../../utils/sessionManager.js";
+-import { isValidClaudeSignature } from "../../utils/claudeSignature.js";
++import { normalizeClaudeSignature } from "../../utils/claudeSignature.js";
+ import { PROVIDERS } from "../../providers/index.js";
+ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
+ import { isDeepSeekModel } from "../../providers/models/helpers.js";
+@@ -288,9 +288,10 @@ export function normalizeClaudePassthrough(body, model = "") {
+       const kept = [];
+       for (const block of msg.content) {
+         if (block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING) {
+-          if (isValidClaudeSignature(block.signature)) {
++          const signature = normalizeClaudeSignature(block.signature);
++          if (signature !== null) {
+             hasKeptThinking = true;
+-            kept.push(block);
++            kept.push(signature === block.signature ? block : { ...block, signature });
+           }
+           continue;
+         }
+@@ -640,9 +641,10 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
+             if (isThinking) {
+               if (!String(block.thinking ?? "").trim()) continue;
+               if (isClaudeNative) {
+-                if (isValidClaudeSignature(block.signature)) {
++                const signature = normalizeClaudeSignature(block.signature);
++                if (signature !== null) {
+                   hasKeptThinking = true;
+-                  kept.push(block);
++                  kept.push(signature === block.signature ? block : { ...block, signature });
+                 }
+               } else if (deepSeekServed) {
+                 hasKeptThinking = true;
+diff --git a/open-sse/translator/response/kiro-to-claude.js b/open-sse/translator/response/kiro-to-claude.js
+index d9fc0aa..40d9919 100644
+--- a/open-sse/translator/response/kiro-to-claude.js
++++ b/open-sse/translator/response/kiro-to-claude.js
+@@ -15,17 +15,49 @@
+  */
+ import { register } from "../index.js";
+ import { FORMATS } from "../formats.js";
++import { resolveToolName } from "../../utils/opencodeFingerprint.js";
++
++// Parallel tool calls: the first tool_use opens at once, as upstream does, and
++// stays open until finish because its arguments arrive in pieces. Until then
++// every later event queues and replays in model order, so two blocks are
++// never open together.
++function emitBlock(state, results, event) {
++  if (state.queuedBlocks) state.queuedBlocks.push(event);
++  else results.push(event);
++}
++
++function toolStartEvent(toolInfo) {
++  return {
++    type: "content_block_start",
++    index: toolInfo.blockIndex,
++    content_block: { type: "tool_use", id: toolInfo.id, name: toolInfo.name, input: {} },
++  };
++}
++
++// Sends the buffered arguments as one delta, then closes the block.
++function closeToolBlock(state, results, toolIndex) {
++  const toolInfo = state.toolCalls.get(toolIndex);
++  const buffered = state.toolArgBuffers?.get(toolIndex);
++  if (buffered) {
++    results.push({
++      type: "content_block_delta",
++      index: toolInfo.blockIndex,
++      delta: { type: "input_json_delta", partial_json: buffered },
++    });
++  }
++  results.push({ type: "content_block_stop", index: toolInfo.blockIndex });
++}
+ 
+ function stopThinkingBlock(state, results) {
+   if (!state.thinkingBlockStarted) return;
+-  results.push({ type: "content_block_stop", index: state.thinkingBlockIndex });
++  emitBlock(state, results, { type: "content_block_stop", index: state.thinkingBlockIndex });
+   state.thinkingBlockStarted = false;
+ }
+ 
+ function stopTextBlock(state, results) {
+   if (!state.textBlockStarted || state.textBlockClosed) return;
+   state.textBlockClosed = true;
+-  results.push({ type: "content_block_stop", index: state.textBlockIndex });
++  emitBlock(state, results, { type: "content_block_stop", index: state.textBlockIndex });
+   state.textBlockStarted = false;
+ }
+ 
+@@ -51,7 +83,7 @@ function convertFinishReason(reason) {
+ function restoreToolName(stateOrData, name) {
+   const raw = name || "";
+   const map = stateOrData?.toolNameMap || stateOrData?._toolNameMap;
+-  return map && typeof map.get === "function" && map.has(raw) ? map.get(raw) : raw;
++  return resolveToolName(raw, map).name;
+ }
+ 
+ export function kiroToClaudeResponse(chunk, state) {
+@@ -124,13 +156,13 @@ export function kiroToClaudeResponse(chunk, state) {
+     if (!state.thinkingBlockStarted) {
+       state.thinkingBlockIndex = state.nextBlockIndex++;
+       state.thinkingBlockStarted = true;
+-      results.push({
++      emitBlock(state, results, {
+         type: "content_block_start",
+         index: state.thinkingBlockIndex,
+         content_block: { type: "thinking", thinking: "" },
+       });
+     }
+-    results.push({
++    emitBlock(state, results, {
+       type: "content_block_delta",
+       index: state.thinkingBlockIndex,
+       delta: { type: "thinking_delta", thinking: reasoningContent },
+@@ -144,13 +176,13 @@ export function kiroToClaudeResponse(chunk, state) {
+       state.textBlockIndex = state.nextBlockIndex++;
+       state.textBlockStarted = true;
+       state.textBlockClosed = false;
+-      results.push({
++      emitBlock(state, results, {
+         type: "content_block_start",
+         index: state.textBlockIndex,
+         content_block: { type: "text", text: "" },
+       });
+     }
+-    results.push({
++    emitBlock(state, results, {
+       type: "content_block_delta",
+       index: state.textBlockIndex,
+       delta: { type: "text_delta", text: delta.content },
+@@ -163,7 +195,8 @@ export function kiroToClaudeResponse(chunk, state) {
+     if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
+     for (const tc of delta.tool_calls) {
+       const idx = tc.index ?? 0;
+-      if (tc.id) {
++      // Open once per index: the replay queue keeps one entry per tool.
++      if (tc.id && !state.toolCalls.has(idx)) {
+         stopThinkingBlock(state, results);
+         stopTextBlock(state, results);
+         const toolBlockIndex = state.nextBlockIndex++;
+@@ -172,16 +205,16 @@ export function kiroToClaudeResponse(chunk, state) {
+           name: restoreToolName(state, tc.function?.name),
+           blockIndex: toolBlockIndex,
+         });
+-        results.push({
+-          type: "content_block_start",
+-          index: toolBlockIndex,
+-          content_block: {
+-            type: "tool_use",
+-            id: tc.id,
+-            name: restoreToolName(state, tc.function?.name),
+-            input: {},
+-          },
+-        });
++        const toolInfo = state.toolCalls.get(idx);
++        if (!state.queuedBlocks) {
++          // The first call opens now, as upstream does, and stays open until
++          // finish. Later events queue behind it.
++          state.queuedBlocks = [];
++          state.openToolIndex = idx;
++          results.push(toolStartEvent(toolInfo));
++        } else {
++          state.queuedBlocks.push({ toolIndex: idx });
++        }
+       }
+       if (tc.function?.arguments) {
+         const toolInfo = state.toolCalls.get(idx);
+@@ -200,19 +233,20 @@ export function kiroToClaudeResponse(chunk, state) {
+     stopThinkingBlock(state, results);
+     stopTextBlock(state, results);
+ 
+-    if (state.toolCalls) {
+-      for (const [idx, toolInfo] of state.toolCalls) {
+-        const buffered = state.toolArgBuffers?.get(idx);
+-        if (buffered) {
+-          results.push({
+-            type: "content_block_delta",
+-            index: toolInfo.blockIndex,
+-            delta: { type: "input_json_delta", partial_json: buffered },
+-          });
+-        }
+-        results.push({ type: "content_block_stop", index: toolInfo.blockIndex });
++    // Close the open tool block first, then replay queued blocks in model order.
++    if (state.openToolIndex !== undefined) {
++      closeToolBlock(state, results, state.openToolIndex);
++      state.openToolIndex = undefined;
++    }
++    for (const item of state.queuedBlocks || []) {
++      if (item.toolIndex === undefined) {
++        results.push(item);
++        continue;
+       }
++      results.push(toolStartEvent(state.toolCalls.get(item.toolIndex)));
++      closeToolBlock(state, results, item.toolIndex);
+     }
++    state.queuedBlocks = null;
+ 
+     state.finishReason = choice.finish_reason;
+     const finalUsage = state.usage || { input_tokens: 0, output_tokens: 0 };
+diff --git a/open-sse/translator/response/openai-to-claude.js b/open-sse/translator/response/openai-to-claude.js
+index 3998cc8..257d162 100644
+--- a/open-sse/translator/response/openai-to-claude.js
++++ b/open-sse/translator/response/openai-to-claude.js
+@@ -46,10 +46,46 @@ function isValidPdfPagesArg(filePath, pages) {
+     /^\d+(?:-\d+)?$/.test(pages);
+ }
+ 
++// Parallel tool calls: the first tool_use opens at once, as upstream does, and
++// stays open until finish because its arguments arrive in pieces. Until then
++// every later event queues and replays in model order, so two blocks are
++// never open together.
++function emitBlock(state, results, event) {
++  if (state.queuedBlocks) state.queuedBlocks.push(event);
++  else results.push(event);
++}
++
++function toolStartEvent(toolInfo) {
++  // Strip prefix from tool name for response
++  let toolName = toolInfo.name;
++  if (toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
++    toolName = toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
++  }
++  return {
++    type: "content_block_start",
++    index: toolInfo.blockIndex,
++    content_block: { type: CLAUDE_BLOCK.TOOL_USE, id: toolInfo.id, name: toolName, input: {} }
++  };
++}
++
++// Sends the buffered, sanitized arguments as one delta, then closes the block.
++function closeToolBlock(state, results, toolIndex) {
++  const toolInfo = state.toolCalls.get(toolIndex);
++  const buffered = state.toolArgBuffers?.get(toolIndex);
++  if (buffered) {
++    results.push({
++      type: "content_block_delta",
++      index: toolInfo.blockIndex,
++      delta: { type: "input_json_delta", partial_json: sanitizeToolArgs(toolInfo.name, buffered) }
++    });
++  }
++  results.push({ type: "content_block_stop", index: toolInfo.blockIndex });
++}
++
+ // Helper: stop thinking block if started
+ function stopThinkingBlock(state, results) {
+   if (!state.thinkingBlockStarted) return;
+-  results.push({
++  emitBlock(state, results, {
+     type: "content_block_stop",
+     index: state.thinkingBlockIndex
+   });
+@@ -60,7 +96,7 @@ function stopThinkingBlock(state, results) {
+ function stopTextBlock(state, results) {
+   if (!state.textBlockStarted || state.textBlockClosed) return;
+   state.textBlockClosed = true;
+-  results.push({
++  emitBlock(state, results, {
+     type: "content_block_stop",
+     index: state.textBlockIndex
+   });
+@@ -143,14 +179,14 @@ export function openaiToClaudeResponse(chunk, state) {
+     if (!state.thinkingBlockStarted) {
+       state.thinkingBlockIndex = state.nextBlockIndex++;
+       state.thinkingBlockStarted = true;
+-      results.push({
++      emitBlock(state, results, {
+         type: "content_block_start",
+         index: state.thinkingBlockIndex,
+         content_block: { type: CLAUDE_BLOCK.THINKING, thinking: "" }
+       });
+     }
+ 
+-    results.push({
++    emitBlock(state, results, {
+       type: "content_block_delta",
+       index: state.thinkingBlockIndex,
+       delta: { type: "thinking_delta", thinking: reasoningContent }
+@@ -165,14 +201,14 @@ export function openaiToClaudeResponse(chunk, state) {
+       state.textBlockIndex = state.nextBlockIndex++;
+       state.textBlockStarted = true;
+       state.textBlockClosed = false;
+-      results.push({
++      emitBlock(state, results, {
+         type: "content_block_start",
+         index: state.textBlockIndex,
+         content_block: { type: CLAUDE_BLOCK.TEXT, text: "" }
+       });
+     }
+ 
+-    results.push({
++    emitBlock(state, results, {
+       type: "content_block_delta",
+       index: state.textBlockIndex,
+       delta: { type: "text_delta", text: delta.content }
+@@ -191,23 +227,16 @@ export function openaiToClaudeResponse(chunk, state) {
+ 
+         const toolBlockIndex = state.nextBlockIndex++;
+         state.toolCalls.set(idx, { id: tc.id, name: tc.function?.name || "", blockIndex: toolBlockIndex });
+-
+-        // Strip prefix from tool name for response
+-        let toolName = tc.function?.name || "";
+-        if (toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
+-          toolName = toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
++        const toolInfo = state.toolCalls.get(idx);
++        if (!state.queuedBlocks) {
++          // The first call opens now, as upstream does, and stays open until
++          // finish. Later events queue behind it.
++          state.queuedBlocks = [];
++          state.openToolIndex = idx;
++          results.push(toolStartEvent(toolInfo));
++        } else {
++          state.queuedBlocks.push({ toolIndex: idx });
+         }
+-
+-        results.push({
+-          type: "content_block_start",
+-          index: toolBlockIndex,
+-          content_block: {
+-            type: CLAUDE_BLOCK.TOOL_USE,
+-            id: tc.id,
+-            name: toolName,
+-            input: {}
+-          }
+-        });
+       }
+ 
+       if (tc.function?.arguments) {
+@@ -226,22 +255,20 @@ export function openaiToClaudeResponse(chunk, state) {
+     stopThinkingBlock(state, results);
+     stopTextBlock(state, results);
+ 
+-    for (const [idx, toolInfo] of state.toolCalls) {
+-      // Emit buffered + sanitized args as single delta before stop
+-      const buffered = state.toolArgBuffers?.get(idx);
+-      if (buffered) {
+-        const sanitized = sanitizeToolArgs(toolInfo.name, buffered);
+-        results.push({
+-          type: "content_block_delta",
+-          index: toolInfo.blockIndex,
+-          delta: { type: "input_json_delta", partial_json: sanitized }
+-        });
++    // Close the open tool block first, then replay queued blocks in model order.
++    if (state.openToolIndex !== undefined) {
++      closeToolBlock(state, results, state.openToolIndex);
++      state.openToolIndex = undefined;
++    }
++    for (const item of state.queuedBlocks || []) {
++      if (item.toolIndex === undefined) {
++        results.push(item);
++        continue;
+       }
+-      results.push({
+-        type: "content_block_stop",
+-        index: toolInfo.blockIndex
+-      });
++      results.push(toolStartEvent(state.toolCalls.get(item.toolIndex)));
++      closeToolBlock(state, results, item.toolIndex);
+     }
++    state.queuedBlocks = null;
+ 
+     // Mark finish for later usage injection in stream.js
+     state.finishReason = choice.finish_reason;
+diff --git a/open-sse/utils/claudeCloaking.js b/open-sse/utils/claudeCloaking.js
+index 60e40b7..de5b523 100644
+--- a/open-sse/utils/claudeCloaking.js
++++ b/open-sse/utils/claudeCloaking.js
+@@ -1,5 +1,6 @@
+ import { createHash, randomBytes, randomUUID } from "crypto";
+ import { CLAUDE_TOOL_SUFFIX, CC_DEFAULT_TOOLS } from "../config/appConstants.js";
++import { resolveToolName } from "./opencodeFingerprint.js";
+ import { CLAUDE_CLI_VERSION } from "../providers/shared.js";
+ 
+ const CC_ENTRYPOINT = "sdk-cli";
+@@ -121,7 +122,7 @@ export function decloakToolNames(body, toolNameMap) {
+   const content = body.content.map(block => {
+     if (block?.type !== "tool_use") return block;
+     if (toolNameMap?.has(block.name)) {
+-      return { ...block, name: toolNameMap.get(block.name) };
++      return { ...block, name: resolveToolName(block.name, toolNameMap).name };
+     }
+     // toolNameMap missing/stale for this name — fall back to suffix stripping
+     // rather than forwarding an unresolvable "<tool>_ide" name to the client.
+@@ -155,7 +156,8 @@ export function decloakStreamChunk(chunk, toolNameMap) {
+   if (chunk.type !== "content_block_start") return chunk;
+   const block = chunk.content_block;
+   if (block?.type !== "tool_use" || typeof block.name !== "string") return chunk;
+-  const original = toolNameMap?.get(block.name) || stripCloakSuffix(block.name);
++  const mapped = toolNameMap?.has(block.name) ? resolveToolName(block.name, toolNameMap).name : null;
++  const original = mapped || stripCloakSuffix(block.name);
+   if (!original) return chunk;
+   return { ...chunk, content_block: { ...block, name: original } };
+ }
+diff --git a/open-sse/utils/claudeSignature.js b/open-sse/utils/claudeSignature.js
+index 1a18696..17b9cd0 100644
+--- a/open-sse/utils/claudeSignature.js
++++ b/open-sse/utils/claudeSignature.js
+@@ -1,41 +1,117 @@
+ // Claude thinking signature validation (ported from CLIProxyAPI internal/signature).
+ // E-form: single-layer base64, decoded[0] == 0x12 (Claude marker).
+-// R-form: double-layer base64, outer decoded[0] == 'E', inner decoded[0] == 0x12.
++// C-form: single-layer base64, the same marker preceded by a protobuf field-1 varint (08 <version>), as in Claude 5.5.
++// Double-layer (R…/Q…): base64 of the E-/C-form text; outer decodes to base64 text, inner carries the marker.
++// The decoded bytes of every form must also be one complete protobuf message.
+ // Cache prefix "...#sig" stripped before validation.
+ 
+ const MAX_CLAUDE_SIGNATURE_LEN = 32 * 1024 * 1024;
+ const CLAUDE_SIGNATURE_MARKER = 0x12;
+ 
+ function stripCachePrefix(rawSignature) {
+-  const sig = (rawSignature || "").trim();
++  const sig = typeof rawSignature === "string" ? rawSignature.trim() : "";
+   if (!sig) return "";
+   const idx = sig.indexOf("#");
+   return idx >= 0 ? sig.slice(idx + 1).trim() : sig;
+ }
+ 
++// Marker may be preceded by a protobuf field-1 varint (08 <version>), as in Claude 5.5 "C…" signatures.
++function hasClaudeMarker(buf) {
++  let i = 0;
++  if (buf[0] === 0x08) {
++    i = 1;
++    while (i < buf.length && (buf[i] & 0x80)) i++;
++    i++;
++  }
++  return i < buf.length && buf[i] === CLAUDE_SIGNATURE_MARKER;
++}
++
++function readVarint(buf, i) {
++  let value = 0n;
++  for (let shift = 0n; shift < 70n && i < buf.length; shift += 7n) {
++    const byte = buf[i++];
++    value |= BigInt(byte & 0x7f) << shift;
++    if (byte < 0x80) return { value, next: i };
++  }
++  return null;
++}
++
++// A Claude signature is one protobuf message: every byte belongs to a field
++// with a valid tag and wire type, and length-delimited fields end inside the
++// buffer. The marker test alone only looks at the leading bytes; another
++// provider's opaque signature passes it whenever its own first byte happens
++// to be 0x12, and Anthropic then rejects the forwarded block.
++function isCompleteProtobufMessage(buf) {
++  let i = 0;
++  while (i < buf.length) {
++    const tag = readVarint(buf, i);
++    if (!tag || tag.value >> 3n === 0n) return false;
++    i = tag.next;
++    switch (Number(tag.value & 7n)) {
++      case 0: {
++        const v = readVarint(buf, i);
++        if (!v) return false;
++        i = v.next;
++        break;
++      }
++      case 1:
++        i += 8;
++        break;
++      case 2: {
++        const len = readVarint(buf, i);
++        if (!len || len.value > BigInt(buf.length - len.next)) return false;
++        i = len.next + Number(len.value);
++        break;
++      }
++      case 5:
++        i += 4;
++        break;
++      default:
++        return false;
++    }
++    if (i > buf.length) return false;
++  }
++  return true;
++}
++
++function isClaudeSignatureBytes(buf) {
++  return buf?.length > 0 && hasClaudeMarker(buf) && isCompleteProtobufMessage(buf);
++}
++
+ export function hasClaudeSignaturePrefix(rawSignature) {
+   const sig = stripCachePrefix(rawSignature);
+   return sig.length > 0 && (sig[0] === "E" || sig[0] === "R");
+ }
+ 
+-// Strict-ish: validates base64 layers + Claude marker byte.
+-export function isValidClaudeSignature(rawSignature) {
++function decodeBase64Strict(text) {
++  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(text)) return null;
++  if (/[+/]/.test(text) && /[-_]/.test(text)) return null;
++  const standard = text.replace(/-/g, "+").replace(/_/g, "/");
++  const decoded = Buffer.from(standard, "base64");
++  const canonical = decoded.toString("base64");
++  const expected = standard.includes("=") ? canonical : canonical.replace(/=+$/, "");
++  return standard === expected ? decoded : null;
++}
++
++// Preserve the encoded provider value; remove only legacy cache metadata.
++// Both encoding layers must be complete canonical padded or unpadded base64.
++export function normalizeClaudeSignature(rawSignature) {
++  if (typeof rawSignature !== "string" || rawSignature.length > MAX_CLAUDE_SIGNATURE_LEN) return null;
+   const sig = stripCachePrefix(rawSignature);
+-  if (!sig || sig.length > MAX_CLAUDE_SIGNATURE_LEN) return false;
++  if (!sig) return null;
+ 
+   try {
+-    if (sig[0] === "E") {
+-      const decoded = Buffer.from(sig, "base64");
+-      return decoded.length > 0 && decoded[0] === CLAUDE_SIGNATURE_MARKER;
+-    }
+-    if (sig[0] === "R") {
+-      const outer = Buffer.from(sig, "base64");
+-      if (!outer.length || outer[0] !== 0x45) return false; // 'E'
+-      const inner = Buffer.from(outer.toString(), "base64");
+-      return inner.length > 0 && inner[0] === CLAUDE_SIGNATURE_MARKER;
+-    }
+-    return false;
++    const decoded = decodeBase64Strict(sig);
++    if (!decoded?.length) return null;
++    if (isClaudeSignatureBytes(decoded)) return sig;
++    const outerText = decoded.toString("latin1");
++    const inner = decodeBase64Strict(outerText);
++    return isClaudeSignatureBytes(inner) ? sig : null;
+   } catch {
+-    return false;
++    return null;
+   }
+ }
++
++export function isValidClaudeSignature(rawSignature) {
++  return normalizeClaudeSignature(rawSignature) !== null;
++}
+diff --git a/tests/translator/claude-adaptive-display.test.js b/tests/translator/claude-adaptive-display.test.js
+new file mode 100644
+index 0000000..390c3f9
+--- /dev/null
++++ b/tests/translator/claude-adaptive-display.test.js
+@@ -0,0 +1,70 @@
++// Always-adaptive Claude models (thinkingCanDisable: false) keep the client's
++// thinking.display. Dropping it sent the redact-thinking beta, so Anthropic
++// returned signature-only thinking blocks even when the client asked for summaries.
++import { describe, it, expect } from "vitest";
++import "./registerAll.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { selectAnthropicBeta } from "../../open-sse/providers/shared.js";
++import { applyThinking } from "../../open-sse/translator/concerns/thinkingUnified.js";
++
++const REDACT = "redact-thinking-2026-02-12";
++const ALWAYS_ADAPTIVE = "claude-opus-5-5";
++const CAN_DISABLE = "claude-sonnet-5-5";
++const FABLE = "claude-fable-5-1";
++
++function toClaude(model, sourceFormat, body) {
++  return translateRequest(sourceFormat, FORMATS.CLAUDE, model, body, true, null, "claude", null, [], "x", "claude");
++}
++
++const claudeBody = thinking => ({
++  model: ALWAYS_ADAPTIVE,
++  max_tokens: 4096,
++  messages: [{ role: "user", content: "hi" }],
++  ...(thinking ? { thinking } : {})
++});
++
++describe("always-adaptive Claude models keep the client's thinking display", () => {
++  it("forwards display summarized with effort and drops the redact beta", () => {
++    const out = toClaude(ALWAYS_ADAPTIVE, FORMATS.CLAUDE, {
++      ...claudeBody({ type: "adaptive", display: "summarized" }),
++      output_config: { effort: "high" }
++    });
++    expect(out.thinking).toEqual({ type: "adaptive", display: "summarized" });
++    expect(out.output_config.effort).toBe("high");
++    expect(selectAnthropicBeta(ALWAYS_ADAPTIVE, out)).not.toContain(REDACT);
++  });
++
++  it("sends no thinking field and keeps the redact beta when no display was requested", () => {
++    const out = toClaude(ALWAYS_ADAPTIVE, FORMATS.CLAUDE, claudeBody({ type: "adaptive" }));
++    expect(out.thinking).toBeUndefined();
++    expect(selectAnthropicBeta(ALWAYS_ADAPTIVE, out)).toContain(REDACT);
++  });
++
++  it("OpenAI reasoning_effort intent yields summarized thinking for always-adaptive models", () => {
++    const out = toClaude(ALWAYS_ADAPTIVE, FORMATS.OPENAI, {
++      model: ALWAYS_ADAPTIVE,
++      messages: [{ role: "user", content: "hi" }],
++      reasoning_effort: "high"
++    });
++    expect(out.thinking).toEqual({ type: "adaptive", display: "summarized" });
++    expect(selectAnthropicBeta(ALWAYS_ADAPTIVE, out)).not.toContain(REDACT);
++  });
++
++  it("keeps display summarized on a model that can disable thinking", () => {
++    const out = toClaude(CAN_DISABLE, FORMATS.CLAUDE, claudeBody({ type: "adaptive", display: "summarized" }));
++    expect(out.thinking).toEqual({ type: "adaptive", display: "summarized" });
++  });
++
++  it("sends no thinking field for Fable when no display was requested", () => {
++    const out = toClaude(FABLE, FORMATS.CLAUDE, claudeBody({ type: "adaptive" }));
++    expect(out.thinking).toBeUndefined();
++  });
++
++  it("leaves MiniMax Code's permanent-adaptive wire shape effort-only despite a display intent", () => {
++    const body = { model: "MiniMax-M3.1-Flash-Preview", messages: [], thinking: { type: "adaptive", display: "summarized" } };
++    applyThinking("claude", "MiniMax-M3.1-Flash-Preview(xhigh)", body, "minimax-code");
++    expect(body.thinking).toBeUndefined();
++    expect(body.output_config.effort).toBe("xhigh");
++  });
++});
+diff --git a/tests/translator/parallel-tool-blocks-sequential.test.js b/tests/translator/parallel-tool-blocks-sequential.test.js
+new file mode 100644
+index 0000000..4345f3e
+--- /dev/null
++++ b/tests/translator/parallel-tool-blocks-sequential.test.js
+@@ -0,0 +1,136 @@
++// Parallel tool_use blocks must reach the Claude client one at a time. Each
++// block opens, receives its complete arguments and closes before the next
++// block opens, and blocks keep the order in which the model produced them.
++// Runs on the OpenAI-chunk route and on the direct Kiro route.
++import { describe, it, expect } from "vitest";
++import "./registerAll.js";
++import { translateResponse, initState } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++
++const READ_ARGS = '{"Path":"/a.txt"}';
++const RUN_ARGS = '{"CommandLine":"ls -la","WaitMsBeforeAsync":500}';
++const GREP_ARGS = '{"Query":"TODO"}';
++
++const chunk = (delta, finish_reason = null) => ({
++  id: "chatcmpl-parallel",
++  object: "chat.completion.chunk",
++  created: 1,
++  model: "parallel-model",
++  choices: [{ index: 0, delta, finish_reason }],
++});
++
++const start = (index, id, name) =>
++  chunk({ tool_calls: [{ index, id, type: "function", function: { name, arguments: "" } }] });
++const args = (index, text) => chunk({ tool_calls: [{ index, function: { arguments: text } }] });
++
++// Both calls start before either finishes its arguments.
++const twoCalls = [
++  start(0, "call_read", "read_file"),
++  start(1, "call_run", "run_command"),
++  args(0, READ_ARGS.slice(0, 9)),
++  args(1, RUN_ARGS.slice(0, 20)),
++  args(0, READ_ARGS.slice(9)),
++  args(1, RUN_ARGS.slice(20)),
++];
++
++const threeCalls = [
++  start(0, "call_read", "read_file"),
++  start(1, "call_run", "run_command"),
++  start(2, "call_grep", "grep_search"),
++  args(0, READ_ARGS.slice(0, 9)),
++  args(1, RUN_ARGS.slice(0, 20)),
++  args(2, GREP_ARGS.slice(0, 8)),
++  args(0, READ_ARGS.slice(9)),
++  args(1, RUN_ARGS.slice(20)),
++  args(2, GREP_ARGS.slice(8)),
++];
++
++const finish = chunk({}, "tool_calls");
++
++// Feeds chunks through the response translator, as the stream does.
++function translate(target, chunks) {
++  const state = initState(FORMATS.CLAUDE);
++  return chunks.flatMap((c) => translateResponse(target, FORMATS.CLAUDE, c, state) || []);
++}
++
++// Only the content block events, in stream order: start, delta, stop.
++function blockSequence(events) {
++  return events
++    .filter((e) => e.type.startsWith("content_block_"))
++    .map((e) => e.type.replace("content_block_", ""));
++}
++
++// Client rule: a delta belongs to the open block, and a block must close
++// before the next one opens.
++function replay(events) {
++  const blocks = [];
++  let open = null;
++  for (const event of events) {
++    if (event.type === "content_block_start") {
++      expect(open, `block ${event.index} opened while block ${open} was open`).toBeNull();
++      open = event.index;
++      const { type, id, name } = event.content_block;
++      blocks.push({ index: event.index, type, id, name, text: "", json: "" });
++    } else if (event.type === "content_block_delta") {
++      expect(event.index, "delta must target the open block").toBe(open);
++      const block = blocks.find((b) => b.index === event.index);
++      if (event.delta.type === "text_delta") block.text += event.delta.text;
++      if (event.delta.type === "thinking_delta") block.text += event.delta.thinking;
++      if (event.delta.type === "input_json_delta") block.json += event.delta.partial_json;
++    } else if (event.type === "content_block_stop") {
++      expect(event.index, "stop must close the open block").toBe(open);
++      open = null;
++    }
++  }
++  expect(open, "a block was left open").toBeNull();
++  return blocks;
++}
++
++const readBlock = (index) => ({ index, type: "tool_use", id: "call_read", name: "read_file", text: "", json: READ_ARGS });
++const runBlock = (index) => ({ index, type: "tool_use", id: "call_run", name: "run_command", text: "", json: RUN_ARGS });
++const grepBlock = (index) => ({ index, type: "tool_use", id: "call_grep", name: "grep_search", text: "", json: GREP_ARGS });
++
++const ROUTES = [
++  ["OpenAI chunks", FORMATS.OPENAI],
++  ["Kiro direct chunks", FORMATS.KIRO],
++];
++
++describe.each(ROUTES)("parallel tool_use blocks on the %s route", (_label, target) => {
++  it("two parallel calls: start1, delta1, stop1, start2, delta2, stop2", () => {
++    const events = translate(target, [...twoCalls, finish]);
++    expect(blockSequence(events)).toEqual(["start", "delta", "stop", "start", "delta", "stop"]);
++    expect(replay(events)).toEqual([readBlock(0), runBlock(1)]);
++  });
++
++  it("three parallel calls: each block keeps its own arguments, in order", () => {
++    const events = translate(target, [...threeCalls, finish]);
++    expect(blockSequence(events)).toEqual([
++      "start", "delta", "stop", "start", "delta", "stop", "start", "delta", "stop",
++    ]);
++    expect(replay(events)).toEqual([readBlock(0), runBlock(1), grepBlock(2)]);
++  });
++
++  it("thinking before parallel calls closes before the first tool opens", () => {
++    const events = translate(target, [chunk({ reasoning_content: "Plan. " }), ...twoCalls, finish]);
++    expect(replay(events)).toEqual([
++      { index: 0, type: "thinking", text: "Plan. ", json: "" },
++      readBlock(1),
++      runBlock(2),
++    ]);
++  });
++
++  it("text before and after parallel calls keeps the model's block order", () => {
++    const events = translate(target, [
++      chunk({ content: "Checking. " }),
++      ...twoCalls,
++      chunk({ content: "Done." }),
++      finish,
++    ]);
++    expect(replay(events)).toEqual([
++      { index: 0, type: "text", text: "Checking. ", json: "" },
++      readBlock(1),
++      runBlock(2),
++      { index: 3, type: "text", text: "Done.", json: "" },
++    ]);
++  });
++});
+diff --git a/tests/unit/claude-same-format-stream.test.js b/tests/unit/claude-same-format-stream.test.js
+new file mode 100644
+index 0000000..eb42c44
+--- /dev/null
++++ b/tests/unit/claude-same-format-stream.test.js
+@@ -0,0 +1,217 @@
++import { describe, it, expect, vi } from "vitest";
++
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => { }),
++  saveRequestDetail: vi.fn(async () => { }),
++  saveUsageStats: vi.fn()
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => { }, remove: async () => { }, getAll: async () => ({}) })
++}));
++vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", async importOriginal => ({
++  ...await importOriginal(),
++  buildRequestDetail: () => ({}),
++  saveUsageStats: () => { },
++  formatDoneLine: () => ""
++}));
++
++import { handleStreamingResponse } from "../../open-sse/handlers/chatCore/streamingHandler.js";
++import { handleNonStreamingResponse } from "../../open-sse/handlers/chatCore/nonStreamingHandler.js";
++import { cloakClaudeTools } from "../../open-sse/utils/claudeCloaking.js";
++import { createStreamController } from "../../open-sse/utils/streamHandler.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++
++const clientRequest = {
++  tools: [{ name: "read", input_schema: { type: "object" } }, { name: "write", input_schema: { type: "object" } }],
++  messages: [{ role: "user", content: "read files" }],
++  tool_choice: { type: "tool", name: "read" }
++};
++
++const derive = () => cloakClaudeTools(clientRequest);
++const upstreamName = (toolNameMap, original) => [...toolNameMap].find(([, name]) => name === original)[0];
++const frame = event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
++const parseEvents = wire => wire.split("\n")
++  .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
++  .map(line => JSON.parse(line.slice(6)));
++const isToolStart = event => event.type === "content_block_start" && event.content_block?.type === "tool_use";
++
++const messageStart = { type: "message_start", message: { id: "msg_stream_1", type: "message", role: "assistant", model: "claude-opus-5-5", content: [], stop_reason: null, usage: { input_tokens: 5, output_tokens: 1 } } };
++const messageDelta = { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 9 } };
++const toolStart = (index, id, name) => ({ type: "content_block_start", index, content_block: { type: "tool_use", id, name, input: {}, caller: { type: "direct" } } });
++const toolCall = (index, id, name, chunks) => [
++  toolStart(index, id, name),
++  ...chunks.map(partial_json => ({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json } })),
++  { type: "content_block_stop", index }
++];
++
++const multiCallEvents = nameOf => [
++  messageStart,
++  ...toolCall(0, "toolu_read_1", nameOf("read"), ['{"path":"文', '件.txt"}']),
++  ...toolCall(1, "toolu_read_2", nameOf("read"), ['{"path":"café.md"}']),
++  ...toolCall(2, "toolu_write_1", nameOf("write"), ['{"path":"日本.txt"}']),
++  messageDelta,
++  { type: "message_stop" }
++];
++
++const richEvents = nameOf => [
++  { ...messageStart, future_field: { enabled: true } },
++  { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
++  { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Plan 思考" } },
++  { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig_opaque" } },
++  { type: "content_block_stop", index: 0 },
++  { type: "content_block_start", index: 1, content_block: { type: "redacted_thinking", data: "opaque_blob" } },
++  { type: "content_block_stop", index: 1 },
++  { type: "ping" },
++  ...toolCall(2, "toolu_read_1", nameOf("read"), ['{"path":"文', '件.txt"}']),
++  { ...messageDelta, future_usage: 1 },
++  { type: "message_stop" }
++];
++
++async function runStream(wire, { toolNameMap, fragmented = false, sourceFormat = FORMATS.CLAUDE, targetFormat = FORMATS.CLAUDE, provider = "claude", body = clientRequest } = {}) {
++  const bytes = new TextEncoder().encode(wire);
++  const chunks = fragmented ? [...bytes].map(byte => Uint8Array.of(byte)) : [bytes];
++  const providerResponse = new Response(new ReadableStream({
++    start(controller) {
++      for (const chunk of chunks) controller.enqueue(chunk);
++      controller.close();
++    }
++  }), { headers: { "content-type": "text/event-stream" } });
++  const result = await handleStreamingResponse({
++    providerResponse,
++    provider,
++    model: "claude-opus-5-5",
++    sourceFormat,
++    targetFormat,
++    body,
++    stream: true,
++    requestStartTime: Date.now(),
++    toolNameMap,
++    streamController: createStreamController({ provider: "claude", model: "claude-opus-5-5" })
++  });
++  return result.response.text();
++}
++
++describe("claude same-format stream keeps tool names and thinking signatures", () => {
++  it.each([false, true])("restores each mapped tool call exactly once and rebuilds the next turn (fragmented=%s)", async fragmented => {
++    const { body: upstreamRequest, toolNameMap } = derive();
++    const mapBefore = new Map(toolNameMap);
++    const wireEvents = multiCallEvents(name => upstreamName(toolNameMap, name));
++    const expectedEvents = multiCallEvents(name => name);
++    const snapshot = structuredClone(wireEvents);
++
++    const out = parseEvents(await runStream(wireEvents.map(frame).join(""), { toolNameMap, fragmented }));
++
++    expect(out).toEqual(expectedEvents);
++    expect(out.filter(isToolStart).map(event => event.content_block.name)).toEqual(["read", "read", "write"]);
++    expect(wireEvents).toEqual(snapshot);
++    expect(toolNameMap).toEqual(mapBefore);
++
++    const upstreamNames = wireEvents.filter(isToolStart).map(event => event.content_block.name);
++    const advertised = new Set(upstreamRequest.tools.map(tool => tool.name));
++    expect(upstreamNames.every(name => advertised.has(name))).toBe(true);
++
++    const starts = out.filter(isToolStart);
++    const inputs = {};
++    for (const event of out) {
++      if (event.type === "content_block_delta") inputs[event.index] = (inputs[event.index] || "") + event.delta.partial_json;
++    }
++    const calls = starts.map(event => ({ type: "tool_use", id: event.content_block.id, name: event.content_block.name, input: JSON.parse(inputs[event.index]) }));
++    expect(calls.map(call => call.input)).toEqual([{ path: "文件.txt" }, { path: "café.md" }, { path: "日本.txt" }]);
++    expect(calls.map(call => call.id)).toEqual(wireEvents.filter(isToolStart).map(event => event.content_block.id));
++
++    const history = [
++      { role: "user", content: "read files" },
++      { role: "assistant", content: calls },
++      { role: "user", content: calls.map(call => ({ type: "tool_result", tool_use_id: call.id, content: "ok" })) }
++    ];
++    const second = cloakClaudeTools({ ...clientRequest, messages: history });
++    expect(second.body.messages[1].content.map(block => block.name)).toEqual(upstreamNames);
++    expect(second.body.messages[2].content.map(block => block.tool_use_id)).toEqual(calls.map(call => call.id));
++    expect(second.body.tool_choice).toEqual({ type: "tool", name: upstreamName(toolNameMap, "read") });
++  });
++
++  it("leaves unmapped, decoy and non-tool events unchanged under an active map and without a map", async () => {
++    const { toolNameMap } = derive();
++    const events = [
++      toolStart(1, "toolu_bash", "Bash"),
++      { type: "content_block_start", index: 2, content_block: { type: "text", text: "", name: upstreamName(toolNameMap, "read") } }
++    ];
++    expect(parseEvents(await runStream(events.map(frame).join(""), { toolNameMap }))).toEqual(events);
++
++    const mappedLooking = [toolStart(0, "toolu_map", "write_ide"), toolStart(1, "toolu_plain", "read_ide")];
++    expect(parseEvents(await runStream(mappedLooking.map(frame).join(""), { toolNameMap: null }))).toEqual(mappedLooking);
++  });
++
++  it.each([false, true])("keeps thinking, redacted, ping, caller, future fields and terminal events (fragmented=%s)", async fragmented => {
++    const { toolNameMap } = derive();
++    const wireEvents = richEvents(name => upstreamName(toolNameMap, name));
++    const raw = await runStream(wireEvents.map(frame).join(""), { toolNameMap, fragmented });
++
++    expect(parseEvents(raw)).toEqual(richEvents(name => name));
++    for (const event of wireEvents.filter(event => !isToolStart(event))) expect(raw).toContain(frame(event));
++  });
++
++  it("passes an overloaded error event through without fabricating a terminal", async () => {
++    const { toolNameMap } = derive();
++    const events = [messageStart, { type: "error", error: { type: "overloaded_error", message: "Overloaded", retry_after: 3 }, request_id: "req_overloaded_1" }];
++    const out = parseEvents(await runStream(events.map(frame).join(""), { toolNameMap }));
++    expect(out).toEqual(events);
++    expect(out.map(event => event.type)).toEqual(["message_start", "error"]);
++  });
++
++  it.each([
++    ["mapped", "read_ide", "read"],
++    ["unmapped", "Bash", "Bash"]
++  ])("frames a final %s tool data line without trailing newline before [DONE]", async (_, upstream, expected) => {
++    const { toolNameMap } = derive();
++    const name = upstream === "read_ide" ? upstreamName(toolNameMap, "read") : upstream;
++    const start = toolStart(0, "toolu_eof_1", name);
++    const wire = frame(messageStart) + `event: content_block_start\ndata: ${JSON.stringify(start)}`;
++
++    const raw = await runStream(wire, { toolNameMap });
++    expect(parseEvents(raw)).toEqual([messageStart, toolStart(0, "toolu_eof_1", expected)]);
++  });
++
++  it("restores a single non-streaming tool name while keeping signed thinking and extra fields", async () => {
++    const request = { tools: [{ name: "view_file", input_schema: { type: "object" } }], messages: [{ role: "user", content: "open" }] };
++    const { toolNameMap } = cloakClaudeTools(request);
++    const [providerName] = toolNameMap.keys();
++    const providerBody = {
++      id: "msg_nonstream_1",
++      type: "message",
++      role: "assistant",
++      model: "claude-opus-5-5",
++      content: [
++        { type: "thinking", thinking: "Need file", signature: "sig_opaque" },
++        { type: "tool_use", id: "toolu_view_1", name: providerName, input: { path: "a.txt" }, caller: { type: "direct" } }
++      ],
++      stop_reason: "tool_use",
++      stop_sequence: null,
++      usage: { input_tokens: 4, output_tokens: 2 },
++      future_field: { kept: true }
++    };
++
++    const result = await handleNonStreamingResponse({
++      providerResponse: new Response(JSON.stringify(providerBody), { status: 200, headers: { "content-type": "application/json" } }),
++      provider: "claude",
++      model: "claude-opus-5-5",
++      sourceFormat: FORMATS.CLAUDE,
++      targetFormat: FORMATS.CLAUDE,
++      body: request,
++      stream: false,
++      requestStartTime: Date.now(),
++      toolNameMap,
++      reqLogger: { logProviderResponse() { }, logConvertedResponse() { } },
++      trackDone() { },
++      appendLog() { }
++    });
++
++    const body = await result.response.json();
++    expect({ ...body, usage: null }).toEqual({
++      ...providerBody,
++      content: [providerBody.content[0], { ...providerBody.content[1], name: "view_file" }],
++      usage: null
++    });
++  });
++});
+diff --git a/tests/unit/claude-signature-foreign-opaque.test.js b/tests/unit/claude-signature-foreign-opaque.test.js
+new file mode 100644
+index 0000000..9717158
+--- /dev/null
++++ b/tests/unit/claude-signature-foreign-opaque.test.js
+@@ -0,0 +1,69 @@
++import { createHash } from "node:crypto";
++import { describe, it, expect } from "vitest";
++import { isValidClaudeSignature } from "../../open-sse/utils/claudeSignature.js";
++import { normalizeClaudePassthrough, prepareClaudeRequest } from "../../open-sse/translator/formats/claude.js";
++
++// Another provider behind an Anthropic-format combo (kimi-for-coding) signs
++// its thinking with opaque bytes that only look random. Some of them start
++// with 0x12, the leading byte of a Claude signature; Anthropic rejects such a
++// block ("Invalid `signature` in `thinking` block") on every retry.
++function opaqueSignature(seed, length, firstByte) {
++  const chunks = [];
++  for (let i = 0; Buffer.concat(chunks).length < length; i++) {
++    chunks.push(createHash("sha256").update(`${seed}:${i}`).digest());
++  }
++  const bytes = Buffer.concat(chunks).subarray(0, length);
++  bytes[0] = firstByte;
++  return bytes.toString("base64");
++}
++
++const b64 = bytes => Buffer.from(bytes).toString("base64");
++// Shape of a real Claude 5.5 signature: version varint, then field 2 holding
++// a nested message, every byte accounted for.
++const claudeLike = b64([0x08, 0x04, 0x12, 0x0a, 0x0a, 0x02, 0x08, 0x13, 0x42, 0x04, 0x74, 0x68, 0x69, 0x6e]);
++const foreignE = opaqueSignature("kimi-e", 3255, 0x12);
++const foreignC = opaqueSignature("kimi-c", 3255, 0x08);
++
++const historyWith = signature => ({
++  model: "claude-sonnet-5-5",
++  thinking: { type: "enabled", budget_tokens: 1024 },
++  messages: [
++    { role: "user", content: "read the file" },
++    {
++      role: "assistant",
++      content: [
++        { type: "thinking", thinking: "t", signature },
++        { type: "tool_use", id: "toolu_1", name: "read", input: {} }
++      ]
++    },
++    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] }
++  ]
++});
++
++describe("foreign opaque signatures with a Claude-looking first byte", () => {
++  it("still accepts a complete Claude-shaped signature", () => {
++    expect(isValidClaudeSignature(claudeLike)).toBe(true);
++    expect(isValidClaudeSignature(Buffer.from(claudeLike).toString("base64"))).toBe(true);
++  });
++
++  it.each([
++    ["first byte 0x12", foreignE],
++    ["first byte 0x08", foreignC],
++    ["double-wrapped", Buffer.from(foreignE).toString("base64")],
++    ["truncated Claude signature", b64([0x08, 0x04, 0x12, 0x0a, 0x0a, 0x02])],
++    ["Claude signature with trailing bytes", b64([0x08, 0x04, 0x12, 0x01, 0x00, 0xff])],
++  ])("rejects %s", (_name, signature) => {
++    expect(isValidClaudeSignature(signature)).toBe(false);
++  });
++
++  it("never forwards the foreign block to Anthropic", () => {
++    const normalized = historyWith(foreignE);
++    normalizeClaudePassthrough(normalized, "claude-sonnet-5-5");
++    const prepared = prepareClaudeRequest(historyWith(foreignE), "claude", "sk-ant-api-test");
++    for (const body of [normalized, prepared]) {
++      const content = body.messages[1].content;
++      expect(content.some(block => block.signature === foreignE)).toBe(false);
++      expect(content.at(-1)).toMatchObject({ type: "tool_use", id: "toolu_1" });
++    }
++  });
++});
+diff --git a/tests/unit/claude-signature-versioned-form.test.js b/tests/unit/claude-signature-versioned-form.test.js
+new file mode 100644
+index 0000000..ab81dbc
+--- /dev/null
++++ b/tests/unit/claude-signature-versioned-form.test.js
+@@ -0,0 +1,138 @@
++import { describe, it, expect } from "vitest";
++import { isValidClaudeSignature, normalizeClaudeSignature } from "../../open-sse/utils/claudeSignature.js";
++import { normalizeClaudePassthrough, prepareClaudeRequest } from "../../open-sse/translator/formats/claude.js";
++
++const b64 = bytes => Buffer.from(bytes).toString("base64");
++
++const cForm = b64([0x08, 0x04, 0x12, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05]);
++const cFormMultiByteVarint = b64([0x08, 0x80, 0x01, 0x12, 0x01, 0x00]);
++const eForm = b64([0x12, 0x03, 0x01, 0x02, 0x03]);
++const rForm = Buffer.from(eForm).toString("base64");
++const qForm = Buffer.from(cForm).toString("base64");
++const foreignMarker = b64([0x0a, 0x10, 0x01, 0x02]);
++const foreignVarint = b64([0x08, 0x04, 0x0a, 0x01]);
++const foreignWrapped = Buffer.from(foreignMarker).toString("base64");
++
++describe("isValidClaudeSignature accepts every Claude signature form", () => {
++  it.each([
++    ["C-form with a version varint", cForm],
++    ["C-form with a multi-byte version varint", cFormMultiByteVarint],
++    ["E-form", eForm],
++    ["R-form wrapping an E-form", rForm],
++    ["Q-form wrapping a C-form", qForm]
++  ])("accepts %s", (_, signature) => {
++    expect(isValidClaudeSignature(signature)).toBe(true);
++  });
++
++  it.each([
++    ["marker byte absent", foreignMarker],
++    ["marker byte absent after a version varint", foreignVarint],
++    ["double-wrapped foreign payload", foreignWrapped],
++    ["empty string", ""]
++  ])("rejects %s", (_, signature) => {
++    expect(isValidClaudeSignature(signature)).toBe(false);
++  });
++
++  it("returns a boolean for non-base64 garbage without throwing", () => {
++    expect(typeof isValidClaudeSignature("CAQS!!@@$$%%")).toBe("boolean");
++  });
++
++  it.each([
++    ["garbage in a C-form", "CAQS!!@@$$%%"],
++    ["garbage after a valid signature", `${cForm}!`],
++    ["internal whitespace", `${cForm.slice(0, 4)}\n${cForm.slice(4)}`],
++    ["extra padding", `${cForm}=`],
++    ["interior padding", `${cForm.slice(0, 4)}=${cForm.slice(4)}`],
++    ["noncanonical padding bits", "Eh=="],
++    ["mixed base64 alphabets", "Ev+_"],
++    ["garbage in the inner layer", Buffer.from(`${cForm}!!`).toString("base64")],
++    ["bad inner padding", Buffer.from(`${cForm}=`).toString("base64")],
++    ["inner whitespace", Buffer.from(`${cForm}\n`).toString("base64")],
++    ["non-string object", {}], ["non-string number", 7],
++    ["non-string array", []], ["non-string boolean", true],
++  ])("rejects the complete encoding for %s", (_name, signature) => {
++    expect(isValidClaudeSignature(signature)).toBe(false);
++    expect(normalizeClaudeSignature(signature)).toBeNull();
++  });
++
++  it.each([
++    eForm.replace(/=+$/, ""), rForm.replace(/=+$/, ""),
++    Buffer.from([0x12, 0x02, 0xfb, 0xff]).toString("base64url"),
++  ])("preserves a valid unpadded or URL-safe provider value %s", signature => {
++    expect(isValidClaudeSignature(signature)).toBe(true);
++    expect(normalizeClaudeSignature(signature)).toBe(signature);
++  });
++});
++
++const historyWith = signature => ({
++  model: "claude-opus-5-5",
++  thinking: { type: "enabled", budget_tokens: 1024 },
++  messages: [
++    { role: "user", content: "read the file" },
++    {
++      role: "assistant",
++      content: [
++        { type: "thinking", thinking: "t", signature },
++        { type: "tool_use", id: "toolu_1", name: "read", input: {} }
++      ]
++    },
++    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] }
++  ]
++});
++
++const assistantContent = body => body.messages[1].content;
++const isPlaceholder = block => block.type === "thinking" && block.thinking === ".";
++
++describe("claude passthrough keeps versioned signatures in history", () => {
++  it.each(["CAQS!!@@$$%%", `${qForm}!`, Buffer.from(`${cForm}!!`).toString("base64"), `${cForm}=`])(
++    "never forwards corrupted thinking signatures %s", signature => {
++      const normalized = historyWith(signature);
++      normalizeClaudePassthrough(normalized, "claude-opus-5-5");
++      const prepared = prepareClaudeRequest(historyWith(signature), "claude", "sk-ant-api-test");
++      for (const body of [normalized, prepared]) {
++        const content = assistantContent(body);
++        expect(content.some(block => block.signature === signature)).toBe(false);
++        expect(content.filter(block => block.type === "thinking")).toEqual([
++          expect.objectContaining({ thinking: "." }),
++        ]);
++      }
++    });
++
++  it.each([`cached-model#${cForm}`, `  ${cForm}\n`])(
++    "forwards only the validated value after legacy cache normalization %s", signature => {
++      const normalized = historyWith(signature);
++      normalizeClaudePassthrough(normalized, "claude-opus-5-5");
++      const prepared = prepareClaudeRequest(historyWith(signature), "claude", "sk-ant-api-test");
++      for (const body of [normalized, prepared]) {
++        expect(assistantContent(body)[0]).toEqual({ type: "thinking", thinking: "t", signature: cForm });
++        expect(assistantContent(body).some(isPlaceholder)).toBe(false);
++      }
++    });
++
++  it("keeps a C-form thinking block and adds no placeholder (normalizeClaudePassthrough)", () => {
++    const body = historyWith(cForm);
++    normalizeClaudePassthrough(body, "claude-opus-5-5");
++
++    const content = assistantContent(body);
++    expect(content[0]).toEqual({ type: "thinking", thinking: "t", signature: cForm });
++    expect(content.some(isPlaceholder)).toBe(false);
++  });
++
++  it("keeps a C-form thinking block for provider claude (prepareClaudeRequest)", () => {
++    const body = prepareClaudeRequest(historyWith(cForm), "claude", "sk-ant-api-test");
++
++    const content = assistantContent(body);
++    expect(content.find(block => block.type === "thinking")).toMatchObject({ thinking: "t", signature: cForm });
++    expect(content.some(isPlaceholder)).toBe(false);
++  });
++
++  it("still drops a foreign-signed thinking block and inserts the placeholder", () => {
++    const body = historyWith(foreignMarker);
++    normalizeClaudePassthrough(body, "claude-opus-5-5");
++
++    const content = assistantContent(body);
++    expect(content.some(block => block.signature === foreignMarker)).toBe(false);
++    expect(content[0]).toMatchObject({ type: "thinking", thinking: "." });
++    expect(content.at(-1)).toMatchObject({ type: "tool_use", id: "toolu_1" });
++  });
++});
+-- 
+2.55.0
+

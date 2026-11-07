@@ -1,0 +1,3154 @@
+From 7815efd2a208ff36b6d6a15642ef45c97db23fbc Mon Sep 17 00:00:00 2001
+From: downstream <downstream@local>
+Date: Sat, 7 Nov 2026 17:42:41 +0000
+Subject: [PATCH] Account availability, combo waiting and cooldowns
+
+
+Consolidated from the following original patches (file custody by final owner):
+
+- original #64: Keep account wait, pacing and cooldown transients (0064)
+- original #65: Divide 429 and 503 account cooldowns by three (0065)
+---
+ open-sse/config/errorConfig.js                |  14 +
+ open-sse/config/runtimeConfig.js              | 105 ++-
+ open-sse/services/accountFallback.js          |  18 +-
+ open-sse/services/combo.js                    |  60 +-
+ src/sse/handlers/chat.js                      | 161 +++-
+ src/sse/services/auth.js                      |  44 +-
+ tests/unit/account-cooldown-division.test.js  |  45 ++
+ ...igravity-native-disabled-functions.test.js | 381 +++++++++
+ tests/unit/antigravity-native-gemini.test.js  | 738 ++++++++++++++++++
+ .../antigravity-native-json-output.test.js    | 608 +++++++++++++++
+ tests/unit/combo-hold-deadline.test.js        |  88 +++
+ tests/unit/combo-transient-no-sleep.test.js   |  63 ++
+ .../unit/gemini-native-entry-contract.test.js | 381 +++++++++
+ 13 files changed, 2663 insertions(+), 43 deletions(-)
+ create mode 100644 tests/unit/account-cooldown-division.test.js
+ create mode 100644 tests/unit/antigravity-native-disabled-functions.test.js
+ create mode 100644 tests/unit/antigravity-native-gemini.test.js
+ create mode 100644 tests/unit/antigravity-native-json-output.test.js
+ create mode 100644 tests/unit/combo-hold-deadline.test.js
+ create mode 100644 tests/unit/combo-transient-no-sleep.test.js
+ create mode 100644 tests/unit/gemini-native-entry-contract.test.js
+
+diff --git a/open-sse/config/errorConfig.js b/open-sse/config/errorConfig.js
+index 5273a80..8ef4ea6 100644
+--- a/open-sse/config/errorConfig.js
++++ b/open-sse/config/errorConfig.js
+@@ -36,6 +36,14 @@ export const BACKOFF_CONFIG = {
+ };
+ 
+ // Default cooldown for transient/unknown errors
++// Router-computed cooldowns triggered by 429/503 responses are scaled down
++// by this divisor: with several accounts in rotation and requests waiting
++// out exhaustion, long locks only starve the pool — a third of the nominal
++// backoff still spreads retries without keeping accounts out needlessly.
++// Provider-reported reset timestamps (resetsAtMs) are NOT scaled: they state
++// when the provider itself lifts the limit, and probing earlier is futile.
++export const RATE_LIMIT_COOLDOWN_DIVISOR = 3;
++
+ export const TRANSIENT_COOLDOWN_MS = 30 * 1000;
+ 
+ // Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h)
+@@ -79,6 +87,12 @@ export const ERROR_RULES = [
+   { status: 403, cooldownMs: COOLDOWN.long },
+   { status: 404, cooldownMs: COOLDOWN.long },
+   { status: 429, backoff: true },
++  // Transient upstream 5xx without a text match: switch accounts now, but let
++  // the account back in quickly — these usually clear in seconds, and the
++  // generic 30s transient cooldown kept healthy accounts out of rotation.
++  { status: 502, cooldownMs: COOLDOWN.short },
++  { status: 503, cooldownMs: COOLDOWN.short },
++  { status: 504, cooldownMs: COOLDOWN.short },
+ ];
+ 
+ // Backward compat: COOLDOWN_MS object (used by index.js re-export)
+diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
+index 4354091..4451539 100644
+--- a/open-sse/config/runtimeConfig.js
++++ b/open-sse/config/runtimeConfig.js
+@@ -1,3 +1,5 @@
++import { FORMATS } from "../translator/formats.js";
++
+ // HTTP status codes
+ export const HTTP_STATUS = {
+   BAD_REQUEST: 400,
+@@ -8,6 +10,7 @@ export const HTTP_STATUS = {
+   NOT_ACCEPTABLE: 406,
+   REQUEST_TIMEOUT: 408,
+   RATE_LIMITED: 429,
++  CLIENT_CLOSED_REQUEST: 499,
+   SERVER_ERROR: 500,
+   BAD_GATEWAY: 502,
+   SERVICE_UNAVAILABLE: 503,
+@@ -69,9 +72,41 @@ export const GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS = envMs("GEMINI_NATIVE_TTS_FETCH
+ // Default token limits
+ export const DEFAULT_MAX_TOKENS = 64000;
+ export const DEFAULT_MIN_TOKENS = 32000;
++export const DEFAULT_PROVIDER_THINKING_BUDGET = 10000;
++
++export const FILE_EXTENSION_MIME = {
++  pdf: "application/pdf", json: "application/json",
++  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
++  mp3: "audio/mpeg", wav: "audio/wav", mp4: "video/mp4",
++  txt: "text/plain", md: "text/markdown", csv: "text/csv",
++};
++
++export const SCHEMA_MAP_KEYS = new Set(["properties", "$defs", "definitions", "patternProperties", "dependentSchemas"]);
++export const SCHEMA_ARRAY_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
++export const SCHEMA_SINGLE_KEYS = new Set(["items", "additionalProperties", "contains", "not", "if", "then", "else"]);
++export const PROTO_SCHEMA_TYPES = new Set(["OBJECT", "ARRAY", "STRING", "NUMBER", "INTEGER", "BOOLEAN", "NULL"]);
++export const LEGACY_PROTO_SCHEMA_KEYS = new Set(["type", "format", "description", "nullable", "enum", "items", "properties", "required", "propertyOrdering"]);
++
+ 
+ export const TOKEN_SAVER_HEADER = "x-9router-token-saver";
+ 
++export const PORTABLE_COLLABORATION = {
++  header: "x-9router-portable-collaboration",
++  namespace: "collaboration",
++  messageTools: ["spawn_agent", "send_message", "followup_task"],
++  aliasPrefix: "collab_plain_",
++  aliasHashLength: 16,
++  aliasNameLength: 30,
++  aliasCollisionBaseLength: 58,
++};
++
++export const RESPONSES_NAMESPACE_ALIAS = {
++  prefix: "ns_",
++  stemLength: 40,
++  hashLength: 16,
++  maxLength: 64,
++};
++
+ // Retry config for 429 responses (legacy - kept for backward compatibility)
+ export const RETRY_CONFIG = {
+   maxAttempts: 2,
+@@ -80,13 +115,41 @@ export const RETRY_CONFIG = {
+ 
+ // Default retry config by status code: { attempts, delayMs }
+ // Backward compat: if value is a number, treated as attempts with RETRY_CONFIG.delayMs
++// Transient 429/5xx are NOT retried on the same account: the router switches
++// to the next account immediately (account fallback), and the failed account
++// cools down via ERROR_RULES instead of burning the request's latency budget
++// on repeat attempts against the endpoint that just rejected it.
+ export const DEFAULT_RETRY_CONFIG = {
+   429: { attempts: 0, delayMs: 0 },
+-  502: { attempts: 3, delayMs: 3000 },
+-  503: { attempts: 3, delayMs: 2000 },
+-  504: { attempts: 2, delayMs: 3000 }
++  502: { attempts: 0, delayMs: 0 },
++  503: { attempts: 0, delayMs: 0 },
++  504: { attempts: 0, delayMs: 0 }
+ };
+ 
++// How long a chat request may wait for a free account (polling account locks)
++// instead of surfacing a 429/503 to the client. Only after this deadline does
++// the router give up, answering 502 rather than the upstream 429/503.
++// Env: ACCOUNT_WAIT_DEADLINE_MS. 0 disables waiting.
++// Parsed separately from envMs: 0 must stay 0 (disables waiting), not fall back.
++export const ACCOUNT_WAIT_DEADLINE_MS = (() => {
++  const raw = process.env.ACCOUNT_WAIT_DEADLINE_MS;
++  if (raw == null || raw === "") return 10 * 60 * 1000;
++  const n = parseInt(raw, 10);
++  return Number.isFinite(n) && n >= 0 ? n : 10 * 60 * 1000;
++})();
++
++// Per-model share of the wait deadline inside a combo: a member whose
++// accounts are all busy waits at most this long before the combo moves to the
++// next member; when every member is busy the combo waits and re-passes the
++// member list until ACCOUNT_WAIT_DEADLINE_MS expires. Env: COMBO_MODEL_WAIT_MS.
++export const COMBO_MODEL_WAIT_MS = envMs("COMBO_MODEL_WAIT_MS", 20 * 1000);
++
++// Maximum request starts per account per rolling minute. An account at the
++// limit is skipped during selection (like a locked account) until its oldest
++// start leaves the window, spreading bursts across accounts before the
++// provider's own rate limit fires. Env: ACCOUNT_START_LIMIT_PER_MIN.
++export const ACCOUNT_START_LIMIT_PER_MIN = envMs("ACCOUNT_START_LIMIT_PER_MIN", 30);
++
+ // Normalize a retry entry to { attempts, delayMs }
+ export function resolveRetryEntry(entry) {
+   if (entry == null) return { attempts: 0, delayMs: RETRY_CONFIG.delayMs };
+@@ -101,3 +164,39 @@ export function resolveRetryEntry(entry) {
+ export const SKIP_PATTERNS = [
+   "Please write a 5-10 word title for the following conversation:"
+ ];
++
++export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
++
++export const SSE_DONE_PAYLOAD = "[DONE]";
++export const SSE_DONE = `data: ${SSE_DONE_PAYLOAD}\n\n`;
++
++export const NATIVE_GEMINI_PRIVATE_HEADERS = new Set([
++  "authorization", "proxy-authorization", "x-goog-api-key", "x-api-key", "cookie", "set-cookie",
++  "host", "content-length", "connection", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer",
++]);
++
++export const NATIVE_GEMINI_THINKING_KEYS = ["thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"];
++
++export const NATIVE_GEMINI_RESPONSE_FIELDS = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
++export const NATIVE_GEMINI_BRIDGE_FIELDS = new Set(["message", "event", "data", "status", "code", "success", "response"]);
++
++export const NATIVE_GEMINI_ERROR_STATUSES = {
++  400: "INVALID_ARGUMENT",
++  401: "UNAUTHENTICATED",
++  403: "PERMISSION_DENIED",
++  404: "NOT_FOUND",
++  429: "RESOURCE_EXHAUSTED",
++  503: "UNAVAILABLE",
++  504: "DEADLINE_EXCEEDED",
++};
++
++export const NATIVE_GEMINI_API_VERSIONS = ["v1", "v1alpha"];
++export const NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES = ["fields", "$fields"];
++export const NATIVE_GEMINI_FIELD_MASK_HEADER_NAME = "x-goog-fieldmask";
++export const NATIVE_GEMINI_JSON_FENCE_PENDING_STATES = ["start", "possible", "open"];
++export const NATIVE_GEMINI_FINISH_REASON_FIELDS = ["finishReason", "finish_reason"];
++export const NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES = ["*", "candidates", "candidates/*"];
++export const NATIVE_GEMINI_FORMATS = [FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY];
++export const REWRITTEN_RESPONSE_HEADERS = ["content-encoding", "content-length", "transfer-encoding"];
++export const AISTUDIO_NATIVE_GEMINI_API_VERSION = "v1beta";
++export const GEMINI_DEFAULT_FILE_MIME_TYPE = "application/octet-stream";
+diff --git a/open-sse/services/accountFallback.js b/open-sse/services/accountFallback.js
+index 08df099..991988c 100644
+--- a/open-sse/services/accountFallback.js
++++ b/open-sse/services/accountFallback.js
+@@ -1,4 +1,4 @@
+-import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS } from "../config/errorConfig.js";
++import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS, RATE_LIMIT_COOLDOWN_DIVISOR } from "../config/errorConfig.js";
+ 
+ /**
+  * Calculate exponential backoff cooldown for rate limits (429)
+@@ -27,6 +27,12 @@ export function getQuotaCooldown(backoffLevel = 0) {
+  * this request, so combo rotation must still try the next member.
+  */
+ export function checkFallbackError(status, errorText, backoffLevel = 0, provider = null) {
++  // Cooldowns caused by 429/503 responses are scaled down (see
++  // RATE_LIMIT_COOLDOWN_DIVISOR); the backoff level still advances as before,
++  // so the ladder keeps its shape at a third of the durations.
++  const scaleCooldown = (status === 429 || status === 503)
++    ? (ms) => Math.max(1, Math.round(ms / RATE_LIMIT_COOLDOWN_DIVISOR))
++    : (ms) => ms;
+   const lowerError = errorText
+     ? (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase()
+     : "";
+@@ -37,18 +43,18 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
+     if (rule.text && lowerError && lowerError.includes(rule.text)) {
+       if (rule.backoff) {
+         const newLevel = Math.min(backoffLevel + 1, BACKOFF_CONFIG.maxLevel);
+-        return { shouldFallback: true, cooldownMs: getQuotaCooldown(newLevel), newBackoffLevel: newLevel };
++        return { shouldFallback: true, cooldownMs: scaleCooldown(getQuotaCooldown(newLevel)), newBackoffLevel: newLevel };
+       }
+-      return { shouldFallback: true, cooldownMs: rule.cooldownMs };
++      return { shouldFallback: true, cooldownMs: scaleCooldown(rule.cooldownMs) };
+     }
+ 
+     // Status-based rule: match HTTP status code
+     if (rule.status && rule.status === status) {
+       if (rule.backoff) {
+         const newLevel = Math.min(backoffLevel + 1, BACKOFF_CONFIG.maxLevel);
+-        return { shouldFallback: true, cooldownMs: getQuotaCooldown(newLevel), newBackoffLevel: newLevel };
++        return { shouldFallback: true, cooldownMs: scaleCooldown(getQuotaCooldown(newLevel)), newBackoffLevel: newLevel };
+       }
+-      return { shouldFallback: true, cooldownMs: rule.cooldownMs };
++      return { shouldFallback: true, cooldownMs: scaleCooldown(rule.cooldownMs) };
+     }
+   }
+ 
+@@ -67,7 +73,7 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
+   }
+ 
+   // Default: transient cooldown for any unmatched error
+-  return { shouldFallback: true, cooldownMs: TRANSIENT_COOLDOWN_MS };
++  return { shouldFallback: true, cooldownMs: scaleCooldown(TRANSIENT_COOLDOWN_MS) };
+ }
+ 
+ /**
+diff --git a/open-sse/services/combo.js b/open-sse/services/combo.js
+index c1ec690..b96a2ef 100644
+--- a/open-sse/services/combo.js
++++ b/open-sse/services/combo.js
+@@ -3,6 +3,7 @@
+  */
+ 
+ import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
++import { COMBO_MODEL_WAIT_MS } from "../config/runtimeConfig.js";
+ import { unavailableResponse } from "../utils/error.js";
+ import { getCapabilitiesForModel } from "../providers/capabilities.js";
+ import { parseModel } from "./model.js";
+@@ -351,6 +352,16 @@ export function isZeroContentResponse(data) {
+  * @param {Function|null} [options.resolveSmartChoice=null] - Smart router resolver callback: (body, models) => Promise<{ choice, probabilities, confidence } | null>
+  * @returns {Promise<Response>}
+  */
++// Sleep that wakes early when the client disconnects, so a combo waiting for
++// a free account never lingers after its caller is gone.
++function sleepAbortable(ms, signal) {
++  if (!(ms > 0)) return Promise.resolve();
++  return new Promise((resolve) => {
++    const timer = setTimeout(resolve, ms);
++    signal?.addEventListener?.("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
++  });
++}
++
+ export async function handleComboChat({
+   body,
+   models,
+@@ -365,7 +376,12 @@ export async function handleComboChat({
+   sessionSticky = true,
+   confidenceThreshold = 0.8,
+   resolveSmartChoice = null,
++  holdDeadlineAt = null,
++  clientSignal = null,
+ }) {
++  // True when at least one member failed on its accounts (not on the request):
++  // only then can waiting for an account to free up change the outcome.
++  let sawAccountFailure = false;
+   let rotatedModels = models;
+   let activeStickyModel = null;
+ 
+@@ -473,7 +489,13 @@ export async function handleComboChat({
+     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
+ 
+     try {
+-      const result = await handleSingleModel(body, modelStr);
++      // Within the overall wait deadline each member gets a bounded share, so
++      // one exhausted provider cannot starve the remaining members; the pass
++      // loop below keeps cycling until the deadline itself expires.
++      const holdMs = holdDeadlineAt
++        ? Math.max(0, Math.min(COMBO_MODEL_WAIT_MS, holdDeadlineAt - Date.now()))
++        : undefined;
++      const result = await handleSingleModel(body, modelStr, holdMs);
+       
+       // Success (2xx). A 2xx is necessary but NOT sufficient: Gemini aborts (e.g.
+       // MALFORMED_FUNCTION_CALL) still return 200 and stream empty content, which would
+@@ -593,22 +615,19 @@ export async function handleComboChat({
+       // request-scoped fault must not evict a healthy account from rotation).
+       if (requestScoped) {
+         log.warn("COMBO", `Model ${modelStr} rejected the request (${result.status}), trying next`, { status: result.status });
+-        lastError = errorText || String(result.status);
++        sawAccountFailure = true;
++      lastError = errorText || String(result.status);
+         if (!lastStatus) lastStatus = result.status;
+         if (!requestScopedResult) requestScopedResult = result;
+         continue;
+       }
+ 
+-      // For transient errors (503/502/504), wait for cooldown before falling through
+-      // so a briefly-overloaded provider gets a chance to recover rather than being
+-      // skipped immediately (fixes: combo falls through on transient 503)
+-      if (cooldownMs && cooldownMs > 0 && cooldownMs <= 5000 &&
+-          (result.status === 503 || result.status === 502 || result.status === 504)) {
+-        log.info("COMBO", `Model ${modelStr} transient ${result.status}, waiting ${cooldownMs}ms before next`);
+-        await new Promise(r => setTimeout(r, cooldownMs));
+-      }
++      // Transient 502/503/504 move to the next combo model at once. The short account
++      // cooldown only marks the account unavailable (see checkFallbackError and
++      // markAccountUnavailable); it never delays the current request.
+ 
+       // Fallback to next model
++      sawAccountFailure = true;
+       lastError = errorText || String(result.status);
+       if (!lastStatus) lastStatus = result.status;
+       log.warn("COMBO", `Model ${modelStr} failed, trying next`, { status: result.status });
+@@ -617,10 +636,26 @@ export async function handleComboChat({
+       if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
+         clearStickyComboSession(comboName, sessionId);
+       }
++      sawAccountFailure = true;
+       lastError = error.message || String(error);
+       if (!lastStatus) lastStatus = 500;
+       log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
+     }
++
++    // Every member failed on account exhaustion (not on the request itself):
++    // wait for the earliest account to free up and pass the member list again
++    // instead of returning 429/503, until the wait deadline expires.
++    if (i === rotatedModels.length - 1 && holdDeadlineAt && sawAccountFailure && !clientSignal?.aborted) {
++      const now = Date.now();
++      if (now < holdDeadlineAt) {
++        let waitMs = earliestRetryAfter ? new Date(earliestRetryAfter).getTime() - now : 1000;
++        waitMs = Math.min(Math.max(waitMs, 250), 2000, holdDeadlineAt - now);
++        log.info("COMBO", `All models busy — waiting ${Math.round(waitMs)}ms before another pass (${Math.round((holdDeadlineAt - now) / 1000)}s left)`);
++        await sleepAbortable(waitMs, clientSignal);
++        earliestRetryAfter = null;
++        i = -1; // restart the member pass
++      }
++    }
+   }
+ 
+   // At least one member rejected the request itself. Hand back that member's own
+@@ -638,7 +673,10 @@ export async function handleComboChat({
+   // the request itself is invalid, but here the providers are simply unavailable
+   // or have no active credentials. 503 is more accurate and retryable by clients.
+   const allDisabled = lastError && lastError.toLowerCase().includes("no credentials");
+-  const status = allDisabled ? 503 : (lastStatus || 503);
++  let status = allDisabled ? 503 : (lastStatus || 503);
++  // The wait deadline was configured and has now expired: report the router's
++  // own 502 rather than relaying an upstream 429/503 to the client.
++  if (holdDeadlineAt && (status === 429 || status === 503)) status = 502;
+   const msg = lastError || "All combo models unavailable";
+ 
+   if (earliestRetryAfter) {
+diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
+index 18e5a01..155bb6f 100644
+--- a/src/sse/handlers/chat.js
++++ b/src/sse/handlers/chat.js
+@@ -1,4 +1,6 @@
++import { createHash } from "node:crypto";
+ import "open-sse/index.js";
++import { hasValidCliToken, isLocalRequest } from "@/dashboardGuard.js";
+ 
+ import {
+   getProviderCredentials,
+@@ -19,28 +21,85 @@ import { upstreamResponseHeaders } from "open-sse/utils/upstreamHeaders.js";
+ import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "open-sse/services/combo.js";
+ import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
+ import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
+-import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
++import { HTTP_STATUS, ACCOUNT_WAIT_DEADLINE_MS } from "open-sse/config/runtimeConfig.js";
+ import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
+ import { resolveSessionIdentity } from "open-sse/utils/sessionManager.js";
+ import * as log from "../utils/logger.js";
+ import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
+ import { getProjectIdForConnection } from "open-sse/services/projectId.js";
+ import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
+-import { getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
++import { extractClientApiKey, getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
+ import { resolveSmartChoice } from "../services/systemoneRouter.js";
+ 
++const GEMINI_ERROR_STATUS = Object.freeze({
++  400: "INVALID_ARGUMENT",
++  401: "UNAUTHENTICATED",
++  403: "PERMISSION_DENIED",
++  404: "NOT_FOUND",
++  408: "DEADLINE_EXCEEDED",
++  409: "ABORTED",
++  410: "FAILED_PRECONDITION",
++  412: "FAILED_PRECONDITION",
++  416: "OUT_OF_RANGE",
++  429: "RESOURCE_EXHAUSTED",
++  499: "CANCELLED",
++  500: "INTERNAL",
++  501: "UNIMPLEMENTED",
++  502: "UNAVAILABLE",
++  503: "UNAVAILABLE",
++  504: "DEADLINE_EXCEEDED",
++});
++
++function isNativeGeminiRequest(options) {
++  return options?.sourceFormatOverride === "gemini";
++}
++
++function nativeGeminiErrorResponse(status, message, extraHeaders = null) {
++  const statusCode = Number.isInteger(status) && status >= 400 ? status : HTTP_STATUS.SERVER_ERROR;
++  const headers = new Headers(extraHeaders || undefined);
++  for (const name of ["content-encoding", "content-length", "transfer-encoding"]) headers.delete(name);
++  headers.set("Content-Type", "application/json");
++  headers.set("Access-Control-Allow-Origin", "*");
++  return new Response(JSON.stringify({ error: {
++    code: statusCode,
++    status: GEMINI_ERROR_STATUS[statusCode] || (statusCode >= 500 ? "INTERNAL" : "INVALID_ARGUMENT"),
++    message: typeof message === "string" && message ? message : `Request failed with HTTP ${statusCode}`,
++  } }), { status: statusCode, headers });
++}
++
++function errorResponseForClient(status, message, options, extraHeaders = null) {
++  return isNativeGeminiRequest(options)
++    ? nativeGeminiErrorResponse(status, message, extraHeaders)
++    : errorResponse(status, message, extraHeaders);
++}
++
++async function responseErrorForClient(response, options, fallbackMessage = "Request failed") {
++  if (!isNativeGeminiRequest(options) || !response || response.status < 400) return response;
++  let message = fallbackMessage;
++  try {
++    const body = await response.clone().json();
++    if (typeof body?.error?.message === "string" && body.error.message) message = body.error.message;
++  } catch { /* Keep the caller's bounded fallback message. */ }
++  return nativeGeminiErrorResponse(response.status, message, response.headers);
++}
++
++function chatCoreErrorResponse(result, options) {
++  if (!isNativeGeminiRequest(options) || result.nativeResponse === true) return result.response;
++  return nativeGeminiErrorResponse(result.status, result.error, result.response?.headers);
++}
++
+ /**
+  * Handle chat completion request
+  * Supports: OpenAI, Claude, Gemini, OpenAI Responses API formats
+  * Format detection and translation handled by translator
+  */
+-export async function handleChat(request, clientRawRequest = null) {
++export async function handleChat(request, clientRawRequest = null, options = {}) {
+   let body;
+   try {
+     body = await request.json();
+   } catch {
+     log.warn("CHAT", "Invalid JSON body");
+-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid JSON body");
++    return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Invalid JSON body", options);
+   }
+ 
+   // Build clientRawRequest for logging (if not provided)
+@@ -75,21 +134,60 @@ export async function handleChat(request, clientRawRequest = null) {
+ 
+   // Enforce API key if enabled in settings
+   const settings = await getSettings();
++  let authenticatedApiKey = false;
++  let serverPartsApiKey = null;
+   if (settings.requireApiKey) {
+     if (!apiKey) {
+       log.warn("AUTH", "Missing API key (requireApiKey=true)");
+-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
++      return errorResponseForClient(HTTP_STATUS.UNAUTHORIZED, "Missing API key", options);
+     }
+     const valid = await isValidApiKey(apiKey);
+     if (!valid) {
+       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
+-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
++      return errorResponseForClient(HTTP_STATUS.UNAUTHORIZED, "Invalid API key", options);
++    }
++    authenticatedApiKey = true;
++    serverPartsApiKey = apiKey;
++  } else {
++    // Optional API keys do not gate the request, but a valid one still provides
++    // a trustworthy tenant boundary for plaintext Gemini server parts.
++    const optionalApiKey = extractClientApiKey(request);
++    if (optionalApiKey) {
++      try {
++        authenticatedApiKey = await isValidApiKey(optionalApiKey);
++        if (authenticatedApiKey) serverPartsApiKey = optionalApiKey;
++      } catch {
++        // Cache identity must not change the acceptance of optional-key requests.
++      }
++    }
++  }
++
++  // Gemini server-side tool parts are plaintext history. Bind their cache to
++  // an authenticated API-key tenant or the existing trusted local/CLI caller.
++  // A client-declared conversation id alone is not a caller identity.
++  let serverPartsTenant = authenticatedApiKey
++    ? createHash("sha256").update("gemini-server-parts-tenant\0").update(serverPartsApiKey).digest("hex")
++    : null;
++  if (!serverPartsTenant) {
++    try {
++      if (isLocalRequest(request)) serverPartsTenant = "trusted-local";
++      else if (await hasValidCliToken(request)) serverPartsTenant = "trusted-cli";
++    } catch {
++      // Failure to resolve a trusted principal disables caching only.
+     }
+   }
++  options = { ...options, serverPartsTenant };
++
++  // Server-side wait deadline, applied once at the top-level chat boundary. An
++  // explicit holdUntil (including null from internal calls) is never overwritten,
++  // so recursive and combo calls do not extend the shared deadline. 0 disables waiting.
++  if (options.holdUntil === undefined && ACCOUNT_WAIT_DEADLINE_MS > 0) {
++    options.holdUntil = Date.now() + ACCOUNT_WAIT_DEADLINE_MS;
++  }
+ 
+   if (!modelStr) {
+     log.warn("CHAT", "Missing model");
+-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
++    return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Missing model", options);
+   }
+ 
+   // Per-key access control: a restricted key may call only its listed combos and
+@@ -97,12 +195,12 @@ export async function handleChat(request, clientRawRequest = null) {
+   // and any credential lookup; an allowed combo grants the members it routes to.
+   const keyAccess = await getKeyAccessContext(request);
+   const keyAccessDenied = await enforceKeyAccess(keyAccess, modelStr);
+-  if (keyAccessDenied) return keyAccessDenied;
++  if (keyAccessDenied) return responseErrorForClient(keyAccessDenied, options, "Request not allowed");
+ 
+   // Bypass naming/warmup requests before combo rotation to avoid wasting rotation slots
+   const userAgent = request?.headers?.get("user-agent") || "";
+   const bypassResponse = handleBypassRequest(body, modelStr, userAgent, !!settings.ccFilterNaming);
+-  if (bypassResponse) return bypassResponse.response || bypassResponse;
++  if (bypassResponse) return responseErrorForClient(bypassResponse.response || bypassResponse, options);
+ 
+   const requiredCapabilities = detectRequiredCapabilities(body);
+ 
+@@ -127,7 +225,7 @@ export async function handleChat(request, clientRawRequest = null) {
+             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
+             cleanRawReq = { ...clientRawRequest, body: cleanBody };
+           }
+-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
++          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options);
+         },
+         log,
+         comboName: modelStr,
+@@ -143,7 +241,7 @@ export async function handleChat(request, clientRawRequest = null) {
+       body,
+       models: augmentedModels,
+       handleSingleModel: withCapacityAdapterStripping(
+-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
++        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
+         adapterAdded
+       ),
+       log,
+@@ -175,7 +273,7 @@ export async function handleChat(request, clientRawRequest = null) {
+       body,
+       models: soloAugmented,
+       handleSingleModel: withCapacityAdapterStripping(
+-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
++        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
+         adapterAdded
+       ),
+       log,
+@@ -184,13 +282,13 @@ export async function handleChat(request, clientRawRequest = null) {
+     });
+   }
+ 
+-  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null);
++  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null, options);
+ }
+ 
+ /**
+  * Handle single model chat request
+  */
+-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null) {
++async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, options = {}) {
+   const modelInfo = await getModelInfo(modelStr);
+ 
+   // If provider is null, this might be a combo name - check and handle
+@@ -220,7 +318,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
+               cleanRawReq = { ...clientRawRequest, body: cleanBody };
+             }
+-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
++            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options);
+           },
+           log,
+           comboName: modelStr,
+@@ -238,7 +336,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+         body,
+         models: augmentedModels,
+         handleSingleModel: withCapacityAdapterStripping(
+-          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
++          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
+           adapterAdded
+         ),
+         log,
+@@ -260,7 +358,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+       });
+     }
+     log.warn("CHAT", "Invalid model format", { model: modelStr });
+-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
++    return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Invalid model format", options);
+   }
+ 
+   const { provider, model } = modelInfo;
+@@ -275,24 +373,27 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+   let lastError = null;
+   let lastStatus = null;
+   let lastHeaders = null;
++  let lastNativeResponse = null;
+ 
+   while (true) {
+     const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { requestedModel: requestedModel || model });
+ 
+     // All accounts unavailable
+     if (!credentials || credentials.allRateLimited) {
++      if (lastNativeResponse) return lastNativeResponse;
+       if (credentials?.allRateLimited) {
+         const errorMsg = lastError || credentials.lastError || "Unavailable";
+         const status = HTTP_STATUS.SERVICE_UNAVAILABLE;
+         log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
+-        return unavailableResponse(status, `[${provider}/${model}] ${errorMsg}`, credentials.retryAfter, credentials.retryAfterHuman, lastHeaders);
++        const response = unavailableResponse(status, `[${provider}/${model}] ${errorMsg}`, credentials.retryAfter, credentials.retryAfterHuman, lastHeaders);
++        return responseErrorForClient(response, options);
+       }
+       if (excludeConnectionIds.size === 0) {
+         log.warn("AUTH", `No active credentials for provider: ${provider}`);
+-        return errorResponse(HTTP_STATUS.NOT_FOUND, `No active credentials for provider: ${provider}`);
++        return errorResponseForClient(HTTP_STATUS.NOT_FOUND, `No active credentials for provider: ${provider}`, options);
+       }
+       log.warn("CHAT", "No more accounts available", { provider });
+-      return errorResponse(lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE, lastError || "All accounts unavailable", lastHeaders);
++      return errorResponseForClient(lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE, lastError || "All accounts unavailable", options, lastHeaders);
+     }
+ 
+     // Account selection shown in the unified "▶" line (acc:...)
+@@ -341,8 +442,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+       providerThinking,
+       // Per-provider user overrides (custom headers / connect timeout) from settings
+       providerOverrides: (chatSettings.providerOverrides || {})[provider] || null,
++      clientSignal: request?.signal,
+       // Detect source format by endpoint + body
+-      sourceFormatOverride: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null,
++      sourceFormatOverride: options.sourceFormatOverride || (request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null),
++      serverPartsTenant: options.serverPartsTenant,
+       onCredentialsRefreshed: async (newCreds) => {
+         await updateProviderCredentials(credentials.connectionId, {
+           ...newCreds,
+@@ -354,10 +457,23 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+         await clearAccountError(credentials.connectionId, credentials, model);
+         // "Consecutive" strikes: a success clears the breaker for this pair.
+         clearAntigravityStrikes(credentials.connectionId, model);
++      },
++      onRequestFailure: async ({ status, error, resetsAtMs }) => {
++        // Headers may already be sent. Retain the failed stream and make the
++        // account/model unavailable to subsequent requests through the usual path.
++        if (provider === "antigravity" && (status === 409 || status === 429)) {
++          const quotaResetMs = await handleAntigravityQuotaError(
++            credentials.connectionId, status, model,
++            refreshedCredentials.accessToken, credentials.providerSpecificData
++          );
++          if (quotaResetMs) return;
++        }
++        await markAccountUnavailable(credentials.connectionId, status, error, provider, model, resetsAtMs);
+       }
+     });
+ 
+     if (result.success) return result.response;
++    if (result.status === 499 || request?.signal?.aborted) return chatCoreErrorResponse(result, options);
+ 
+     // Antigravity 409/429: refresh live quota to get exact resetAt before locking
+     let quotaResetMs = null;
+@@ -382,9 +498,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+       lastError = result.error;
+       lastStatus = result.status;
+       lastHeaders = upstreamResponseHeaders(result.response?.headers);
++      lastNativeResponse = result.nativeResponse === true ? result.response : null;
+       continue;
+     }
+ 
+-    return result.response;
++    return chatCoreErrorResponse(result, options);
+   }
+ }
+diff --git a/src/sse/services/auth.js b/src/sse/services/auth.js
+index 035d969..aea5340 100644
+--- a/src/sse/services/auth.js
++++ b/src/sse/services/auth.js
+@@ -2,6 +2,7 @@ import { getProviderConnections, validateApiKey, updateProviderConnection, getSe
+ import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
+ import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
+ import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
++import { ACCOUNT_START_LIMIT_PER_MIN } from "open-sse/config/runtimeConfig.js";
+ import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
+ import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravityQuota.js";
+ import * as log from "../utils/logger.js";
+@@ -9,6 +10,35 @@ import * as log from "../utils/logger.js";
+ // Mutex to prevent race conditions during account selection
+ let selectionMutex = Promise.resolve();
+ 
++// Per-account request-start pacing: rolling 60s window of selection timestamps.
++// An account whose window is full is skipped during selection until its oldest
++// start expires, so bursts spread across accounts instead of concentrating on
++// the first one until the provider rate-limits it. In-memory only (like the
++// Antigravity quota cache); timestamps need no release bookkeeping.
++const ACCOUNT_START_WINDOW_MS = 60 * 1000;
++const accountStartLog = new Map(); // connectionId -> number[] (ascending ms)
++
++function pruneAccountStarts(connectionId, now) {
++  const starts = accountStartLog.get(connectionId);
++  if (!starts) return [];
++  while (starts.length > 0 && now - starts[0] >= ACCOUNT_START_WINDOW_MS) starts.shift();
++  if (starts.length === 0) accountStartLog.delete(connectionId);
++  return starts;
++}
++
++// Ms timestamp when a start slot frees for this account, or 0 if not saturated.
++function accountStartSaturatedUntil(connectionId, now) {
++  if (!ACCOUNT_START_LIMIT_PER_MIN) return 0;
++  const starts = pruneAccountStarts(connectionId, now);
++  return starts.length >= ACCOUNT_START_LIMIT_PER_MIN ? starts[0] + ACCOUNT_START_WINDOW_MS : 0;
++}
++
++function recordAccountStart(connectionId, now) {
++  const starts = pruneAccountStarts(connectionId, now);
++  starts.push(now);
++  accountStartLog.set(connectionId, starts);
++}
++
+ const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
+ 
+ function githubMonthlyResetMs(status, errorText, provider) {
+@@ -83,10 +113,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
+     const isAntigravity = providerId === "antigravity";
+     const antigravityQuotaCache = isAntigravity && model ? getAntigravityQuotaCache() : null;
+ 
+-    // Filter out model-locked, excluded, and Antigravity quota-exhausted connections.
++    // Filter out model-locked, excluded, start-saturated, and Antigravity quota-exhausted connections.
++    const selectionNow = Date.now();
+     const availableConnections = connections.filter(c => {
+       if (excludeSet.has(c.id)) return false;
+       if (isModelLockActive(c, model)) return false;
++      if (accountStartSaturatedUntil(c.id, selectionNow)) return false;
+       const enabled = c.providerSpecificData?.enabledModels;
+       if (providerId === "codex" && Array.isArray(enabled) && enabled.length && requestedModel && !enabled.includes(requestedModel)) return false;
+       // Antigravity: skip if live quota exhausted for this model
+@@ -116,6 +148,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
+       // Find earliest persistent lock or lazy Antigravity quota-cache reset for retry timing.
+       const lockedConns = connections.filter(c => isModelLockActive(c, model));
+       const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
++      // Start-saturated accounts also free up with time; their slot expiry is
++      // a valid retryAfter for the allRateLimited contract (callers may wait).
++      for (const c of connections) {
++        const saturatedUntil = accountStartSaturatedUntil(c.id, selectionNow);
++        if (saturatedUntil) expiries.push(new Date(saturatedUntil).toISOString());
++      }
+       if (isAntigravity && model && antigravityQuotaCache) {
+         connections.forEach((c) => {
+           const connQuotas = antigravityQuotaCache.get(c.id);
+@@ -201,6 +239,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
+ 
+     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
+ 
++    // Count this selection as a request start for pacing (still under the
++    // selection mutex, so concurrent selections observe the updated window).
++    recordAccountStart(connection.id, Date.now());
++
+     return {
+       authType: connection.authType,
+       apiKey: connection.apiKey,
+diff --git a/tests/unit/account-cooldown-division.test.js b/tests/unit/account-cooldown-division.test.js
+new file mode 100644
+index 0000000..b28d72c
+--- /dev/null
++++ b/tests/unit/account-cooldown-division.test.js
+@@ -0,0 +1,45 @@
++// Regression for the 429/503 cooldown division (RATE_LIMIT_COOLDOWN_DIVISOR = 3).
++// Only cooldowns caused by 429 and 503 are divided. Other statuses keep their
++// configured duration, and provider-reported reset timestamps are never divided.
++import { describe, expect, it } from "vitest";
++import { checkFallbackError } from "../../open-sse/services/accountFallback.js";
++import { RATE_LIMIT_COOLDOWN_DIVISOR, COOLDOWN_MS, TRANSIENT_COOLDOWN_MS } from "../../open-sse/config/errorConfig.js";
++
++describe("RATE_LIMIT_COOLDOWN_DIVISOR scales only 429 and 503", () => {
++  it("the divisor is 3", () => {
++    expect(RATE_LIMIT_COOLDOWN_DIVISOR).toBe(3);
++  });
++
++  it("a 503 with the short cooldown is divided by 3", () => {
++    const r = checkFallbackError(503, "upstream unavailable", 0, "p");
++    // COOLDOWN.short is 5000 ms for 503; the divisor brings it to round(5000 / 3).
++    expect(r.cooldownMs).toBe(Math.round(5000 / RATE_LIMIT_COOLDOWN_DIVISOR));
++  });
++
++  it("a 429 backoff level is divided by 3", () => {
++    // Backoff level 1 gives the base 2000 ms (getQuotaCooldown(1)); the divisor
++    // must bring it to round(2000 / 3), not leave the nominal value.
++    const r = checkFallbackError(429, "rate limit", 0, "p");
++    expect(r.cooldownMs).toBe(Math.round(2000 / RATE_LIMIT_COOLDOWN_DIVISOR));
++  });
++
++  it("a 502 keeps its undivided short cooldown", () => {
++    const r = checkFallbackError(502, "upstream unavailable", 0, "p");
++    expect(r.cooldownMs).toBe(5000);
++  });
++
++  it("a 504 keeps its undivided short cooldown", () => {
++    const r = checkFallbackError(504, "upstream unavailable", 0, "p");
++    expect(r.cooldownMs).toBe(5000);
++  });
++
++  it("an unmatched transient error keeps the undivided default cooldown", () => {
++    const r = checkFallbackError(500, "strange failure", 0, "p");
++    expect(r.cooldownMs).toBe(TRANSIENT_COOLDOWN_MS);
++  });
++
++  it("a 401 keeps its undivided account cooldown", () => {
++    const r = checkFallbackError(401, "unauthorized", 0, "p");
++    expect(r.cooldownMs).toBe(COOLDOWN_MS.unauthorized);
++  });
++});
+diff --git a/tests/unit/antigravity-native-disabled-functions.test.js b/tests/unit/antigravity-native-disabled-functions.test.js
+new file mode 100644
+index 0000000..d22374e
+--- /dev/null
++++ b/tests/unit/antigravity-native-disabled-functions.test.js
+@@ -0,0 +1,381 @@
++// Native Gemini disabled-function structured-output controls through the
++// public route, real chat core, and real Antigravity executor.
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import fs from "node:fs";
++import path from "node:path";
++import vm from "node:vm";
++import { createHash } from "node:crypto";
++import { fileURLToPath } from "node:url";
++
++const { network, executorInstances } = vi.hoisted(() => ({
++  network: vi.fn(),
++  executorInstances: new Map(),
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: network }));
++vi.mock("../../open-sse/executors/index.js", async () => {
++  const { AntigravityExecutor } = await import("../../open-sse/executors/antigravity.js");
++  return {
++    getExecutor(provider) {
++      if (provider !== "antigravity") throw new Error(`Unexpected fixture provider: ${provider}`);
++      if (!executorInstances.has(provider)) executorInstances.set(provider, new AntigravityExecutor());
++      return executorInstances.get(provider);
++    },
++  };
++});
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: async () => new Proxy({}, {
++    get: (_target, name) => name === "then" ? undefined : vi.fn(),
++  }),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
++const { resolveSessionIdentity } = await import("../../open-sse/utils/sessionManager.js");
++const { ANTIGRAVITY_HEADERS } = await import("../../open-sse/config/appConstants.js");
++
++const root = fileURLToPath(new URL("../../", import.meta.url));
++const MODEL = "gemini-3.8-flash-high";
++const quiet = Object.fromEntries(["debug", "info", "warn", "error", "line", "errorLine"].map(name => [name, vi.fn()]));
++const SCHEMA = {
++  type: "OBJECT",
++  properties: { code: { type: "STRING" } },
++  required: ["code"],
++  additionalProperties: false,
++  description: "Preserve this complete response schema.",
++};
++
++function makeBody({ schemaKey = "responseSchema", mode = "NONE" } = {}) {
++  return {
++    systemInstruction: { parts: [{ text: "Follow the task protocol." }] },
++    contents: [
++      { role: "user", parts: [{ text: "Read the image and return its code as JSON." }] },
++      { role: "model", parts: [
++        { text: "Earlier thought", thought: true, thoughtSignature: "history-thought-signature" },
++        { functionCall: { id: "history-call-31", name: "lookup_record", args: { key: "opaque" } }, thoughtSignature: "history-call-signature" },
++      ] },
++      { role: "user", parts: [
++        { functionResponse: { id: "history-call-31", name: "lookup_record", response: { record: { value: 31 } } } },
++        { inlineData: { mimeType: "image/png", data: "aW1hZ2UtYnl0ZXM=" } },
++        { futurePart: { preserve: true, token: "opaque-client-part" } },
++      ] },
++    ],
++    tools: [
++      {
++        functionDeclarations: [{
++          name: "forbidden_dummy",
++          description: "Must remain disabled in this control.",
++          parametersJsonSchema: { type: "OBJECT", properties: { code: { type: "STRING" } } },
++        }],
++        googleSearch: { dynamicRetrievalConfig: { mode: "MODE_UNSPECIFIED" } },
++        futureGroupField: { group: "search-and-functions", value: 1 },
++      },
++      {
++        function_declarations: [{ name: "inactive_snake_alias", parameters: { type: "OBJECT" } }],
++        urlContext: {},
++        futureGroupField: { group: "url-and-functions", value: 2 },
++      },
++      {
++        functionDeclarations: [{ name: "only_inactive_function", parameters: { type: "OBJECT" } }],
++      },
++    ],
++    toolConfig: { functionCallingConfig: { mode, allowedFunctionNames: ["forbidden_dummy"] } },
++    generationConfig: {
++      maxOutputTokens: 2048,
++      temperature: 0,
++      thinkingConfig: { thinkingLevel: "HIGH", includeThoughts: true },
++      responseMimeType: "application/json",
++      [schemaKey]: structuredClone(SCHEMA),
++    },
++    cachedContent: "cachedContents/native-prefix",
++    clientExtension: { continuation: { token: "opaque-future-field" } },
++  };
++}
++
++function responseForWire(wire) {
++  const declarationsRemain = (wire.request.tools || []).some(group =>
++    (group.functionDeclarations || []).length > 0 || (group.function_declarations || []).length > 0
++  );
++  const candidate = declarationsRemain
++    ? {
++        index: 0,
++        content: { role: "model", parts: [{
++          functionCall: { id: "provider-forbidden-call", name: "forbidden_dummy", args: { code: "4821" } },
++          thoughtSignature: "provider-function-signature",
++        }] },
++        finishReason: "STOP",
++      }
++    : {
++        index: 0,
++        content: { role: "model", parts: [{ text: "{\"code\":\"4821\"}" }] },
++        finishReason: "STOP",
++      };
++  return Response.json({ response: {
++    candidates: [candidate],
++    usageMetadata: { promptTokenCount: 81, candidatesTokenCount: 4, totalTokenCount: 85 },
++  } });
++}
++
++function moduleSource(relative) {
++  return fs.readFileSync(path.join(root, relative), "utf8")
++    .replace(/^import[\s\S]*?;\s*$/gm, "")
++    .replace(/^export /gm, "");
++}
++
++function loadPublicNativeRoute() {
++  const services = {
++    handleChatCore: vi.fn(options => handleChatCore(options)),
++    getSettings: vi.fn(async () => ({ requireApiKey: false })),
++    getProviderCredentials: vi.fn(async () => ({ accessToken: "offline-token", projectId: "fixture-project", connectionId: "route-fixture", providerSpecificData: {} })),
++    getModelInfo: vi.fn(async model => {
++      const index = model.indexOf("/");
++      return index < 0 ? { provider: null, model } : { provider: model.slice(0, index), model: model.slice(index + 1) };
++    }),
++    isValidApiKey: vi.fn(async () => true),
++    getKeyAccessContext: vi.fn(async () => null),
++    enforceKeyAccess: vi.fn(async () => null),
++    enforceKeyAccessResolved: vi.fn(async () => null),
++    filterAdapterModels: vi.fn(async (_keyAccess, models) => models),
++    markAccountUnavailable: vi.fn(async () => ({ shouldFallback: false })),
++    clearAccountError: vi.fn(async () => {}),
++    handleAntigravityQuotaError: vi.fn(async () => null),
++    clearAntigravityStrikes: vi.fn(),
++    getComboModels: vi.fn(async () => null),
++    augmentModelsWithCapacityAdapter: models => models,
++    withCapacityAdapterStripping: callback => callback,
++    getActiveAdapterStrategy: vi.fn(),
++    detectRequiredCapabilities: () => new Set(),
++    handleBypassRequest: () => null,
++    checkAndRefreshToken: vi.fn(async (_provider, credentials) => credentials),
++    updateProviderCredentials: vi.fn(async () => {}),
++    getProjectIdForConnection: vi.fn(async () => "fixture-project"),
++    getPxpipeTransform: vi.fn(async () => null),
++    appendPxpipeEvent: vi.fn(),
++    detectFormatByEndpoint: vi.fn(() => null),
++    stripModelContextMarker: model => ({ model, contextMarker: null }),
++    upstreamResponseHeaders: headers => Object.fromEntries(headers || []),
++    errorResponse: (status, message, headers) => Response.json({ error: { message } }, { status, headers }),
++    unavailableResponse: (status, message) => Response.json({ error: { message } }, { status }),
++    fetch: vi.fn(),
++  };
++  const logger = Object.fromEntries(["log", "debug", "info", "warn", "error"].map(name => [name, vi.fn()]));
++  logger.maskKey = () => "masked-fixture-key";
++  const context = {
++    ...services,
++    console: logger,
++    log: logger,
++    Request,
++    Response,
++    Headers,
++    URL,
++    Buffer,
++    AbortController,
++    ReadableStream,
++    TextEncoder,
++    TextDecoder,
++    TransformStream,
++    setTimeout,
++    clearTimeout,
++    GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS: 50,
++    PROVIDER_MODELS: { gemini: [], "gemini-tts-models": [] },
++    HTTP_STATUS: { BAD_REQUEST: 400, UNAUTHORIZED: 401, NOT_FOUND: 404, SERVICE_UNAVAILABLE: 503 },
++    // Immediate-response scenarios: the harness sets the server wait deadline to 0 so
++    // exhausted accounts answer at once. Positive-deadline behaviour is covered by
++    // separate regressions outside this file. The import line is stripped below, so
++    // the sandbox must supply the binding itself.
++    ACCOUNT_WAIT_DEADLINE_MS: 0,
++    FORMATS: { GEMINI: "gemini", OPENAI: "openai" },
++    DEFAULT_HEADROOM_URL: "http://unused.test",
++    getTargetFormat,
++    supportsNativeGemini,
++    resolveSessionIdentity,
++    initTranslators: async () => {},
++    proxyAwareFetch: (...args) => services.fetch(...args),
++    stripModelContextMarker: services.stripModelContextMarker,
++    detectRequiredCapabilities: services.detectRequiredCapabilities,
++    augmentModelsWithCapacityAdapter: services.augmentModelsWithCapacityAdapter,
++    handleBypassRequest: services.handleBypassRequest,
++    checkAndRefreshToken: services.checkAndRefreshToken,
++    getPxpipeTransform: services.getPxpipeTransform,
++    appendPxpipeEvent: services.appendPxpipeEvent,
++    detectFormatByEndpoint: services.detectFormatByEndpoint,
++    upstreamResponseHeaders: services.upstreamResponseHeaders,
++    updateProviderCredentials: services.updateProviderCredentials,
++    unavailableResponse: services.unavailableResponse,
++  };
++  // Production crypto is real; these remote fixtures have no trusted local/CLI principal.
++  Object.assign(context, { createHash, isLocalRequest: () => false, hasValidCliToken: async () => false });
++  vm.createContext(context);
++
++  const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
++  const start = auth.indexOf("export function extractApiKey(");
++  const end = auth.indexOf("/**", start);
++  vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  // Upstream added the wider client-key accessor; load its real pure implementation
++  // just like the legacy auth accessor, without importing DB/account boundaries.
++  const keyAccess = fs.readFileSync(path.join(root, "src/sse/services/keyAccess.js"), "utf8");
++  const keyStart = keyAccess.indexOf("export function extractClientApiKey(");
++  const keyEnd = keyAccess.indexOf("/**", keyStart);
++  if (keyStart < 0 || keyEnd <= keyStart) throw new Error("Real client-key accessor is missing");
++  vm.runInContext(keyAccess.slice(keyStart, keyEnd).replace("export ", ""), context);
++  vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
++  vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
++  return { context, services };
++}
++
++async function postNative(body) {
++  const { context, services } = loadPublicNativeRoute();
++  const modelPath = `antigravity/${MODEL}:generateContent`;
++  const request = new Request(`https://router.test/v1beta/models/${modelPath}`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json", Authorization: "Bearer router-client-key" },
++    body: JSON.stringify(body),
++  });
++  const response = await context.POST(request, {
++    params: Promise.resolve({ path: ["antigravity", `${MODEL}:generateContent`] }),
++  });
++  return { response, services };
++}
++
++function wireRequest(index = -1) {
++  return JSON.parse(network.mock.calls.at(index)[1].body);
++}
++
++function expectedBuiltinTools() {
++  return [
++    {
++      googleSearch: { dynamicRetrievalConfig: { mode: "MODE_UNSPECIFIED" } },
++      futureGroupField: { group: "search-and-functions", value: 1 },
++    },
++    {
++      urlContext: {},
++      futureGroupField: { group: "url-and-functions", value: 2 },
++    },
++  ];
++}
++
++describe("native Gemini disabled function declarations with JSON response schema", () => {
++  beforeEach(() => {
++    network.mockReset();
++    executorInstances.clear();
++    network.mockImplementation(async (_url, options) => responseForWire(JSON.parse(options.body)));
++    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("DIRECT_NETWORK_FORBIDDEN"); }));
++  });
++
++  afterEach(() => vi.unstubAllGlobals());
++
++  it.each([
++    ["responseSchema", "camelCase"],
++    ["response_schema", "snake_case"],
++  ])("removes only inactive function declarations for NONE with %s", async (schemaKey, _caseName) => {
++    const body = makeBody({ schemaKey, mode: "NONE" });
++    const before = structuredClone(body);
++    const { response, services } = await postNative(body);
++
++    expect(response.status).toBe(200);
++    const returned = await response.json();
++    const ordinaryText = returned.candidates[0].content.parts.find(part => typeof part.text === "string")?.text;
++    expect(JSON.parse(ordinaryText)).toEqual({ code: "4821" });
++    expect(returned.candidates[0].finishReason).toBe("STOP");
++    expect(returned.candidates[0].content.parts.some(part => part.functionCall)).toBe(false);
++    expect(services.handleChatCore).toHaveBeenCalledOnce();
++    expect(network).toHaveBeenCalledOnce();
++
++    const wire = wireRequest();
++    expect(wire).toMatchObject({
++      project: "fixture-project",
++      model: MODEL,
++      userAgent: "antigravity",
++      request: {
++        systemInstruction: before.systemInstruction,
++        contents: before.contents,
++        cachedContent: before.cachedContent,
++        clientExtension: before.clientExtension,
++        toolConfig: before.toolConfig,
++      },
++    });
++    expect(wire).not.toHaveProperty("requestType");
++    expect(wire.requestId).toMatch(/^agent\/.+\/\d+\/.+\/\d+$/);
++    expect(wire.request.generationConfig[schemaKey]).toEqual(SCHEMA);
++    expect(wire.request.generationConfig.responseMimeType).toBe("application/json");
++    expect(wire.request.generationConfig.maxOutputTokens).toBe(2048);
++    expect(wire.request.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "HIGH", includeThoughts: true });
++    expect(wire.request.toolConfig.functionCallingConfig).toEqual({ mode: "NONE", allowedFunctionNames: ["forbidden_dummy"] });
++    expect(wire.request.tools).toEqual(expectedBuiltinTools());
++    expect(wire.request.tools.flatMap(group => Object.keys(group))).toEqual([
++      "googleSearch", "futureGroupField", "urlContext", "futureGroupField",
++    ]);
++    expect(body).toEqual(before);
++
++    const headers = new Headers(network.mock.calls[0][1].headers);
++    expect(headers.get("authorization")).toBe("Bearer offline-token");
++    expect(headers.get("user-agent")).toBe(ANTIGRAVITY_HEADERS["User-Agent"]);
++  });
++
++  it("keeps declarations when only responseJsonSchema is present with NONE", async () => {
++    const body = makeBody({ schemaKey: "responseJsonSchema", mode: "NONE" });
++    const beforeTools = structuredClone(body.tools);
++    const { response } = await postNative(body);
++
++    expect(response.status).toBe(200);
++    const returned = await response.json();
++    expect(returned.candidates[0].content.parts[0].functionCall).toMatchObject({
++      id: "provider-forbidden-call",
++      name: "forbidden_dummy",
++    });
++    const wire = wireRequest();
++    expect(wire.request.generationConfig.responseJsonSchema).toEqual(SCHEMA);
++    expect(wire.request.generationConfig.responseSchema).toBeUndefined();
++    expect(wire.request.tools).toEqual(beforeTools);
++  });
++
++  it("preserves opaque nested request data without treating it as parent generation controls", async () => {
++    const body = makeBody({ schemaKey: "responseSchema", mode: "AUTO" });
++    delete body.generationConfig.responseSchema;
++    delete body.generationConfig.responseMimeType;
++    body.request = {
++      generationConfig: { responseSchema: SCHEMA, responseMimeType: "application/json" },
++      toolConfig: { functionCallingConfig: { mode: "NONE" } },
++      tools: [{ functionDeclarations: [{ name: "initialize_child_task", parameters: SCHEMA }] }],
++      initialMessage: { task: "opaque child initialization", context: "retain this packet" },
++    };
++    const before = structuredClone(body);
++    const text = '```json\n{"code":"4821"}\n```';
++    network.mockImplementationOnce(async () => Response.json({ response: {
++      candidates: [{ index: 0, content: { role: "model", parts: [{ text }] }, finishReason: "STOP" }],
++    } }));
++    const { response } = await postNative(body);
++    const returned = await response.json();
++    expect(returned.candidates[0].content.parts[0].text).toBe(text);
++    expect(wireRequest().request.request).toEqual(before.request);
++    expect(wireRequest().request.tools).toEqual(before.tools);
++    expect(body).toEqual(before);
++  });
++
++  it.each(["AUTO", "ANY", "VALIDATED", undefined])("keeps declarations for responseSchema with tool mode %s", async mode => {
++    const body = makeBody({ schemaKey: "responseSchema", mode });
++    const beforeTools = structuredClone(body.tools);
++    if (mode === undefined) delete body.toolConfig.functionCallingConfig.mode;
++    const { response } = await postNative(body);
++
++    expect(response.status).toBe(200);
++    const returned = await response.json();
++    expect(returned.candidates[0].content.parts[0].functionCall).toMatchObject({
++      id: "provider-forbidden-call",
++      name: "forbidden_dummy",
++    });
++    const wire = wireRequest();
++    expect(wire.request.generationConfig.responseSchema).toEqual(SCHEMA);
++    expect(wire.request.tools).toEqual(beforeTools);
++    expect(wire.request.toolConfig.functionCallingConfig.mode).toBe(mode);
++  });
++});
+diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
+new file mode 100644
+index 0000000..e631c1d
+--- /dev/null
++++ b/tests/unit/antigravity-native-gemini.test.js
+@@ -0,0 +1,738 @@
++// Native Gemini → Antigravity regression coverage. The provider network and
++// accounting boundaries are replaced; the real chat core and Antigravity
++// executor own request/response adaptation.
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import fs from "node:fs";
++import path from "node:path";
++import vm from "node:vm";
++import { createHash } from "node:crypto";
++import { fileURLToPath } from "node:url";
++
++const { network, executorInstances } = vi.hoisted(() => ({
++  network: vi.fn(),
++  executorInstances: new Map(),
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: network }));
++vi.mock("../../open-sse/executors/index.js", async () => {
++  const { AntigravityExecutor } = await import("../../open-sse/executors/antigravity.js");
++  return {
++    getExecutor(provider) {
++      if (provider !== "antigravity") throw new Error(`Unexpected fixture provider: ${provider}`);
++      if (!executorInstances.has(provider)) executorInstances.set(provider, new AntigravityExecutor());
++      return executorInstances.get(provider);
++    },
++  };
++});
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: async () => new Proxy({}, {
++    get: (_target, name) => name === "then" ? undefined : vi.fn(),
++  }),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++const { FORMATS } = await import("../../open-sse/translator/formats.js");
++const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
++const { resolveSessionIdentity } = await import("../../open-sse/utils/sessionManager.js");
++const { ANTIGRAVITY_HEADERS } = await import("../../open-sse/config/appConstants.js");
++const { AntigravityExecutor } = await import("../../open-sse/executors/antigravity.js");
++
++const root = fileURLToPath(new URL("../../", import.meta.url));
++const MODEL = "gemini-3.8-flash-high";
++const quiet = Object.fromEntries(["debug", "info", "warn", "error", "line", "errorLine"].map(name => [name, vi.fn()]));
++
++function nativeBody() {
++  return {
++    systemInstruction: { parts: [{ text: "Follow the task protocol." }] },
++    contents: [
++      { role: "user", parts: [{ text: "Use the tool result and continue." }] },
++      { role: "model", parts: [
++        { text: "Earlier reasoning that remains available.", thought: true },
++        { functionCall: { id: "call-native-17", name: "lookup_record", args: { key: "opaque-9" } }, thoughtSignature: "native-call-signature" },
++      ] },
++      { role: "user", parts: [
++        { functionResponse: { id: "call-native-17", name: "lookup_record", response: { record: { kind: "customer", value: 17 } } } },
++        { inlineData: { mimeType: "image/png", data: "aW1hZ2UtYnl0ZXM=" } },
++      ] },
++    ],
++    tools: [
++      { functionDeclarations: [{ name: "lookup_record", parameters: { type: "OBJECT", properties: { key: { type: "STRING" } }, required: ["key"] } }] },
++      { functionDeclarations: [{ name: "finish_task", parameters: { type: "OBJECT", properties: { result: { type: "STRING" } } } }] },
++    ],
++    toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["lookup_record", "finish_task"] } },
++    generationConfig: {
++      maxOutputTokens: 3072,
++      temperature: 0,
++      thinkingConfig: { thinkingLevel: "HIGH", includeThoughts: true },
++      mediaResolution: "MEDIA_RESOLUTION_HIGH",
++    },
++    cachedContent: "cachedContents/native-prefix",
++    clientExtension: { continuation: { kind: "delegated-task", token: "fixture-state" } },
++  };
++}
++
++function makeCredentials() {
++  return {
++    accessToken: "offline-provider-token",
++    projectId: "fixture-project",
++    connectionId: "offline-antigravity-test",
++    providerSpecificData: {},
++  };
++}
++
++async function runNativeGemini(requestBody = nativeBody(), {
++  stream = false,
++  signal,
++  onRequestSuccess,
++  model = MODEL,
++  queryParams = [],
++  headers = {},
++} = {}) {
++  const rawBody = structuredClone(requestBody);
++  const credentials = makeCredentials();
++  const result = await handleChatCore({
++    body: { ...structuredClone(requestBody), model: `antigravity/${model}`, stream },
++    modelInfo: { provider: "antigravity", model },
++    sourceFormatOverride: FORMATS.GEMINI,
++    credentials,
++    clientRawRequest: {
++      endpoint: `/v1beta/models/antigravity/${model}:${stream ? "streamGenerateContent" : "generateContent"}`,
++      body: rawBody,
++      headers: { "user-agent": "native-gemini-fixture", ...headers },
++      queryParams,
++      apiVersion: "v1beta",
++    },
++    connectionId: credentials.connectionId,
++    userAgent: "native-gemini-fixture",
++    clientSignal: signal,
++    onRequestSuccess,
++    log: quiet,
++    providerThinking: { mode: "high" },
++    rtkEnabled: false,
++    headroomEnabled: false,
++    cavemanEnabled: false,
++    ponytailEnabled: false,
++    pxpipeEnabled: false,
++  });
++  return { result, credentials, rawBody };
++}
++
++function wireRequest() {
++  return JSON.parse(network.mock.calls.at(-1)[1].body);
++}
++
++function nativeChunk(text = "completed") {
++  return {
++    candidates: [{
++      index: 0,
++      content: { role: "model", parts: [{ text }] },
++      finishReason: "STOP",
++    }],
++  };
++}
++
++function sseFrame(value) {
++  return `data: ${JSON.stringify(value)}\r\n\r\n`;
++}
++
++function byteFragmentedStream(text) {
++  const bytes = new TextEncoder().encode(text);
++  return new ReadableStream({
++    start(controller) {
++      for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
++      controller.close();
++    },
++  });
++}
++
++function moduleSource(relative) {
++  return fs.readFileSync(path.join(root, relative), "utf8")
++    .replace(/^import[\s\S]*?;\s*$/gm, "")
++    .replace(/^export /gm, "");
++}
++
++function loadRouteHarness() {
++  const services = {
++    handleChatCore: vi.fn(options => handleChatCore(options)),
++    getSettings: vi.fn(async () => ({ requireApiKey: false })),
++    getProviderCredentials: vi.fn(async () => ({ accessToken: "offline-token", projectId: "fixture-project", connectionId: "route-fixture", providerSpecificData: {} })),
++    getModelInfo: vi.fn(async model => {
++      const index = model.indexOf("/");
++      return index < 0 ? { provider: null, model } : { provider: model.slice(0, index), model: model.slice(index + 1) };
++    }),
++    isValidApiKey: vi.fn(async () => true),
++    getKeyAccessContext: vi.fn(async () => null),
++    enforceKeyAccess: vi.fn(async () => null),
++    enforceKeyAccessResolved: vi.fn(async () => null),
++    filterAdapterModels: vi.fn(async (_keyAccess, models) => models),
++    markAccountUnavailable: vi.fn(async () => ({ shouldFallback: false })),
++    clearAccountError: vi.fn(async () => {}),
++    handleAntigravityQuotaError: vi.fn(async () => null),
++    clearAntigravityStrikes: vi.fn(),
++    getComboModels: vi.fn(async () => null),
++    augmentModelsWithCapacityAdapter: models => models,
++    withCapacityAdapterStripping: callback => callback,
++    getActiveAdapterStrategy: vi.fn(),
++    detectRequiredCapabilities: () => new Set(),
++    handleBypassRequest: () => null,
++    checkAndRefreshToken: vi.fn(async (_provider, credentials) => credentials),
++    updateProviderCredentials: vi.fn(async () => {}),
++    getProjectIdForConnection: vi.fn(async () => "fixture-project"),
++    getPxpipeTransform: vi.fn(async () => null),
++    appendPxpipeEvent: vi.fn(),
++    detectFormatByEndpoint: vi.fn(() => null),
++    stripModelContextMarker: model => ({ model, contextMarker: null }),
++    upstreamResponseHeaders: headers => Object.fromEntries(headers || []),
++    errorResponse: (status, message, headers) => Response.json({ error: { message } }, { status, headers }),
++    unavailableResponse: (status, message) => Response.json({ error: { message } }, { status }),
++    fetch: vi.fn(),
++  };
++  const logger = Object.fromEntries(["log", "debug", "info", "warn", "error"].map(name => [name, vi.fn()]));
++  logger.maskKey = () => "masked-fixture-key";
++  const context = {
++    ...services,
++    console: logger,
++    log: logger,
++    Request,
++    Response,
++    Headers,
++    URL,
++    Buffer,
++    AbortController,
++    ReadableStream,
++    TextEncoder,
++    TextDecoder,
++    TransformStream,
++    setTimeout,
++    clearTimeout,
++    GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS: 50,
++    PROVIDER_MODELS: { gemini: [], "gemini-tts-models": [] },
++    HTTP_STATUS: { BAD_REQUEST: 400, UNAUTHORIZED: 401, NOT_FOUND: 404, SERVICE_UNAVAILABLE: 503 },
++    // Immediate-response scenarios: the harness sets the server wait deadline to 0 so
++    // exhausted accounts answer at once. Positive-deadline behaviour is covered by
++    // separate regressions outside this file. The import line is stripped below, so
++    // the sandbox must supply the binding itself.
++    ACCOUNT_WAIT_DEADLINE_MS: 0,
++    FORMATS: { GEMINI: "gemini", OPENAI: "openai" },
++    DEFAULT_HEADROOM_URL: "http://unused.test",
++    getTargetFormat,
++    supportsNativeGemini,
++    resolveSessionIdentity,
++    initTranslators: async () => {},
++    proxyAwareFetch: (...args) => services.fetch(...args),
++    stripModelContextMarker: services.stripModelContextMarker,
++    detectRequiredCapabilities: services.detectRequiredCapabilities,
++    augmentModelsWithCapacityAdapter: services.augmentModelsWithCapacityAdapter,
++    handleBypassRequest: services.handleBypassRequest,
++    checkAndRefreshToken: services.checkAndRefreshToken,
++    getPxpipeTransform: services.getPxpipeTransform,
++    appendPxpipeEvent: services.appendPxpipeEvent,
++    detectFormatByEndpoint: services.detectFormatByEndpoint,
++    upstreamResponseHeaders: services.upstreamResponseHeaders,
++    updateProviderCredentials: services.updateProviderCredentials,
++    unavailableResponse: services.unavailableResponse,
++  };
++  // Production crypto is real; these remote fixtures have no trusted local/CLI principal.
++  Object.assign(context, { createHash, isLocalRequest: () => false, hasValidCliToken: async () => false });
++  vm.createContext(context);
++
++  const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
++  const start = auth.indexOf("export function extractApiKey(");
++  const end = auth.indexOf("/**", start);
++  vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  // Upstream added the wider client-key accessor; load its real pure implementation
++  // just like the legacy auth accessor, without importing DB/account boundaries.
++  const keyAccess = fs.readFileSync(path.join(root, "src/sse/services/keyAccess.js"), "utf8");
++  const keyStart = keyAccess.indexOf("export function extractClientApiKey(");
++  const keyEnd = keyAccess.indexOf("/**", keyStart);
++  if (keyStart < 0 || keyEnd <= keyStart) throw new Error("Real client-key accessor is missing");
++  vm.runInContext(keyAccess.slice(keyStart, keyEnd).replace("export ", ""), context);
++  vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
++  vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
++  return { context, services };
++}
++
++async function postNativeGemini(context, requestBody = nativeBody()) {
++  const request = new Request(`https://router.test/v1beta/models/antigravity/${MODEL}:generateContent`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify(requestBody),
++  });
++  return context.POST(request, {
++    params: Promise.resolve({ path: ["antigravity", `${MODEL}:generateContent`] }),
++  });
++}
++
++describe("native Gemini through Antigravity", () => {
++  beforeEach(() => {
++    network.mockReset();
++    executorInstances.clear();
++    network.mockImplementation(async () => Response.json({ response: nativeChunk() }));
++    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("DIRECT_NETWORK_FORBIDDEN"); }));
++  });
++  afterEach(() => vi.unstubAllGlobals());
++
++  it.each([null, "invalid", [], { parts: "invalid" }, { parts: [null] }, { parts: [[]] }, { parts: ["invalid"] }].map(content => [content]))(
++    "rejects malformed candidate content %j before non-streaming account success", async content => {
++      const succeeded = vi.fn();
++      network.mockResolvedValueOnce(Response.json({ response: {
++        candidates: [{ index: 0, finishReason: "STOP", content }],
++      } }));
++      const { result } = await runNativeGemini(nativeBody(), { onRequestSuccess: succeeded });
++      expect(result.success).toBe(false);
++      expect(result.response.status).toBe(502);
++      expect((await result.response.json()).error.code).toBe(502);
++      expect(succeeded).not.toHaveBeenCalled();
++    });
++
++  it("wraps the native body for Antigravity while preserving continuation, controls and media meaning", async () => {
++    const original = nativeBody();
++    const before = structuredClone(original);
++    network.mockImplementationOnce(async () => Response.json({ response: nativeChunk("done") }));
++
++    const { result, credentials } = await runNativeGemini(original);
++    expect(result.success).toBe(true);
++    expect(credentials.nativeGeminiPassthrough).toBe(true);
++    expect(original).toEqual(before);
++
++    const wire = wireRequest();
++    expect(wire).toMatchObject({
++      project: "fixture-project",
++      model: MODEL,
++      userAgent: "antigravity",
++      request: {
++        systemInstruction: original.systemInstruction,
++        cachedContent: original.cachedContent,
++        clientExtension: original.clientExtension,
++        generationConfig: {
++          maxOutputTokens: 3072,
++          thinkingConfig: { thinkingLevel: "HIGH", includeThoughts: true },
++          mediaResolution: "MEDIA_RESOLUTION_HIGH",
++        },
++        toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["lookup_record", "finish_task"] } },
++      },
++    });
++    expect(wire.request.contents.map(item => item.role)).toEqual(["user", "model", "user"]);
++    expect(wire.request.contents[1].parts).toContainEqual({ text: "Earlier reasoning that remains available.", thought: true });
++    expect(wire.request.contents[1].parts).toContainEqual({
++      functionCall: { id: "call-native-17", name: "lookup_record", args: { key: "opaque-9" } },
++      thoughtSignature: "native-call-signature",
++    });
++    expect(wire.request.contents[2].parts).toContainEqual({
++      functionResponse: { id: "call-native-17", name: "lookup_record", response: { record: { kind: "customer", value: 17 } } },
++    });
++    expect(wire.request.contents[2].parts).toContainEqual({ inlineData: { mimeType: "image/png", data: "aW1hZ2UtYnl0ZXM=" } });
++    expect(wire.request.tools).toHaveLength(2);
++    expect(wire.request.tools).toEqual(original.tools);
++    expect(wire).not.toHaveProperty("requestType");
++    expect(wire.requestId).toMatch(/^agent\/[0-9a-f-]{36}\/\d+\/[0-9a-f-]{36}\/\d+$/);
++    const headers = new Headers(network.mock.calls[0][1].headers);
++    expect(headers.get("authorization")).toBe("Bearer offline-provider-token");
++    expect(headers.get("user-agent")).toBe(ANTIGRAVITY_HEADERS["User-Agent"]);
++    expect(wire.request.tools.flatMap(group => group.functionDeclarations.map(fn => fn.name)).sort()).toEqual(["finish_task", "lookup_record"]);
++    expect(await result.response.json()).toEqual(nativeChunk("done"));
++  });
++
++  it("unwraps byte-fragmented Antigravity SSE and keeps late usage after a finished tool call", async () => {
++    const call = {
++      candidates: [{ index: 0, content: { role: "model", parts: [
++        { functionCall: { id: "call-stream-23", name: "lookup_record", args: { key: "новое-значение" } }, thoughtSignature: "stream-signature" },
++      ] }, finishReason: "STOP" }],
++    };
++    const lateUsage = { usageMetadata: { promptTokenCount: 81, candidatesTokenCount: 12, cachedContentTokenCount: 64, totalTokenCount: 93 } };
++    const upstream = sseFrame({ response: call, serverTrace: "opaque" }) + sseFrame({ response: lateUsage });
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(upstream), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++
++    const { result } = await runNativeGemini(nativeBody(), { stream: true, queryParams: [["alt", "sse"]] });
++    expect(result.success).toBe(true);
++    const output = await result.response.text();
++    const frames = output.split(/\r?\n\r?\n/)
++      .filter(frame => frame.startsWith("data:"))
++      .map(frame => JSON.parse(frame.replace(/^data:\s*/, "")));
++    expect(frames).toEqual([{ ...call, serverTrace: "opaque" }, lateUsage]);
++    expect(frames[0].candidates[0].content.parts[0].functionCall).toEqual({
++      id: "call-stream-23", name: "lookup_record", args: { key: "новое-значение" },
++    });
++  });
++
++  it("adapts upstream SSE to the native JSON-array stream requested without alt=sse", async () => {
++    const first = nativeChunk("модель готова");
++    const usage = { usageMetadata: { promptTokenCount: 5000, cachedContentTokenCount: 4096, totalTokenCount: 5000 } };
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(sseFrame({ response: first }) + sseFrame({ response: usage })), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++    const { result } = await runNativeGemini(nativeBody(), { stream: true });
++    expect(result.response.headers.get("content-type")).toBe("application/json");
++    expect(await result.response.json()).toEqual([first, usage]);
++  });
++
++  it("retains native JSON Schema and disabled tool mode without touching ordinary argument keys", async () => {
++    const original = nativeBody();
++    original.tools = [{ functionDeclarations: [{ name: "lookup_record", parametersJsonSchema: {
++      type: "object", properties: { default: { type: "string", const: "required-value" } }, required: ["default"], additionalProperties: false,
++    } }] }];
++    original.toolConfig = { functionCallingConfig: { mode: "NONE" } };
++    original.contents[1].parts[1].functionCall.args = { default: "required-value", format: "user-data", title: "user-data" };
++    const { result } = await runNativeGemini(original);
++    expect(wireRequest().request.tools).toEqual(original.tools);
++    expect(wireRequest().request.toolConfig).toEqual(original.toolConfig);
++    expect(wireRequest().request.contents).toEqual(original.contents);
++    await result.response.text();
++  });
++
++  it.each([
++    ["nested query", [["fields", "candidates(content(parts(text))),usageMetadata(cachedContentTokenCount)"]], {}],
++    ["slash query", [["$fields", "candidates/content/parts/text,usageMetadata/cachedContentTokenCount"]], {}],
++    ["header", [], { "X-Goog-FieldMask": "candidates.content.parts.text,usageMetadata.cachedContentTokenCount" }],
++  ])("applies the client's %s projection to unary and both stream framings", async (_name, queryParams, headers) => {
++    const reply = { ...nativeChunk("selected"), usageMetadata: { promptTokenCount: 5000, cachedContentTokenCount: 4096 } };
++    const selected = { candidates: [{ content: { parts: [{ text: "selected" }] } }], usageMetadata: { cachedContentTokenCount: 4096 } };
++    for (const framing of ["unary", "sse", "json"]) {
++      network.mockImplementationOnce(async () => framing === "unary" ? Response.json({ response: reply })
++        : new Response(sseFrame({ response: reply }), { headers: { "Content-Type": "text/event-stream" } }));
++      const { result } = await runNativeGemini(nativeBody(), {
++        stream: framing !== "unary", queryParams: [...queryParams, ["alt", framing === "sse" ? "sse" : "json"]], headers,
++      });
++      expect(result.success).toBe(true);
++      if (framing === "sse") {
++        const text = await result.response.text();
++        expect(JSON.parse(text.split("\n").find(line => line.startsWith("data: ")).slice(6))).toEqual(selected);
++      } else expect(await result.response.json()).toEqual(framing === "unary" ? selected : [selected]);
++    }
++  });
++
++  it("a whole parent selector wins over a narrower selector for the same parent", async () => {
++    const reply = nativeChunk();
++    network.mockImplementationOnce(async () => Response.json({ response: reply }));
++    const { result } = await runNativeGemini(nativeBody(), { queryParams: [["fields", "candidates,candidates/content/parts/text"]] });
++    expect(await result.response.json()).toEqual(reply);
++  });
++
++  it("rejects a malformed field mask before any provider admission", async () => {
++    const { result } = await runNativeGemini(nativeBody(), { queryParams: [["fields", "candidates(content"]] });
++    expect(result.response.status).toBe(400);
++    expect(await result.response.json()).toMatchObject({ error: { code: 400, status: "INVALID_ARGUMENT" } });
++    expect(network).not.toHaveBeenCalled();
++  });
++
++  it("a valid field mask never hides an error inside a successful provider envelope", async () => {
++    const error = { error: { code: 400, status: "INVALID_ARGUMENT", message: "fixture failure", details: [{ reason: "keep" }] } };
++    network.mockImplementationOnce(async () => Response.json({ response: error }));
++    const { result } = await runNativeGemini(nativeBody(), { queryParams: [["fields", "candidates/content/parts/text"]] });
++    expect(result.response.status).toBe(400);
++    expect(await result.response.json()).toEqual(error);
++  });
++
++  it("keeps the existing system branding mask without rewriting task data or mutating the caller", async () => {
++    const original = nativeBody();
++    original.systemInstruction.parts[0].text = "OpenCode: follow the task protocol.";
++    original.contents[0].parts[0].text = "Read OpenCode/format.json";
++    const before = structuredClone(original);
++    const { result } = await runNativeGemini(original);
++    expect(wireRequest().request.systemInstruction.parts[0].text).toBe("Antigravity: follow the task protocol.");
++    expect(wireRequest().request.contents).toEqual(original.contents);
++    expect(original).toEqual(before);
++    await result.response.text();
++  });
++
++  it("unwraps a JSON-array stream without converting it to SSE or losing late usage", async () => {
++    const first = nativeChunk("модель готова");
++    const lateUsage = { usageMetadata: { promptTokenCount: 41, cachedContentTokenCount: 32, totalTokenCount: 41 } };
++    const raw = JSON.stringify([{ response: first }, { response: lateUsage }], null, 2);
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(raw), {
++      headers: { "Content-Type": "application/json; charset=utf-8" },
++    }));
++
++    const { result } = await runNativeGemini(nativeBody(), { stream: true });
++    expect(result.success).toBe(true);
++    expect(result.response.headers.get("content-type")).toMatch(/^application\/json/);
++    expect(JSON.parse(await result.response.text())).toEqual([first, lateUsage]);
++  });
++
++  it("reports a clean EOF before a candidate finishes as an incomplete native JSON stream", async () => {
++    const partial = { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "unfinished" }] } }] };
++    network.mockImplementationOnce(async () => new Response(JSON.stringify([{ response: partial }]), {
++      headers: { "Content-Type": "application/json" },
++    }));
++
++    const { result } = await runNativeGemini(nativeBody(), { stream: true });
++    expect(result.success).toBe(true);
++    await expect(result.response.text()).rejects.toThrow(/Upstream Gemini JSON stream|candidate finished/i);
++  });
++
++  it("does not invent a Gemini finish reason when an Antigravity SSE stream ends early", async () => {
++    const partial = { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "unfinished" }] } }] };
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(sseFrame({ response: partial })), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++
++    const { result } = await runNativeGemini(nativeBody(), { stream: true, queryParams: [["alt", "sse"]] });
++    const output = await result.response.text();
++    expect(output).toContain('"text":"unfinished"');
++    expect(output).toContain('"code":502');
++    expect(output).not.toContain('"finishReason":"STOP"');
++    expect(output).not.toContain("[DONE]");
++  });
++
++  it("keeps native provider error details and does not mark the request successful", async () => {
++    const error = { error: { code: 400, status: "INVALID_ARGUMENT", message: "fixture rejected", details: [{ field: "toolConfig" }] } };
++    const onRequestSuccess = vi.fn();
++    network.mockImplementationOnce(async () => Response.json(error, {
++      status: 400,
++      headers: { "Retry-After": "17" },
++    }));
++
++    const { result } = await runNativeGemini(nativeBody(), { onRequestSuccess });
++    expect(result.success).toBe(false);
++    expect(result.response.status).toBe(400);
++    expect(result.response.headers.get("retry-after")).toBe("17");
++    expect(await result.response.json()).toEqual(error);
++    expect(onRequestSuccess).not.toHaveBeenCalled();
++    expect(network).toHaveBeenCalledOnce();
++  });
++
++  it("turns an Antigravity HTTP-200 error envelope into the native Gemini error response", async () => {
++    const error = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "fixture quota", details: [{ retryDelay: "9s" }] } };
++    const onRequestSuccess = vi.fn();
++    network.mockImplementationOnce(async () => Response.json({ response: error }));
++
++    const { result } = await runNativeGemini(nativeBody(), { onRequestSuccess });
++    expect(result.success).toBe(false);
++    expect(result.response.status).toBe(429);
++    expect(await result.response.json()).toEqual(error);
++    expect(onRequestSuccess).not.toHaveBeenCalled();
++  });
++
++  it.each([[null], [[]], [{}], ["invalid"]])("does not treat a malformed envelope with trace metadata as a successful unary response: %j", async response => {
++    network.mockImplementationOnce(async () => Response.json({ response, serverTrace: "fixture" }));
++    const { result } = await runNativeGemini();
++    expect(result.success).toBe(false);
++    expect(result.response.status).toBe(502);
++    expect(await result.response.json()).toMatchObject({ error: { code: 502, message: "Invalid Antigravity response envelope" } });
++  });
++
++  it("cancelling the client stream cancels the Antigravity request", async () => {
++    let upstreamCancelled;
++    const cancelled = new Promise(resolve => { upstreamCancelled = resolve; });
++    let executorSignal;
++    const firstFrame = sseFrame({ response: nativeChunk("partial") });
++    const upstream = new ReadableStream({
++      start(controller) { controller.enqueue(new TextEncoder().encode(firstFrame)); },
++      cancel: upstreamCancelled,
++    });
++    network.mockImplementationOnce(async (_url, options) => {
++      executorSignal = options.signal;
++      return new Response(upstream, { headers: { "Content-Type": "text/event-stream" } });
++    });
++
++    const { result } = await runNativeGemini(nativeBody(), { stream: true });
++    const reader = result.response.body.getReader();
++    expect((await reader.read()).done).toBe(false);
++    await reader.cancel("fixture client cancelled");
++    await vi.waitFor(() => expect(executorSignal.aborted).toBe(true));
++    await expect(cancelled).resolves.toBeDefined();
++  });
++
++  it("leaves the Antigravity Claude request path on its existing translated wrapper", async () => {
++    const request = {
++      model: "antigravity/claude-sonnet-4-6",
++      messages: [{ role: "user", content: "Keep this Claude prompt." }],
++      max_tokens: 1024,
++      tools: [{ name: "lookup_record", description: "Look up", input_schema: { type: "object", properties: { key: { type: "string" } } } }],
++    };
++    network.mockImplementationOnce(async () => Response.json({ error: { code: 400, status: "INVALID_ARGUMENT", message: "fixture stop" } }, { status: 400 }));
++    const credentials = makeCredentials();
++    const result = await handleChatCore({
++      body: request,
++      modelInfo: { provider: "antigravity", model: "claude-sonnet-4-6" },
++      sourceFormatOverride: FORMATS.CLAUDE,
++      credentials,
++      clientRawRequest: { endpoint: "/v1/messages", body: structuredClone(request), headers: {}, queryParams: [] },
++      connectionId: credentials.connectionId,
++      log: quiet,
++      rtkEnabled: false,
++      headroomEnabled: false,
++      cavemanEnabled: false,
++      ponytailEnabled: false,
++      pxpipeEnabled: false,
++    });
++    expect(result.success).toBe(false);
++    expect(supportsNativeGemini("antigravity", "claude-sonnet-4-6")).toBe(false);
++    expect(credentials.nativeGeminiPassthrough).toBe(false);
++    const wire = wireRequest();
++    expect(wire.userAgent).toBe("antigravity");
++    expect(wire.request.contents[0]).toMatchObject({ role: "user", parts: [{ text: "Keep this Claude prompt." }] });
++    expect(wire.request.tools[0].functionDeclarations.map(fn => fn.name)).toContain("lookup_record");
++  });
++});
++
++describe("Gemini endpoint source selection for Antigravity", () => {
++  it("routes only supported Antigravity Gemini models through native Gemini core input", async () => {
++    expect(supportsNativeGemini("antigravity", MODEL)).toBe(true);
++    expect(supportsNativeGemini("antigravity", "claude-sonnet-4-6")).toBe(false);
++    expect(supportsNativeGemini("antigravity", "gemini-3.1-flash-image")).toBe(false);
++
++    network.mockReset();
++    executorInstances.clear();
++    const reply = { candidates: [{ index: 0, finishReason: "STOP", content: { role: "model", parts: [{
++      functionCall: { id: "returned-call", name: "lookup_record", args: { key: "actual-request" } }, thoughtSignature: "returned-state",
++    }] } }], usageMetadata: { cachedContentTokenCount: 4096 } };
++    network.mockImplementationOnce(async () => Response.json({ response: reply }));
++
++    const { context, services } = loadRouteHarness();
++    const original = nativeBody();
++    const url = `https://router.test/v1beta/models/antigravity/${MODEL}:generateContent?alt=json&trace=fixture&key=router-key`;
++    const request = new Request(url, {
++      method: "POST",
++      headers: { Authorization: "Bearer router-key", "Content-Type": "application/json" },
++      body: JSON.stringify(original),
++    });
++    const response = await context.POST(request, {
++      params: Promise.resolve({ path: ["antigravity", `${MODEL}:generateContent`] }),
++    });
++
++    expect(response.status).toBe(200);
++    expect(await response.json()).toEqual(reply);
++    expect(services.handleChatCore).toHaveBeenCalledOnce();
++    expect(network).toHaveBeenCalledOnce();
++    const options = services.handleChatCore.mock.calls[0][0];
++    expect(options.modelInfo).toEqual({ provider: "antigravity", model: MODEL });
++    expect(options.sourceFormatOverride).toBe("gemini");
++    expect(options.body).toEqual({ ...original, model: `antigravity/${MODEL}`, stream: false });
++    expect(options.clientRawRequest.body).toEqual(original);
++    expect(options.clientRawRequest.queryParams).toEqual([["alt", "json"], ["trace", "fixture"]]);
++    expect(options.credentials.nativeGeminiPassthrough).toBe(true);
++    expect(wireRequest().request.contents[1].parts).toContainEqual({
++      functionCall: { id: "call-native-17", name: "lookup_record", args: { key: "opaque-9" } },
++      thoughtSignature: "native-call-signature",
++    });
++  });
++
++  it("wraps real fetch failures after account fallback exhaustion in the Gemini error envelope", async () => {
++    const { context, services } = loadRouteHarness();
++    const executor = new AntigravityExecutor();
++    executor.config = {
++      ...executor.config,
++      retry: { ...(executor.config.retry || {}), 502: { attempts: 0, delayMs: 0 } },
++    };
++    executorInstances.set("antigravity", executor);
++
++    const credentials = connectionId => ({
++      accessToken: `offline-token-${connectionId}`,
++      projectId: "fixture-project",
++      connectionId,
++      providerSpecificData: {},
++    });
++    services.getProviderCredentials.mockReset()
++      .mockResolvedValueOnce(credentials("first-account"))
++      .mockResolvedValueOnce(credentials("second-account"))
++      .mockResolvedValueOnce(null);
++    services.markAccountUnavailable.mockReset()
++      .mockResolvedValueOnce({ shouldFallback: true })
++      .mockResolvedValueOnce({ shouldFallback: true });
++    network.mockReset()
++      .mockRejectedValueOnce(new Error("first account fetch failed"))
++      .mockRejectedValueOnce(new Error("second account fetch failed"));
++
++    const response = await postNativeGemini(context);
++
++    expect(response.status).toBe(502);
++    expect(await response.json()).toEqual({ error: {
++      code: 502,
++      status: "UNAVAILABLE",
++      message: expect.stringContaining("second account fetch failed"),
++    } });
++    expect(network).toHaveBeenCalledTimes(2);
++    expect(services.getProviderCredentials).toHaveBeenCalledTimes(3);
++  });
++
++  it("uses the latest transport failure after an earlier native quota error", async () => {
++    const { context, services } = loadRouteHarness();
++    const executor = new AntigravityExecutor();
++    executor.config = {
++      ...executor.config,
++      retry: { ...(executor.config.retry || {}),
++        429: { attempts: 0, delayMs: 0 }, 502: { attempts: 0, delayMs: 0 } },
++    };
++    executorInstances.set("antigravity", executor);
++    const credentials = connectionId => ({
++      accessToken: `offline-token-${connectionId}`, projectId: "fixture-project",
++      connectionId, providerSpecificData: {},
++    });
++    services.getProviderCredentials.mockReset()
++      .mockResolvedValueOnce(credentials("quota-account"))
++      .mockResolvedValueOnce(credentials("transport-account"))
++      .mockResolvedValueOnce(null);
++    services.markAccountUnavailable.mockReset()
++      .mockResolvedValueOnce({ shouldFallback: true })
++      .mockResolvedValueOnce({ shouldFallback: true });
++    network.mockReset()
++      .mockResolvedValueOnce(Response.json({ error: {
++        code: 429, status: "RESOURCE_EXHAUSTED", message: "earlier quota error",
++      } }, { status: 429, headers: { "Retry-After": "13" } }))
++      .mockRejectedValueOnce(new Error("latest account transport failed"));
++
++    const response = await postNativeGemini(context);
++
++    expect(response.status).toBe(502);
++    expect(await response.json()).toEqual({ error: {
++      code: 502, status: "UNAVAILABLE",
++      message: expect.stringContaining("latest account transport failed"),
++    } });
++    expect(response.headers.get("retry-after")).toBeNull();
++    expect(network).toHaveBeenCalledTimes(2);
++    expect(services.getProviderCredentials).toHaveBeenCalledTimes(3);
++  });
++
++  it("preserves a marked upstream Gemini error body and headers through account fallback", async () => {
++    const { context, services } = loadRouteHarness();
++    const raw = '{ "error": { "code": 400, "status": "INVALID_ARGUMENT", "message": "native upstream detail", "details": [{"field":"contents"}] } }';
++    services.getProviderCredentials.mockReset()
++      .mockResolvedValueOnce({
++        accessToken: "offline-provider-token",
++        projectId: "fixture-project",
++        connectionId: "first-account",
++        providerSpecificData: {},
++      })
++      .mockResolvedValueOnce(null);
++    services.markAccountUnavailable.mockReset().mockResolvedValueOnce({ shouldFallback: true });
++    network.mockReset().mockResolvedValueOnce(new Response(raw, { status: 400, headers: {
++      "Content-Type": "application/json",
++      "Retry-After": "13",
++      "X-Google-Trace": "native-trace",
++    } }));
++
++    const response = await postNativeGemini(context);
++
++    expect(response.status).toBe(400);
++    expect(response.headers.get("retry-after")).toBe("13");
++    expect(response.headers.get("x-google-trace")).toBe("native-trace");
++    expect(await response.text()).toBe(raw);
++    expect(network).toHaveBeenCalledOnce();
++  });
++
++  it("returns the Gemini status field for unexpected route failures", async () => {
++    const { context, services } = loadRouteHarness();
++    services.getModelInfo.mockRejectedValueOnce(new Error("fixture route setup failed"));
++
++    const response = await postNativeGemini(context);
++
++    expect(response.status).toBe(500);
++    expect(await response.json()).toEqual({ error: {
++      code: 500,
++      status: "INTERNAL",
++      message: "fixture route setup failed",
++    } });
++  });
++});
+diff --git a/tests/unit/antigravity-native-json-output.test.js b/tests/unit/antigravity-native-json-output.test.js
+new file mode 100644
+index 0000000..44a7339
+--- /dev/null
++++ b/tests/unit/antigravity-native-json-output.test.js
+@@ -0,0 +1,608 @@
++// Native Gemini JSON-output regression coverage through the public route, real
++// chat core, and real Antigravity executor. Only the upstream network boundary
++// and accounting services are mocked.
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import fs from "node:fs";
++import path from "node:path";
++import vm from "node:vm";
++import { createHash } from "node:crypto";
++import { fileURLToPath } from "node:url";
++
++const { network, executorInstances } = vi.hoisted(() => ({
++  network: vi.fn(),
++  executorInstances: new Map(),
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: network }));
++vi.mock("../../open-sse/executors/index.js", async () => {
++  const { AntigravityExecutor } = await import("../../open-sse/executors/antigravity.js");
++  return {
++    getExecutor(provider) {
++      if (provider !== "antigravity") throw new Error(`Unexpected fixture provider: ${provider}`);
++      if (!executorInstances.has(provider)) executorInstances.set(provider, new AntigravityExecutor());
++      return executorInstances.get(provider);
++    },
++  };
++});
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: async () => new Proxy({}, {
++    get: (_target, name) => name === "then" ? undefined : vi.fn(),
++  }),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
++const { resolveSessionIdentity } = await import("../../open-sse/utils/sessionManager.js");
++const { ANTIGRAVITY_HEADERS } = await import("../../open-sse/config/appConstants.js");
++
++const root = fileURLToPath(new URL("../../", import.meta.url));
++const MODEL = "gemini-3.8-flash-high";
++const quiet = Object.fromEntries(["debug", "info", "warn", "error", "line", "errorLine"].map(name => [name, vi.fn()]));
++
++function jsonRequestBody() {
++  return {
++    systemInstruction: { parts: [{ text: "Follow the task protocol." }] },
++    contents: [
++      { role: "user", parts: [{ text: "Read the attached image and return its code as JSON." }] },
++      { role: "model", parts: [
++        { text: "Earlier reasoning that remains available.", thought: true, thoughtSignature: "history-thought-signature" },
++        { functionCall: { id: "history-call-23", name: "lookup_record", args: { key: "opaque-9" } }, thoughtSignature: "history-call-signature" },
++      ] },
++      { role: "user", parts: [
++        { functionResponse: { id: "history-call-23", name: "lookup_record", response: { record: { kind: "customer", value: 17 } } } },
++        { inlineData: { mimeType: "image/png", data: "aW1hZ2UtYnl0ZXM=" } },
++        { providerOpaquePart: { version: 4, identity: "preserve-me" } },
++      ] },
++    ],
++    tools: [{ functionDeclarations: [{
++      name: "forbidden_dummy",
++      description: "Declared but disabled by native toolConfig.",
++      parametersJsonSchema: { type: "OBJECT", properties: { code: { type: "STRING" } } },
++    }] }],
++    toolConfig: { functionCallingConfig: { mode: "NONE", allowedFunctionNames: ["forbidden_dummy"] } },
++    generationConfig: {
++      maxOutputTokens: 2048,
++      temperature: 0,
++      thinkingConfig: { thinkingLevel: "HIGH", includeThoughts: true },
++      responseMimeType: "application/json",
++      responseJsonSchema: {
++        type: "OBJECT",
++        properties: { code: { type: "STRING" } },
++        required: ["code"],
++        additionalProperties: false,
++      },
++    },
++    cachedContent: "cachedContents/native-prefix",
++    clientExtension: { continuation: { kind: "delegated-task", token: "opaque-client-state" } },
++  };
++}
++
++function moduleSource(relative) {
++  return fs.readFileSync(path.join(root, relative), "utf8")
++    .replace(/^import[\s\S]*?;\s*$/gm, "")
++    .replace(/^export /gm, "");
++}
++
++function loadPublicNativeRoute() {
++  const services = {
++    handleChatCore: vi.fn(options => handleChatCore(options)),
++    getSettings: vi.fn(async () => ({ requireApiKey: false })),
++    getProviderCredentials: vi.fn(async () => ({ accessToken: "offline-token", projectId: "fixture-project", connectionId: "route-fixture", providerSpecificData: {} })),
++    getModelInfo: vi.fn(async model => {
++      const index = model.indexOf("/");
++      return index < 0 ? { provider: null, model } : { provider: model.slice(0, index), model: model.slice(index + 1) };
++    }),
++    isValidApiKey: vi.fn(async () => true),
++    getKeyAccessContext: vi.fn(async () => null),
++    enforceKeyAccess: vi.fn(async () => null),
++    enforceKeyAccessResolved: vi.fn(async () => null),
++    filterAdapterModels: vi.fn(async (_keyAccess, models) => models),
++    markAccountUnavailable: vi.fn(async () => ({ shouldFallback: false })),
++    clearAccountError: vi.fn(async () => {}),
++    handleAntigravityQuotaError: vi.fn(async () => null),
++    clearAntigravityStrikes: vi.fn(),
++    getComboModels: vi.fn(async () => null),
++    augmentModelsWithCapacityAdapter: models => models,
++    withCapacityAdapterStripping: callback => callback,
++    getActiveAdapterStrategy: vi.fn(),
++    detectRequiredCapabilities: () => new Set(),
++    handleBypassRequest: () => null,
++    checkAndRefreshToken: vi.fn(async (_provider, credentials) => credentials),
++    updateProviderCredentials: vi.fn(async () => {}),
++    getProjectIdForConnection: vi.fn(async () => "fixture-project"),
++    getPxpipeTransform: vi.fn(async () => null),
++    appendPxpipeEvent: vi.fn(),
++    detectFormatByEndpoint: vi.fn(() => null),
++    stripModelContextMarker: model => ({ model, contextMarker: null }),
++    upstreamResponseHeaders: headers => Object.fromEntries(headers || []),
++    errorResponse: (status, message, headers) => Response.json({ error: { message } }, { status, headers }),
++    unavailableResponse: (status, message) => Response.json({ error: { message } }, { status }),
++    fetch: vi.fn(),
++  };
++  const logger = Object.fromEntries(["log", "debug", "info", "warn", "error"].map(name => [name, vi.fn()]));
++  logger.maskKey = () => "masked-fixture-key";
++  const context = {
++    ...services,
++    console: logger,
++    log: logger,
++    Request,
++    Response,
++    Headers,
++    URL,
++    Buffer,
++    AbortController,
++    ReadableStream,
++    TextEncoder,
++    TextDecoder,
++    TransformStream,
++    setTimeout,
++    clearTimeout,
++    GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS: 50,
++    PROVIDER_MODELS: { gemini: [], "gemini-tts-models": [] },
++    HTTP_STATUS: { BAD_REQUEST: 400, UNAUTHORIZED: 401, NOT_FOUND: 404, SERVICE_UNAVAILABLE: 503 },
++    // Immediate-response scenarios: the harness sets the server wait deadline to 0 so
++    // exhausted accounts answer at once. Positive-deadline behaviour is covered by
++    // separate regressions outside this file. The import line is stripped below, so
++    // the sandbox must supply the binding itself.
++    ACCOUNT_WAIT_DEADLINE_MS: 0,
++    FORMATS: { GEMINI: "gemini", OPENAI: "openai" },
++    DEFAULT_HEADROOM_URL: "http://unused.test",
++    getTargetFormat,
++    supportsNativeGemini,
++    resolveSessionIdentity,
++    initTranslators: async () => {},
++    proxyAwareFetch: (...args) => services.fetch(...args),
++    stripModelContextMarker: services.stripModelContextMarker,
++    detectRequiredCapabilities: services.detectRequiredCapabilities,
++    augmentModelsWithCapacityAdapter: services.augmentModelsWithCapacityAdapter,
++    handleBypassRequest: services.handleBypassRequest,
++    checkAndRefreshToken: services.checkAndRefreshToken,
++    getPxpipeTransform: services.getPxpipeTransform,
++    appendPxpipeEvent: services.appendPxpipeEvent,
++    detectFormatByEndpoint: services.detectFormatByEndpoint,
++    upstreamResponseHeaders: services.upstreamResponseHeaders,
++    updateProviderCredentials: services.updateProviderCredentials,
++    unavailableResponse: services.unavailableResponse,
++  };
++  // Production crypto is real; these remote fixtures have no trusted local/CLI principal.
++  Object.assign(context, { createHash, isLocalRequest: () => false, hasValidCliToken: async () => false });
++  vm.createContext(context);
++
++  const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
++  const start = auth.indexOf("export function extractApiKey(");
++  const end = auth.indexOf("/**", start);
++  vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  // Upstream added the wider client-key accessor; load its real pure implementation
++  // just like the legacy auth accessor, without importing DB/account boundaries.
++  const keyAccess = fs.readFileSync(path.join(root, "src/sse/services/keyAccess.js"), "utf8");
++  const keyStart = keyAccess.indexOf("export function extractClientApiKey(");
++  const keyEnd = keyAccess.indexOf("/**", keyStart);
++  if (keyStart < 0 || keyEnd <= keyStart) throw new Error("Real client-key accessor is missing");
++  vm.runInContext(keyAccess.slice(keyStart, keyEnd).replace("export ", ""), context);
++  vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
++  vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
++  return { context, services };
++}
++
++async function postNative(body = jsonRequestBody(), { stream = false, alt, headers = {} } = {}) {
++  const { context, services } = loadPublicNativeRoute();
++  const action = stream ? "streamGenerateContent" : "generateContent";
++  const modelPath = `antigravity/${MODEL}:${action}`;
++  const query = alt ? `?alt=${encodeURIComponent(alt)}` : "";
++  const request = new Request(`https://router.test/v1beta/models/${modelPath}${query}`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json", Authorization: "Bearer router-client-key", ...headers },
++    body: JSON.stringify(body),
++  });
++  const response = await context.POST(request, {
++    params: Promise.resolve({ path: [`antigravity`, `${MODEL}:${action}`] }),
++  });
++  return { response, services };
++}
++
++function sseFrame(value) {
++  return `data: ${JSON.stringify(value)}\r\n\r\n`;
++}
++
++function byteFragmentedStream(text) {
++  const bytes = new TextEncoder().encode(text);
++  return new ReadableStream({
++    start(controller) {
++      for (let offset = 0; offset < bytes.length; offset += 23) {
++        controller.enqueue(bytes.slice(offset, offset + 23));
++      }
++      controller.close();
++    },
++  });
++}
++
++function parseSseEvents(text) {
++  return text.split(/\r?\n\r?\n/).flatMap(block => {
++    const data = block.split(/\r?\n/)
++      .filter(line => line.startsWith("data:"))
++      .map(line => line.slice(5).replace(/^ /, ""))
++      .join("\n");
++    if (!data || data === "[DONE]") return [];
++    return [JSON.parse(data)];
++  });
++}
++
++function nativeTextParts(response, index = 0) {
++  return (response.candidates || [])
++    .filter(candidate => candidate.index === index)
++    .flatMap(candidate => candidate.content?.parts || [])
++    .filter(part => typeof part.text === "string" && !part.thought);
++}
++
++describe("native Gemini JSON output through public Antigravity route", () => {
++  beforeEach(() => {
++    network.mockReset();
++    executorInstances.clear();
++    network.mockImplementation(async () => Response.json({
++      response: { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }] },
++    }));
++    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("DIRECT_NETWORK_FORBIDDEN"); }));
++  });
++
++  afterEach(() => vi.unstubAllGlobals());
++
++  it("removes only the enclosing JSON fence on unary STOP and preserves the native request and response fields", async () => {
++    const requestBody = jsonRequestBody();
++    const inputCopy = structuredClone(requestBody);
++    const providerResponse = {
++      candidates: [
++        {
++          index: 3,
++          content: { role: "model", parts: [
++            { text: "```json\n{\"code\":\"4821\"}\n```", providerPartMeta: { part: 1 } },
++            { text: "private thought", thought: true, thoughtSignature: "provider-thought-signature", providerThoughtMeta: "keep" },
++          ] },
++          finishReason: "STOP",
++          providerCandidateMeta: { identity: "candidate-3" },
++        },
++        {
++          index: 9,
++          content: { role: "model", parts: [{
++            functionCall: { id: "provider-function-call-91", name: "forbidden_dummy", args: { code: "4821" } },
++            thoughtSignature: "provider-function-signature",
++            providerPartMeta: "keep-function-part",
++          }] },
++          finishReason: "STOP",
++          providerCandidateMeta: { identity: "candidate-9" },
++        },
++      ],
++      usageMetadata: { promptTokenCount: 81, candidatesTokenCount: 12, totalTokenCount: 93, cachedContentTokenCount: 64 },
++      modelVersion: "gemini-3.8-flash-high",
++      responseId: "provider-response-id-17",
++      providerEnvelopeMeta: { source: "antigravity", sequence: 11 },
++    };
++    network.mockImplementationOnce(async () => Response.json({ response: providerResponse, cloudCodeTrace: "keep-envelope-metadata" }));
++
++    const { response, services } = await postNative(requestBody);
++    expect(response.status).toBe(200);
++    const returned = await response.json();
++    expect(JSON.parse(nativeTextParts(returned, 3).map(part => part.text).join(""))).toEqual({ code: "4821" });
++    expect(nativeTextParts(returned, 3).map(part => part.text).join("")).toBe('{"code":"4821"}\n');
++    expect(returned.candidates.map(candidate => candidate.index)).toEqual([3, 9]);
++    expect(returned.candidates[0].providerCandidateMeta).toEqual({ identity: "candidate-3" });
++    expect(returned.candidates[0].content.parts[0]).toMatchObject({
++      providerPartMeta: { part: 1 },
++    });
++    expect(returned.candidates[0].content.parts[1]).toMatchObject({
++      text: "private thought",
++      thought: true,
++      thoughtSignature: "provider-thought-signature",
++      providerThoughtMeta: "keep",
++    });
++    expect(returned.candidates[1].content.parts[0]).toMatchObject({
++      functionCall: { id: "provider-function-call-91", name: "forbidden_dummy", args: { code: "4821" } },
++      thoughtSignature: "provider-function-signature",
++      providerPartMeta: "keep-function-part",
++    });
++    expect(returned.usageMetadata).toEqual(providerResponse.usageMetadata);
++    expect(returned.modelVersion).toBe(providerResponse.modelVersion);
++    expect(returned.responseId).toBe(providerResponse.responseId);
++    expect(returned.providerEnvelopeMeta).toEqual(providerResponse.providerEnvelopeMeta);
++
++    expect(network).toHaveBeenCalledOnce();
++    expect(services.handleChatCore).toHaveBeenCalledOnce();
++    const wire = JSON.parse(network.mock.calls[0][1].body);
++    expect(wire.request.generationConfig).toEqual(inputCopy.generationConfig);
++    expect(wire.request.toolConfig).toEqual(inputCopy.toolConfig);
++    expect(wire.request.tools).toEqual(inputCopy.tools);
++    expect(wire.request.contents).toEqual(inputCopy.contents);
++    expect(wire.request.cachedContent).toBe(inputCopy.cachedContent);
++    expect(wire.request.clientExtension).toEqual(inputCopy.clientExtension);
++    expect(wire.request.generationConfig.responseJsonSchema).toEqual(inputCopy.generationConfig.responseJsonSchema);
++    expect(wire.request.generationConfig.responseSchema).toBeUndefined();
++    expect(wire.request.generationConfig.responseMimeType).toBe("application/json");
++    expect(wire.request.generationConfig.maxOutputTokens).toBe(2048);
++    expect(wire.request.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "HIGH", includeThoughts: true });
++    expect(wire.request.toolConfig.functionCallingConfig).toEqual({ mode: "NONE", allowedFunctionNames: ["forbidden_dummy"] });
++    expect(requestBody).toEqual(inputCopy);
++    expect(wire).not.toHaveProperty("requestType");
++    expect(wire.userAgent).toBe("antigravity");
++    expect(wire.requestId).toMatch(/^agent\/.+\/\d+\/.+\/\d+$/);
++    expect(new Headers(network.mock.calls[0][1].headers).get("authorization")).toBe("Bearer offline-token");
++    expect(new Headers(network.mock.calls[0][1].headers).get("user-agent")).toBe(ANTIGRAVITY_HEADERS["User-Agent"]);
++  });
++
++  it("normalizes a signed ordinary JSON part and retransmits its exact signature in native continuation history", async () => {
++    const ordinarySignature = "eyJwcm92aWRlciI6ImFudGlncmF2aXR5Iiwic2Vzc2lvbiI6InNpZy0xIn0=";
++    const thoughtSignature = "eyJ0aG91Z2h0IjoiaGlzdG9yeS1zaWduYXR1cmUifQ==";
++    const thoughtPart = { text: "thought before ordinary output", thought: true, thoughtSignature, providerThoughtMeta: "keep-thought" };
++    const signedFencedPart = {
++      text: "```json\n{\"code\":\"4821\"}\n```",
++      thoughtSignature: ordinarySignature,
++      providerPartMeta: { carrier: "ordinary-text", sequence: 1 },
++    };
++    const firstProviderReply = {
++      candidates: [{
++        index: 12,
++        content: { role: "model", parts: [thoughtPart, signedFencedPart] },
++        finishReason: "STOP",
++        providerCandidateMeta: "signed-candidate",
++      }],
++      usageMetadata: { promptTokenCount: 91, candidatesTokenCount: 8, totalTokenCount: 99, cachedContentTokenCount: 64 },
++      providerEnvelopeMeta: { trace: "signed-unary" },
++    };
++    const continuationReply = {
++      candidates: [{
++        index: 0,
++        content: { role: "model", parts: [{
++          text: "{\"continued\":true}",
++          thoughtSignature: ordinarySignature,
++          providerPartMeta: { carrier: "ordinary-text", sequence: 2 },
++        }] },
++        finishReason: "STOP",
++      }],
++      usageMetadata: { promptTokenCount: 102, candidatesTokenCount: 4, totalTokenCount: 106 },
++    };
++    network
++      .mockImplementationOnce(async () => Response.json({ response: firstProviderReply }))
++      .mockImplementationOnce(async () => Response.json({ response: continuationReply }));
++
++    const { response: firstResponse } = await postNative(jsonRequestBody());
++    expect(firstResponse.status).toBe(200);
++    const firstReturned = await firstResponse.json();
++    const firstParts = firstReturned.candidates[0].content.parts;
++    const normalizedSignedPart = { ...signedFencedPart, text: "{\"code\":\"4821\"}\n" };
++    expect(firstParts).toEqual([thoughtPart, normalizedSignedPart]);
++    expect(JSON.parse(firstParts.filter(part => !part.thought).map(part => part.text).join(""))).toEqual({ code: "4821" });
++    expect(firstParts.map(part => part.thoughtSignature)).toEqual([thoughtSignature, ordinarySignature]);
++    expect(Buffer.from(firstParts[1].thoughtSignature, "utf8")).toEqual(Buffer.from(ordinarySignature, "utf8"));
++    expect(firstReturned.providerEnvelopeMeta).toEqual({ trace: "signed-unary" });
++    expect(firstReturned.usageMetadata.cachedContentTokenCount).toBe(64);
++
++    const continuationBody = jsonRequestBody();
++    continuationBody.contents = [
++      ...continuationBody.contents,
++      { role: "model", parts: structuredClone(firstParts) },
++      { role: "user", parts: [{ text: "Continue from the normalized model result." }] },
++    ];
++    const continuationBefore = structuredClone(continuationBody);
++    const { response: continuationResponse } = await postNative(continuationBody);
++    expect(continuationResponse.status).toBe(200);
++    const continuationWire = JSON.parse(network.mock.calls[1][1].body);
++    expect(continuationWire.request.contents).toEqual(continuationBody.contents);
++    expect(continuationWire.request.contents[3].parts).toEqual(firstParts);
++    expect(continuationWire.request.contents[3].parts[1].thoughtSignature).toBe(ordinarySignature);
++    expect(continuationBody).toEqual(continuationBefore);
++    const continuationReturned = await continuationResponse.json();
++    const continuationText = nativeTextParts(continuationReturned).map(part => part.text).join("");
++    expect(JSON.parse(continuationText)).toEqual({ continued: true });
++    expect(continuationReturned.candidates[0].content.parts[0].thoughtSignature).toBe(ordinarySignature);
++    expect(network).toHaveBeenCalledTimes(2);
++  });
++
++  it("strips fence fragments across SSE events and retains candidate, thought, function, and late usage data in order", async () => {
++    const chunks = [
++      { response: { candidates: [{ index: 4, content: { role: "model", parts: [{ text: "```json\n{" }] } }] } },
++      { response: { candidates: [{ index: 4, content: { role: "model", parts: [
++        { text: "\"code\":\"4821\"", providerPartMeta: "middle" },
++        { text: "private thought", thought: true, thoughtSignature: "stream-thought-signature" },
++      ] } }] } },
++      { response: { candidates: [{ index: 4, content: { role: "model", parts: [{ text: "}\n```" }] }, finishReason: "STOP", providerCandidateMeta: "candidate-four" }] } },
++      { response: { candidates: [{ index: 8, content: { role: "model", parts: [{ functionCall: { id: "stream-function-16", name: "forbidden_dummy", args: { code: "4821" } }, thoughtSignature: "stream-function-signature" }] }, finishReason: "STOP" }] } },
++      { response: { usageMetadata: { promptTokenCount: 81, candidatesTokenCount: 12, totalTokenCount: 93, cachedContentTokenCount: 64 }, providerTailMeta: "late-usage" } },
++    ];
++    const upstream = chunks.map(sseFrame).join("");
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(upstream), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++
++    const { response } = await postNative(jsonRequestBody(), { stream: true, alt: "sse" });
++    expect(response.status).toBe(200);
++    const events = parseSseEvents(await response.text());
++    const candidateIndexes = [];
++    for (const event of events) {
++      for (const candidate of event.candidates || []) {
++        if (!candidateIndexes.includes(candidate.index)) candidateIndexes.push(candidate.index);
++      }
++    }
++    expect(candidateIndexes).toEqual([4, 8]);
++    const ordinaryText = nativeTextParts({ candidates: events.flatMap(event => event.candidates || []) }, 4)
++      .map(part => part.text).join("");
++    expect(JSON.parse(ordinaryText)).toEqual({ code: "4821" });
++    expect(ordinaryText).toBe('{"code":"4821"}\n');
++
++    const allParts = events.flatMap(event => event.candidates || []).flatMap(candidate => candidate.content?.parts || []);
++    expect(allParts.some(part => part.thoughtSignature === "stream-thought-signature" && part.thought === true)).toBe(true);
++    expect(allParts.find(part => part.functionCall)?.functionCall).toEqual({
++      id: "stream-function-16", name: "forbidden_dummy", args: { code: "4821" },
++    });
++    const lateUsageIndex = events.findIndex(event => event.usageMetadata?.cachedContentTokenCount === 64);
++    const lastCandidateIndex = events.reduce((last, event, index) => event.candidates?.length ? index : last, -1);
++    expect(lateUsageIndex).toBeGreaterThan(lastCandidateIndex);
++    expect(events[lateUsageIndex]).toMatchObject({
++      usageMetadata: { promptTokenCount: 81, candidatesTokenCount: 12, totalTokenCount: 93, cachedContentTokenCount: 64 },
++      providerTailMeta: "late-usage",
++    });
++    expect(network).toHaveBeenCalledOnce();
++  });
++
++  it("strips fence fragments from signed ordinary-text SSE parts without changing signature bytes or part positions", async () => {
++    const signatureValues = [
++      "eyJ0aG91Z2h0IjoiMSJ9",
++      "eyJvcmRpbmFyeSI6Im9wZW5pbmcifQ==",
++      "eyJ0aG91Z2h0IjoiMiJ9",
++      "eyJvcmRpbmFyeSI6Im1pZGRsZSJ9",
++      "eyJ0aG91Z2h0IjoiMyJ9",
++      "eyJvcmRpbmFyeSI6ImNsb3NpbmcifQ==",
++    ];
++    const thoughtParts = [
++      { text: "thought-1", thought: true, thoughtSignature: signatureValues[0], providerThoughtMeta: 1 },
++      { text: "thought-2", thought: true, thoughtSignature: signatureValues[2], providerThoughtMeta: 2 },
++      { text: "thought-3", thought: true, thoughtSignature: signatureValues[4], providerThoughtMeta: 3 },
++    ];
++    const signedTextParts = [
++      { text: "```json\n{", thoughtSignature: signatureValues[1], providerPartMeta: { fragment: "opening" } },
++      { text: "\"code\":\"4821\"", thoughtSignature: signatureValues[3], providerPartMeta: { fragment: "middle" } },
++      { text: "}\n```", thoughtSignature: signatureValues[5], providerPartMeta: { fragment: "closing" } },
++    ];
++    const chunks = [
++      { response: { candidates: [{ index: 15, content: { role: "model", parts: [thoughtParts[0], signedTextParts[0]] } }] } },
++      { response: { candidates: [{ index: 15, content: { role: "model", parts: [thoughtParts[1], signedTextParts[1]] } }] } },
++      { response: { candidates: [{ index: 15, content: { role: "model", parts: [thoughtParts[2], signedTextParts[2]] }, finishReason: "STOP" }] } },
++      { response: { usageMetadata: { promptTokenCount: 91, candidatesTokenCount: 8, totalTokenCount: 99, cachedContentTokenCount: 64 }, providerTailMeta: "late-usage" } },
++    ];
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(chunks.map(sseFrame).join("")), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++
++    const { response } = await postNative(jsonRequestBody(), { stream: true, alt: "sse" });
++    expect(response.status).toBe(200);
++    const events = parseSseEvents(await response.text());
++    const candidateEvents = events.flatMap(event => event.candidates || []).filter(candidate => candidate.index === 15);
++    expect(candidateEvents).toHaveLength(3);
++    const expectedText = ["{", "\"code\":\"4821\"", "}\n"];
++    for (let index = 0; index < candidateEvents.length; index++) {
++      expect(candidateEvents[index].content.parts).toEqual([
++        thoughtParts[index],
++        { ...signedTextParts[index], text: expectedText[index] },
++      ]);
++    }
++    const ordinaryText = candidateEvents.flatMap(candidate => candidate.content.parts)
++      .filter(part => !part.thought && typeof part.text === "string")
++      .map(part => part.text).join("");
++    expect(JSON.parse(ordinaryText)).toEqual({ code: "4821" });
++    expect(ordinaryText).toBe('{"code":"4821"}\n');
++
++    const returnedSignatures = candidateEvents.flatMap(candidate => candidate.content.parts)
++      .map(part => part.thoughtSignature);
++    expect(returnedSignatures).toEqual(signatureValues);
++    for (let index = 0; index < returnedSignatures.length; index++) {
++      expect(Buffer.from(returnedSignatures[index], "utf8")).toEqual(Buffer.from(signatureValues[index], "utf8"));
++    }
++    const lateUsageIndex = events.findIndex(event => event.usageMetadata?.cachedContentTokenCount === 64);
++    const lastCandidateIndex = events.reduce((last, event, index) => event.candidates?.length ? index : last, -1);
++    expect(lateUsageIndex).toBeGreaterThan(lastCandidateIndex);
++    expect(events[lateUsageIndex]).toMatchObject({
++      usageMetadata: { promptTokenCount: 91, candidatesTokenCount: 8, totalTokenCount: 99, cachedContentTokenCount: 64 },
++      providerTailMeta: "late-usage",
++    });
++    expect(network).toHaveBeenCalledOnce();
++  });
++
++  it.each([
++    ["JSON MIME without schema", body => { delete body.generationConfig.responseJsonSchema; }],
++    ["no JSON MIME", body => { delete body.generationConfig.responseMimeType; delete body.generationConfig.responseJsonSchema; }],
++    ["non-JSON MIME", body => { body.generationConfig.responseMimeType = "text/plain"; delete body.generationConfig.responseJsonSchema; }],
++  ])("selects JSON output only for explicit application/json MIME: %s", async (name, changeBody) => {
++    const body = jsonRequestBody();
++    changeBody(body);
++    const fenced = "```json\n{\"code\":\"4821\"}\n```";
++    network.mockImplementationOnce(async () => Response.json({ response: {
++      candidates: [{ index: 0, content: { role: "model", parts: [{ text: fenced }] }, finishReason: "STOP" }],
++    } }));
++
++    const { response } = await postNative(body);
++    expect(response.status).toBe(200);
++    const candidateText = (await response.json()).candidates[0].content.parts[0].text;
++    if (name === "JSON MIME without schema") expect(candidateText).toBe('{"code":"4821"}\n');
++    else expect(candidateText).toBe(fenced);
++  });
++
++  it.each([
++    ["malformed JSON", "```json\n{\"code\":}\n```", "STOP"],
++    ["unfinished candidate", "```json\n{\"code\":\"4821\"}\n```", undefined],
++    ["MAX_TOKENS candidate", "```json\n{\"code\":\"4821\"}\n```", "MAX_TOKENS"],
++  ])("does not sanitize %s", async (_name, fenced, finishReason) => {
++    const candidate = { index: 0, content: { role: "model", parts: [{ text: fenced }] } };
++    if (finishReason !== undefined) candidate.finishReason = finishReason;
++    network.mockImplementationOnce(async () => Response.json({ response: { candidates: [candidate] } }));
++
++    const { response } = await postNative();
++    expect(response.status).toBe(200);
++    expect((await response.json()).candidates[0].content.parts[0].text).toBe(fenced);
++  });
++
++  it("passes provider errors through without treating error text as JSON output", async () => {
++    const error = { error: { code: 400, status: "INVALID_ARGUMENT", message: "structured output rejected", details: [{ field: "generationConfig.responseJsonSchema" }] } };
++    network.mockImplementationOnce(async () => Response.json(error, { status: 400, headers: { "Retry-After": "11" } }));
++
++    const { response } = await postNative();
++    expect(response.status).toBe(400);
++    expect(response.headers.get("retry-after")).toBe("11");
++    expect(await response.json()).toEqual(error);
++  });
++
++  it("preserves an HTTP-200 Gemini error envelope", async () => {
++    const error = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "provider quota", details: [{ retryDelay: "4s" }] } };
++    network.mockImplementationOnce(async () => Response.json({ response: error }));
++
++    const { response } = await postNative();
++    expect(response.status).toBe(429);
++    expect(await response.json()).toEqual(error);
++  });
++
++  it("does not synthesize a JSON completion for an incomplete fenced SSE stream", async () => {
++    const incomplete = sseFrame({ response: {
++      candidates: [{ index: 0, content: { role: "model", parts: [{ text: "```json\n{\"code\":\"4821\"}" }] } }],
++    } });
++    network.mockImplementationOnce(async () => new Response(byteFragmentedStream(incomplete), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++
++    const { response } = await postNative(jsonRequestBody(), { stream: true, alt: "sse" });
++    const output = await response.text();
++    expect(output).toContain("```json");
++    expect(output).not.toContain('"finishReason":"STOP"');
++    expect(output).toContain('"code":502');
++    expect(output).not.toContain("[DONE]");
++  });
++
++  it("cancels the upstream stream while an opening fence is still buffered", async () => {
++    let upstreamCancelled;
++    const cancelled = new Promise(resolve => { upstreamCancelled = resolve; });
++    let executorSignal;
++    const upstream = new ReadableStream({
++      start(controller) {
++        controller.enqueue(new TextEncoder().encode(sseFrame({ response: {
++          candidates: [{ index: 0, content: { role: "model", parts: [{ text: "```j" }] } }],
++        } })));
++      },
++      cancel: upstreamCancelled,
++    });
++    network.mockImplementationOnce(async (_url, options) => {
++      executorSignal = options.signal;
++      return new Response(upstream, { headers: { "Content-Type": "text/event-stream" } });
++    });
++
++    const { response } = await postNative(jsonRequestBody(), { stream: true, alt: "sse" });
++    const reader = response.body.getReader();
++    expect((await reader.read()).done).toBe(false);
++    await reader.cancel("fixture client cancelled during JSON fence");
++    await vi.waitFor(() => expect(executorSignal.aborted).toBe(true));
++    await expect(cancelled).resolves.toBe("fixture client cancelled during JSON fence");
++  });
++});
+diff --git a/tests/unit/combo-hold-deadline.test.js b/tests/unit/combo-hold-deadline.test.js
+new file mode 100644
+index 0000000..50cd690
+--- /dev/null
++++ b/tests/unit/combo-hold-deadline.test.js
+@@ -0,0 +1,88 @@
++// Regression for the combo account-wait contract (0064). Waiting only happens when
++// the caller provides holdDeadlineAt; without it the historical immediate handoff
++// is kept. The wait ends at the deadline, stops on client abort, and an expired
++// deadline reports the router's own 502 instead of relaying an upstream 429/503.
++import { describe, expect, it, vi } from "vitest";
++import { handleComboChat } from "../../open-sse/services/combo.js";
++
++const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
++
++// combo reads ok, status, headers, body, clone and statusText from the result object.
++function resultFor(status, ok) {
++  const make = () => new Response(JSON.stringify({ error: { message: "account exhausted" } }), {
++    status,
++    headers: { "Content-Type": "application/json" },
++  });
++  const response = make();
++  return { ok, status, statusText: "", headers: response.headers, body: response.body, clone: () => make() };
++}
++
++// Every member fails on account exhaustion (429), so only waiting can change the outcome.
++function exhaustedMember() {
++  const calls = [];
++  const handleSingleModel = async (_body, modelStr) => {
++    calls.push(modelStr);
++    return resultFor(429, false);
++  };
++  return { calls, handleSingleModel };
++}
++
++describe("combo account wait is driven by holdDeadlineAt only", () => {
++  it("without holdDeadlineAt, exhaustion is handed back at once (no wait pass)", async () => {
++    const { calls, handleSingleModel } = exhaustedMember();
++    const started = Date.now();
++    await handleComboChat({
++      body: { model: "combo", messages: [{ role: "user", content: "hi" }] },
++      models: ["p/a", "p/b"],
++      handleSingleModel,
++      log,
++    });
++    expect(Date.now() - started).toBeLessThan(1000);
++    // One pass only: no re-pass of the member list.
++    expect(calls).toEqual(["p/a", "p/b"]);
++  });
++
++  it("with an expired holdDeadlineAt, the router answers 502 instead of 429", async () => {
++    const { handleSingleModel } = exhaustedMember();
++    const result = await handleComboChat({
++      body: { model: "combo", messages: [{ role: "user", content: "hi" }] },
++      models: ["p/a", "p/b"],
++      handleSingleModel,
++      log,
++      holdDeadlineAt: Date.now() - 1,
++    });
++    expect(result.status).toBe(502);
++  });
++
++  it("with a live holdDeadlineAt, exhausted members are re-passed until the deadline", async () => {
++    const { calls, handleSingleModel } = exhaustedMember();
++    const deadline = Date.now() + 1500;
++    await handleComboChat({
++      body: { model: "combo", messages: [{ role: "user", content: "hi" }] },
++      models: ["p/a", "p/b"],
++      handleSingleModel,
++      log,
++      holdDeadlineAt: deadline,
++    });
++    // More than one pass proves the wait re-pass ran; the deadline bounds it.
++    expect(calls.length).toBeGreaterThan(2);
++    expect(Date.now()).toBeGreaterThanOrEqual(deadline - 50);
++  });
++
++  it("a client abort during the wait ends it at once", async () => {
++    const { calls, handleSingleModel } = exhaustedMember();
++    const controller = new AbortController();
++    const started = Date.now();
++    setTimeout(() => controller.abort(), 100);
++    await handleComboChat({
++      body: { model: "combo", messages: [{ role: "user", content: "hi" }] },
++      models: ["p/a", "p/b"],
++      handleSingleModel,
++      log,
++      holdDeadlineAt: Date.now() + 5000,
++      clientSignal: controller.signal,
++    });
++    expect(Date.now() - started).toBeLessThan(1500);
++    expect(calls.length).toBeGreaterThanOrEqual(2);
++  });
++});
+diff --git a/tests/unit/combo-transient-no-sleep.test.js b/tests/unit/combo-transient-no-sleep.test.js
+new file mode 100644
+index 0000000..65a79c8
+--- /dev/null
++++ b/tests/unit/combo-transient-no-sleep.test.js
+@@ -0,0 +1,63 @@
++// Regression: a transient 502/503/504 from one combo model must move to the next
++// model at once, without sleeping on the account cooldown. The short cooldown only
++// marks the account unavailable; it must never delay the current request.
++import { describe, expect, it, vi } from "vitest";
++import { handleComboChat } from "../../open-sse/services/combo.js";
++import { checkFallbackError } from "../../open-sse/services/accountFallback.js";
++
++const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
++
++// combo reads ok, status, headers, body, clone and statusText from the result object.
++function resultFor(status, ok) {
++  const make = () => new Response(JSON.stringify({ error: { message: "upstream unavailable" } }), {
++    status,
++    headers: { "Content-Type": "application/json" },
++  });
++  const response = make();
++  return {
++    ok,
++    status,
++    statusText: "",
++    headers: response.headers,
++    body: response.body,
++    clone: () => make(),
++  };
++}
++
++describe("combo transient 502/503/504 do not sleep before the next model", () => {
++  for (const status of [502, 503, 504]) {
++    it(`status ${status}: the next model runs without waiting on the cooldown`, async () => {
++      const calls = [];
++      const handleSingleModel = async (_body, modelStr) => {
++        calls.push({ modelStr, at: Date.now() });
++        if (modelStr === "p/first") return resultFor(status, false);
++        return resultFor(200, true);
++      };
++
++      const started = Date.now();
++      const result = await handleComboChat({
++        body: { model: "combo", messages: [{ role: "user", content: "hi" }] },
++        models: ["p/first", "p/second"],
++        handleSingleModel,
++        log,
++      });
++      const elapsed = Date.now() - started;
++
++      expect(calls.map(c => c.modelStr)).toEqual(["p/first", "p/second"]);
++      // Without the sleep the whole handoff is effectively immediate; the old 5s pause
++      // would blow well past this bound.
++      expect(elapsed).toBeLessThan(1000);
++      expect(result).toBeDefined();
++    });
++  }
++});
++
++describe("account cooldown classification stays short", () => {
++  it("a bare 502 gets the transient account cooldown, not a sleep budget", () => {
++    const r = checkFallbackError(502, "upstream unavailable", 0, "p");
++    expect(r.shouldFallback).toBe(true);
++    expect(typeof r.cooldownMs).toBe("number");
++    expect(r.cooldownMs).toBeGreaterThan(0);
++  });
++
++});
+diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
+new file mode 100644
+index 0000000..7cc7aba
+--- /dev/null
++++ b/tests/unit/gemini-native-entry-contract.test.js
+@@ -0,0 +1,381 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import fs from "node:fs";
++import path from "node:path";
++import vm from "node:vm";
++import { createHash } from "node:crypto";
++import { fileURLToPath } from "node:url";
++import { resolveSessionIdentity } from "../../open-sse/utils/sessionManager.js";
++
++// Real endpoint + handler control flow. Only imported service boundaries are
++// replaced; no database, external fetch, model, or provider account is contacted.
++const root = fileURLToPath(new URL("../../", import.meta.url));
++function moduleSource(relative) {
++  return fs.readFileSync(path.join(root, relative), "utf8")
++    .replace(/^import[\s\S]*?;\s*$/gm, "")
++    .replace(/^export /gm, "");
++}
++function nativeBody() {
++  return {
++    systemInstruction: { parts: [{ text: "Initialization instruction" }] },
++    contents: [
++      { role: "user", parts: [{ text: "Use the tool result" }] },
++      { role: "model", parts: [{ functionCall: { id: "call-1", name: "task", args: { type: "customer", task: "init" } }, thoughtSignature: "fixture-provider-signature" }] },
++      { role: "user", parts: [{ functionResponse: { id: "call-1", name: "task", response: { result: { type: "customer", value: 9 } } } }] },
++    ],
++    tools: [{ functionDeclarations: [{ name: "task", parametersJsonSchema: { type: "object", properties: { type: { type: "string" } }, additionalProperties: false } }] }],
++    toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["task"] } },
++    generationConfig: { maxOutputTokens: 2048, temperature: 0, seed: 7, thinkingConfig: { thinking_level: "HIGH", include_thoughts: false } },
++    cachedContent: "cachedContents/fixture",
++    labels: { trace: "fixture" },
++    // A hypothetical future opaque extension: this is not a claim about a
++    // currently supported subagent protocol or its actual field names.
++    futureInitialization: { task: "fixture", args: { type: "customer" } },
++  };
++}
++let context;
++let services;
++function load() {
++  services = {
++    getSettings: vi.fn().mockResolvedValue({ requireApiKey: true }),
++    isValidApiKey: vi.fn().mockImplementation(async key => key === "router-key"),
++    getKeyAccessContext: vi.fn(async () => null),
++    enforceKeyAccess: vi.fn(async () => null),
++    enforceKeyAccessResolved: vi.fn(async () => null),
++    filterAdapterModels: vi.fn(async (_keyAccess, models) => models),
++    getProviderCredentials: vi.fn().mockResolvedValue({ apiKey: "provider-key", connectionId: "fixture-connection", providerSpecificData: {} }),
++    markAccountUnavailable: vi.fn().mockResolvedValue({ shouldFallback: false }),
++    clearAccountError: vi.fn().mockResolvedValue(undefined),
++    handleChatCore: vi.fn().mockImplementation(async () => ({ success: true, response: Response.json({ candidates: [{ content: { role: "model", parts: [{ text: "done" }] }, finishReason: "STOP" }] }) })),
++    fetch: vi.fn().mockResolvedValue(Response.json({ candidates: [{ content: { parts: [{ inlineData: { mimeType: "audio/pcm", data: "AA==" } }] } }] })),
++  };
++  const quiet = Object.fromEntries(["log", "debug", "warn", "error", "info"].map(k => [k, () => {}]));
++  quiet.maskKey = () => "masked-test-key";
++  context = {
++    ...services, console: quiet, log: quiet,
++    Request, Response, Headers, URL, Buffer, AbortController, ReadableStream,
++    TextEncoder, TextDecoder, TransformStream, setTimeout, clearTimeout,
++    GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS: 50,
++    PROVIDER_MODELS: { gemini: [], "gemini-tts-models": [] },
++    initTranslators: async () => {},
++    HTTP_STATUS: { BAD_REQUEST: 400, UNAUTHORIZED: 401, NOT_FOUND: 404, SERVICE_UNAVAILABLE: 503 },
++    // Immediate-response scenarios: the harness sets the server wait deadline to 0 so
++    // exhausted accounts answer at once. Positive-deadline behaviour is covered by
++    // separate regressions outside this file. The import line is stripped below, so
++    // the sandbox must supply the binding itself.
++    ACCOUNT_WAIT_DEADLINE_MS: 0,
++    FORMATS: { GEMINI: "gemini", OPENAI: "openai" },
++    DEFAULT_HEADROOM_URL: "http://unused.test",
++    getComboModels: async () => null,
++    getTargetFormat: provider => ["gemini", "aistudio"].includes(provider) ? "gemini" : "openai",
++    resolveSessionIdentity,
++    proxyAwareFetch: (...args) => services.fetch(...args),
++    getModelInfo: async model => { const i = model.indexOf("/"); return { provider: i < 0 ? "gemini" : model.slice(0, i), model: i < 0 ? model : model.slice(i + 1) }; },
++    stripModelContextMarker: model => ({ model, contextMarker: null }),
++    detectRequiredCapabilities: () => new Set(),
++    augmentModelsWithCapacityAdapter: models => models,
++    handleBypassRequest: () => null,
++    checkAndRefreshToken: async (_provider, credentials) => credentials,
++    clearAntigravityStrikes: () => {},
++    getPxpipeTransform: async () => null,
++    appendPxpipeEvent: () => {},
++    detectFormatByEndpoint: () => null,
++    upstreamResponseHeaders: headers => Object.fromEntries(headers || []),
++    updateProviderCredentials: async () => {},
++    errorResponse: (status, message, headers) => Response.json({ error: { message } }, { status, headers }),
++    unavailableResponse: (status, message) => Response.json({ error: { message } }, { status }),
++  };
++  // Production crypto is real; these remote fixtures have no trusted local/CLI principal.
++  Object.assign(context, { createHash, isLocalRequest: () => false, hasValidCliToken: async () => false });
++  vm.createContext(context);
++  // Reuse the real key extraction implementation, not a permissive test copy.
++  const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
++  const start = auth.indexOf("export function extractApiKey(");
++  const end = auth.indexOf("/**", start);
++  vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  // Upstream added the wider client-key accessor; load its real pure implementation
++  // just like the legacy auth accessor, without importing DB/account boundaries.
++  const keyAccess = fs.readFileSync(path.join(root, "src/sse/services/keyAccess.js"), "utf8");
++  const keyStart = keyAccess.indexOf("export function extractClientApiKey(");
++  const keyEnd = keyAccess.indexOf("/**", keyStart);
++  if (keyStart < 0 || keyEnd <= keyStart) throw new Error("Real client-key accessor is missing");
++  vm.runInContext(keyAccess.slice(keyStart, keyEnd).replace("export ", ""), context);
++  vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
++  vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
++}
++function request(provider, action, body = nativeBody(), { headers = { Authorization: "Bearer router-key" }, query = "", signal } = {}) {
++  const model = "gemini-3.5-flash-lite(high)";
++  const url = `https://router.test/v1beta/models/${provider}/${model}:${action}${query}`;
++  const req = new Request(url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body), signal });
++  return { req, params: { params: Promise.resolve({ path: [provider, `${model}:${action}`] }) } };
++}
++async function call(provider, action, body, options) {
++  const { req, params } = request(provider, action, body, options);
++  const response = await context.POST(req, params);
++  if (response.status === 500) throw new Error(await response.clone().text());
++  return response;
++}
++
++function audioRequest(action = "streamGenerateContent") {
++  return {
++    req: new Request(`https://router.test/v1beta/models/gemini/tts-model:${action}`, {
++      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer router-key" },
++      body: JSON.stringify({ contents: [{ parts: [{ text: "Speak" }] }], generationConfig: { responseModalities: ["AUDIO"] } }),
++    }),
++    params: { params: Promise.resolve({ path: ["gemini", `tts-model:${action}`] }) },
++  };
++}
++
++describe("native Gemini endpoint entry contract", () => {
++  beforeEach(load);
++
++  it("isolates native server-parts tenancy between authenticated client keys", async () => {
++    services.isValidApiKey.mockResolvedValue(true);
++    for (const key of ["first-fixture-key", "second-fixture-key"]) {
++      const response = await call("gemini", "generateContent", nativeBody(),
++        { headers: { Authorization: `Bearer ${key}` } });
++      expect(response.status).toBe(200);
++    }
++    const tenants = services.handleChatCore.mock.calls.map(([options]) => options.serverPartsTenant);
++    expect(tenants).toHaveLength(2);
++    for (const tenant of tenants) expect(tenant).toMatch(/^[0-9a-f]{64}$/);
++    expect(tenants[0]).not.toBe(tenants[1]);
++  });
++
++
++it("loads the real client-key accessor for every supported credential location", () => {
++  for (const [headers, query, expected] of [
++    [{ Authorization: "Bearer bearer-fixture", "x-goog-api-key": "ignored" }, "?key=ignored", "bearer-fixture"],
++    [{ "x-api-key": "header-fixture" }, "", "header-fixture"],
++    [{ "x-goog-api-key": "google-fixture" }, "", "google-fixture"],
++    [{}, "?key=query-fixture", "query-fixture"],
++    [{}, "?$key=dollar-fixture", "dollar-fixture"],
++  ]) {
++    const { req } = request("gemini", "generateContent", nativeBody(), { headers, query });
++    expect(context.extractClientApiKey(req)).toBe(expected);
++  }
++});
++
++
++  it.each(["generateContent", "streamGenerateContent"])("TTS %s waits for EOF and its account update", async action => {
++    let releaseAccount;
++    const accountUpdated = new Promise(resolve => { releaseAccount = resolve; });
++    services.clearAccountError.mockImplementationOnce(() => accountUpdated);
++    context.setTimeout = vi.fn(() => 77);
++    context.clearTimeout = vi.fn();
++    const payload = { candidates: [{ content: { parts: [{ inlineData: { mimeType: "audio/pcm", data: "AA==" } }] }, finishReason: "STOP" }] };
++    const raw = JSON.stringify(action === "streamGenerateContent" ? [payload] : payload);
++    services.fetch.mockResolvedValueOnce(new Response(raw, { headers: { "Content-Type": "application/json" } }));
++    const { req, params } = audioRequest(action);
++    const response = await context.POST(req, params);
++    expect(services.clearAccountError).not.toHaveBeenCalled();
++    let finished = false;
++    const reading = response.text().then(text => { finished = true; return text; });
++    await vi.waitFor(() => expect(services.clearAccountError).toHaveBeenCalledOnce());
++    expect(context.clearTimeout).toHaveBeenCalledWith(77);
++    expect(finished).toBe(false);
++    releaseAccount();
++    expect(await reading).toBe(raw);
++    expect(services.markAccountUnavailable).not.toHaveBeenCalled();
++  });
++
++  it("TTS retains its deadline after headers and marks a stalled response unavailable", async () => {
++    let expire;
++    context.setTimeout = vi.fn(callback => { expire = callback; return 77; });
++    context.clearTimeout = vi.fn();
++    services.fetch.mockImplementationOnce(async (_url, options) => new Response(new ReadableStream({
++      start(controller) {
++        options.signal.addEventListener("abort", () => controller.error(Object.assign(new Error("body timed out"), { name: "AbortError" })), { once: true });
++      },
++    }), { headers: { "Content-Type": "text/event-stream" } }));
++    const { req, params } = audioRequest();
++    const response = await context.POST(req, params);
++    expect(context.clearTimeout).not.toHaveBeenCalled();
++    const reading = response.text().catch(error => error);
++    expire();
++    expect(await reading).toBeInstanceOf(Error);
++    expect(services.fetch).toHaveBeenCalledOnce();
++    expect(services.markAccountUnavailable.mock.calls[0].slice(0, 2)).toEqual(["fixture-connection", 504]);
++    expect(services.clearAccountError).not.toHaveBeenCalled();
++    expect(context.clearTimeout).toHaveBeenCalledWith(77);
++  });
++
++  it("TTS awaits the post-header failure update before rejecting the body", async () => {
++    let releaseAccount;
++    const accountUpdated = new Promise(resolve => { releaseAccount = resolve; });
++    services.markAccountUnavailable.mockImplementationOnce(() => accountUpdated);
++    context.setTimeout = vi.fn(() => 77);
++    context.clearTimeout = vi.fn();
++    let upstream;
++    services.fetch.mockResolvedValueOnce(new Response(new ReadableStream({ start(controller) { upstream = controller; } }), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++    const { req, params } = audioRequest();
++    const response = await context.POST(req, params);
++    let failed = false;
++    const reading = response.text().catch(error => { failed = true; return error; });
++    upstream.error(new Error("socket hang up"));
++    await vi.waitFor(() => expect(services.markAccountUnavailable).toHaveBeenCalledOnce());
++    expect(failed).toBe(false);
++    expect(services.markAccountUnavailable.mock.calls[0].slice(0, 2)).toEqual(["fixture-connection", 502]);
++    releaseAccount({ shouldFallback: false });
++    expect(await reading).toBeInstanceOf(Error);
++    expect(services.clearAccountError).not.toHaveBeenCalled();
++  });
++
++  for (const provider of ["gemini", "aistudio"]) {
++    it(`${provider}: preserves native tool history, settings and arbitrary opaque extensions`, async () => {
++      const original = nativeBody();
++      const response = await call(provider, "generateContent", original);
++      expect(response.status).toBe(200);
++      expect(services.handleChatCore).toHaveBeenCalledTimes(1);
++      const options = services.handleChatCore.mock.calls[0][0];
++      for (const [key, value] of Object.entries(original)) expect(options.body[key], key).toEqual(value);
++      expect(options.modelInfo.provider).toBe(provider);
++      expect(options.body.model).toBe(`${provider}/gemini-3.5-flash-lite(high)`);
++      expect(options.sourceFormatOverride).toBe("gemini");
++      expect(options.body.stream).toBe(false);
++      expect(services.fetch).not.toHaveBeenCalled();
++    });
++
++    for (const auth of ["google-header", "query", "query-alias", "bearer"]) {
++      it(`${provider}: accepts ${auth} router credentials before selecting a provider`, async () => {
++        const options = auth === "google-header" ? { headers: { "x-goog-api-key": "router-key" } }
++          : auth === "query" ? { headers: {}, query: "?key=router-key" }
++          : auth === "query-alias" ? { headers: {}, query: "?$key=router-key" }
++          : { headers: { Authorization: "Bearer router-key" } };
++        const response = await call(provider, "generateContent", nativeBody(), options);
++        expect(response.status).toBe(200);
++        expect(services.isValidApiKey).toHaveBeenCalledWith("router-key");
++        expect(services.handleChatCore).toHaveBeenCalledTimes(1);
++      });
++    }
++
++    it(`${provider}: rejects a bad Google-style router credential without provider calls`, async () => {
++      const response = await call(provider, "generateContent", nativeBody(), { headers: { "x-goog-api-key": "invalid" } });
++      expect(response.status).toBe(401);
++      expect(services.handleChatCore).not.toHaveBeenCalled();
++      expect(services.getProviderCredentials).not.toHaveBeenCalled();
++    });
++
++    it(`${provider}: malformed JSON is a non-retryable native client error without provider calls`, async () => {
++      const req = new Request(`https://router.test/v1beta/models/${provider}/gemini-3.5-flash-lite:generateContent`, {
++        method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer router-key" }, body: '{"contents":[',
++      });
++      const response = await context.POST(req, { params: Promise.resolve({ path: [provider, "gemini-3.5-flash-lite:generateContent"] }) });
++      expect(response.status).toBe(400);
++      expect(response.headers.get("access-control-allow-origin")).toBe("*");
++      expect(await response.json()).toEqual({ error: { code: 400, status: "INVALID_ARGUMENT", message: "Request body is not valid JSON" } });
++      expect(services.getProviderCredentials).not.toHaveBeenCalled();
++      expect(services.handleChatCore).not.toHaveBeenCalled();
++      expect(services.fetch).not.toHaveBeenCalled();
++    });
++
++    it(`${provider}: action determines streaming and provider-native frames return unchanged`, async () => {
++      const payload = 'data: {"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-1","name":"task","args":{"value":9}},"thoughtSignature":"fixture"}]}}]}\n\ndata: {"usageMetadata":{"cachedContentTokenCount":4096}}\n\n';
++      services.handleChatCore.mockImplementationOnce(async options => ({ success: true, response: new Response(payload, { headers: { "Content-Type": "text/event-stream" } }) }));
++      const response = await call(provider, "streamGenerateContent");
++      expect(services.handleChatCore.mock.calls[0][0].body.stream).toBe(true);
++      expect(await response.text()).toBe(payload);
++    });
++
++    it(`${provider}: client abort remains connected to the core provider signal`, async () => {
++      const abort = new AbortController();
++      await call(provider, "generateContent", nativeBody(), { signal: abort.signal });
++      const options = services.handleChatCore.mock.calls[0][0];
++      expect(options.clientSignal).toBeDefined();
++      expect(options.clientSignal.aborted).toBe(false);
++      abort.abort();
++      expect(options.clientSignal.aborted).toBe(true);
++    });
++
++    it(`${provider}: native error category/details and Retry-After survive an exhausted account fallback`, async () => {
++      const error = { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "fixture quota", details: [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "17s" }] } };
++      services.getProviderCredentials.mockResolvedValueOnce({ apiKey: "provider-key", connectionId: "fixture-connection", providerSpecificData: {} }).mockResolvedValueOnce(null);
++      services.markAccountUnavailable.mockResolvedValueOnce({ shouldFallback: true });
++      services.handleChatCore.mockResolvedValueOnce({ success: false, status: 429, error: "fixture quota", nativeResponse: true, response: Response.json(error, { status: 429, headers: { "Retry-After": "17" } }) });
++      const response = await call(provider, "generateContent");
++      expect(response.status).toBe(429);
++      expect(response.headers.get("retry-after")).toBe("17");
++      expect(await response.json()).toEqual(error);
++    });
++
++    it(`${provider}: a late native stream failure marks the selected account unavailable`, async () => {
++      services.handleChatCore.mockImplementationOnce(async options => ({
++        success: true,
++        response: new Response(new ReadableStream({
++          async pull(controller) {
++            await options.onRequestFailure({ status: 429, error: "fixture stream quota" });
++            controller.enqueue(new TextEncoder().encode('data: {"error":{"code":429,"message":"fixture stream quota"}}\n\n'));
++            controller.close();
++          },
++        }), { headers: { "Content-Type": "text/event-stream" } }),
++      }));
++      const response = await call(provider, "streamGenerateContent");
++      expect(await response.text()).toContain('"code":429');
++      expect(services.markAccountUnavailable).toHaveBeenCalledOnce();
++      expect(services.markAccountUnavailable.mock.calls[0].slice(0, 5)).toEqual([
++        "fixture-connection", 429, "fixture stream quota", provider, "gemini-3.5-flash-lite(high)",
++      ]);
++      expect(services.clearAccountError).not.toHaveBeenCalled();
++    });
++
++    for (const [first, second] of [["account-a", "account-b"], ["account-b", "account-a"]]) {
++      it(`${provider}: ${first} to ${second} fallback preserves signed tool history and native settings`, async () => {
++        const original = nativeBody();
++        const credentials = id => ({ apiKey: `fixture-${id}-key`, connectionId: id, providerSpecificData: {} });
++        services.getProviderCredentials.mockReset()
++          .mockResolvedValueOnce(credentials(first))
++          .mockResolvedValueOnce(credentials(second));
++        services.markAccountUnavailable.mockResolvedValueOnce({ shouldFallback: true });
++        services.handleChatCore
++          .mockResolvedValueOnce({ success: false, status: 429, error: "fixture quota", nativeResponse: true, response: Response.json({ error: { code: 429, status: "RESOURCE_EXHAUSTED" } }, { status: 429 }) })
++          .mockImplementationOnce(async options => {
++            await options.onRequestSuccess();
++            return { success: true, response: Response.json({ candidates: [{ content: { parts: [{ text: "continued tool task" }] }, finishReason: "STOP" }] }) };
++          });
++        const response = await call(provider, "generateContent", original, { query: "?fields=candidates" });
++        expect(response.status).toBe(200);
++        expect((await response.json()).candidates[0].content.parts[0].text).toBe("continued tool task");
++        expect(services.handleChatCore).toHaveBeenCalledTimes(2);
++        const attempts = services.handleChatCore.mock.calls.map(([options]) => options);
++        expect(attempts.map(options => options.connectionId)).toEqual([first, second]);
++        for (const options of attempts) {
++          expect(options.sourceFormatOverride).toBe("gemini");
++          expect(options.body).toEqual({ ...original, model: `${provider}/gemini-3.5-flash-lite(high)`, stream: false });
++          expect(options.clientRawRequest.body).toEqual(original);
++          expect(options.clientRawRequest.queryParams).toEqual([["fields", "candidates"]]);
++        }
++        expect(services.getProviderCredentials.mock.calls[1][1].has(first)).toBe(true);
++        expect(services.markAccountUnavailable).toHaveBeenCalledTimes(1);
++        expect(services.markAccountUnavailable.mock.calls[0][0]).toBe(first);
++        expect(services.clearAccountError.mock.calls[0][0]).toBe(second);
++      });
++    }
++  }
++
++  it("Gemini AUDIO abort after fetch headers cancels the existing native upstream operation", async () => {
++    const abort = new AbortController();
++    const audio = { contents: [{ parts: [{ text: "Speak" }] }], generationConfig: { responseModalities: ["AUDIO"] } };
++    const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('data: {"candidates":[]}\n\n')); } });
++    services.fetch.mockResolvedValueOnce(new Response(body, { headers: { "Content-Type": "text/event-stream" } }));
++    const req = new Request("https://router.test/v1beta/models/gemini/tts-model:streamGenerateContent", { method: "POST", headers: { Authorization: "Bearer router-key", "Content-Type": "application/json" }, body: JSON.stringify(audio), signal: abort.signal });
++    const response = await context.POST(req, { params: Promise.resolve({ path: ["gemini", "tts-model:streamGenerateContent"] }) });
++    expect(response.status).toBe(200);
++    expect(services.fetch).toHaveBeenCalledTimes(1);
++    const signal = services.fetch.mock.calls[0][1].signal;
++    abort.abort();
++    expect(signal.aborted).toBe(true);
++    await response.body.cancel();
++    expect(services.clearAccountError).not.toHaveBeenCalled();
++    expect(services.markAccountUnavailable).not.toHaveBeenCalled();
++  });
++
++  it("a foreign-provider request keeps the existing translated route", async () => {
++    const response = await call("openai", "generateContent", { contents: [{ role: "user", parts: [{ text: "hello" }] }] });
++    expect(response.status).toBe(200);
++    const options = services.handleChatCore.mock.calls[0][0];
++    expect(options.modelInfo.provider).toBe("openai");
++    expect(options.body.messages).toEqual([{ role: "user", content: "hello" }]);
++    expect(services.fetch).not.toHaveBeenCalled();
++  });
++});
+-- 
+2.55.0
+
