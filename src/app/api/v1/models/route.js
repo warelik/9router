@@ -17,6 +17,7 @@ import { resolveCopilotModels } from "open-sse/services/copilotModels.js";
 import { resolveClinepassModels, resolveClineModels } from "open-sse/services/clinepassModels.js";
 import { resolveGrokCliModels } from "open-sse/services/grokCliModels.js";
 import { resolveCursorModels } from "open-sse/services/cursorModels.js";
+import { resolveAIStudioModels } from "open-sse/services/aistudioModels.js";
 import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
@@ -63,6 +64,12 @@ function comboSeatCapabilities(seat) {
 // returns { models: [{ id, name? }, ...] } | null on failure.
 // Adding a provider here makes /v1/models prefer the live catalog for it.
 const LIVE_MODEL_RESOLVERS = {
+  aistudio: async (conn) => {
+    const result = await resolveAIStudioModels(conn, {
+      proxyOptions: await resolveConnectionProxyConfig(conn.providerSpecificData || {}),
+    });
+    return result?.models?.length ? { models: result.models } : null;
+  },
   kiro: async (conn) => {
     const result = await resolveKiroModels({
       accessToken: conn.accessToken,
