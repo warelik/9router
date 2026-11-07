@@ -2,12 +2,42 @@ import { getProviderConnections, validateApiKey, updateProviderConnection, getSe
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
+import { ACCOUNT_START_LIMIT_PER_MIN } from "open-sse/config/runtimeConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravityQuota.js";
 import * as log from "../utils/logger.js";
 
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
+
+// Per-account request-start pacing: rolling 60s window of selection timestamps.
+// An account whose window is full is skipped during selection until its oldest
+// start expires, so bursts spread across accounts instead of concentrating on
+// the first one until the provider rate-limits it. In-memory only (like the
+// Antigravity quota cache); timestamps need no release bookkeeping.
+const ACCOUNT_START_WINDOW_MS = 60 * 1000;
+const accountStartLog = new Map(); // connectionId -> number[] (ascending ms)
+
+function pruneAccountStarts(connectionId, now) {
+  const starts = accountStartLog.get(connectionId);
+  if (!starts) return [];
+  while (starts.length > 0 && now - starts[0] >= ACCOUNT_START_WINDOW_MS) starts.shift();
+  if (starts.length === 0) accountStartLog.delete(connectionId);
+  return starts;
+}
+
+// Ms timestamp when a start slot frees for this account, or 0 if not saturated.
+function accountStartSaturatedUntil(connectionId, now) {
+  if (!ACCOUNT_START_LIMIT_PER_MIN) return 0;
+  const starts = pruneAccountStarts(connectionId, now);
+  return starts.length >= ACCOUNT_START_LIMIT_PER_MIN ? starts[0] + ACCOUNT_START_WINDOW_MS : 0;
+}
+
+function recordAccountStart(connectionId, now) {
+  const starts = pruneAccountStarts(connectionId, now);
+  starts.push(now);
+  accountStartLog.set(connectionId, starts);
+}
 
 const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
 
@@ -83,10 +113,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const isAntigravity = providerId === "antigravity";
     const antigravityQuotaCache = isAntigravity && model ? getAntigravityQuotaCache() : null;
 
-    // Filter out model-locked, excluded, and Antigravity quota-exhausted connections.
+    // Filter out model-locked, excluded, start-saturated, and Antigravity quota-exhausted connections.
+    const selectionNow = Date.now();
     const availableConnections = connections.filter(c => {
       if (excludeSet.has(c.id)) return false;
       if (isModelLockActive(c, model)) return false;
+      if (accountStartSaturatedUntil(c.id, selectionNow)) return false;
       const enabled = c.providerSpecificData?.enabledModels;
       if (providerId === "codex" && Array.isArray(enabled) && enabled.length && requestedModel && !enabled.includes(requestedModel)) return false;
       // Antigravity: skip if live quota exhausted for this model
@@ -116,6 +148,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // Find earliest persistent lock or lazy Antigravity quota-cache reset for retry timing.
       const lockedConns = connections.filter(c => isModelLockActive(c, model));
       const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
+      // Start-saturated accounts also free up with time; their slot expiry is
+      // a valid retryAfter for the allRateLimited contract (callers may wait).
+      for (const c of connections) {
+        const saturatedUntil = accountStartSaturatedUntil(c.id, selectionNow);
+        if (saturatedUntil) expiries.push(new Date(saturatedUntil).toISOString());
+      }
       if (isAntigravity && model && antigravityQuotaCache) {
         connections.forEach((c) => {
           const connQuotas = antigravityQuotaCache.get(c.id);
@@ -200,6 +238,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     }
 
     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
+
+    // Count this selection as a request start for pacing (still under the
+    // selection mutex, so concurrent selections observe the updated window).
+    recordAccountStart(connection.id, Date.now());
 
     return {
       authType: connection.authType,
