@@ -47,10 +47,46 @@ function isValidPdfPagesArg(filePath, pages) {
     /^\d+(?:-\d+)?$/.test(pages);
 }
 
+// Parallel tool calls: the first tool_use opens at once, as upstream does, and
+// stays open until finish because its arguments arrive in pieces. Until then
+// every later event queues and replays in model order, so two blocks are
+// never open together.
+function emitBlock(state, results, event) {
+  if (state.queuedBlocks) state.queuedBlocks.push(event);
+  else results.push(event);
+}
+
+function toolStartEvent(toolInfo) {
+  // Strip prefix from tool name for response
+  let toolName = toolInfo.name;
+  if (toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
+    toolName = toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
+  }
+  return {
+    type: "content_block_start",
+    index: toolInfo.blockIndex,
+    content_block: { type: CLAUDE_BLOCK.TOOL_USE, id: toolInfo.id, name: toolName, input: {} }
+  };
+}
+
+// Sends the buffered, sanitized arguments as one delta, then closes the block.
+function closeToolBlock(state, results, toolIndex) {
+  const toolInfo = state.toolCalls.get(toolIndex);
+  const buffered = state.toolArgBuffers?.get(toolIndex);
+  if (buffered) {
+    results.push({
+      type: "content_block_delta",
+      index: toolInfo.blockIndex,
+      delta: { type: "input_json_delta", partial_json: sanitizeToolArgs(toolInfo.name, buffered) }
+    });
+  }
+  results.push({ type: "content_block_stop", index: toolInfo.blockIndex });
+}
+
 // Helper: stop thinking block if started
 function stopThinkingBlock(state, results) {
   if (!state.thinkingBlockStarted) return;
-  results.push({
+  emitBlock(state, results, {
     type: "content_block_stop",
     index: state.thinkingBlockIndex
   });
@@ -61,7 +97,7 @@ function stopThinkingBlock(state, results) {
 function stopTextBlock(state, results) {
   if (!state.textBlockStarted || state.textBlockClosed) return;
   state.textBlockClosed = true;
-  results.push({
+  emitBlock(state, results, {
     type: "content_block_stop",
     index: state.textBlockIndex
   });
@@ -144,14 +180,14 @@ export function openaiToClaudeResponse(chunk, state) {
     if (!state.thinkingBlockStarted) {
       state.thinkingBlockIndex = state.nextBlockIndex++;
       state.thinkingBlockStarted = true;
-      results.push({
+      emitBlock(state, results, {
         type: "content_block_start",
         index: state.thinkingBlockIndex,
         content_block: { type: CLAUDE_BLOCK.THINKING, thinking: "" }
       });
     }
 
-    results.push({
+    emitBlock(state, results, {
       type: "content_block_delta",
       index: state.thinkingBlockIndex,
       delta: { type: "thinking_delta", thinking: reasoningContent }
@@ -167,14 +203,14 @@ export function openaiToClaudeResponse(chunk, state) {
       state.textBlockIndex = state.nextBlockIndex++;
       state.textBlockStarted = true;
       state.textBlockClosed = false;
-      results.push({
+      emitBlock(state, results, {
         type: "content_block_start",
         index: state.textBlockIndex,
         content_block: { type: CLAUDE_BLOCK.TEXT, text: "" }
       });
     }
 
-    results.push({
+    emitBlock(state, results, {
       type: "content_block_delta",
       index: state.textBlockIndex,
       delta: { type: "text_delta", text: textContent }
@@ -193,23 +229,16 @@ export function openaiToClaudeResponse(chunk, state) {
 
         const toolBlockIndex = state.nextBlockIndex++;
         state.toolCalls.set(idx, { id: tc.id, name: tc.function?.name || "", blockIndex: toolBlockIndex });
-
-        // Strip prefix from tool name for response
-        let toolName = tc.function?.name || "";
-        if (toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
-          toolName = toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
+        const toolInfo = state.toolCalls.get(idx);
+        if (!state.queuedBlocks) {
+          // The first call opens now, as upstream does, and stays open until
+          // finish. Later events queue behind it.
+          state.queuedBlocks = [];
+          state.openToolIndex = idx;
+          results.push(toolStartEvent(toolInfo));
+        } else {
+          state.queuedBlocks.push({ toolIndex: idx });
         }
-
-        results.push({
-          type: "content_block_start",
-          index: toolBlockIndex,
-          content_block: {
-            type: CLAUDE_BLOCK.TOOL_USE,
-            id: tc.id,
-            name: toolName,
-            input: {}
-          }
-        });
       }
 
       if (tc.function?.arguments) {
@@ -228,22 +257,20 @@ export function openaiToClaudeResponse(chunk, state) {
     stopThinkingBlock(state, results);
     stopTextBlock(state, results);
 
-    for (const [idx, toolInfo] of state.toolCalls) {
-      // Emit buffered + sanitized args as single delta before stop
-      const buffered = state.toolArgBuffers?.get(idx);
-      if (buffered) {
-        const sanitized = sanitizeToolArgs(toolInfo.name, buffered);
-        results.push({
-          type: "content_block_delta",
-          index: toolInfo.blockIndex,
-          delta: { type: "input_json_delta", partial_json: sanitized }
-        });
-      }
-      results.push({
-        type: "content_block_stop",
-        index: toolInfo.blockIndex
-      });
+    // Close the open tool block first, then replay queued blocks in model order.
+    if (state.openToolIndex !== undefined) {
+      closeToolBlock(state, results, state.openToolIndex);
+      state.openToolIndex = undefined;
     }
+    for (const item of state.queuedBlocks || []) {
+      if (item.toolIndex === undefined) {
+        results.push(item);
+        continue;
+      }
+      results.push(toolStartEvent(state.toolCalls.get(item.toolIndex)));
+      closeToolBlock(state, results, item.toolIndex);
+    }
+    state.queuedBlocks = null;
 
     // Mark finish for later usage injection in stream.js
     state.finishReason = choice.finish_reason;
