@@ -178,6 +178,11 @@ export const MODEL_PRICING = {
   "muse-spark-1.1":                { input: 1.25, output: 4.25, cached: 0.15,  reasoning: 4.25,   cache_creation: 0 },
   "muse-spark-1.3-contributor":    { input: 0.10, output: 0.20, cached: 0.002, reasoning: 0.20,   cache_creation: 0 },
   "muse-spark-1.2-contributor":    { input: 0.10, output: 0.20, cached: 0.002, reasoning: 0.20,   cache_creation: 0 },
+  // Wonder has no public pay-as-you-go rate; the full variant is subscription
+  // only. Use the published muse-wonder-1.0 API rates so usage costing is
+  // visible instead of silently zero.
+  "muse-wonder-1.0":               { input: 4.00, output: 20.00, cached: 0.20,  reasoning: 20.00,  cache_creation: 0 },
+  "muse-wonder-full-1.0-contributor": { input: 4.00, output: 20.00, cached: 0.20,  reasoning: 20.00,  cache_creation: 0 },
 
   // === OpenRouter fallback ===
   "auto":                         { input: 2.00,  output: 8.00,  cached: 1.00,  reasoning: 12.00,  cache_creation: 2.00  },
