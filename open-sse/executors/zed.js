@@ -17,6 +17,8 @@
 import { BaseExecutor } from "./base.js";
 import { FORMATS } from "../translator/formats.js";
 import { initState } from "../translator/index.js";
+import { ensureToolCallIds, fixMissingToolResponses } from "../translator/concerns/toolCall.js";
+import { applyThinking, captureThinking } from "../translator/concerns/thinkingUnified.js";
 import { openaiToClaudeRequest } from "../translator/request/openai-to-claude.js";
 import { openaiToGeminiRequest } from "../translator/request/openai-to-gemini.js";
 import { openaiToOpenAIResponsesRequest } from "../translator/request/openai-responses.js";
@@ -59,28 +61,45 @@ function normalizeZedProvider(value, model) {
 
 function buildProviderRequest(provider, model, body, stream, credentials) {
   if (provider === ZED_PROVIDER.anthropic) {
+    ensureToolCallIds(body);
+    fixMissingToolResponses(body);
     return openaiToClaudeRequest(model, body, true);
   }
   if (provider === ZED_PROVIDER.google) {
-    const geminiRequest = openaiToGeminiRequest(model, body, true);
+    ensureToolCallIds(body, { preserveIds: true });
+    const geminiRequest = openaiToGeminiRequest(model, body, true, credentials);
+    applyThinking(FORMATS.GEMINI, model, geminiRequest, "gemini", captureThinking(body));
     // Zed's hosted Gemini backend speaks the Vertex safety vocabulary, not the
     // public Gemini API enum the shared translator emits (`OFF`, `CIVIC_INTEGRITY`,
     // `DANGEROUS_CONTENT`). Drop client-side safetySettings for the Zed Google
     // path so Zed applies its own defaults — scoped here so native Gemini/
     // Antigravity is untouched.
     delete geminiRequest.safetySettings;
+    delete geminiRequest._customToolNames;
+    delete geminiRequest._toolNameMap;
     return geminiRequest;
   }
   if (provider === ZED_PROVIDER.openai) {
+    ensureToolCallIds(body);
+    fixMissingToolResponses(body);
     return openaiToOpenAIResponsesRequest(model, body, true, credentials);
   }
   // xAI is OpenAI-shaped — forward as-is.
+  ensureToolCallIds(body);
+  fixMissingToolResponses(body);
   return { ...(body || {}), model, stream: stream !== false };
 }
 
-function initProviderState(provider, model) {
+function initProviderState(provider, model, continuity = null) {
   if (provider === ZED_PROVIDER.anthropic) return initState(FORMATS.CLAUDE);
-  if (provider === ZED_PROVIDER.google) return initState(FORMATS.GEMINI);
+  if (provider === ZED_PROVIDER.google) {
+    return {
+      ...initState(FORMATS.GEMINI), model,
+      sessionId: continuity?.sessionId || null,
+      serverPartsSessionId: continuity?.serverPartsSessionId || null,
+      turnScope: continuity?.turnScope || null,
+    };
+  }
   if (provider === ZED_PROVIDER.openai) return initState(FORMATS.OPENAI_RESPONSES);
   const state = initState(FORMATS.OPENAI);
   state.model = model;
@@ -145,12 +164,12 @@ function normalizeStatus(status) {
   return null;
 }
 
-function wrapZedCompletionStream(response, provider, model) {
+function wrapZedCompletionStream(response, provider, model, continuity = null) {
   if (!response.ok || !response.body) return response;
 
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
-  const state = initProviderState(provider, model);
+  const state = initProviderState(provider, model, continuity);
   let buffer = "";
   let done = false;
 
@@ -246,6 +265,13 @@ class ZedExecutor extends BaseExecutor {
   async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
     const { provider } = await this.resolveModel(model, credentials, signal, log);
     const providerRequest = buildProviderRequest(provider, model, body, stream, credentials);
+    // Request translation records the exact history scope. Snapshot it before
+    // awaiting fetch so another request cannot replace this decoder's context.
+    const continuity = provider === ZED_PROVIDER.google ? {
+      sessionId: credentials?._clientSessionId || null,
+      serverPartsSessionId: credentials?._geminiServerPartsSessionId || null,
+      turnScope: credentials?._geminiTurnScope || null,
+    } : null;
     const bodyRecord = body || {};
     const payload = {
       thread_id: bodyRecord.thread_id || credentials?._clientSessionId,
@@ -272,7 +298,7 @@ class ZedExecutor extends BaseExecutor {
       },
     });
 
-    const wrapped = response.ok ? wrapZedCompletionStream(response, provider, model) : response;
+    const wrapped = response.ok ? wrapZedCompletionStream(response, provider, model, continuity) : response;
     return {
       response: wrapped,
       url: `${this.config?.llmBaseUrl || "https://cloud.zed.dev"}/completions`,

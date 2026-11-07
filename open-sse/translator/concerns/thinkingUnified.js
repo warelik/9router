@@ -6,6 +6,8 @@ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 import { getThinkingLevels } from "../../providers/thinkingLevels.js";
 import { PROVIDERS } from "../../providers/index.js";
 import { LEVEL_TO_BUDGET, budgetToLevel, effortToBudget, effortToThinkingLevel } from "./thinking.js";
+import { DEFAULT_PROVIDER_THINKING_BUDGET, NATIVE_GEMINI_THINKING_KEYS } from "../../config/runtimeConfig.js";
+import { FORMATS } from "../formats.js";
 
 // Map a target wire-format to its native thinking format (when capability has none).
 const FORMAT_TO_NATIVE = {
@@ -436,7 +438,7 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display, model = "")
 // Mutates and returns body. No-op when model has no reasoning capability.
 // `intent` is a pre-captured config (from captureThinking on the original body);
 // falls back to extracting from the current body when omitted.
-export function applyThinking(targetFormat, model, body, provider = null, intent = undefined) {
+export function applyThinking(targetFormat, model, body, provider = null, intent = undefined, { preserveResponsesOptions = false } = {}) {
   if (!body || typeof body !== "object") return body;
 
   const { cleanModel, override } = parseSuffix(model);
@@ -452,6 +454,16 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
 
   const fmt = resolveFormat(targetFormat, cleanModel, provider);
   const supportedLevels = getThinkingLevels(provider, cleanModel);
+  // A translated/native Responses request already owns its wire options; preserve explicit effort and opaque reasoning fields without inventing a summary.
+  if (preserveResponsesOptions && targetFormat === FORMATS.OPENAI_RESPONSES) {
+    const current = body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning) ? body.reasoning : {};
+    const rawEffort = body.reasoning_effort ?? current.effort;
+    const inferred = cfg.mode === "none" ? "none" : toLevel(cfg);
+    const effort = !override && rawEffort !== undefined ? rawEffort : normalizeOpenAILevel(inferred, supportedLevels);
+    if (effort !== null && effort !== undefined) body.reasoning = { ...current, effort };
+    delete body.reasoning_effort;
+    return body;
+  }
   // Anthropic's `display` (summarized | omitted) decides whether thinking text
   // comes back at all; keep what the client asked for instead of resetting it.
   // An OpenAI-shaped client's ask arrives via the captured intent instead.
@@ -459,4 +471,35 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
   stripAll(body);
   applyFormat(fmt, body, cfg, caps, supportedLevels, display, cleanModel);
   return body;
+}
+
+// A native Gemini client already chose provider-native settings. Preserve them;
+// only a model suffix or an absent client setting permits a router default.
+export function applyNativeGeminiThinking(model, body, provider, providerThinking = null) {
+  const { override } = parseSuffix(model);
+  const generationKey = body.generation_config ? "generation_config" : "generationConfig";
+  const generation = body[generationKey] || {};
+  const thinkingKey = generation.thinking_config ? "thinking_config" : "thinkingConfig";
+  const clientThinking = generation[thinkingKey] || {};
+  const explicit = NATIVE_GEMINI_THINKING_KEYS.some(key => Object.hasOwn(clientThinking, key));
+  if (!override && explicit) return body;
+  const mode = providerThinking?.mode;
+  const intent = override || (!mode || mode === "auto" ? null
+    : mode === "on" ? { mode: "budget", budget: DEFAULT_PROVIDER_THINKING_BUDGET }
+    : mode === "off" || mode === "none" ? { mode: "none" }
+    : { mode: "level", level: mode });
+  if (!intent) return body;
+
+  // Reuse the capability-aware mapping, without its translated-request output
+  // floor or its replacement of client-native options such as includeThoughts.
+  const mapped = applyThinking(FORMATS.GEMINI, model, {}, provider, intent).generationConfig?.thinkingConfig;
+  if (!mapped) return body;
+  const thinking = { ...clientThinking };
+  for (const key of NATIVE_GEMINI_THINKING_KEYS) delete thinking[key];
+  if (mapped.thinkingLevel !== undefined) thinking.thinkingLevel = String(mapped.thinkingLevel).toUpperCase();
+  if (mapped.thinkingBudget !== undefined) thinking.thinkingBudget = mapped.thinkingBudget;
+  if (!Object.hasOwn(thinking, "includeThoughts") && !Object.hasOwn(thinking, "include_thoughts") && mapped.includeThoughts !== undefined) {
+    thinking.includeThoughts = mapped.includeThoughts;
+  }
+  return { ...body, [generationKey]: { ...generation, [thinkingKey]: thinking } };
 }

@@ -31,20 +31,44 @@ export const CLAUDE_BLOCK = {
   WEB_SEARCH_TOOL_RESULT: "web_search_tool_result",
 };
 
-// OpenAI Responses API item types.
+// OpenAI Responses API item types and observed collaboration compatibility types.
 export const RESPONSES_ITEM = {
   MESSAGE: "message",
+  AGENT_MESSAGE: "agent_message",
   FUNCTION_CALL: "function_call",
   FUNCTION_CALL_OUTPUT: "function_call_output",
   CUSTOM_TOOL_CALL: "custom_tool_call",
   CUSTOM_TOOL_CALL_OUTPUT: "custom_tool_call_output",
+  WEB_SEARCH_CALL: "web_search_call",
   ADDITIONAL_TOOLS: "additional_tools",
   REASONING: "reasoning",
   OUTPUT_TEXT: "output_text",
   INPUT_TEXT: "input_text",
+  ENCRYPTED_CONTENT: "encrypted_content",
   INPUT_IMAGE: "input_image",
+  INPUT_FILE: "input_file",
   SUMMARY_TEXT: "summary_text",
 };
+
+// OpenAI Responses tool declaration and tool-choice discriminator types.
+export const RESPONSES_TOOL = {
+  NAMESPACE: "namespace",
+  FUNCTION: "function",
+  CUSTOM: "custom",
+  WEB_SEARCH: "web_search",
+  ALLOWED_TOOLS: "allowed_tools",
+};
+
+// OpenAI client-facing tool_choice selectors.
+export const OPENAI_TOOL_CHOICE_AUTO = "auto";
+export const OPENAI_TOOL_CHOICE_NONE = "none";
+export const OPENAI_TOOL_CHOICE_REQUIRED = "required";
+
+// Gemini function-calling modes.
+export const GEMINI_FUNCTION_CALLING_MODE_AUTO = "AUTO";
+export const GEMINI_FUNCTION_CALLING_MODE_NONE = "NONE";
+export const GEMINI_FUNCTION_CALLING_MODE_ANY = "ANY";
+export const GEMINI_FUNCTION_CALLING_MODE_VALIDATED = "VALIDATED";
 
 // Valid OpenAI block types (used by filterToOpenAIFormat).
 export const VALID_OPENAI_CONTENT_TYPES = [
