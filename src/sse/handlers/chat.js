@@ -21,7 +21,7 @@ import { upstreamResponseHeaders } from "open-sse/utils/upstreamHeaders.js";
 import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "open-sse/services/combo.js";
 import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
-import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
+import { HTTP_STATUS, ACCOUNT_WAIT_DEADLINE_MS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import { resolveSessionIdentity } from "open-sse/utils/sessionManager.js";
 import * as log from "../utils/logger.js";
@@ -177,6 +177,13 @@ export async function handleChat(request, clientRawRequest = null, options = {})
     }
   }
   options = { ...options, serverPartsTenant };
+
+  // Server-side wait deadline, applied once at the top-level chat boundary. An
+  // explicit holdUntil (including null from internal calls) is never overwritten,
+  // so recursive and combo calls do not extend the shared deadline. 0 disables waiting.
+  if (options.holdUntil === undefined && ACCOUNT_WAIT_DEADLINE_MS > 0) {
+    options.holdUntil = Date.now() + ACCOUNT_WAIT_DEADLINE_MS;
+  }
 
   if (!modelStr) {
     log.warn("CHAT", "Missing model");

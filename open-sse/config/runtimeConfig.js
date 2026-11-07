@@ -115,12 +115,40 @@ export const RETRY_CONFIG = {
 
 // Default retry config by status code: { attempts, delayMs }
 // Backward compat: if value is a number, treated as attempts with RETRY_CONFIG.delayMs
+// Transient 429/5xx are NOT retried on the same account: the router switches
+// to the next account immediately (account fallback), and the failed account
+// cools down via ERROR_RULES instead of burning the request's latency budget
+// on repeat attempts against the endpoint that just rejected it.
 export const DEFAULT_RETRY_CONFIG = {
   429: { attempts: 0, delayMs: 0 },
-  502: { attempts: 3, delayMs: 3000 },
-  503: { attempts: 3, delayMs: 2000 },
-  504: { attempts: 2, delayMs: 3000 }
+  502: { attempts: 0, delayMs: 0 },
+  503: { attempts: 0, delayMs: 0 },
+  504: { attempts: 0, delayMs: 0 }
 };
+
+// How long a chat request may wait for a free account (polling account locks)
+// instead of surfacing a 429/503 to the client. Only after this deadline does
+// the router give up, answering 502 rather than the upstream 429/503.
+// Env: ACCOUNT_WAIT_DEADLINE_MS. 0 disables waiting.
+// Parsed separately from envMs: 0 must stay 0 (disables waiting), not fall back.
+export const ACCOUNT_WAIT_DEADLINE_MS = (() => {
+  const raw = process.env.ACCOUNT_WAIT_DEADLINE_MS;
+  if (raw == null || raw === "") return 10 * 60 * 1000;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 10 * 60 * 1000;
+})();
+
+// Per-model share of the wait deadline inside a combo: a member whose
+// accounts are all busy waits at most this long before the combo moves to the
+// next member; when every member is busy the combo waits and re-passes the
+// member list until ACCOUNT_WAIT_DEADLINE_MS expires. Env: COMBO_MODEL_WAIT_MS.
+export const COMBO_MODEL_WAIT_MS = envMs("COMBO_MODEL_WAIT_MS", 20 * 1000);
+
+// Maximum request starts per account per rolling minute. An account at the
+// limit is skipped during selection (like a locked account) until its oldest
+// start leaves the window, spreading bursts across accounts before the
+// provider's own rate limit fires. Env: ACCOUNT_START_LIMIT_PER_MIN.
+export const ACCOUNT_START_LIMIT_PER_MIN = envMs("ACCOUNT_START_LIMIT_PER_MIN", 30);
 
 // Normalize a retry entry to { attempts, delayMs }
 export function resolveRetryEntry(entry) {

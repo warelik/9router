@@ -58,6 +58,11 @@ function load() {
     PROVIDER_MODELS: { gemini: [], "gemini-tts-models": [] },
     initTranslators: async () => {},
     HTTP_STATUS: { BAD_REQUEST: 400, UNAUTHORIZED: 401, NOT_FOUND: 404, SERVICE_UNAVAILABLE: 503 },
+    // Immediate-response scenarios: the harness sets the server wait deadline to 0 so
+    // exhausted accounts answer at once. Positive-deadline behaviour is covered by
+    // separate regressions outside this file. The import line is stripped below, so
+    // the sandbox must supply the binding itself.
+    ACCOUNT_WAIT_DEADLINE_MS: 0,
     FORMATS: { GEMINI: "gemini", OPENAI: "openai" },
     DEFAULT_HEADROOM_URL: "http://unused.test",
     getComboModels: async () => null,

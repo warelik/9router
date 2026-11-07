@@ -79,6 +79,12 @@ export const ERROR_RULES = [
   { status: 403, cooldownMs: COOLDOWN.long },
   { status: 404, cooldownMs: COOLDOWN.long },
   { status: 429, backoff: true },
+  // Transient upstream 5xx without a text match: switch accounts now, but let
+  // the account back in quickly — these usually clear in seconds, and the
+  // generic 30s transient cooldown kept healthy accounts out of rotation.
+  { status: 502, cooldownMs: COOLDOWN.short },
+  { status: 503, cooldownMs: COOLDOWN.short },
+  { status: 504, cooldownMs: COOLDOWN.short },
 ];
 
 // Backward compat: COOLDOWN_MS object (used by index.js re-export)
