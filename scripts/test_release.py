@@ -214,6 +214,52 @@ class ReviewPolicyTests(unittest.TestCase):
                 "warelik/9router", evidence_with(before))
         pages.assert_not_called()
 
+    def test_accepted_baseline_keeps_adopted_config_behind_downstream(self):
+        adopted = "c" * 40
+        product = {
+            "schema": 1, "repository": "warelik/9router", "upstream_sha": HEAD,
+            "application_sha": OTHER, "patchset_sha256": "d" * 64,
+            "recipe_sha256": "e" * 64, "platform": "linux/amd64",
+        }
+        metadata_candidate = {**product, "configuration_sha": "f" * 40}
+        checkpoint_candidate = {**product, "configuration_sha": adopted}
+        publication = {"kind": "github-release", "id": 55,
+                       "published_at": "2026-10-16T09:00:00Z",
+                       "metadata_sha256": "1" * 64}
+        variable = {
+            "name": "FORK_ACCEPTED_BASELINE",
+            "created_at": "2026-10-16T08:00:00Z", "updated_at": "2026-10-16T09:05:00Z",
+            "value": json.dumps({
+                "schema": 1, "repository": "warelik/9router",
+                "candidate": checkpoint_candidate, "publication": publication,
+            }, sort_keys=True, separators=(",", ":")),
+        }
+        release_record = {"id": 55, "published_at": "2026-10-16T09:00:00Z"}
+
+        def api_for(status):
+            def fake(route, **kwargs):
+                if route == "repos/warelik/9router/commits/downstream":
+                    return {"sha": HEAD}
+                if route == f"repos/warelik/9router/compare/{adopted}...{HEAD}":
+                    return {"status": status,
+                            "merge_base_commit": {"sha": adopted}}
+                raise AssertionError(f"unexpected api route: {route}")
+            return fake
+
+        with patch.object(release, "_read_optional_variable", return_value=(variable, False)), \
+                patch.object(release, "owner_token", return_value="owner-token"), \
+                patch.object(release, "api", side_effect=api_for("ahead")):
+            proof = release._accepted_baseline(
+                "warelik/9router", release_record, "1" * 64, metadata_candidate)
+        self.assertEqual(proof["variable"], variable)
+
+        with patch.object(release, "_read_optional_variable", return_value=(variable, False)), \
+                patch.object(release, "owner_token", return_value="owner-token"), \
+                patch.object(release, "api", side_effect=api_for("diverged")), \
+                self.assertRaisesRegex(ValueError, "checkpoint does not match"):
+            release._accepted_baseline(
+                "warelik/9router", release_record, "1" * 64, metadata_candidate)
+
     def test_review_mode_bot_keeps_the_configured_trigger(self):
         candidate = {
             "upstream_sha": HEAD, "application_sha": HEAD, "configuration_sha": OTHER,
