@@ -21,10 +21,16 @@ const SPECIALIZED = new Set([
   "codex", "cursor", "vertex", "vertex-partner", "opencode",
   "opencode-go", "grok-web", "perplexity-web", "ollama-local", "commandcode",
   "xiaomi-tokenplan", "mimo-free",
+  // Fork-only local bridge; its URL and header contract is locked by unit/aistudio-provider.test.js.
+  "aistudio",
 ]);
 
 // Per-process / per-request values: kimi's random device name, minimax's session UUID.
-const VOLATILE_HEADERS = new Set(["x-msh-device-name", "x-mavis-session-id"]);
+const VOLATILE_HEADERS = new Set([
+  "x-msh-device-name", "x-mavis-session-id",
+  // CodeBuddy channel checks mint fresh request/conversation identifiers per call.
+  "x-request-id", "x-conversation-id", "x-conversation-request-id", "x-conversation-message-id",
+]);
 
 // Sanitize header: khử token + field thời gian động (kimi X-Msh-Device-Id) để snapshot ổn định.
 function sanitize(headers) {
@@ -66,6 +72,16 @@ describe("GOLDEN buildHeaders (default executor providers)", () => {
         oauth: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : OAUTH_CRED, true))),
         nonStream: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, false))),
       };
+      const raw = {
+        apiKey: safe(() => ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, true)),
+        oauth: safe(() => ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : OAUTH_CRED, true)),
+        nonStream: safe(() => ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, false)),
+      };
+      for (const headers of Object.values(raw)) {
+        if (typeof headers?.["X-Mavis-Session-Id"] === "string") {
+          expect(headers["X-Mavis-Session-Id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+        }
+      }
       expect(snap).toMatchSnapshot();
     });
   }
