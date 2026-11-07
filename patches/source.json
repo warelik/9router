@@ -72,12 +72,15 @@
     "tests/unit/zed-completions-wire.test.js"
   ],
   "regression_files": [
-    "tests/unit/downstream-translator-history-regressions.test.js",
+    "tests/translator/parallel-tool-blocks-sequential.test.js",
     "tests/translator/thinking-unified.test.js",
+    "tests/unit/account-cooldown-division.test.js",
     "tests/unit/aistudio-discovery.test.js",
+    "tests/unit/combo-hold-deadline.test.js",
+    "tests/unit/combo-transient-no-sleep.test.js",
     "tests/unit/docker-publish-source-recipe.test.js",
+    "tests/unit/downstream-translator-history-regressions.test.js",
     "tests/unit/muse-cloaking.test.js",
-    "tests/unit/muse-responses-wire.test.js",
-    "tests/translator/parallel-tool-blocks-sequential.test.js"
+    "tests/unit/muse-responses-wire.test.js"
   ]
 }
