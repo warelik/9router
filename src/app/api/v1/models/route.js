@@ -17,6 +17,7 @@ import { resolveCopilotModels } from "open-sse/services/copilotModels.js";
 import { resolveClinepassModels, resolveClineModels } from "open-sse/services/clinepassModels.js";
 import { resolveGrokCliModels } from "open-sse/services/grokCliModels.js";
 import { resolveCursorModels } from "open-sse/services/cursorModels.js";
+import { resolveAIStudioModels } from "open-sse/services/aistudioModels.js";
 import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { resolveCommandCodeModels } from "open-sse/services/commandcodeModels.js";
 import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
@@ -100,6 +101,12 @@ const LIVE_MODEL_RESOLVERS = {
     } catch {
       return null;
     }
+  },
+  aistudio: async (conn) => {
+    const result = await resolveAIStudioModels(conn, {
+      proxyOptions: await resolveConnectionProxyConfig(conn.providerSpecificData || {}),
+    });
+    return result?.models?.length ? { models: result.models } : null;
   },
   kiro: async (conn) => {
     const result = await resolveKiroModels({
