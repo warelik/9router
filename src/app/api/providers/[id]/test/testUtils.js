@@ -801,6 +801,7 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
       case "atria":
       case "agnes":
       case "bai":
+      case "aistudio":
       case "muse":
       case "runcrate": {
         const cfg = PROVIDERS[connection.provider];
