@@ -93,6 +93,24 @@ describe("GOLDEN request: OpenAI → Gemini", () => {
     expect(out.request.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "high", includeThoughts: true });
     expect(out.request.generationConfig.maxOutputTokens).toBe(65535);
   });
+
+  it("Gemini CLI retains the thinking output floor when the client set no cap", () => {
+    const body = {
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "high",
+    };
+    const out = translateRequest(
+      FORMATS.OPENAI,
+      FORMATS.GEMINI_CLI,
+      "gemini-3.1-pro-preview",
+      body,
+      true,
+      { accessToken: "t", projectId: "p" },
+      "gemini-cli"
+    );
+    expect(out.request.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "high", includeThoughts: true });
+    expect(out.request.generationConfig.maxOutputTokens).toBe(65535);
+  });
 });
 
 describe("GOLDEN request: OpenAI → Kiro", () => {
