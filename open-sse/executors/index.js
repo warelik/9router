@@ -19,6 +19,7 @@ import { PerplexityWebExecutor } from "./perplexity-web.js";
 import { DeepSeekWebExecutor } from "./deepseek-web.js";
 import { GeminiWebExecutor } from "./gemini-web.js";
 import { MuseWebExecutor } from "./muse-web.js";
+import { MuseExecutor } from "./muse.js";
 import { VeoAiFreeWebExecutor } from "./veoaifree-web.js";
 import { UcWebExecutor } from "./uc-web.js";
 import { ChatGptWebExecutor } from "./chatgpt-web.js";
@@ -61,6 +62,7 @@ const executors = {
   "perplexity-web": new PerplexityWebExecutor(),
   "deepseek-web": new DeepSeekWebExecutor(),
   "gemini-web": new GeminiWebExecutor(),
+  muse: new MuseExecutor(),
   "muse-web": new MuseWebExecutor(),
   "veoaifree-web": new VeoAiFreeWebExecutor(),
   "veo-free": new VeoAiFreeWebExecutor(), // Alias
@@ -123,6 +125,7 @@ export { GrokCliExecutor } from "./grok-cli.js";
 export { PerplexityWebExecutor } from "./perplexity-web.js";
 export { DeepSeekWebExecutor } from "./deepseek-web.js";
 export { GeminiWebExecutor } from "./gemini-web.js";
+export { MuseExecutor } from "./muse.js";
 export { MuseWebExecutor } from "./muse-web.js";
 export { ChatGptWebExecutor } from "./chatgpt-web.js";
 export { OllamaLocalExecutor } from "./ollama-local.js";
