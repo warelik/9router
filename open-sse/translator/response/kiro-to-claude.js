@@ -17,16 +17,47 @@ import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
 import { resolveToolName } from "../../utils/opencodeFingerprint.js";
 
+// Parallel tool calls: the first tool_use opens at once, as upstream does, and
+// stays open until finish because its arguments arrive in pieces. Until then
+// every later event queues and replays in model order, so two blocks are
+// never open together.
+function emitBlock(state, results, event) {
+  if (state.queuedBlocks) state.queuedBlocks.push(event);
+  else results.push(event);
+}
+
+function toolStartEvent(toolInfo) {
+  return {
+    type: "content_block_start",
+    index: toolInfo.blockIndex,
+    content_block: { type: "tool_use", id: toolInfo.id, name: toolInfo.name, input: {} },
+  };
+}
+
+// Sends the buffered arguments as one delta, then closes the block.
+function closeToolBlock(state, results, toolIndex) {
+  const toolInfo = state.toolCalls.get(toolIndex);
+  const buffered = state.toolArgBuffers?.get(toolIndex);
+  if (buffered) {
+    results.push({
+      type: "content_block_delta",
+      index: toolInfo.blockIndex,
+      delta: { type: "input_json_delta", partial_json: buffered },
+    });
+  }
+  results.push({ type: "content_block_stop", index: toolInfo.blockIndex });
+}
+
 function stopThinkingBlock(state, results) {
   if (!state.thinkingBlockStarted) return;
-  results.push({ type: "content_block_stop", index: state.thinkingBlockIndex });
+  emitBlock(state, results, { type: "content_block_stop", index: state.thinkingBlockIndex });
   state.thinkingBlockStarted = false;
 }
 
 function stopTextBlock(state, results) {
   if (!state.textBlockStarted || state.textBlockClosed) return;
   state.textBlockClosed = true;
-  results.push({ type: "content_block_stop", index: state.textBlockIndex });
+  emitBlock(state, results, { type: "content_block_stop", index: state.textBlockIndex });
   state.textBlockStarted = false;
 }
 
@@ -125,13 +156,13 @@ export function kiroToClaudeResponse(chunk, state) {
     if (!state.thinkingBlockStarted) {
       state.thinkingBlockIndex = state.nextBlockIndex++;
       state.thinkingBlockStarted = true;
-      results.push({
+      emitBlock(state, results, {
         type: "content_block_start",
         index: state.thinkingBlockIndex,
         content_block: { type: "thinking", thinking: "" },
       });
     }
-    results.push({
+    emitBlock(state, results, {
       type: "content_block_delta",
       index: state.thinkingBlockIndex,
       delta: { type: "thinking_delta", thinking: reasoningContent },
@@ -145,13 +176,13 @@ export function kiroToClaudeResponse(chunk, state) {
       state.textBlockIndex = state.nextBlockIndex++;
       state.textBlockStarted = true;
       state.textBlockClosed = false;
-      results.push({
+      emitBlock(state, results, {
         type: "content_block_start",
         index: state.textBlockIndex,
         content_block: { type: "text", text: "" },
       });
     }
-    results.push({
+    emitBlock(state, results, {
       type: "content_block_delta",
       index: state.textBlockIndex,
       delta: { type: "text_delta", text: delta.content },
@@ -164,7 +195,8 @@ export function kiroToClaudeResponse(chunk, state) {
     if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
     for (const tc of delta.tool_calls) {
       const idx = tc.index ?? 0;
-      if (tc.id) {
+      // Open once per index: the replay queue keeps one entry per tool.
+      if (tc.id && !state.toolCalls.has(idx)) {
         stopThinkingBlock(state, results);
         stopTextBlock(state, results);
         const toolBlockIndex = state.nextBlockIndex++;
@@ -173,16 +205,16 @@ export function kiroToClaudeResponse(chunk, state) {
           name: restoreToolName(state, tc.function?.name),
           blockIndex: toolBlockIndex,
         });
-        results.push({
-          type: "content_block_start",
-          index: toolBlockIndex,
-          content_block: {
-            type: "tool_use",
-            id: tc.id,
-            name: restoreToolName(state, tc.function?.name),
-            input: {},
-          },
-        });
+        const toolInfo = state.toolCalls.get(idx);
+        if (!state.queuedBlocks) {
+          // The first call opens now, as upstream does, and stays open until
+          // finish. Later events queue behind it.
+          state.queuedBlocks = [];
+          state.openToolIndex = idx;
+          results.push(toolStartEvent(toolInfo));
+        } else {
+          state.queuedBlocks.push({ toolIndex: idx });
+        }
       }
       if (tc.function?.arguments) {
         const toolInfo = state.toolCalls.get(idx);
@@ -201,19 +233,20 @@ export function kiroToClaudeResponse(chunk, state) {
     stopThinkingBlock(state, results);
     stopTextBlock(state, results);
 
-    if (state.toolCalls) {
-      for (const [idx, toolInfo] of state.toolCalls) {
-        const buffered = state.toolArgBuffers?.get(idx);
-        if (buffered) {
-          results.push({
-            type: "content_block_delta",
-            index: toolInfo.blockIndex,
-            delta: { type: "input_json_delta", partial_json: buffered },
-          });
-        }
-        results.push({ type: "content_block_stop", index: toolInfo.blockIndex });
-      }
+    // Close the open tool block first, then replay queued blocks in model order.
+    if (state.openToolIndex !== undefined) {
+      closeToolBlock(state, results, state.openToolIndex);
+      state.openToolIndex = undefined;
     }
+    for (const item of state.queuedBlocks || []) {
+      if (item.toolIndex === undefined) {
+        results.push(item);
+        continue;
+      }
+      results.push(toolStartEvent(state.toolCalls.get(item.toolIndex)));
+      closeToolBlock(state, results, item.toolIndex);
+    }
+    state.queuedBlocks = null;
 
     state.finishReason = choice.finish_reason;
     const finalUsage = state.usage || { input_tokens: 0, output_tokens: 0 };
