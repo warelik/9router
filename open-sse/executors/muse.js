@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { DefaultExecutor } from "./default.js";
 
 const FOREIGN_REASONING_ERROR = "reasoning `encrypted_content` was not issued to this caller";
+const EXPIRED_REASONING_REFERENCE = /Referenced reasoning item '([^']+)' was not found or has expired/;
 const MAX_TRACKED_CALLERS = 64;
 const MAX_TRACKED_HASHES_PER_CALLER = 10000;
 
@@ -87,10 +88,47 @@ export function sanitizeMuseForeignReasoning(body, incompatibleHashes = null) {
   };
 }
 
+/**
+ * Remove reasoning items whose server-side reference Meta no longer holds.
+ * The referenced form carries only an id (plus summary); without the stored
+ * object the caller cannot resolve it, so keep the portable summary/content
+ * when present and drop the id, dropping the item when nothing usable remains.
+ */
+export function dropMuseReasoningReferences(body, referencedIds) {
+  if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.input)
+    || !(referencedIds instanceof Set) || !referencedIds.size) {
+    return { body, removedIds: [] };
+  }
+
+  let changed = false;
+  const removedIds = [];
+  const input = [];
+
+  for (const item of body.input) {
+    if (!item || typeof item !== "object" || Array.isArray(item)
+      || item.type !== "reasoning" || !referencedIds.has(item.id)) {
+      input.push(item);
+      continue;
+    }
+
+    changed = true;
+    removedIds.push(item.id);
+    const clean = { ...item };
+    delete clean.id;
+    if (hasSummary(clean) || hasContent(clean)) input.push(clean);
+  }
+
+  return {
+    body: changed ? { ...body, input } : body,
+    removedIds,
+  };
+}
+
 export class MuseExecutor extends DefaultExecutor {
   constructor() {
     super("muse");
     this._foreignReasoningByScope = new Map();
+    this._expiredReferencesByScope = new Map();
   }
 
   _callerScope(args) {
@@ -128,15 +166,50 @@ export class MuseExecutor extends DefaultExecutor {
     }
   }
 
+  _knownExpiredReferences(scope) {
+    const known = this._expiredReferencesByScope.get(scope);
+    if (!known) return null;
+    this._expiredReferencesByScope.delete(scope);
+    this._expiredReferencesByScope.set(scope, known);
+    return known;
+  }
+
+  _rememberExpiredReferences(scope, ids) {
+    if (!ids.length) return;
+    let known = this._expiredReferencesByScope.get(scope);
+    if (!known) {
+      known = new Set();
+      this._expiredReferencesByScope.set(scope, known);
+    }
+    for (const id of ids) known.add(id);
+    while (known.size > MAX_TRACKED_HASHES_PER_CALLER) {
+      known.delete(known.values().next().value);
+    }
+
+    while (this._expiredReferencesByScope.size > MAX_TRACKED_CALLERS) {
+      const oldest = this._expiredReferencesByScope.keys().next().value;
+      this._expiredReferencesByScope.delete(oldest);
+    }
+  }
+
   async execute(args) {
     const scope = this._callerScope(args);
     const knownForeignHashes = this._knownForeignHashes(scope);
-    const prepared = knownForeignHashes
-      ? sanitizeMuseForeignReasoning(args.body, knownForeignHashes)
-      : { body: args.body };
-    const first = await super.execute({ ...args, body: prepared.body });
+    const knownExpiredReferences = this._knownExpiredReferences(scope);
+    let preparedBody = knownForeignHashes
+      ? sanitizeMuseForeignReasoning(args.body, knownForeignHashes).body
+      : args.body;
+    if (knownExpiredReferences) {
+      preparedBody = dropMuseReasoningReferences(preparedBody, knownExpiredReferences).body;
+    }
+    const first = await this._executeRecovering({ ...args, body: preparedBody }, scope, false);
+    return first;
+  }
 
-    if (first.response?.status !== 400 || typeof first.response.clone !== "function") {
+  async _executeRecovering(args, scope, retried) {
+    const first = await super.execute(args);
+
+    if (retried || first.response?.status !== 400 || typeof first.response.clone !== "function") {
       return first;
     }
 
@@ -146,9 +219,31 @@ export class MuseExecutor extends DefaultExecutor {
     } catch {
       return first;
     }
+
+    const expiredMatch = errorText.match(EXPIRED_REASONING_REFERENCE);
+    if (expiredMatch) {
+      const dropped = dropMuseReasoningReferences(args.body, new Set([expiredMatch[1]]));
+      if (!dropped.removedIds.length) return first;
+
+      this._rememberExpiredReferences(scope, dropped.removedIds);
+      args.log?.warn?.(
+        "RETRY",
+        `MUSE | expired reasoning reference rejected; retrying without ${dropped.removedIds.length} referenced item(s)`,
+      );
+
+      try {
+        const retry = await this._executeRecovering({ ...args, body: dropped.body }, scope, true);
+        return retry.response?.ok || (retry.response && retry.response.status !== 400)
+          ? retry
+          : first;
+      } catch {
+        return first;
+      }
+    }
+
     if (!errorText.includes(FOREIGN_REASONING_ERROR)) return first;
 
-    const sanitized = sanitizeMuseForeignReasoning(prepared.body);
+    const sanitized = sanitizeMuseForeignReasoning(args.body);
     if (!sanitized.removedHashes.length) return first;
 
     this._rememberForeignHashes(scope, sanitized.removedHashes);
@@ -158,7 +253,7 @@ export class MuseExecutor extends DefaultExecutor {
     );
 
     try {
-      const retry = await super.execute({ ...args, body: sanitized.body });
+      const retry = await this._executeRecovering({ ...args, body: sanitized.body }, scope, true);
       return retry.response?.ok || (retry.response && retry.response.status !== 400)
         ? retry
         : first;

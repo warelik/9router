@@ -5,7 +5,7 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
   proxyAwareFetch: (...args) => fetchMock(...args),
 }));
 
-const { MuseExecutor, sanitizeMuseForeignReasoning } = await import("../../open-sse/executors/muse.js");
+const { MuseExecutor, sanitizeMuseForeignReasoning, dropMuseReasoningReferences } = await import("../../open-sse/executors/muse.js");
 const { getExecutor } = await import("../../open-sse/executors/index.js");
 
 const FOREIGN_ERROR = {
@@ -16,6 +16,39 @@ const FOREIGN_ERROR = {
     type: "invalid_request_error",
   },
 };
+
+const EXPIRED_ERROR = {
+  error: {
+    code: null,
+    message: "Referenced reasoning item 'rs_stale' was not found or has expired.",
+    param: null,
+    type: "invalid_request_error",
+  },
+};
+
+function makeExpiredBody() {
+  return {
+    model: "muse-spark-1.3-contributor",
+    stream: false,
+    store: false,
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "first" }] },
+      {
+        type: "reasoning",
+        id: "rs_stale",
+        summary: [{ type: "summary_text", text: "stale plan" }],
+      },
+      {
+        type: "reasoning",
+        id: "rs_current",
+        status: "completed",
+        summary: [{ type: "summary_text", text: "current plan" }],
+        encrypted_content: "current-blob",
+      },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
+    ],
+  };
+}
 
 function response(status, body) {
   return new Response(JSON.stringify(body), {
@@ -178,5 +211,52 @@ describe("Muse foreign reasoning recovery", () => {
       status: "completed",
       summary: [{ type: "summary_text", text: "prior plan" }],
     }]);
+  });
+
+  it("retries without the referenced item after Meta reports it expired", async () => {
+    fetchMock
+      .mockResolvedValueOnce(response(400, EXPIRED_ERROR))
+      .mockResolvedValueOnce(response(200, { id: "resp_retry", status: "completed", output: [] }));
+    const executor = new MuseExecutor();
+
+    const out = await executor.execute(makeArgs(makeExpiredBody()));
+
+    expect(out.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const retryInput = sentBody(1).input;
+    expect(JSON.stringify(retryInput)).not.toContain("rs_stale");
+    expect(retryInput).toEqual(expect.arrayContaining([
+      { type: "reasoning", summary: [{ type: "summary_text", text: "stale plan" }] },
+      expect.objectContaining({ type: "reasoning", id: "rs_current", encrypted_content: "current-blob" }),
+    ]));
+  });
+
+  it("pre-strips expired references already rejected for this caller", async () => {
+    fetchMock
+      .mockResolvedValueOnce(response(400, EXPIRED_ERROR))
+      .mockResolvedValueOnce(response(200, { id: "resp_retry", status: "completed", output: [] }))
+      .mockResolvedValueOnce(response(200, { id: "resp_next", status: "completed", output: [] }));
+    const executor = new MuseExecutor();
+
+    await executor.execute(makeArgs(makeExpiredBody()));
+    const out = await executor.execute(makeArgs(makeExpiredBody()));
+
+    expect(out.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(JSON.stringify(sentBody(2).input)).not.toContain("rs_stale");
+    expect(JSON.stringify(sentBody(2).input)).toContain("current-blob");
+  });
+
+  it("reference dropper keeps summaries and removes only named ids", () => {
+    const { body, removedIds } = dropMuseReasoningReferences(
+      makeExpiredBody(),
+      new Set(["rs_stale"]),
+    );
+
+    expect(removedIds).toEqual(["rs_stale"]);
+    expect(body.input.filter((item) => item.type === "reasoning")).toEqual([
+      { type: "reasoning", summary: [{ type: "summary_text", text: "stale plan" }] },
+      expect.objectContaining({ type: "reasoning", id: "rs_current" }),
+    ]);
   });
 });
