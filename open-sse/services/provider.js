@@ -1,6 +1,7 @@
 import { PROVIDERS } from "../config/providers.js";
 import { OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
 import { ROLE } from "../translator/schema/roles.js";
+import { FORMATS } from "../translator/formats.js";
 
 const OPENAI_COMPATIBLE_PREFIX = "openai-compatible-";
 const OPENAI_COMPATIBLE_DEFAULTS = {
@@ -141,6 +142,15 @@ export function getTargetFormat(provider, credentials = null) {
   }
   const config = getProviderConfig(provider, credentials);
   return config.format || "openai";
+}
+
+// Antigravity's Gemini chat API wraps GenerateContent in a Cloud Code envelope.
+// Its executor can adapt that envelope without translating the Gemini payload.
+// Other Antigravity models (including image generation) keep their own path.
+export function supportsNativeGemini(provider, model) {
+  if (getTargetFormat(provider) === FORMATS.GEMINI) return true;
+  return provider === "antigravity" && typeof model === "string"
+    && model.startsWith("gemini-") && !/image|imagen/i.test(model);
 }
 
 // Resolve which transport to use for a provider given the client sourceFormat.

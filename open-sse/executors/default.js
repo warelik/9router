@@ -4,10 +4,13 @@ import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE, selectAnthropicBeta, mergeAnthropicBeta } from "../providers/shared.js";
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
 import { OAUTH_ENDPOINTS, buildKimiHeaders, NOUS_ATTRIBUTION } from "../config/appConstants.js";
+import { NATIVE_GEMINI_PRIVATE_HEADERS, NATIVE_GEMINI_API_VERSIONS } from "../config/runtimeConfig.js";
 import { buildClineHeaders } from "../shared/clineAuth.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
+import { FORMATS } from "../translator/formats.js";
+import { adaptAIStudioStructuredOutput } from "../translator/formats/gemini.js";
 import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
 
 // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
@@ -90,6 +93,27 @@ const REFRESH_GRANTS = Object.fromEntries(
     })
 );
 
+function isResponsesWire(provider, config, credentials) {
+  const runtimeFormat = credentials?.runtimeTransport?.format;
+  if (runtimeFormat) return runtimeFormat === FORMATS.OPENAI_RESPONSES;
+  if (provider?.startsWith?.("openai-compatible-")) {
+    return resolveOpenAICompatibleApiType(provider, credentials) === "responses";
+  }
+  return config?.format === FORMATS.OPENAI_RESPONSES;
+}
+
+function normalizeResponsesReasoning(body) {
+  if (!body || typeof body !== "object" || body.reasoning_effort === undefined) return body;
+
+  const reasoning = body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning)
+    ? { ...body.reasoning }
+    : {};
+  reasoning.effort = body.reasoning_effort;
+  body.reasoning = reasoning;
+  delete body.reasoning_effort;
+  return body;
+}
+
 export class DefaultExecutor extends BaseExecutor {
   constructor(provider) {
     super(provider, PROVIDERS[provider] || PROVIDERS.openai);
@@ -97,6 +121,9 @@ export class DefaultExecutor extends BaseExecutor {
 
   transformRequest(model, body, stream, credentials) {
     let transformed = this.applyJsonSchemaFallback(this.applyNousAttribution(model, body, stream, credentials));
+    if (this.provider === "aistudio" && credentials?.nativeGeminiPassthrough) {
+      transformed = adaptAIStudioStructuredOutput(transformed);
+    }
 
     if (transformed && typeof transformed === "object") {
       // OpenAI-compatible upstreams (NVIDIA NIM, DeepSeek) reject `stream_options` on
@@ -112,7 +139,10 @@ export class DefaultExecutor extends BaseExecutor {
       stripUnsupportedParams(this.provider, model, transformed);
     }
 
-    return injectReasoningContent({ provider: this.provider, model, body: transformed });
+    const injected = injectReasoningContent({ provider: this.provider, model, body: transformed });
+    return isResponsesWire(this.provider, this.config, credentials)
+      ? normalizeResponsesReasoning(injected)
+      : injected;
   }
 
   applyNousAttribution(model, body, stream, credentials) {
@@ -177,7 +207,23 @@ export class DefaultExecutor extends BaseExecutor {
     }
     // gemini-format: build :streamGenerateContent / :generateContent path
     if (this.config.format === "gemini") {
-      return `${this.config.baseUrl}/${model}:${stream ? "streamGenerateContent?alt=sse" : "generateContent"}`;
+      // The caller has resolved the provider wire version. Format it without
+      // overriding that routing decision for any Gemini-format provider.
+      const nativeVersion = credentials?.nativeGeminiPassthrough
+        && NATIVE_GEMINI_API_VERSIONS.includes(credentials.nativeGeminiRequest?.apiVersion)
+        ? credentials.nativeGeminiRequest.apiVersion : null;
+      const baseUrl = nativeVersion
+        ? this.config.baseUrl.replace("/v1beta/", `/${nativeVersion}/`) : this.config.baseUrl;
+      // A model ID is one resource component, never a URL path or query.
+      const modelSegment = encodeURIComponent(String(model).toWellFormed());
+      const url = new URL(`${baseUrl}/${modelSegment}:${stream ? "streamGenerateContent" : "generateContent"}`);
+      const nativeQuery = credentials?.nativeGeminiRequest?.query;
+      if (credentials?.nativeGeminiPassthrough && Array.isArray(nativeQuery)) {
+        for (const [key, value] of nativeQuery) {
+          if (key !== "key" && key !== "$key") url.searchParams.append(key, value);
+        }
+      } else if (stream) url.searchParams.set("alt", "sse");
+      return url.toString();
     }
     // urlSuffix (e.g. ?beta=true) declared per-provider in registry
     if (this.config.urlSuffix) {
@@ -210,6 +256,16 @@ export class DefaultExecutor extends BaseExecutor {
     // Hooks run BEFORE auth so dynamic overlays can't clobber the token.
     for (const hook of desc.hooks || []) HEADER_HOOKS[hook]?.(headers, credentials);
     applyAuth(headers, desc, credentials);
+    if (credentials?.nativeGeminiPassthrough) {
+      const reserved = new Set(Object.keys(headers).map(key => key.toLowerCase()));
+      const privateHeaders = NATIVE_GEMINI_PRIVATE_HEADERS;
+      for (const [name, value] of Object.entries(credentials.nativeGeminiRequest?.headers || {})) {
+        const lower = name.toLowerCase();
+        if (!privateHeaders.has(lower) && !reserved.has(lower) && !lower.startsWith("x-forwarded-") && !lower.startsWith("x-9router-") && !lower.startsWith("x-9r-")) {
+          headers[name] = value;
+        }
+      }
+    }
 
     // anthropic-compatible-* nodes serving a real Claude model sit in front of
     // Anthropic itself (a rotating multi-account proxy, a corporate gateway),
