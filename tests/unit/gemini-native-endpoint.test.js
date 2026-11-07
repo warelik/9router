@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { isolateDataDir } from "../helpers/isolatedDataDir.js";
 
 const mocks = vi.hoisted(() => ({
   handleChat: vi.fn(),
@@ -7,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   getProviderCredentials: vi.fn(),
   markAccountUnavailable: vi.fn(),
   clearAccountError: vi.fn(),
+  getModelInfo: vi.fn(),
+  proxyAwareFetch: vi.fn(),
 }));
 
 vi.mock("@/sse/handlers/chat.js", () => ({
@@ -24,8 +27,29 @@ vi.mock("@/lib/localDb", () => ({
   getSettings: mocks.getSettings,
 }));
 
+vi.mock("@/sse/services/model.js", () => ({
+  getModelInfo: mocks.getModelInfo,
+}));
+
+// proxyFetch captures the native fetch at module import; explicitly replace the
+// transport boundary so these tests can never call Google with fixture keys.
+vi.mock("open-sse/utils/proxyFetch.js", () => ({
+  proxyAwareFetch: (...args) => {
+    if (!vi.isMockFunction(global.fetch)) throw new Error("Offline Gemini test requires mocked fetch");
+    return mocks.proxyAwareFetch(...args);
+  },
+}));
+
+const restoreDataDir = isolateDataDir();
+afterAll(() => restoreDataDir());
 const { GET } = await import("../../src/app/api/v1beta/models/route.js");
-const { POST } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
+const { POST: nativePOST, OPTIONS } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
+const responses = [];
+async function POST(...args) {
+  const response = await nativePOST(...args);
+  responses.push(response);
+  return response;
+}
 
 function makeGeminiRequest(path, body, headers = {}, signal) {
   return new Request(`https://router.test/v1beta/models/${path}`, {
@@ -68,15 +92,47 @@ describe("Gemini native v1beta endpoint", () => {
       providerSpecificData: {},
     });
     mocks.markAccountUnavailable.mockResolvedValue({ shouldFallback: false });
-    global.fetch = vi.fn().mockResolvedValue(
+    mocks.getModelInfo.mockImplementation(async model => {
+      const separator = model.indexOf("/");
+      return separator < 0
+        ? { provider: "gemini", model }
+        : { provider: model.slice(0, separator), model: model.slice(separator + 1) };
+    });
+    mocks.proxyAwareFetch.mockImplementation((...args) => global.fetch(...args));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       })
-    );
+    ));
     mocks.handleChat.mockResolvedValue(
       Response.json({ candidates: [{ content: { parts: [{ text: "chat" }] } }] })
     );
+  });
+
+  afterEach(async () => {
+    await Promise.allSettled(responses.splice(0).filter(response => response.body && !response.bodyUsed)
+      .map(response => response.body.cancel()));
+    vi.unstubAllGlobals();
+  });
+
+  it.each(["missing", "invalid"])("exposes %s native TTS authentication errors to cross-origin clients", async kind => {
+    mocks.isValidApiKey.mockResolvedValue(false);
+    const request = makeGeminiRequest("gemini-3.1-flash-tts-preview:generateContent", audioBody());
+    if (kind === "missing") request.headers.delete("Authorization");
+    const response = await POST(request, { params: Promise.resolve({ path: ["gemini-3.1-flash-tts-preview:generateContent"] }) });
+    expect(response.status).toBe(401);
+    expect(response.headers.get("access-control-allow-origin")).toBe("*");
+    expect((await response.json()).error.message).toEqual(expect.any(String));
+    expect(mocks.getProviderCredentials).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("allows Authorization explicitly in native preflight while preserving wildcard headers", async () => {
+    const response = await OPTIONS();
+    const headers = response.headers.get("access-control-allow-headers").toLowerCase().split(/,\s*/);
+    expect(headers).toContain("authorization");
+    expect(headers).toContain("*");
   });
 
   it("lists Gemini TTS models using standard Google model names", async () => {
@@ -190,6 +246,8 @@ describe("Gemini native v1beta endpoint", () => {
       "gemini",
       "gemini-3.1-flash-tts-preview"
     );
+    expect(mocks.clearAccountError).not.toHaveBeenCalled();
+    await response.arrayBuffer();
     expect(mocks.clearAccountError).toHaveBeenCalledWith(
       "second-conn",
       expect.objectContaining({ apiKey: "second-gemini-key" }),
@@ -246,7 +304,35 @@ describe("Gemini native v1beta endpoint", () => {
     });
 
     expect(mocks.handleChat).toHaveBeenCalledTimes(1);
+    const [request, clientRawRequest, options] = mocks.handleChat.mock.calls[0];
+    expect(await request.json()).toEqual({ ...body, model: "gemini-2.5-flash", stream: false });
+    expect(clientRawRequest.body).toEqual(body);
+    expect(options).toMatchObject({ sourceFormatOverride: "gemini", stream: false });
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("passes strict proxy requirements to the native AUDIO transport", async () => {
+    mocks.getProviderCredentials.mockResolvedValueOnce({
+      apiKey: "real-gemini-key",
+      connectionId: "gemini-conn",
+      providerSpecificData: {
+        connectionProxyEnabled: true,
+        connectionProxyUrl: "http://127.0.0.1:18080",
+        connectionNoProxy: "localhost",
+        strictProxy: true,
+      },
+    });
+    const response = await POST(makeGeminiRequest("gemini-3.1-flash-tts-preview:generateContent", audioBody()), {
+      params: Promise.resolve({ path: ["gemini-3.1-flash-tts-preview:generateContent"] }),
+    });
+    expect(response.status).toBe(200);
+    expect(mocks.proxyAwareFetch).toHaveBeenCalledTimes(1);
+    expect(mocks.proxyAwareFetch.mock.calls[0][2]).toEqual({
+      connectionProxyEnabled: true,
+      connectionProxyUrl: "http://127.0.0.1:18080",
+      connectionNoProxy: "localhost",
+      strictProxy: true,
+    });
   });
 
   it("does not hijack provider-prefixed non-Gemini audio requests", async () => {
