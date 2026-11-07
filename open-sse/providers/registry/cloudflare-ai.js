@@ -56,6 +56,7 @@ export default {
     baseUrl: "https://api.cloudflare.com/client/v4/accounts/{accountId}/ai/run/{model}",
     authType: "apikey",
     authHeader: "bearer",
+    responseRoot: "result",
   },
   imageConfig: { baseUrl: "https://api.cloudflare.com/client/v4/accounts" },
 };
