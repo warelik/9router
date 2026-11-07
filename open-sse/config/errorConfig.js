@@ -36,6 +36,14 @@ export const BACKOFF_CONFIG = {
 };
 
 // Default cooldown for transient/unknown errors
+// Router-computed cooldowns triggered by 429/503 responses are scaled down
+// by this divisor: with several accounts in rotation and requests waiting
+// out exhaustion, long locks only starve the pool — a third of the nominal
+// backoff still spreads retries without keeping accounts out needlessly.
+// Provider-reported reset timestamps (resetsAtMs) are NOT scaled: they state
+// when the provider itself lifts the limit, and probing earlier is futile.
+export const RATE_LIMIT_COOLDOWN_DIVISOR = 3;
+
 export const TRANSIENT_COOLDOWN_MS = 30 * 1000;
 
 // Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h)
