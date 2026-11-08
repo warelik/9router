@@ -73,6 +73,14 @@ export const ERROR_RULES = [
   // NVIDIA NIM returns 400 with "degraded" when specific model cluster is unhealthy.
   // Lock only the degraded model (modelScoped: true) without locking the API key.
   { provider: "nvidia", text: "degraded", cooldownMs: 15 * 60 * 1000, modelScoped: true },
+  // Muse reasoning continuity is bound to the caller that issued it: a 400
+  // naming a foreign or expired reasoning item indicts this credential for
+  // this history, not the request itself — another account (the issuer)
+  // may serve it as-is. The Muse executor first tries to recover in place
+  // by stripping/dropping that state; a rejection that still reaches here
+  // rotates to the next account without cooling this healthy one down.
+  { provider: "muse", text: "was not issued to this caller", cooldownMs: 0 },
+  { provider: "muse", text: "referenced reasoning item", cooldownMs: 0 },
   { text: "no credentials",           cooldownMs: COOLDOWN.long },
   { text: "request not allowed",      cooldownMs: COOLDOWN.short },
   { text: "improperly formed request", cooldownMs: COOLDOWN.long },

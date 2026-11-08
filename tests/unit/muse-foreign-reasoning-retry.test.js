@@ -5,8 +5,9 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
   proxyAwareFetch: (...args) => fetchMock(...args),
 }));
 
-const { MuseExecutor, sanitizeMuseForeignReasoning, dropMuseReasoningReferences } = await import("../../open-sse/executors/muse.js");
+const { MuseExecutor, sanitizeMuseForeignReasoning, dropMuseReasoningReferences, dropMuseReasoningItems } = await import("../../open-sse/executors/muse.js");
 const { getExecutor } = await import("../../open-sse/executors/index.js");
+const { checkFallbackError } = await import("../../open-sse/services/accountFallback.js");
 
 const FOREIGN_ERROR = {
   error: {
@@ -258,5 +259,114 @@ describe("Muse foreign reasoning recovery", () => {
       { type: "reasoning", summary: [{ type: "summary_text", text: "stale plan" }] },
       expect.objectContaining({ type: "reasoning", id: "rs_current" }),
     ]);
+  });
+
+  // Regression (2026-11-08): the original one-shot recovery returned the
+  // first foreign-reasoning 400 whenever its single retry also failed,
+  // whatever the retry's actual outcome was. Two live requests died that
+  // way while the same sanitized body is accepted by Meta on replay.
+  it("escalates to dropping reasoning items when summary-only replay is still rejected", async () => {
+    fetchMock
+      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
+      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
+      .mockResolvedValueOnce(response(200, { id: "resp_escalated", status: "completed", output: [] }));
+    const executor = new MuseExecutor();
+
+    const out = await executor.execute(makeArgs(makeBody()));
+
+    expect(out.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const thirdInput = sentBody(2).input;
+    expect(thirdInput.filter((item) => item.type === "reasoning")).toHaveLength(0);
+    expect(thirdInput).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "function_call", call_id: "call_1" }),
+      expect.objectContaining({ type: "function_call_output", call_id: "call_1" }),
+    ]));
+  });
+
+  it("recovers a composite foreign-then-expired rejection in one execution", async () => {
+    fetchMock
+      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
+      .mockResolvedValueOnce(response(400, EXPIRED_ERROR))
+      .mockResolvedValueOnce(response(200, { id: "resp_composite", status: "completed", output: [] }));
+    const executor = new MuseExecutor();
+
+    const body = makeBody();
+    body.input.splice(3, 0, {
+      type: "reasoning",
+      id: "rs_stale",
+      summary: [{ type: "summary_text", text: "stale plan" }],
+    });
+    const out = await executor.execute(makeArgs(body));
+
+    expect(out.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const thirdInput = sentBody(2).input;
+    expect(JSON.stringify(thirdInput)).not.toContain("foreign-blob");
+    expect(JSON.stringify(thirdInput)).not.toContain("rs_stale");
+    expect(thirdInput.filter((item) => item.type === "reasoning")).toEqual([
+      { type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: "prior plan" }] },
+      { type: "reasoning", summary: [{ type: "summary_text", text: "stale plan" }] },
+    ]);
+  });
+
+  it("does not mask a transport failure of the recovery attempt as the first 400", async () => {
+    fetchMock
+      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
+      .mockRejectedValueOnce(new Error("fetch failed"));
+    const executor = new MuseExecutor();
+
+    await expect(executor.execute(makeArgs(makeBody()))).rejects.toThrow("fetch failed");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns the recovery attempt's own error instead of the first rejection", async () => {
+    fetchMock
+      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
+      .mockResolvedValueOnce(response(400, {
+        error: { message: "The request contains invalid parameters." },
+      }));
+    const executor = new MuseExecutor();
+
+    const out = await executor.execute(makeArgs(makeBody()));
+
+    expect(out.response.status).toBe(400);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const returned = await out.response.text();
+    expect(returned).toContain("invalid parameters");
+    expect(returned).not.toContain("was not issued to this caller");
+  });
+
+  it("reasoning item dropper removes reasoning items and strips encrypted payloads", () => {
+    const { body, removedItems, removedHashes } = dropMuseReasoningItems(makeBody());
+
+    expect(removedHashes).toHaveLength(2);
+    expect(removedItems).toBe(1);
+    expect(body.input.some((item) => item.type === "reasoning")).toBe(false);
+    expect(JSON.stringify(body.input)).not.toContain("foreign-blob");
+    expect(body.input).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "function_call", call_id: "call_1" }),
+      expect.objectContaining({ type: "function_call_output", call_id: "call_1" }),
+    ]));
+  });
+
+  it("classifies Muse foreign/expired reasoning rejections as caller-scoped", () => {
+    const foreign = checkFallbackError(400, FOREIGN_ERROR.error.message, 0, "muse");
+    expect(foreign.shouldFallback).toBe(true);
+    expect(foreign.cooldownMs).toBe(0);
+    expect(foreign.requestScoped).toBeFalsy();
+
+    const expired = checkFallbackError(400, EXPIRED_ERROR.error.message, 0, "muse");
+    expect(expired.shouldFallback).toBe(true);
+    expect(expired.cooldownMs).toBe(0);
+    expect(expired.requestScoped).toBeFalsy();
+
+    const generic = checkFallbackError(400, "The request contains invalid parameters.", 0, "muse");
+    expect(generic.requestScoped).toBe(true);
+    expect(generic.shouldFallback).toBe(false);
+
+    const otherProvider = checkFallbackError(400, FOREIGN_ERROR.error.message, 0, "openai");
+    expect(otherProvider.requestScoped).toBe(true);
+    expect(otherProvider.shouldFallback).toBe(false);
   });
 });
