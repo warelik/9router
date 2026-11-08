@@ -1,0 +1,383 @@
+From b35016213e186c7edf232443f0fc3e6c3c607192 Mon Sep 17 00:00:00 2001
+From: downstream <downstream@local>
+Date: Sun, 8 Nov 2026 19:08:27 +0000
+Subject: [PATCH] Recover Muse foreign reasoning past the first retry
+
+The 0067/0069 recovery made exactly one stripped retry and returned
+the original foreign-reasoning 400 whenever that retry also failed,
+masking the retry's real outcome. Two live requests on 2026-11-08
+died that way: the sanitized body is accepted by Meta on replay, so
+the masked retry failure (a second 400 or a transport error) was
+misreported to the client and, classified request-scoped, never
+reached account fallback. The same turn then succeeded on resend
+when rotation landed on the account that issued the blobs.
+
+Recovery is now a bounded ladder: strip encrypted payloads, drop
+prior reasoning items, and drop named expired references whenever
+Meta reports one, returning the newest upstream error and letting
+transport failures propagate to account fallback. A surviving
+foreign/expired rejection is classified caller-scoped for Muse
+(rotate without cooldown) instead of request-scoped.
+---
+ open-sse/config/errorConfig.js                |   8 +
+ open-sse/executors/muse.js                    | 161 ++++++++++++------
+ .../unit/muse-foreign-reasoning-retry.test.js | 112 +++++++++++-
+ 3 files changed, 228 insertions(+), 53 deletions(-)
+
+diff --git a/open-sse/config/errorConfig.js b/open-sse/config/errorConfig.js
+index 8ef4ea68..7203cb33 100644
+--- a/open-sse/config/errorConfig.js
++++ b/open-sse/config/errorConfig.js
+@@ -70,6 +70,14 @@ export const ERROR_RULES = [
+   // Intl gateway blocks affect the account/IP, so let the connection back off.
+   { provider: "codebuddy-intl", text: "request illegal", backoff: true },
+   { provider: "codebuddy-intl", text: "conversation id missing", backoff: true },
++  // Muse reasoning continuity is bound to the caller that issued it: a 400
++  // naming a foreign or expired reasoning item indicts this credential for
++  // this history, not the request itself — another account (the issuer)
++  // may serve it as-is. The Muse executor first tries to recover in place
++  // by stripping/dropping that state; a rejection that still reaches here
++  // rotates to the next account without cooling this healthy one down.
++  { provider: "muse", text: "was not issued to this caller", cooldownMs: 0 },
++  { provider: "muse", text: "referenced reasoning item", cooldownMs: 0 },
+   { text: "no credentials",           cooldownMs: COOLDOWN.long },
+   { text: "request not allowed",      cooldownMs: COOLDOWN.short },
+   { text: "improperly formed request", cooldownMs: COOLDOWN.long },
+diff --git a/open-sse/executors/muse.js b/open-sse/executors/muse.js
+index 1363d1df..2bec85ca 100644
+--- a/open-sse/executors/muse.js
++++ b/open-sse/executors/muse.js
+@@ -6,6 +6,7 @@ const FOREIGN_REASONING_ERROR = "reasoning `encrypted_content` was not issued to
+ const EXPIRED_REASONING_REFERENCE = /Referenced reasoning item '([^']+)' was not found or has expired/;
+ const MAX_TRACKED_CALLERS = 64;
+ const MAX_TRACKED_HASHES_PER_CALLER = 10000;
++const MAX_RECOVERY_ATTEMPTS = 4;
+ 
+ function hashValue(value) {
+   return createHash("sha256").update(value).digest("hex");
+@@ -36,8 +37,7 @@ function hasContent(item) {
+  *
+  * When incompatibleHashes is provided, only payloads already known to be
+  * rejected for this caller are removed. Without it, every encrypted payload
+- * is removed for the one recovery attempt after Meta has identified a
+- * mismatch.
++ * is removed for a recovery attempt after Meta has identified a mismatch.
+  */
+ export function sanitizeMuseForeignReasoning(body, incompatibleHashes = null) {
+   if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.input)) {
+@@ -124,6 +124,32 @@ export function dropMuseReasoningReferences(body, referencedIds) {
+   };
+ }
+ 
++/**
++ * Last-resort recovery: drop prior reasoning items entirely instead of
++ * replaying them summary-only. Caller-bound encrypted payloads on other
++ * item types are stripped as in sanitizeMuseForeignReasoning. The rest of
++ * the history (messages, function calls and outputs) is preserved, so a
++ * tool-calling loop can continue without its encrypted continuity state.
++ */
++export function dropMuseReasoningItems(body) {
++  if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.input)) {
++    return { body, removedItems: 0, removedHashes: [] };
++  }
++
++  const sanitized = sanitizeMuseForeignReasoning(body);
++  const input = sanitized.body.input.filter((item) => item?.type !== "reasoning");
++  const removedItems = sanitized.body.input.length - input.length;
++  if (!removedItems && !sanitized.removedHashes.length) {
++    return { body, removedItems: 0, removedHashes: [] };
++  }
++
++  return {
++    body: { ...sanitized.body, input },
++    removedItems,
++    removedHashes: sanitized.removedHashes,
++  };
++}
++
+ export class MuseExecutor extends DefaultExecutor {
+   constructor() {
+     super("muse");
+@@ -196,69 +222,100 @@ export class MuseExecutor extends DefaultExecutor {
+     const scope = this._callerScope(args);
+     const knownForeignHashes = this._knownForeignHashes(scope);
+     const knownExpiredReferences = this._knownExpiredReferences(scope);
+-    let preparedBody = knownForeignHashes
++    let body = knownForeignHashes
+       ? sanitizeMuseForeignReasoning(args.body, knownForeignHashes).body
+       : args.body;
+     if (knownExpiredReferences) {
+-      preparedBody = dropMuseReasoningReferences(preparedBody, knownExpiredReferences).body;
++      body = dropMuseReasoningReferences(body, knownExpiredReferences).body;
+     }
+-    const first = await this._executeRecovering({ ...args, body: preparedBody }, scope, false);
+-    return first;
+-  }
+ 
+-  async _executeRecovering(args, scope, retried) {
+-    const first = await super.execute(args);
+-
+-    if (retried || first.response?.status !== 400 || typeof first.response.clone !== "function") {
+-      return first;
+-    }
+-
+-    let errorText = "";
+-    try {
+-      errorText = await first.response.clone().text();
+-    } catch {
+-      return first;
+-    }
+-
+-    const expiredMatch = errorText.match(EXPIRED_REASONING_REFERENCE);
+-    if (expiredMatch) {
+-      const dropped = dropMuseReasoningReferences(args.body, new Set([expiredMatch[1]]));
+-      if (!dropped.removedIds.length) return first;
+-
+-      this._rememberExpiredReferences(scope, dropped.removedIds);
+-      args.log?.warn?.(
+-        "RETRY",
+-        `MUSE | expired reasoning reference rejected; retrying without ${dropped.removedIds.length} referenced item(s)`,
+-      );
++    // Recovery is a bounded ladder, not a single retry: strip the encrypted
++    // payloads (keeping summaries), then drop the prior reasoning items
++    // entirely, dropping server-side references whenever Meta names one.
++    // Each rung runs only after Meta rejected the previous form, and only
++    // while it changes the body. The outcome of a recovery attempt is never
++    // masked by the original rejection: a newer upstream error is the one
++    // returned, and a transport failure propagates so account fallback can
++    // try another caller (possibly the one that issued the blobs) instead
++    // of the request being filed as an unrecoverable request-scoped 400.
++    let strippedEncrypted = false;
++    let droppedReasoning = false;
++    for (let recoveries = 0; ; recoveries++) {
++      const result = await super.execute({ ...args, body });
++
++      if (result.response?.status !== 400 || typeof result.response.clone !== "function"
++        || recoveries >= MAX_RECOVERY_ATTEMPTS) {
++        return result;
++      }
+ 
++      let errorText = "";
+       try {
+-        const retry = await this._executeRecovering({ ...args, body: dropped.body }, scope, true);
+-        return retry.response?.ok || (retry.response && retry.response.status !== 400)
+-          ? retry
+-          : first;
++        errorText = await result.response.clone().text();
+       } catch {
+-        return first;
++        return result;
+       }
+-    }
+ 
+-    if (!errorText.includes(FOREIGN_REASONING_ERROR)) return first;
++      const expiredMatch = errorText.match(EXPIRED_REASONING_REFERENCE);
++      if (expiredMatch) {
++        const dropped = dropMuseReasoningReferences(body, new Set([expiredMatch[1]]));
++        if (dropped.removedIds.length) {
++          this._rememberExpiredReferences(scope, dropped.removedIds);
++          args.log?.warn?.(
++            "RETRY",
++            `MUSE | expired reasoning reference rejected; retrying without ${dropped.removedIds.length} referenced item(s)`,
++          );
++          body = dropped.body;
++          continue;
++        }
++        // The named reference is not a top-level reasoning id in this body;
++        // fall through to dropping the reasoning items outright.
++        if (!droppedReasoning) {
++          const droppedAll = dropMuseReasoningItems(body);
++          droppedReasoning = true;
++          if (droppedAll.removedItems || droppedAll.removedHashes.length) {
++            this._rememberForeignHashes(scope, droppedAll.removedHashes);
++            args.log?.warn?.(
++              "RETRY",
++              `MUSE | expired reasoning reference has no droppable id; retrying without ${droppedAll.removedItems} reasoning item(s)`,
++            );
++            body = droppedAll.body;
++            continue;
++          }
++        }
++        return result;
++      }
+ 
+-    const sanitized = sanitizeMuseForeignReasoning(args.body);
+-    if (!sanitized.removedHashes.length) return first;
++      if (!errorText.includes(FOREIGN_REASONING_ERROR)) return result;
++
++      if (!strippedEncrypted) {
++        const sanitized = sanitizeMuseForeignReasoning(body);
++        strippedEncrypted = true;
++        if (sanitized.removedHashes.length) {
++          this._rememberForeignHashes(scope, sanitized.removedHashes);
++          args.log?.warn?.(
++            "RETRY",
++            `MUSE | foreign reasoning state rejected; retrying without ${sanitized.removedHashes.length} encrypted item(s)`,
++          );
++          body = sanitized.body;
++          continue;
++        }
++      }
+ 
+-    this._rememberForeignHashes(scope, sanitized.removedHashes);
+-    args.log?.warn?.(
+-      "RETRY",
+-      `MUSE | foreign reasoning state rejected; retrying without ${sanitized.removedHashes.length} encrypted item(s)`,
+-    );
++      if (!droppedReasoning) {
++        const droppedAll = dropMuseReasoningItems(body);
++        droppedReasoning = true;
++        if (droppedAll.removedItems || droppedAll.removedHashes.length) {
++          this._rememberForeignHashes(scope, droppedAll.removedHashes);
++          args.log?.warn?.(
++            "RETRY",
++            `MUSE | foreign reasoning state still rejected; retrying without ${droppedAll.removedItems} reasoning item(s)`,
++          );
++          body = droppedAll.body;
++          continue;
++        }
++      }
+ 
+-    try {
+-      const retry = await this._executeRecovering({ ...args, body: sanitized.body }, scope, true);
+-      return retry.response?.ok || (retry.response && retry.response.status !== 400)
+-        ? retry
+-        : first;
+-    } catch {
+-      return first;
++      return result;
+     }
+   }
+ }
+diff --git a/tests/unit/muse-foreign-reasoning-retry.test.js b/tests/unit/muse-foreign-reasoning-retry.test.js
+index ab37f410..03a78fb7 100644
+--- a/tests/unit/muse-foreign-reasoning-retry.test.js
++++ b/tests/unit/muse-foreign-reasoning-retry.test.js
+@@ -5,8 +5,9 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
+   proxyAwareFetch: (...args) => fetchMock(...args),
+ }));
+ 
+-const { MuseExecutor, sanitizeMuseForeignReasoning, dropMuseReasoningReferences } = await import("../../open-sse/executors/muse.js");
++const { MuseExecutor, sanitizeMuseForeignReasoning, dropMuseReasoningReferences, dropMuseReasoningItems } = await import("../../open-sse/executors/muse.js");
+ const { getExecutor } = await import("../../open-sse/executors/index.js");
++const { checkFallbackError } = await import("../../open-sse/services/accountFallback.js");
+ 
+ const FOREIGN_ERROR = {
+   error: {
+@@ -259,4 +260,113 @@ describe("Muse foreign reasoning recovery", () => {
+       expect.objectContaining({ type: "reasoning", id: "rs_current" }),
+     ]);
+   });
++
++  // Regression (2026-11-08): the original one-shot recovery returned the
++  // first foreign-reasoning 400 whenever its single retry also failed,
++  // whatever the retry's actual outcome was. Two live requests died that
++  // way while the same sanitized body is accepted by Meta on replay.
++  it("escalates to dropping reasoning items when summary-only replay is still rejected", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_escalated", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(3);
++    const thirdInput = sentBody(2).input;
++    expect(thirdInput.filter((item) => item.type === "reasoning")).toHaveLength(0);
++    expect(thirdInput).toEqual(expect.arrayContaining([
++      expect.objectContaining({ type: "function_call", call_id: "call_1" }),
++      expect.objectContaining({ type: "function_call_output", call_id: "call_1" }),
++    ]));
++  });
++
++  it("recovers a composite foreign-then-expired rejection in one execution", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(400, EXPIRED_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_composite", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    const body = makeBody();
++    body.input.splice(3, 0, {
++      type: "reasoning",
++      id: "rs_stale",
++      summary: [{ type: "summary_text", text: "stale plan" }],
++    });
++    const out = await executor.execute(makeArgs(body));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(3);
++    const thirdInput = sentBody(2).input;
++    expect(JSON.stringify(thirdInput)).not.toContain("foreign-blob");
++    expect(JSON.stringify(thirdInput)).not.toContain("rs_stale");
++    expect(thirdInput.filter((item) => item.type === "reasoning")).toEqual([
++      { type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: "prior plan" }] },
++      { type: "reasoning", summary: [{ type: "summary_text", text: "stale plan" }] },
++    ]);
++  });
++
++  it("does not mask a transport failure of the recovery attempt as the first 400", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockRejectedValueOnce(new Error("fetch failed"));
++    const executor = new MuseExecutor();
++
++    await expect(executor.execute(makeArgs(makeBody()))).rejects.toThrow("fetch failed");
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  it("returns the recovery attempt's own error instead of the first rejection", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(400, {
++        error: { message: "The request contains invalid parameters." },
++      }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(400);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    const returned = await out.response.text();
++    expect(returned).toContain("invalid parameters");
++    expect(returned).not.toContain("was not issued to this caller");
++  });
++
++  it("reasoning item dropper removes reasoning items and strips encrypted payloads", () => {
++    const { body, removedItems, removedHashes } = dropMuseReasoningItems(makeBody());
++
++    expect(removedHashes).toHaveLength(2);
++    expect(removedItems).toBe(1);
++    expect(body.input.some((item) => item.type === "reasoning")).toBe(false);
++    expect(JSON.stringify(body.input)).not.toContain("foreign-blob");
++    expect(body.input).toEqual(expect.arrayContaining([
++      expect.objectContaining({ type: "function_call", call_id: "call_1" }),
++      expect.objectContaining({ type: "function_call_output", call_id: "call_1" }),
++    ]));
++  });
++
++  it("classifies Muse foreign/expired reasoning rejections as caller-scoped", () => {
++    const foreign = checkFallbackError(400, FOREIGN_ERROR.error.message, 0, "muse");
++    expect(foreign.shouldFallback).toBe(true);
++    expect(foreign.cooldownMs).toBe(0);
++    expect(foreign.requestScoped).toBeFalsy();
++
++    const expired = checkFallbackError(400, EXPIRED_ERROR.error.message, 0, "muse");
++    expect(expired.shouldFallback).toBe(true);
++    expect(expired.cooldownMs).toBe(0);
++    expect(expired.requestScoped).toBeFalsy();
++
++    const generic = checkFallbackError(400, "The request contains invalid parameters.", 0, "muse");
++    expect(generic.requestScoped).toBe(true);
++    expect(generic.shouldFallback).toBe(false);
++
++    const otherProvider = checkFallbackError(400, FOREIGN_ERROR.error.message, 0, "openai");
++    expect(otherProvider.requestScoped).toBe(true);
++    expect(otherProvider.shouldFallback).toBe(false);
++  });
+ });
+-- 
+2.55.0
+
