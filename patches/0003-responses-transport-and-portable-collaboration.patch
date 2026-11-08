@@ -1,8 +1,7 @@
-From 75067283ea0f5a7c8e6a96a066c810c20f5848fc Mon Sep 17 00:00:00 2001
+From e8e8ceac6f3730f387142bc6ad834532732cf86b Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:23 +0000
 Subject: [PATCH] Responses transport and portable collaboration
-
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -25,11 +24,11 @@ Consolidated from the following original patches (file custody by final owner):
  tests/unit/kimi-responses-transport.test.js   |  15 +-
  .../openai-responses-agent-messages.test.js   | 240 ++++++++++
  .../unit/openai-responses-namespaces.test.js  | 444 ++++++++++++++++++
- .../opencode-go-transport-routing.test.js     |  50 +-
+ .../opencode-go-transport-routing.test.js     |  51 +-
  tests/unit/responses-reasoning-wire.test.js   | 414 ++++++++++++++++
  ...onses-thinking-option-preservation.test.js |  71 +++
  tests/unit/undeclared-responses-sse.test.js   | 206 ++++++++
- 12 files changed, 1521 insertions(+), 23 deletions(-)
+ 12 files changed, 1522 insertions(+), 23 deletions(-)
  create mode 100644 open-sse/translator/concerns/portableCollaboration.js
  create mode 100644 tests/unit/openai-responses-agent-messages.test.js
  create mode 100644 tests/unit/openai-responses-namespaces.test.js
@@ -38,7 +37,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/undeclared-responses-sse.test.js
 
 diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
-index 5a72398..3bcd7f8 100644
+index 5a723981..3bcd7f81 100644
 --- a/open-sse/handlers/chatCore/sseToJsonHandler.js
 +++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
 @@ -8,6 +8,7 @@ import { PROVIDERS } from "../../config/providers.js";
@@ -77,7 +76,7 @@ index 5a72398..3bcd7f8 100644
      console.error("[ChatCore] Chat Completions SSE→JSON failed:", err);
      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Failed to convert streaming response to JSON");
 diff --git a/open-sse/providers/registry/kimi.js b/open-sse/providers/registry/kimi.js
-index 88f6e38..e90fe5a 100644
+index 88f6e386..e90fe5a5 100644
 --- a/open-sse/providers/registry/kimi.js
 +++ b/open-sse/providers/registry/kimi.js
 @@ -56,6 +56,9 @@ export default {
@@ -92,7 +91,7 @@ index 88f6e38..e90fe5a 100644
    ],
 diff --git a/open-sse/translator/concerns/portableCollaboration.js b/open-sse/translator/concerns/portableCollaboration.js
 new file mode 100644
-index 0000000..6315598
+index 00000000..63155983
 --- /dev/null
 +++ b/open-sse/translator/concerns/portableCollaboration.js
 @@ -0,0 +1,89 @@
@@ -186,7 +185,7 @@ index 0000000..6315598
 +  return { body: toolNameMap.size ? rewritten : body, toolNameMap };
 +}
 diff --git a/open-sse/utils/responsesStreamHelpers.js b/open-sse/utils/responsesStreamHelpers.js
-index eaacdcd..6a1e94c 100644
+index eaacdcd0..6a1e94c2 100644
 --- a/open-sse/utils/responsesStreamHelpers.js
 +++ b/open-sse/utils/responsesStreamHelpers.js
 @@ -7,6 +7,7 @@ const OPENAI_RESPONSES_TERMINAL_EVENTS = new Set([
@@ -207,7 +206,7 @@ index eaacdcd..6a1e94c 100644
  
  const sharedEncoder = new TextEncoder();
 diff --git a/tests/unit/cli-connect.test.js b/tests/unit/cli-connect.test.js
-index 3695a4b..7da8ede 100644
+index 3695a4b6..7da8ede2 100644
 --- a/tests/unit/cli-connect.test.js
 +++ b/tests/unit/cli-connect.test.js
 @@ -194,10 +194,12 @@ describe("connect run()", () => {
@@ -224,7 +223,7 @@ index 3695a4b..7da8ede 100644
    });
  
 diff --git a/tests/unit/kimi-responses-transport.test.js b/tests/unit/kimi-responses-transport.test.js
-index faffc08..4d80dd8 100644
+index faffc086..4d80dd8f 100644
 --- a/tests/unit/kimi-responses-transport.test.js
 +++ b/tests/unit/kimi-responses-transport.test.js
 @@ -3,8 +3,8 @@
@@ -256,7 +255,7 @@ index faffc08..4d80dd8 100644
  });
 diff --git a/tests/unit/openai-responses-agent-messages.test.js b/tests/unit/openai-responses-agent-messages.test.js
 new file mode 100644
-index 0000000..7d6b9cb
+index 00000000..7d6b9cbe
 --- /dev/null
 +++ b/tests/unit/openai-responses-agent-messages.test.js
 @@ -0,0 +1,240 @@
@@ -502,7 +501,7 @@ index 0000000..7d6b9cb
 +});
 diff --git a/tests/unit/openai-responses-namespaces.test.js b/tests/unit/openai-responses-namespaces.test.js
 new file mode 100644
-index 0000000..645f7eb
+index 00000000..645f7eb2
 --- /dev/null
 +++ b/tests/unit/openai-responses-namespaces.test.js
 @@ -0,0 +1,444 @@
@@ -951,7 +950,7 @@ index 0000000..645f7eb
 +  });
 +});
 diff --git a/tests/unit/opencode-go-transport-routing.test.js b/tests/unit/opencode-go-transport-routing.test.js
-index 7d65a40..b2fd58c 100644
+index 8b67ad49..8f3d0a6b 100644
 --- a/tests/unit/opencode-go-transport-routing.test.js
 +++ b/tests/unit/opencode-go-transport-routing.test.js
 @@ -10,8 +10,8 @@
@@ -968,7 +967,7 @@ index 7d65a40..b2fd58c 100644
 @@ -96,14 +96,18 @@ const RESPONSE_BY_FORMAT = {
  };
  
- async function route(model, sourceFormat) {
+ async function route(model, sourceFormat, bodyOverrides = {}) {
 -  executeMock.mockResolvedValueOnce({
 -    response: new Response(JSON.stringify(RESPONSE_BY_FORMAT[sourceFormat === "openai" ? "openai" : sourceFormat] || RESPONSE_BY_FORMAT.openai), {
 -      status: 200,
@@ -992,21 +991,22 @@ index 7d65a40..b2fd58c 100644
    });
  
    const credentials = { apiKey: "test-key", providerSpecificData: {} };
-@@ -122,7 +126,12 @@ async function route(model, sourceFormat) {
+@@ -123,7 +127,13 @@ async function route(model, sourceFormat, bodyOverrides = {}) {
    });
  
-   const { credentials: creds } = executeMock.mock.calls.at(-1)[0];
--  return { result, runtimeTransport: creds.runtimeTransport ?? null };
+   const { credentials: creds, body: sentBody } = executeMock.mock.calls.at(-1)[0];
+-  return { result, runtimeTransport: creds.runtimeTransport ?? null, sentBody };
 +  const executorResult = await executeMock.mock.results.at(-1).value;
 +  return {
 +    result,
 +    runtimeTransport: creds.runtimeTransport ?? null,
++    sentBody,
 +    effectiveUrl: executorResult.url,
 +  };
  }
  
  describe("opencode-go DeepSeek endpoint matrix (via real handleChatCore)", () => {
-@@ -149,16 +158,21 @@ describe("opencode-go thinking-suffix guard (regression)", () => {
+@@ -199,16 +209,21 @@ describe("opencode-go thinking-suffix guard (regression)", () => {
      vi.clearAllMocks();
    });
  
@@ -1032,7 +1032,7 @@ index 7d65a40..b2fd58c 100644
    });
  
    it("still routes minimax-m3(max) + claude-format client to /messages", async () => {
-@@ -168,9 +182,11 @@ describe("opencode-go thinking-suffix guard (regression)", () => {
+@@ -218,9 +233,11 @@ describe("opencode-go thinking-suffix guard (regression)", () => {
    });
  
    it("does NOT route minimax-m3(max) (no responses support) to /responses", async () => {
@@ -1048,7 +1048,7 @@ index 7d65a40..b2fd58c 100644
  
 diff --git a/tests/unit/responses-reasoning-wire.test.js b/tests/unit/responses-reasoning-wire.test.js
 new file mode 100644
-index 0000000..40cd512
+index 00000000..40cd5125
 --- /dev/null
 +++ b/tests/unit/responses-reasoning-wire.test.js
 @@ -0,0 +1,414 @@
@@ -1468,7 +1468,7 @@ index 0000000..40cd512
 +});
 diff --git a/tests/unit/responses-thinking-option-preservation.test.js b/tests/unit/responses-thinking-option-preservation.test.js
 new file mode 100644
-index 0000000..19b385e
+index 00000000..19b385e7
 --- /dev/null
 +++ b/tests/unit/responses-thinking-option-preservation.test.js
 @@ -0,0 +1,71 @@
@@ -1545,7 +1545,7 @@ index 0000000..19b385e
 +});
 diff --git a/tests/unit/undeclared-responses-sse.test.js b/tests/unit/undeclared-responses-sse.test.js
 new file mode 100644
-index 0000000..8a0e19b
+index 00000000..8a0e19b6
 --- /dev/null
 +++ b/tests/unit/undeclared-responses-sse.test.js
 @@ -0,0 +1,206 @@

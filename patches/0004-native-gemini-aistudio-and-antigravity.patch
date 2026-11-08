@@ -1,8 +1,7 @@
-From 7999f7a6c7216577d57f719624bf2dc9ef8eb113 Mon Sep 17 00:00:00 2001
+From 830ca3c7b544ccfd7cd965799efdb0d4f3b536d5 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:27 +0000
 Subject: [PATCH] Native Gemini, AIStudio and Antigravity routes
-
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -62,7 +61,7 @@ Consolidated from the following original patches (file custody by final owner):
  ...eam-translator-history-regressions.test.js |  153 +++
  .../gemini-contents-normalization.test.js     |    4 +-
  .../unit/gemini-native-alpha-contract.test.js |  221 ++++
- tests/unit/gemini-native-proxy-abort.test.js  |   80 ++
+ tests/unit/gemini-native-proxy-abort.test.js  |   88 ++
  tests/unit/gemini-native-stream.test.js       | 1005 +++++++++++++++++
  .../gemini-nonstream-source-format.test.js    |   65 ++
  .../gemini-server-parts-isolation.test.js     |  130 +++
@@ -71,7 +70,7 @@ Consolidated from the following original patches (file custody by final owner):
  .../unit/native-public-gemini-rewrite.test.js |  133 +++
  .../unit/translated-chat-stream-done.test.js  |   57 +
  tests/unit/zed-completions-wire.test.js       |  227 ++++
- 38 files changed, 3980 insertions(+), 376 deletions(-)
+ 38 files changed, 3988 insertions(+), 376 deletions(-)
  create mode 100644 src/app/api/v1alpha/models/[...path]/route.js
  create mode 100644 tests/unit/aistudio-discovery.test.js
  create mode 100644 tests/unit/aistudio-native-response-format.test.js
@@ -89,10 +88,10 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/translated-chat-stream-done.test.js
 
 diff --git a/next.config.mjs b/next.config.mjs
-index dd276e6..cfda347 100644
+index 05e6be59..a8a71d57 100644
 --- a/next.config.mjs
 +++ b/next.config.mjs
-@@ -92,6 +92,14 @@ const nextConfig = {
+@@ -100,6 +100,14 @@ const nextConfig = {
          source: "/v1beta",
          destination: "/api/v1beta"
        },
@@ -108,10 +107,10 @@ index dd276e6..cfda347 100644
          source: "/v1/:path*",
          destination: "/api/v1/:path*"
 diff --git a/open-sse/executors/base.js b/open-sse/executors/base.js
-index 0697c08..5e57627 100644
+index 239c97ad..109e0eb0 100644
 --- a/open-sse/executors/base.js
 +++ b/open-sse/executors/base.js
-@@ -168,6 +168,10 @@ export class BaseExecutor {
+@@ -177,6 +177,10 @@ export class BaseExecutor {
          return { response, url, headers, transformedBody };
        } catch (error) {
          clearTimeout(connectTimer);
@@ -123,7 +122,7 @@ index 0697c08..5e57627 100644
          const isConnectTimeout = connectCtrl.signal.aborted && error.name === "AbortError";
          dbg("FETCH", `${this.provider.toUpperCase()} ✖ ${error.name}: ${error.message}${isConnectTimeout ? " (connect timeout)" : ""}`);
 diff --git a/open-sse/providers/registry/index.js b/open-sse/providers/registry/index.js
-index 41dc660..10f7e8c 100644
+index 41dc6605..10f7e8c1 100644
 --- a/open-sse/providers/registry/index.js
 +++ b/open-sse/providers/registry/index.js
 @@ -139,6 +139,7 @@ import p135 from "./minimax-code-global.js";
@@ -143,24 +142,24 @@ index 41dc660..10f7e8c 100644
    p143,
    p144,
 diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
-index f73a5aa..6d6eade 100644
+index efdc64ac..af0b4624 100644
 --- a/open-sse/translator/formats/gemini.js
 +++ b/open-sse/translator/formats/gemini.js
 @@ -1,8 +1,10 @@
  // Gemini helper functions for translator
  
  import { safeParseJSON } from "../concerns/json.js";
--import { OPENAI_BLOCK } from "../schema/index.js";
-+import { OPENAI_BLOCK, RESPONSES_ITEM, GEMINI_ROLE } from "../schema/index.js";
+-import { DEFAULT_IMAGE_MIME, OPENAI_BLOCK } from "../schema/index.js";
++import { DEFAULT_IMAGE_MIME, OPENAI_BLOCK, RESPONSES_ITEM, GEMINI_ROLE } from "../schema/index.js";
  import { isGemini4Model } from "../../providers/capabilities.js";
 +import { FILE_EXTENSION_MIME, GEMINI_DEFAULT_FILE_MIME_TYPE, SCHEMA_MAP_KEYS, SCHEMA_ARRAY_KEYS, SCHEMA_SINGLE_KEYS,
 +  PROTO_SCHEMA_TYPES, LEGACY_PROTO_SCHEMA_KEYS } from "../../config/runtimeConfig.js";
  
  // Unsupported JSON Schema constraints that should be removed for Antigravity
  export const UNSUPPORTED_SCHEMA_CONSTRAINTS = [
-@@ -52,6 +54,36 @@ export const DEFAULT_SAFETY_SETTINGS = [
-   { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "OFF" }
- ];
+@@ -63,6 +65,36 @@ function remoteImageMimeType(url) {
+   return DEFAULT_IMAGE_MIME;
+ }
  
 +function fileMimeType(filename, explicit) {
 +  if (typeof explicit === "string" && explicit.includes("/")) return explicit;
@@ -195,7 +194,7 @@ index f73a5aa..6d6eade 100644
  // Convert OpenAI content to Gemini parts
  export function convertOpenAIContentToParts(content) {
    const parts = [];
-@@ -95,14 +127,10 @@ export function convertOpenAIContentToParts(content) {
+@@ -106,14 +138,10 @@ export function convertOpenAIContentToParts(content) {
              inlineData: { mime_type: mimeType, data: data }
            });
          }
@@ -214,7 +213,7 @@ index f73a5aa..6d6eade 100644
        }
      }
    }
-@@ -143,50 +171,57 @@ export function generateProjectId() {
+@@ -154,50 +182,57 @@ export function generateProjectId() {
    return `${adj}-${noun}-${crypto.randomUUID().slice(0, 5)}`;
  }
  
@@ -293,7 +292,7 @@ index f73a5aa..6d6eade 100644
  
    if (obj.enum && Array.isArray(obj.enum)) {
      obj.enum = obj.enum.map(v => String(v));
-@@ -196,16 +231,12 @@ function convertEnumValuesToStrings(obj) {
+@@ -207,16 +242,12 @@ function convertEnumValuesToStrings(obj) {
      }
    }
  
@@ -312,7 +311,7 @@ index f73a5aa..6d6eade 100644
  
    if (obj.allOf && Array.isArray(obj.allOf)) {
      const merged = {};
-@@ -230,11 +261,7 @@ function mergeAllOf(obj) {
+@@ -241,11 +272,7 @@ function mergeAllOf(obj) {
      if (merged.required) obj.required = [...(obj.required || []), ...merged.required];
    }
  
@@ -325,7 +324,7 @@ index f73a5aa..6d6eade 100644
  }
  
  // Select best schema from anyOf/oneOf
-@@ -266,7 +293,7 @@ function selectBest(items) {
+@@ -277,7 +304,7 @@ function selectBest(items) {
  
  // Flatten anyOf/oneOf
  function flattenAnyOfOneOf(obj) {
@@ -334,7 +333,7 @@ index f73a5aa..6d6eade 100644
  
    if (obj.anyOf && Array.isArray(obj.anyOf) && obj.anyOf.length > 0) {
      const nonNullSchemas = obj.anyOf.filter(s => s && s.type !== "null");
-@@ -288,16 +315,12 @@ function flattenAnyOfOneOf(obj) {
+@@ -299,16 +326,12 @@ function flattenAnyOfOneOf(obj) {
      }
    }
  
@@ -353,7 +352,7 @@ index f73a5aa..6d6eade 100644
  
    if (obj.type && Array.isArray(obj.type)) {
      const nonNullTypes = obj.type.filter(t => t !== "null");
-@@ -325,31 +348,20 @@ function flattenTypeArrays(obj) {
+@@ -336,31 +359,20 @@ function flattenTypeArrays(obj) {
      }
    }
  
@@ -389,7 +388,7 @@ index f73a5aa..6d6eade 100644
  
    if (Array.isArray(obj.prefixItems) && obj.prefixItems.length > 0) {
      const variants = obj.prefixItems.filter(s => s && s.type !== "null");
-@@ -361,16 +373,12 @@ function convertPrefixItems(obj) {
+@@ -372,16 +384,12 @@ function convertPrefixItems(obj) {
      delete obj.prefixItems;
    }
  
@@ -408,7 +407,7 @@ index f73a5aa..6d6eade 100644
    if (obj.type === "array") {
      if (!obj.items || typeof obj.items !== "object" || Object.keys(obj.items).length === 0) {
        obj.items = { type: "string" };
-@@ -384,22 +392,23 @@ function ensureArrayItems(obj) {
+@@ -395,22 +403,23 @@ function ensureArrayItems(obj) {
        }
      }
    }
@@ -440,7 +439,7 @@ index f73a5aa..6d6eade 100644
      delete obj.properties;
      delete obj.required;
      if (!obj.items || typeof obj.items !== "object" || Object.keys(obj.items).length === 0) {
-@@ -418,7 +427,7 @@ function enforceTypeConstraints(obj) {
+@@ -429,7 +438,7 @@ function enforceTypeConstraints(obj) {
      delete obj.items;
    }
  
@@ -449,7 +448,7 @@ index f73a5aa..6d6eade 100644
      delete obj.properties;
      delete obj.required;
    }
-@@ -450,7 +459,7 @@ export function cleanJSONSchemaForAntigravity(schema) {
+@@ -461,7 +470,7 @@ export function cleanJSONSchemaForAntigravity(schema) {
  
    // Phase 4: Cleanup required fields recursively
    function cleanupRequired(obj) {
@@ -458,7 +457,7 @@ index f73a5aa..6d6eade 100644
  
      if (obj.required && Array.isArray(obj.required) && obj.properties) {
        const validRequired = obj.required.filter(field =>
-@@ -463,12 +472,8 @@ export function cleanJSONSchemaForAntigravity(schema) {
+@@ -474,12 +483,8 @@ export function cleanJSONSchemaForAntigravity(schema) {
        }
      }
  
@@ -473,7 +472,7 @@ index f73a5aa..6d6eade 100644
    }
  
    cleanupRequired(cleaned);
-@@ -502,12 +507,8 @@ export function cleanJSONSchemaForAntigravity(schema) {
+@@ -513,12 +518,8 @@ export function cleanJSONSchemaForAntigravity(schema) {
        }
      }
  
@@ -488,7 +487,7 @@ index f73a5aa..6d6eade 100644
    }
  
    addPlaceholders(cleaned);
-@@ -518,6 +519,60 @@ export function cleanJSONSchemaForAntigravity(schema) {
+@@ -529,6 +530,60 @@ export function cleanJSONSchemaForAntigravity(schema) {
    return cleaned;
  }
  
@@ -549,7 +548,7 @@ index f73a5aa..6d6eade 100644
  // Gemini / Cloud Code treat a `$ref` key inside functionResponse.response as a
  // pointer to functionResponse.parts and reject the request with
  // "The referenced name `#/$defs/...` in function_response.response does not match
-@@ -551,7 +606,12 @@ function moveFunctionResponsesLast(parts) {
+@@ -562,7 +617,12 @@ function moveFunctionResponsesLast(parts) {
  }
  
  // Merge adjacent same-role messages, strip empty parts, ensure initial and terminal user turns
@@ -563,7 +562,7 @@ index f73a5aa..6d6eade 100644
    const frLast = isGemini4Model(model);
    const out = [];
    for (const c of contents || []) {
-@@ -570,16 +630,18 @@ export function normalizeGeminiContents(contents, model = null) {
+@@ -581,16 +641,18 @@ export function normalizeGeminiContents(contents, model = null) {
    if (out.length > 0 && out.at(-1).role === "model") {
      const fnCalls = (out.at(-1).parts || []).filter(p => p && p.functionCall);
      if (fnCalls.length > 0) {
@@ -592,13 +591,13 @@ index f73a5aa..6d6eade 100644
      } else {
        out.push({ role: "user", parts: [{ text: "Continue." }] });
      }
-@@ -587,4 +649,3 @@ export function normalizeGeminiContents(contents, model = null) {
+@@ -598,4 +660,3 @@ export function normalizeGeminiContents(contents, model = null) {
    return out;
  }
  
 -
 diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
-index 182abf9..b42a48f 100644
+index 182abf93..b42a48f8 100644
 --- a/open-sse/translator/request/openai-to-gemini.js
 +++ b/open-sse/translator/request/openai-to-gemini.js
 @@ -2,7 +2,8 @@ import { register } from "../index.js";
@@ -1133,7 +1132,7 @@ index 182abf9..b42a48f 100644
 +register(FORMATS.OPENAI, FORMATS.GEMINI_CLI, (model, body, stream, credentials) => wrapInCloudCodeEnvelope(model, openaiToGeminiCLIRequest(model, body, stream, credentials), credentials), null);
  register(FORMATS.OPENAI, FORMATS.ANTIGRAVITY, openaiToAntigravityRequest, null);
 diff --git a/open-sse/translator/response/gemini-to-openai.js b/open-sse/translator/response/gemini-to-openai.js
-index 14c4793..1e9da0b 100644
+index 14c47939..1e9da0b0 100644
 --- a/open-sse/translator/response/gemini-to-openai.js
 +++ b/open-sse/translator/response/gemini-to-openai.js
 @@ -6,7 +6,8 @@ import { toOpenAIUsage } from "../concerns/usage.js";
@@ -1253,27 +1252,27 @@ index 14c4793..1e9da0b 100644
      if (finishReason === OPENAI_FINISH.STOP && state.geminiToolCallCount > 0) {
        finishReason = OPENAI_FINISH.TOOL_CALLS;
 diff --git a/open-sse/utils/proxyFetch.js b/open-sse/utils/proxyFetch.js
-index 5574bcd..eea1f62 100644
+index 40eb81b2..a2a00ca7 100644
 --- a/open-sse/utils/proxyFetch.js
 +++ b/open-sse/utils/proxyFetch.js
-@@ -361,6 +361,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
+@@ -478,6 +478,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
        try {
-         return await fetchWithTlsFallback(url, options, proxyUrl);
+         return await fetchWithTlsFallback(url, options, proxyUrl, forceFreshSocket);
        } catch (proxyError) {
 +        if (options.signal?.aborted || proxyError?.name === "AbortError") throw proxyError;
          if (proxyOptions?.strictProxy === true) {
            throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
          }
-@@ -381,6 +382,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
+@@ -498,6 +499,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
      try {
-       return await fetchWithTlsFallback(url, options, proxyUrl);
+       return await fetchWithTlsFallback(url, options, proxyUrl, forceFreshSocket);
      } catch (proxyError) {
 +      if (options.signal?.aborted || proxyError?.name === "AbortError") throw proxyError;
        // If strictProxy is enabled, fail hard instead of falling back to direct
        if (proxyOptions?.strictProxy === true) {
          throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
 diff --git a/open-sse/utils/sessionManager.js b/open-sse/utils/sessionManager.js
-index 4f701b8..8fb6081 100644
+index 4f701b88..8fb60815 100644
 --- a/open-sse/utils/sessionManager.js
 +++ b/open-sse/utils/sessionManager.js
 @@ -220,6 +220,22 @@ export function resolveSessionIdentity({ headers, body, connectionId, workspaceI
@@ -1300,7 +1299,7 @@ index 4f701b8..8fb6081 100644
      return resolveSessionIdentity(opts).sessionId;
  }
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 7123de6..0f2b994 100644
+index 7123de6f..0f2b994e 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -1,15 +1,20 @@
@@ -1901,7 +1900,7 @@ index 7123de6..0f2b994 100644
      reqLogger,
      toolNameMap,
 diff --git a/open-sse/utils/usageTracking.js b/open-sse/utils/usageTracking.js
-index 62a5cc7..09643fa 100644
+index 62a5cc76..09643fa5 100644
 --- a/open-sse/utils/usageTracking.js
 +++ b/open-sse/utils/usageTracking.js
 @@ -83,7 +83,7 @@ export function filterUsageForFormat(usage, targetFormat) {
@@ -1914,7 +1913,7 @@ index 62a5cc7..09643fa 100644
        'estimated'
      ],
 diff --git a/src/app/api/providers/[id]/models/route.js b/src/app/api/providers/[id]/models/route.js
-index 609402d..5b00b0e 100644
+index 609402dc..5b00b0e9 100644
 --- a/src/app/api/providers/[id]/models/route.js
 +++ b/src/app/api/providers/[id]/models/route.js
 @@ -9,6 +9,7 @@ import { resolveKiroModels } from "open-sse/services/kiroModels.js";
@@ -1938,10 +1937,10 @@ index 609402d..5b00b0e 100644
      url: "https://api.meta.ai/v1/models",
      method: "GET",
 diff --git a/src/app/api/providers/[id]/test/testUtils.js b/src/app/api/providers/[id]/test/testUtils.js
-index bbe356f..0f929f9 100644
+index 689364ae..8da7463b 100644
 --- a/src/app/api/providers/[id]/test/testUtils.js
 +++ b/src/app/api/providers/[id]/test/testUtils.js
-@@ -798,6 +798,7 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
+@@ -801,6 +801,7 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
        case "atria":
        case "agnes":
        case "bai":
@@ -1950,7 +1949,7 @@ index bbe356f..0f929f9 100644
        case "runcrate": {
          const cfg = PROVIDERS[connection.provider];
 diff --git a/src/app/api/providers/validate/route.js b/src/app/api/providers/validate/route.js
-index 5139883..807318d 100644
+index cc74ab26..d6ae2e42 100644
 --- a/src/app/api/providers/validate/route.js
 +++ b/src/app/api/providers/validate/route.js
 @@ -382,6 +382,7 @@ export async function POST(request) {
@@ -1962,7 +1961,7 @@ index 5139883..807318d 100644
          case "groq":
          case "xai":
 diff --git a/src/app/api/v1/models/[...model]/route.js b/src/app/api/v1/models/[...model]/route.js
-index 77df20f..8ffcecc 100644
+index 77df20f3..8ffcecc0 100644
 --- a/src/app/api/v1/models/[...model]/route.js
 +++ b/src/app/api/v1/models/[...model]/route.js
 @@ -17,12 +17,26 @@ export async function OPTIONS() {
@@ -1995,7 +1994,7 @@ index 77df20f..8ffcecc 100644
    return Response.json(data, {
      ...options,
 diff --git a/src/app/api/v1/models/route.js b/src/app/api/v1/models/route.js
-index 83ee968..4d9a694 100644
+index 83ee968e..4d9a694d 100644
 --- a/src/app/api/v1/models/route.js
 +++ b/src/app/api/v1/models/route.js
 @@ -17,6 +17,7 @@ import { resolveCopilotModels } from "open-sse/services/copilotModels.js";
@@ -2021,14 +2020,14 @@ index 83ee968..4d9a694 100644
        accessToken: conn.accessToken,
 diff --git a/src/app/api/v1alpha/models/[...path]/route.js b/src/app/api/v1alpha/models/[...path]/route.js
 new file mode 100644
-index 0000000..a4a2e71
+index 00000000..a4a2e714
 --- /dev/null
 +++ b/src/app/api/v1alpha/models/[...path]/route.js
 @@ -0,0 +1,2 @@
 +// Alpha generation uses the same native request, auth and streaming handler.
 +export { POST, OPTIONS } from "../../../v1beta/models/[...path]/route.js";
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index 19925a5..203cac0 100644
+index 19925a5c..203cac04 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -9,7 +9,10 @@ import { getSettings } from "@/lib/localDb";
@@ -2320,7 +2319,7 @@ index 19925a5..203cac0 100644
        credentials.connectionId,
        upstreamResponse.status,
 diff --git a/src/dashboardGuard.js b/src/dashboardGuard.js
-index 5b81775..2c65331 100644
+index 5b817750..2c65331a 100644
 --- a/src/dashboardGuard.js
 +++ b/src/dashboardGuard.js
 @@ -13,7 +13,7 @@ async function getCliToken() {
@@ -2353,7 +2352,7 @@ index 5b81775..2c65331 100644
  
  async function hasValidApiKey(request) {
 diff --git a/src/sse/services/keyAccess.js b/src/sse/services/keyAccess.js
-index 4450fdc..6de0e32 100644
+index 4450fdc7..6de0e321 100644
 --- a/src/sse/services/keyAccess.js
 +++ b/src/sse/services/keyAccess.js
 @@ -41,7 +41,7 @@ const canonicalModel = (provider, model) => lower(`${provider}/${model}`);
@@ -2376,7 +2375,7 @@ index 4450fdc..6de0e32 100644
      return null;
    }
 diff --git a/tests/translator/__snapshots__/golden-request.test.js.snap b/tests/translator/__snapshots__/golden-request.test.js.snap
-index 8bcab64..bf1d55d 100644
+index 8bcab641..bf1d55df 100644
 --- a/tests/translator/__snapshots__/golden-request.test.js.snap
 +++ b/tests/translator/__snapshots__/golden-request.test.js.snap
 @@ -167,9 +167,7 @@ exports[`GOLDEN request: OpenAI → Gemini > full body (system/image/tool/tool_r
@@ -2391,7 +2390,7 @@ index 8bcab64..bf1d55d 100644
            },
          },
 diff --git a/tests/translator/bugs-gemini-cursor-commandcode.test.js b/tests/translator/bugs-gemini-cursor-commandcode.test.js
-index 8bbc3ff..1bb6c78 100644
+index a4080e78..5e92bdf8 100644
 --- a/tests/translator/bugs-gemini-cursor-commandcode.test.js
 +++ b/tests/translator/bugs-gemini-cursor-commandcode.test.js
 @@ -9,9 +9,9 @@ const O2C = (body) => translateRequest(FORMATS.OPENAI, FORMATS.CURSOR, "m", body
@@ -2416,7 +2415,7 @@ index 8bbc3ff..1bb6c78 100644
  });
  
 diff --git a/tests/translator/golden-request.test.js b/tests/translator/golden-request.test.js
-index 21cf49f..5a12ae2 100644
+index 21cf49f7..5a12ae26 100644
 --- a/tests/translator/golden-request.test.js
 +++ b/tests/translator/golden-request.test.js
 @@ -93,6 +93,24 @@ describe("GOLDEN request: OpenAI → Gemini", () => {
@@ -2446,7 +2445,7 @@ index 21cf49f..5a12ae2 100644
  describe("GOLDEN request: OpenAI → Kiro", () => {
 diff --git a/tests/unit/aistudio-discovery.test.js b/tests/unit/aistudio-discovery.test.js
 new file mode 100644
-index 0000000..79e8726
+index 00000000..79e87264
 --- /dev/null
 +++ b/tests/unit/aistudio-discovery.test.js
 @@ -0,0 +1,239 @@
@@ -2691,7 +2690,7 @@ index 0000000..79e8726
 +});
 diff --git a/tests/unit/aistudio-native-response-format.test.js b/tests/unit/aistudio-native-response-format.test.js
 new file mode 100644
-index 0000000..3b54234
+index 00000000..3b542347
 --- /dev/null
 +++ b/tests/unit/aistudio-native-response-format.test.js
 @@ -0,0 +1,191 @@
@@ -2888,7 +2887,7 @@ index 0000000..3b54234
 +});
 diff --git a/tests/unit/aistudio-provider.test.js b/tests/unit/aistudio-provider.test.js
 new file mode 100644
-index 0000000..a443db6
+index 00000000..a443db61
 --- /dev/null
 +++ b/tests/unit/aistudio-provider.test.js
 @@ -0,0 +1,78 @@
@@ -2972,7 +2971,7 @@ index 0000000..a443db6
 +});
 diff --git a/tests/unit/antigravity-native-sdk-heartbeat.test.js b/tests/unit/antigravity-native-sdk-heartbeat.test.js
 new file mode 100644
-index 0000000..e3acccd
+index 00000000..e3acccd7
 --- /dev/null
 +++ b/tests/unit/antigravity-native-sdk-heartbeat.test.js
 @@ -0,0 +1,38 @@
@@ -3016,7 +3015,7 @@ index 0000000..e3acccd
 +});
 diff --git a/tests/unit/downstream-translator-history-regressions.test.js b/tests/unit/downstream-translator-history-regressions.test.js
 new file mode 100644
-index 0000000..6c895f3
+index 00000000..6c895f3d
 --- /dev/null
 +++ b/tests/unit/downstream-translator-history-regressions.test.js
 @@ -0,0 +1,153 @@
@@ -3174,7 +3173,7 @@ index 0000000..6c895f3
 +  });
 +});
 diff --git a/tests/unit/gemini-contents-normalization.test.js b/tests/unit/gemini-contents-normalization.test.js
-index 6b8a94c..e446e52 100644
+index 6b8a94c8..e446e522 100644
 --- a/tests/unit/gemini-contents-normalization.test.js
 +++ b/tests/unit/gemini-contents-normalization.test.js
 @@ -190,7 +190,7 @@ describe("functionResponse `$ref` sanitization", () => {
@@ -3189,7 +3188,7 @@ index 6b8a94c..e446e52 100644
 -
 diff --git a/tests/unit/gemini-native-alpha-contract.test.js b/tests/unit/gemini-native-alpha-contract.test.js
 new file mode 100644
-index 0000000..5904adc
+index 00000000..5904adc6
 --- /dev/null
 +++ b/tests/unit/gemini-native-alpha-contract.test.js
 @@ -0,0 +1,221 @@
@@ -3416,13 +3415,14 @@ index 0000000..5904adc
 +});
 diff --git a/tests/unit/gemini-native-proxy-abort.test.js b/tests/unit/gemini-native-proxy-abort.test.js
 new file mode 100644
-index 0000000..ca4ae99
+index 00000000..580d7b0a
 --- /dev/null
 +++ b/tests/unit/gemini-native-proxy-abort.test.js
-@@ -0,0 +1,80 @@
-+// The actual proxy layer captures originalFetch at import time. Stub that
-+// boundary first; unlike core dispatch tests this exercises its catch/fallback
-+// logic and BaseExecutor retries without allowing any network traffic.
+@@ -0,0 +1,88 @@
++// The proxy layer fetches through the undici package instance (rawFetch),
++// not globalThis.fetch. Stub that boundary first; unlike core dispatch tests
++// this exercises its catch/fallback logic and BaseExecutor retries without
++// allowing any network traffic.
 +import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 +
 +let fetchBoundary;
@@ -3432,12 +3432,16 @@ index 0000000..ca4ae99
 +beforeEach(async () => {
 +  vi.resetModules();
 +  fetchBoundary = vi.fn();
-+  vi.stubGlobal("fetch", fetchBoundary);
++  vi.doMock("undici", async () => {
++    const actual = await vi.importActual("undici");
++    return { ...actual, fetch: fetchBoundary };
++  });
 +  ({ proxyAwareFetch } = await import("../../open-sse/utils/proxyFetch.js"));
 +  ({ DefaultExecutor } = await import("../../open-sse/executors/default.js"));
 +});
 +afterEach(() => {
 +  vi.restoreAllMocks();
++  vi.doUnmock("undici");
 +  vi.unstubAllGlobals();
 +});
 +
@@ -3470,7 +3474,10 @@ index 0000000..ca4ae99
 +    expect(await response.text()).toBe("offline fallback result");
 +    expect(fetchBoundary).toHaveBeenCalledTimes(2);
 +    expect(fetchBoundary.mock.calls[0][1].dispatcher).toBeDefined();
-+    expect(fetchBoundary.mock.calls[1][1].dispatcher).toBeUndefined();
++    // The direct path now also goes through a shared capped Agent, so the
++    // fallback dispatcher is defined too — but it must not be the proxy one.
++    expect(fetchBoundary.mock.calls[1][1].dispatcher).toBeDefined();
++    expect(fetchBoundary.mock.calls[1][1].dispatcher).not.toBe(fetchBoundary.mock.calls[0][1].dispatcher);
 +  });
 +
 +  it.each(["gemini", "aistudio"])("%s: non-DOMException abort reason does not trigger executor retries and clears the connect timer", async provider => {
@@ -3502,7 +3509,7 @@ index 0000000..ca4ae99
 +});
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
 new file mode 100644
-index 0000000..35a17d9
+index 00000000..35a17d9e
 --- /dev/null
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -0,0 +1,1005 @@
@@ -4513,7 +4520,7 @@ index 0000000..35a17d9
 +});
 diff --git a/tests/unit/gemini-nonstream-source-format.test.js b/tests/unit/gemini-nonstream-source-format.test.js
 new file mode 100644
-index 0000000..225c30b
+index 00000000..225c30b1
 --- /dev/null
 +++ b/tests/unit/gemini-nonstream-source-format.test.js
 @@ -0,0 +1,65 @@
@@ -4584,7 +4591,7 @@ index 0000000..225c30b
 +});
 diff --git a/tests/unit/gemini-server-parts-isolation.test.js b/tests/unit/gemini-server-parts-isolation.test.js
 new file mode 100644
-index 0000000..e2949f2
+index 00000000..e2949f2e
 --- /dev/null
 +++ b/tests/unit/gemini-server-parts-isolation.test.js
 @@ -0,0 +1,130 @@
@@ -4720,7 +4727,7 @@ index 0000000..e2949f2
 +});
 diff --git a/tests/unit/gemini-tool-call-id-fifo.test.js b/tests/unit/gemini-tool-call-id-fifo.test.js
 new file mode 100644
-index 0000000..c1930f9
+index 00000000..c1930f9f
 --- /dev/null
 +++ b/tests/unit/gemini-tool-call-id-fifo.test.js
 @@ -0,0 +1,118 @@
@@ -4844,7 +4851,7 @@ index 0000000..c1930f9
 +});
 diff --git a/tests/unit/gemini-turn-signature.test.js b/tests/unit/gemini-turn-signature.test.js
 new file mode 100644
-index 0000000..5053c4a
+index 00000000..5053c4a8
 --- /dev/null
 +++ b/tests/unit/gemini-turn-signature.test.js
 @@ -0,0 +1,195 @@
@@ -5045,7 +5052,7 @@ index 0000000..5053c4a
 +});
 diff --git a/tests/unit/native-public-gemini-rewrite.test.js b/tests/unit/native-public-gemini-rewrite.test.js
 new file mode 100644
-index 0000000..faa3a3d
+index 00000000..faa3a3d9
 --- /dev/null
 +++ b/tests/unit/native-public-gemini-rewrite.test.js
 @@ -0,0 +1,133 @@
@@ -5184,7 +5191,7 @@ index 0000000..faa3a3d
 +});
 diff --git a/tests/unit/translated-chat-stream-done.test.js b/tests/unit/translated-chat-stream-done.test.js
 new file mode 100644
-index 0000000..63b7453
+index 00000000..63b74532
 --- /dev/null
 +++ b/tests/unit/translated-chat-stream-done.test.js
 @@ -0,0 +1,57 @@
@@ -5246,7 +5253,7 @@ index 0000000..63b7453
 +  });
 +});
 diff --git a/tests/unit/zed-completions-wire.test.js b/tests/unit/zed-completions-wire.test.js
-index 5be982a..88e4787 100644
+index 5be982ae..88e47879 100644
 --- a/tests/unit/zed-completions-wire.test.js
 +++ b/tests/unit/zed-completions-wire.test.js
 @@ -5,6 +5,13 @@

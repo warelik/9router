@@ -1,8 +1,7 @@
-From ad3dc8d2c230c4804ac56c1e7c685d1a2848696f Mon Sep 17 00:00:00 2001
+From 95dc5a2c6f02dad4c7152447eda9efcdbbd5db7c Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:46 +0000
 Subject: [PATCH] Muse provider: cloaking, reasoning recovery and pricing
-
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -34,7 +33,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/target-format-transport.test.js
 
 diff --git a/open-sse/executors/index.js b/open-sse/executors/index.js
-index 9ed15fe..cf7ca34 100644
+index 9ed15fee..cf7ca340 100644
 --- a/open-sse/executors/index.js
 +++ b/open-sse/executors/index.js
 @@ -19,6 +19,7 @@ import { PerplexityWebExecutor } from "./perplexity-web.js";
@@ -63,7 +62,7 @@ index 9ed15fe..cf7ca34 100644
  export { OllamaLocalExecutor } from "./ollama-local.js";
 diff --git a/open-sse/executors/muse.js b/open-sse/executors/muse.js
 new file mode 100644
-index 0000000..1363d1d
+index 00000000..1363d1df
 --- /dev/null
 +++ b/open-sse/executors/muse.js
 @@ -0,0 +1,266 @@
@@ -334,7 +333,7 @@ index 0000000..1363d1d
 +
 +export default MuseExecutor;
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index 68a1350..a8f1d5a 100644
+index c05dd4ba..a95232a3 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
 @@ -1,7 +1,9 @@
@@ -605,7 +604,7 @@ index 68a1350..a8f1d5a 100644
      return result;
    }
 diff --git a/open-sse/providers/capabilities.js b/open-sse/providers/capabilities.js
-index af27afe..f65f5f3 100644
+index af27afee..f65f5f32 100644
 --- a/open-sse/providers/capabilities.js
 +++ b/open-sse/providers/capabilities.js
 @@ -53,6 +53,7 @@ export const DEFAULT_CAPABILITIES = {
@@ -644,7 +643,7 @@ index af27afe..f65f5f3 100644
    // ── Others ───────────────────────────────────────────────────────
    { pattern: "*hunyuan*",       caps: { reasoning: true, thinkingFormat: "hunyuan", contextWindow: 262144, maxOutput: 262144 } },
 diff --git a/open-sse/providers/pricing.js b/open-sse/providers/pricing.js
-index d1e4fc0..20df077 100644
+index d1e4fc04..20df077f 100644
 --- a/open-sse/providers/pricing.js
 +++ b/open-sse/providers/pricing.js
 @@ -178,6 +178,11 @@ export const MODEL_PRICING = {
@@ -660,7 +659,7 @@ index d1e4fc0..20df077 100644
    // === OpenRouter fallback ===
    "auto":                         { input: 2.00,  output: 8.00,  cached: 1.00,  reasoning: 12.00,  cache_creation: 2.00  },
 diff --git a/open-sse/providers/registry/muse.js b/open-sse/providers/registry/muse.js
-index a5f2728..08c9173 100644
+index a5f2728f..08c91738 100644
 --- a/open-sse/providers/registry/muse.js
 +++ b/open-sse/providers/registry/muse.js
 @@ -36,9 +36,9 @@ export default {
@@ -686,7 +685,7 @@ index a5f2728..08c9173 100644
      { id: "muse-spark-1.2", name: "Muse Spark 1.2", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
      { id: "muse-spark-1.1", name: "Muse Spark 1.1", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
 diff --git a/open-sse/providers/thinkingLevels.js b/open-sse/providers/thinkingLevels.js
-index 30ff693..b9f1f80 100644
+index 30ff6935..b9f1f80f 100644
 --- a/open-sse/providers/thinkingLevels.js
 +++ b/open-sse/providers/thinkingLevels.js
 @@ -41,6 +41,9 @@ const CLAUDE_NO_XHIGH = ["none", "low", "medium", "high", "max"];
@@ -700,7 +699,7 @@ index 30ff693..b9f1f80 100644
    { pattern: "*gemini-4*", levels: ["low", "medium", "high"] },
    { pattern: "*claude*4.6*", levels: CLAUDE_NO_XHIGH },
 diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
-index 9afde2f..b6ee45b 100644
+index 02ff9093..768e305d 100644
 --- a/open-sse/translator/index.js
 +++ b/open-sse/translator/index.js
 @@ -1,15 +1,19 @@
@@ -774,17 +773,17 @@ index 9afde2f..b6ee45b 100644
 +
 +  let sourceToolNameMap = null;
  
-   // If same format, skip translation steps
-   if (sourceFormat !== targetFormat) {
-@@ -106,6 +123,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+   const translationOptions = {
+     preserveCacheControl: targetFormat === FORMATS.OPENAI && !!PROVIDERS[provider]?.quirks?.preserveCacheControl,
+@@ -110,6 +127,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
      const directFn = requestRegistry.get(`${sourceFormat}:${targetFormat}`);
      if (directFn) {
-       result = directFn(model, result, stream, credentials);
+       result = directFn(model, result, stream, credentials, translationOptions);
 +      if (result._toolNameMap instanceof Map) sourceToolNameMap = result._toolNameMap;
      } else {
        // Step 1: source -> openai (if source is not openai)
        if (sourceFormat !== FORMATS.OPENAI) {
-@@ -116,6 +134,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+@@ -120,6 +138,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
            reqLogger?.logOpenAIRequest?.(result);
          }
        }
@@ -792,7 +791,7 @@ index 9afde2f..b6ee45b 100644
  
        // Step 2: openai -> target (if target is not openai)
        if (targetFormat !== FORMATS.OPENAI) {
-@@ -135,7 +154,47 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+@@ -139,7 +158,47 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
      targetFormat === FORMATS.KIRO &&
      (sourceFormat === FORMATS.OPENAI || sourceFormat === FORMATS.CLAUDE);
    if (!kiroThinkingMappedByTranslator) {
@@ -841,7 +840,7 @@ index 9afde2f..b6ee45b 100644
    }
  
    // Always normalize to clean OpenAI format when target is OpenAI
-@@ -161,11 +220,37 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+@@ -163,11 +222,37 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
        const { body: cloakedBody, toolNameMap } = cloakClaudeTools(result);
        result = cloakedBody;
        if (toolNameMap?.size > 0) {
@@ -880,7 +879,7 @@ index 9afde2f..b6ee45b 100644
    // Antigravity cloaking disabled
    // if (provider === FORMATS.ANTIGRAVITY && body.userAgent !== FORMATS.ANTIGRAVITY) {
    //   const { cloakedBody, toolNameMap } = AntigravityExecutor.cloakTools(result);
-@@ -181,10 +266,10 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+@@ -183,10 +268,10 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
  // Translate response chunk: target -> openai -> source
  export function translateResponse(targetFormat, sourceFormat, chunk, state) {
    ensureInitialized();
@@ -897,7 +896,7 @@ index 9afde2f..b6ee45b 100644
      // client as-is. A fragment that opens a new tool-call index without an id
 diff --git a/open-sse/utils/museCloaking.js b/open-sse/utils/museCloaking.js
 new file mode 100644
-index 0000000..28b277c
+index 00000000..28b277c8
 --- /dev/null
 +++ b/open-sse/utils/museCloaking.js
 @@ -0,0 +1,77 @@
@@ -980,7 +979,7 @@ index 0000000..28b277c
 +}
 diff --git a/tests/unit/muse-cloaking.test.js b/tests/unit/muse-cloaking.test.js
 new file mode 100644
-index 0000000..cc1e807
+index 00000000..cc1e807e
 --- /dev/null
 +++ b/tests/unit/muse-cloaking.test.js
 @@ -0,0 +1,271 @@
@@ -1257,7 +1256,7 @@ index 0000000..cc1e807
 +});
 diff --git a/tests/unit/muse-foreign-reasoning-retry.test.js b/tests/unit/muse-foreign-reasoning-retry.test.js
 new file mode 100644
-index 0000000..ab37f41
+index 00000000..ab37f410
 --- /dev/null
 +++ b/tests/unit/muse-foreign-reasoning-retry.test.js
 @@ -0,0 +1,262 @@
@@ -1524,7 +1523,7 @@ index 0000000..ab37f41
 +  });
 +});
 diff --git a/tests/unit/muse-responses-wire.test.js b/tests/unit/muse-responses-wire.test.js
-index 46b828d..bdeef99 100644
+index 46b828d1..bdeef99d 100644
 --- a/tests/unit/muse-responses-wire.test.js
 +++ b/tests/unit/muse-responses-wire.test.js
 @@ -18,6 +18,8 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelUpstreamId, PRO
@@ -1580,7 +1579,7 @@ index 46b828d..bdeef99 100644
      const body = { input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }] };
 diff --git a/tests/unit/provider-pricing-muse-wonder.test.js b/tests/unit/provider-pricing-muse-wonder.test.js
 new file mode 100644
-index 0000000..69c37cb
+index 00000000..69c37cbf
 --- /dev/null
 +++ b/tests/unit/provider-pricing-muse-wonder.test.js
 @@ -0,0 +1,29 @@
@@ -1615,7 +1614,7 @@ index 0000000..69c37cb
 +});
 diff --git a/tests/unit/target-format-transport.test.js b/tests/unit/target-format-transport.test.js
 new file mode 100644
-index 0000000..5dacdb8
+index 00000000..5dacdb8b
 --- /dev/null
 +++ b/tests/unit/target-format-transport.test.js
 @@ -0,0 +1,317 @@
