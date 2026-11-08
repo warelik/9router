@@ -6,6 +6,7 @@ const FOREIGN_REASONING_ERROR = "reasoning `encrypted_content` was not issued to
 const EXPIRED_REASONING_REFERENCE = /Referenced reasoning item '([^']+)' was not found or has expired/;
 const MAX_TRACKED_CALLERS = 64;
 const MAX_TRACKED_HASHES_PER_CALLER = 10000;
+const MAX_RECOVERY_ATTEMPTS = 4;
 
 function hashValue(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -36,8 +37,7 @@ function hasContent(item) {
  *
  * When incompatibleHashes is provided, only payloads already known to be
  * rejected for this caller are removed. Without it, every encrypted payload
- * is removed for the one recovery attempt after Meta has identified a
- * mismatch.
+ * is removed for a recovery attempt after Meta has identified a mismatch.
  */
 export function sanitizeMuseForeignReasoning(body, incompatibleHashes = null) {
   if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.input)) {
@@ -124,6 +124,32 @@ export function dropMuseReasoningReferences(body, referencedIds) {
   };
 }
 
+/**
+ * Last-resort recovery: drop prior reasoning items entirely instead of
+ * replaying them summary-only. Caller-bound encrypted payloads on other
+ * item types are stripped as in sanitizeMuseForeignReasoning. The rest of
+ * the history (messages, function calls and outputs) is preserved, so a
+ * tool-calling loop can continue without its encrypted continuity state.
+ */
+export function dropMuseReasoningItems(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.input)) {
+    return { body, removedItems: 0, removedHashes: [] };
+  }
+
+  const sanitized = sanitizeMuseForeignReasoning(body);
+  const input = sanitized.body.input.filter((item) => item?.type !== "reasoning");
+  const removedItems = sanitized.body.input.length - input.length;
+  if (!removedItems && !sanitized.removedHashes.length) {
+    return { body, removedItems: 0, removedHashes: [] };
+  }
+
+  return {
+    body: { ...sanitized.body, input },
+    removedItems,
+    removedHashes: sanitized.removedHashes,
+  };
+}
+
 export class MuseExecutor extends DefaultExecutor {
   constructor() {
     super("muse");
@@ -196,69 +222,100 @@ export class MuseExecutor extends DefaultExecutor {
     const scope = this._callerScope(args);
     const knownForeignHashes = this._knownForeignHashes(scope);
     const knownExpiredReferences = this._knownExpiredReferences(scope);
-    let preparedBody = knownForeignHashes
+    let body = knownForeignHashes
       ? sanitizeMuseForeignReasoning(args.body, knownForeignHashes).body
       : args.body;
     if (knownExpiredReferences) {
-      preparedBody = dropMuseReasoningReferences(preparedBody, knownExpiredReferences).body;
-    }
-    const first = await this._executeRecovering({ ...args, body: preparedBody }, scope, false);
-    return first;
-  }
-
-  async _executeRecovering(args, scope, retried) {
-    const first = await super.execute(args);
-
-    if (retried || first.response?.status !== 400 || typeof first.response.clone !== "function") {
-      return first;
+      body = dropMuseReasoningReferences(body, knownExpiredReferences).body;
     }
 
-    let errorText = "";
-    try {
-      errorText = await first.response.clone().text();
-    } catch {
-      return first;
-    }
+    // Recovery is a bounded ladder, not a single retry: strip the encrypted
+    // payloads (keeping summaries), then drop the prior reasoning items
+    // entirely, dropping server-side references whenever Meta names one.
+    // Each rung runs only after Meta rejected the previous form, and only
+    // while it changes the body. The outcome of a recovery attempt is never
+    // masked by the original rejection: a newer upstream error is the one
+    // returned, and a transport failure propagates so account fallback can
+    // try another caller (possibly the one that issued the blobs) instead
+    // of the request being filed as an unrecoverable request-scoped 400.
+    let strippedEncrypted = false;
+    let droppedReasoning = false;
+    for (let recoveries = 0; ; recoveries++) {
+      const result = await super.execute({ ...args, body });
 
-    const expiredMatch = errorText.match(EXPIRED_REASONING_REFERENCE);
-    if (expiredMatch) {
-      const dropped = dropMuseReasoningReferences(args.body, new Set([expiredMatch[1]]));
-      if (!dropped.removedIds.length) return first;
-
-      this._rememberExpiredReferences(scope, dropped.removedIds);
-      args.log?.warn?.(
-        "RETRY",
-        `MUSE | expired reasoning reference rejected; retrying without ${dropped.removedIds.length} referenced item(s)`,
-      );
-
-      try {
-        const retry = await this._executeRecovering({ ...args, body: dropped.body }, scope, true);
-        return retry.response?.ok || (retry.response && retry.response.status !== 400)
-          ? retry
-          : first;
-      } catch {
-        return first;
+      if (result.response?.status !== 400 || typeof result.response.clone !== "function"
+        || recoveries >= MAX_RECOVERY_ATTEMPTS) {
+        return result;
       }
-    }
 
-    if (!errorText.includes(FOREIGN_REASONING_ERROR)) return first;
+      let errorText = "";
+      try {
+        errorText = await result.response.clone().text();
+      } catch {
+        return result;
+      }
 
-    const sanitized = sanitizeMuseForeignReasoning(args.body);
-    if (!sanitized.removedHashes.length) return first;
+      const expiredMatch = errorText.match(EXPIRED_REASONING_REFERENCE);
+      if (expiredMatch) {
+        const dropped = dropMuseReasoningReferences(body, new Set([expiredMatch[1]]));
+        if (dropped.removedIds.length) {
+          this._rememberExpiredReferences(scope, dropped.removedIds);
+          args.log?.warn?.(
+            "RETRY",
+            `MUSE | expired reasoning reference rejected; retrying without ${dropped.removedIds.length} referenced item(s)`,
+          );
+          body = dropped.body;
+          continue;
+        }
+        // The named reference is not a top-level reasoning id in this body;
+        // fall through to dropping the reasoning items outright.
+        if (!droppedReasoning) {
+          const droppedAll = dropMuseReasoningItems(body);
+          droppedReasoning = true;
+          if (droppedAll.removedItems || droppedAll.removedHashes.length) {
+            this._rememberForeignHashes(scope, droppedAll.removedHashes);
+            args.log?.warn?.(
+              "RETRY",
+              `MUSE | expired reasoning reference has no droppable id; retrying without ${droppedAll.removedItems} reasoning item(s)`,
+            );
+            body = droppedAll.body;
+            continue;
+          }
+        }
+        return result;
+      }
 
-    this._rememberForeignHashes(scope, sanitized.removedHashes);
-    args.log?.warn?.(
-      "RETRY",
-      `MUSE | foreign reasoning state rejected; retrying without ${sanitized.removedHashes.length} encrypted item(s)`,
-    );
+      if (!errorText.includes(FOREIGN_REASONING_ERROR)) return result;
 
-    try {
-      const retry = await this._executeRecovering({ ...args, body: sanitized.body }, scope, true);
-      return retry.response?.ok || (retry.response && retry.response.status !== 400)
-        ? retry
-        : first;
-    } catch {
-      return first;
+      if (!strippedEncrypted) {
+        const sanitized = sanitizeMuseForeignReasoning(body);
+        strippedEncrypted = true;
+        if (sanitized.removedHashes.length) {
+          this._rememberForeignHashes(scope, sanitized.removedHashes);
+          args.log?.warn?.(
+            "RETRY",
+            `MUSE | foreign reasoning state rejected; retrying without ${sanitized.removedHashes.length} encrypted item(s)`,
+          );
+          body = sanitized.body;
+          continue;
+        }
+      }
+
+      if (!droppedReasoning) {
+        const droppedAll = dropMuseReasoningItems(body);
+        droppedReasoning = true;
+        if (droppedAll.removedItems || droppedAll.removedHashes.length) {
+          this._rememberForeignHashes(scope, droppedAll.removedHashes);
+          args.log?.warn?.(
+            "RETRY",
+            `MUSE | foreign reasoning state still rejected; retrying without ${droppedAll.removedItems} reasoning item(s)`,
+          );
+          body = droppedAll.body;
+          continue;
+        }
+      }
+
+      return result;
     }
   }
 }
