@@ -1,8 +1,7 @@
-From 9e91edac9c98c3948ad7f3aa360b327cfda942ed Mon Sep 17 00:00:00 2001
+From 5dd9d8453de02e949ffb04634c605025208f2a31 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:20 +0000
 Subject: [PATCH] Build inputs, packaging and regression harness fixtures
-
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -30,7 +29,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/gemini-native-api-version.test.js
 
 diff --git a/.github/workflows/docker-publish.yml b/.github/workflows/docker-publish.yml
-index 64be9c1..7387d50 100644
+index 64be9c1c..7387d501 100644
 --- a/.github/workflows/docker-publish.yml
 +++ b/.github/workflows/docker-publish.yml
 @@ -152,15 +152,6 @@ jobs:
@@ -58,7 +57,7 @@ index 64be9c1..7387d50 100644
            outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
            build-args: |
 diff --git a/Dockerfile b/Dockerfile
-index 2464132..8601ae0 100644
+index 24641323..8601ae0a 100644
 --- a/Dockerfile
 +++ b/Dockerfile
 @@ -1,5 +1,5 @@
@@ -82,19 +81,19 @@ index 2464132..8601ae0 100644
        --fetch-retry-factor=2 \
 diff --git a/npm-shrinkwrap.json b/npm-shrinkwrap.json
 new file mode 100644
-index 0000000..92aff8a
+index 00000000..2aff3904
 --- /dev/null
 +++ b/npm-shrinkwrap.json
 @@ -0,0 +1,9652 @@
 +{
 +  "name": "9router-app",
-+  "version": "0.5.111",
++  "version": "0.5.116",
 +  "lockfileVersion": 3,
 +  "requires": true,
 +  "packages": {
 +    "": {
 +      "name": "9router-app",
-+      "version": "0.5.111",
++      "version": "0.5.116",
 +      "dependencies": {
 +        "@dnd-kit/core": "^6.3.1",
 +        "@dnd-kit/modifiers": "^9.0.0",
@@ -123,7 +122,7 @@ index 0000000..92aff8a
 +        "recharts": "^3.7.0",
 +        "socks-proxy-agent": "^8.0.5",
 +        "sql.js": "^1.14.1",
-+        "undici": "^7.30.1",
++        "undici": "^8.12.3",
 +        "uuid": "^13.0.0",
 +        "zustand": "^5.0.10"
 +      },
@@ -9244,12 +9243,12 @@ index 0000000..92aff8a
 +      }
 +    },
 +    "node_modules/undici": {
-+      "version": "7.30.1",
-+      "resolved": "https://registry.npmjs.org/undici/-/undici-7.30.1.tgz",
-+      "integrity": "sha512-03KrMbjIFDWQR5RNPrSw3bd1r12JpyFQl9/yxjUbJtqkjmllqC5lFjZh6ujeuJCKr8EOQvRW872Oy/az+nLYxg==",
++      "version": "8.12.4",
++      "resolved": "https://registry.npmjs.org/undici/-/undici-8.12.4.tgz",
++      "integrity": "sha512-8Mx+uNKKER2bA4AdtedkqRbwUCIJFr2nJckXRe5yrDqzePqwLP7VNcctN8/XdmDSbF7mS+jJKIszlL+vbam1VA==",
 +      "license": "MIT",
 +      "engines": {
-+        "node": ">=20.18.1"
++        "node": ">=22.19.0"
 +      }
 +    },
 +    "node_modules/undici-types": {
@@ -9740,7 +9739,7 @@ index 0000000..92aff8a
 +}
 diff --git a/tests/helpers/isolatedDataDir.js b/tests/helpers/isolatedDataDir.js
 new file mode 100644
-index 0000000..1a2eea4
+index 00000000..1a2eea40
 --- /dev/null
 +++ b/tests/helpers/isolatedDataDir.js
 @@ -0,0 +1,20 @@
@@ -9765,7 +9764,7 @@ index 0000000..1a2eea4
 +  };
 +}
 diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
-index d88e67f..f9b3a1f 100644
+index d88e67f1..f9b3a1fb 100644
 --- a/tests/translator/golden-url-header.test.js
 +++ b/tests/translator/golden-url-header.test.js
 @@ -21,10 +21,16 @@ const SPECIALIZED = new Set([
@@ -9805,7 +9804,7 @@ index d88e67f..f9b3a1f 100644
    }
 diff --git a/tests/unit/docker-publish-source-recipe.test.js b/tests/unit/docker-publish-source-recipe.test.js
 new file mode 100644
-index 0000000..bae2f87
+index 00000000..bae2f872
 --- /dev/null
 +++ b/tests/unit/docker-publish-source-recipe.test.js
 @@ -0,0 +1,53 @@
@@ -9864,7 +9863,7 @@ index 0000000..bae2f87
 +});
 diff --git a/tests/unit/gemini-native-api-version.test.js b/tests/unit/gemini-native-api-version.test.js
 new file mode 100644
-index 0000000..31c06c4
+index 00000000..31c06c46
 --- /dev/null
 +++ b/tests/unit/gemini-native-api-version.test.js
 @@ -0,0 +1,203 @@
@@ -10072,7 +10071,7 @@ index 0000000..31c06c4
 +
 +});
 diff --git a/tests/unit/gemini-native-endpoint.test.js b/tests/unit/gemini-native-endpoint.test.js
-index 83a8716..9a48710 100644
+index 83a8716c..9a487101 100644
 --- a/tests/unit/gemini-native-endpoint.test.js
 +++ b/tests/unit/gemini-native-endpoint.test.js
 @@ -1,4 +1,5 @@
