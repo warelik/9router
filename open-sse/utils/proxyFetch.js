@@ -31,10 +31,48 @@ export function isStaleSocketError(error) {
 // dispatchers created by a different undici copy (UND_ERR_INVALID_ARG on the
 // bundled-in-Node global fetch), so originalFetch/globalThis.fetch is not an
 // option once we build our own Agents.
-let undiciFetch = null;
+let undiciModule = null;
+
+async function loadUndici() {
+  return (undiciModule ??= await import("undici"));
+}
+
+// A FormData created by Node/Next's bundled Undici realm is not recognized as
+// multipart by the package Undici fetch below: it derives a non-multipart
+// Content-Type from the first part instead (Cloudflare rejects the Worker
+// upload with "Content-Type must be one of: ..., multipart/form-data").
+// Rebuild foreign FormData bodies with the same implementation as the fetch
+// that will send them, preserving entry order, filenames, and Blob objects.
+function normalizeFormDataBody(options, UndiciFormData) {
+  if (!options || typeof options !== "object" || typeof UndiciFormData !== "function") {
+    return options;
+  }
+  const body = options.body;
+  const GlobalFormData = globalThis.FormData;
+  if (
+    !body ||
+    typeof GlobalFormData !== "function" ||
+    GlobalFormData === UndiciFormData ||
+    !(body instanceof GlobalFormData) ||
+    body instanceof UndiciFormData
+  ) {
+    return options;
+  }
+
+  const normalized = new UndiciFormData();
+  for (const [name, value] of body.entries()) {
+    if (value && typeof value === "object" && typeof value.name === "string") {
+      normalized.append(name, value, value.name);
+    } else {
+      normalized.append(name, value);
+    }
+  }
+  return { ...options, body: normalized };
+}
+
 async function rawFetch(url, options) {
-  undiciFetch ??= (await import("undici")).fetch;
-  return undiciFetch(url, options);
+  const undici = await loadUndici();
+  return undici.fetch(url, normalizeFormDataBody(options, undici.FormData));
 }
 
 // ─── TLS fingerprinting via got-scraping (browser-like JA3) ───────────────
