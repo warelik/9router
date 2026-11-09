@@ -1,0 +1,179 @@
+From dd44fbd1a087443101ca4339504f9ab1172f9399 Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Mon, 9 Nov 2026 10:10:45 +0000
+Subject: [PATCH] Fix multipart uploads through the bundled Undici proxy fetch
+
+The Cloudflare Worker admin deploy creates a global FormData in Node's bundled Undici realm, while proxyFetch deliberately sends requests through the package Undici instance. Package Undici does not recognize the foreign FormData as multipart and derives the first part's application/javascript+module type as the request Content-Type, so Cloudflare returns HTTP 415.
+
+Rebuild only foreign-realm FormData bodies with package Undici's FormData immediately before rawFetch, preserving entry order, filenames, and Blob values. Bodies already owned by package Undici remain untouched. This also restores multipart requests sent through the globally patched fetch.
+---
+ open-sse/utils/proxyFetch.js                  |  44 +++++++-
+ .../unit/proxy-fetch-formdata-compat.test.js  | 100 ++++++++++++++++++
+ 2 files changed, 141 insertions(+), 3 deletions(-)
+ create mode 100644 tests/unit/proxy-fetch-formdata-compat.test.js
+
+diff --git a/open-sse/utils/proxyFetch.js b/open-sse/utils/proxyFetch.js
+index a2a00ca7..a85144ff 100644
+--- a/open-sse/utils/proxyFetch.js
++++ b/open-sse/utils/proxyFetch.js
+@@ -31,10 +31,48 @@ export function isStaleSocketError(error) {
+ // dispatchers created by a different undici copy (UND_ERR_INVALID_ARG on the
+ // bundled-in-Node global fetch), so originalFetch/globalThis.fetch is not an
+ // option once we build our own Agents.
+-let undiciFetch = null;
++let undiciModule = null;
++
++async function loadUndici() {
++  return (undiciModule ??= await import("undici"));
++}
++
++// A FormData created by Node/Next's bundled Undici realm is not recognized as
++// multipart by the package Undici fetch below: it derives a non-multipart
++// Content-Type from the first part instead (Cloudflare rejects the Worker
++// upload with "Content-Type must be one of: ..., multipart/form-data").
++// Rebuild foreign FormData bodies with the same implementation as the fetch
++// that will send them, preserving entry order, filenames, and Blob objects.
++function normalizeFormDataBody(options, UndiciFormData) {
++  if (!options || typeof options !== "object" || typeof UndiciFormData !== "function") {
++    return options;
++  }
++  const body = options.body;
++  const GlobalFormData = globalThis.FormData;
++  if (
++    !body ||
++    typeof GlobalFormData !== "function" ||
++    GlobalFormData === UndiciFormData ||
++    !(body instanceof GlobalFormData) ||
++    body instanceof UndiciFormData
++  ) {
++    return options;
++  }
++
++  const normalized = new UndiciFormData();
++  for (const [name, value] of body.entries()) {
++    if (value && typeof value === "object" && typeof value.name === "string") {
++      normalized.append(name, value, value.name);
++    } else {
++      normalized.append(name, value);
++    }
++  }
++  return { ...options, body: normalized };
++}
++
+ async function rawFetch(url, options) {
+-  undiciFetch ??= (await import("undici")).fetch;
+-  return undiciFetch(url, options);
++  const undici = await loadUndici();
++  return undici.fetch(url, normalizeFormDataBody(options, undici.FormData));
+ }
+ 
+ // ─── TLS fingerprinting via got-scraping (browser-like JA3) ───────────────
+diff --git a/tests/unit/proxy-fetch-formdata-compat.test.js b/tests/unit/proxy-fetch-formdata-compat.test.js
+new file mode 100644
+index 00000000..3ca1768a
+--- /dev/null
++++ b/tests/unit/proxy-fetch-formdata-compat.test.js
+@@ -0,0 +1,100 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++describe("proxyFetch FormData compatibility", () => {
++  const savedEnv = { ...process.env };
++  const savedFetch = globalThis.fetch;
++
++  beforeEach(() => {
++    vi.resetModules();
++    process.env = { ...savedEnv };
++    delete process.env.HTTPS_PROXY;
++    delete process.env.https_proxy;
++    delete process.env.HTTP_PROXY;
++    delete process.env.http_proxy;
++    delete process.env.ALL_PROXY;
++    delete process.env.all_proxy;
++  });
++
++  afterEach(() => {
++    process.env = { ...savedEnv };
++    globalThis.fetch = savedFetch;
++    vi.doUnmock("undici");
++  });
++
++  async function mockUndici(fetchMock) {
++    const actual = await vi.importActual("undici");
++    class UndiciFormData extends actual.FormData {}
++    vi.doMock("undici", () => ({
++      ...actual,
++      fetch: fetchMock,
++      FormData: UndiciFormData,
++    }));
++    return UndiciFormData;
++  }
++
++  it("rebinds a global FormData body to the Undici package implementation", async () => {
++    const fetchMock = vi.fn().mockResolvedValue({ status: 200, ok: true });
++    const UndiciFormData = await mockUndici(fetchMock);
++
++    const { proxyAwareFetch, resetDirectDispatchersForTests } =
++      await import("../../open-sse/utils/proxyFetch.js");
++    resetDirectDispatchersForTests();
++
++    const body = new FormData();
++    body.append(
++      "index.js",
++      new Blob(["export default {}"], { type: "application/javascript+module" }),
++      "index.js",
++    );
++    body.append(
++      "metadata",
++      new Blob([JSON.stringify({ main_module: "index.js" })], {
++        type: "application/json",
++      }),
++      "metadata.json",
++    );
++    body.append("plain", "value");
++
++    await proxyAwareFetch("https://api.cloudflare.com/client/v4/test", {
++      method: "PUT",
++      body,
++    });
++
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    const sentBody = fetchMock.mock.calls[0][1].body;
++    expect(sentBody).toBeInstanceOf(UndiciFormData);
++    expect(sentBody).not.toBe(body);
++    expect(sentBody.get("plain")).toBe("value");
++
++    const script = sentBody.get("index.js");
++    expect(script.name).toBe("index.js");
++    expect(script.type).toBe("application/javascript+module");
++    await expect(script.text()).resolves.toBe("export default {}");
++
++    const metadata = sentBody.get("metadata");
++    expect(metadata.name).toBe("metadata.json");
++    expect(metadata.type).toBe("application/json");
++    await expect(metadata.text()).resolves.toBe(
++      JSON.stringify({ main_module: "index.js" }),
++    );
++  });
++
++  it("leaves an Undici FormData body untouched", async () => {
++    const fetchMock = vi.fn().mockResolvedValue({ status: 200, ok: true });
++    const UndiciFormData = await mockUndici(fetchMock);
++
++    const { proxyAwareFetch, resetDirectDispatchersForTests } =
++      await import("../../open-sse/utils/proxyFetch.js");
++    resetDirectDispatchersForTests();
++
++    const body = new UndiciFormData();
++    body.append("field", "value");
++
++    await proxyAwareFetch("https://example.test/upload", {
++      method: "POST",
++      body,
++    });
++
++    expect(fetchMock.mock.calls[0][1].body).toBe(body);
++  });
++});
+-- 
+2.55.0
+
