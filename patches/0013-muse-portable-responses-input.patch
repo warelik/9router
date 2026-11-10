@@ -1,0 +1,83 @@
+From 830e5179d74a2ed85ff1b51868b7e1e3285794a1 Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Tue, 10 Nov 2026 07:50:20 +0000
+Subject: [PATCH] Rewrite Codex multi-agent history for the strict Muse input
+ schema
+
+Meta rejects agent_message input items outright ("input[0] did not
+match any supported type"), so a Muse parent cannot receive a
+subagent's message and a Muse child cannot receive its delegated
+task. Declare the existing portableResponsesInput quirk on the Muse
+Responses transport, as the Kimi strict endpoint already does:
+agent_message items become user messages with their readable parts,
+call_id-less delegation outputs become text, and Fernet-only Codex
+reasoning is dropped, while Meta's own encrypted reasoning (not
+Fernet) round-trips untouched.
+---
+ open-sse/providers/registry/muse.js  |  5 ++++
+ tests/unit/muse-custom-tools.test.js | 36 ++++++++++++++++++++++++++++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/open-sse/providers/registry/muse.js b/open-sse/providers/registry/muse.js
+index 08c9173..ed187a1 100644
+--- a/open-sse/providers/registry/muse.js
++++ b/open-sse/providers/registry/muse.js
+@@ -51,6 +51,11 @@ export default {
+       auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["museHeaders"] },
+       // Strict Responses API: rejects top-level reasoning_effort, needs reasoning:{effort,summary}.
+       thinkingFormat: "openai-responses",
++      // Strict input schema: Codex multi-agent items (agent_message,
++      // call_id-less delegation outputs, Fernet reasoning) are rejected as
++      // unsupported input types — rewrite them to portable shapes.
++      // Provider-native encrypted reasoning (non-Fernet) is preserved.
++      quirks: { portableResponsesInput: true },
+     },
+   ],
+   models: [
+diff --git a/tests/unit/muse-custom-tools.test.js b/tests/unit/muse-custom-tools.test.js
+index cd22261..4db0ce8 100644
+--- a/tests/unit/muse-custom-tools.test.js
++++ b/tests/unit/muse-custom-tools.test.js
+@@ -302,3 +302,39 @@ describe("Muse custom tool restore (streaming passthrough)", () => {
+     expect(body.output[0]).toMatchObject({ type: "custom_tool_call", name: "apply_patch", call_id: "call_1", input: PATCH });
+   });
+ });
++
++describe("Muse portable Responses input (multi-agent histories)", () => {
++  it("declares the strict-input quirk on the Responses transport only", async () => {
++    const { resolveTransport } = await import("../../open-sse/services/provider.js");
++    expect(resolveTransport("muse", "openai-responses")?.quirks?.portableResponsesInput).toBe(true);
++    expect(resolveTransport("muse", "openai")?.quirks?.portableResponsesInput).toBeUndefined();
++  });
++
++  it("rewrites agent_message for Meta while keeping its native reasoning", async () => {
++    const { toPortableResponsesInput } = await import("../../open-sse/translator/formats/responsesApi.js");
++    const metaReasoning = {
++      type: "reasoning", id: "rs_meta", status: "completed", summary: [],
++      encrypted_content: "Q-PaDgFdLdBPCAXOYA7lSpfH-meta-native",
++    };
++    const out = toPortableResponsesInput([
++      {
++        type: "agent_message", author: "/root/child", recipient: "/root",
++        content: [
++          { type: "input_text", text: "child: done" },
++          { type: "encrypted_content", encrypted_content: "gAAAAABh-codex-fernet" },
++        ],
++      },
++      { type: "function_call_output", name: "send_message_to_thread", namespace: "codex_tui", output: "delegated" },
++      metaReasoning,
++    ]);
++    expect(out[0]).toEqual({
++      type: "message", role: "user",
++      content: [{ type: "input_text", text: "child: done" }],
++    });
++    expect(out[1]).toEqual({
++      type: "message", role: "user",
++      content: [{ type: "input_text", text: "delegated" }],
++    });
++    expect(out[2]).toBe(metaReasoning);
++  });
++});
+-- 
+2.55.0
+
