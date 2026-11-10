@@ -88,7 +88,12 @@ describe("Muse Code request cloaking", () => {
     );
     expect(result.tools.map(tool => tool.name)).toEqual(nativeRequest().tools.map(tool => tool.name));
     expect(result.input[0].name).toBe("read_file");
-    expect(result._toolNameMap).toBeUndefined();
+    // No cloaking aliases; the map carries only namespace descriptors used
+    // to split Meta's flattened namespace calls back on the way out.
+    expect([...(result._toolNameMap?.values() || [])].every(value => typeof value === "object")).toBe(true);
+    expect(result._toolNameMap?.get("collaboration.read_file")).toEqual({
+      name: "read_file", namespace: "collaboration", type: "function",
+    });
   });
 
   it("allocates unique bounded aliases and rewrites allowed_tools without mutating hosted entries", () => {
