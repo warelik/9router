@@ -50,6 +50,28 @@ export function normalizeResponsesAgentMessage(item, { dropOpaqueContent = false
   return { ...item, type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content: normalizedContent };
 }
 
+/**
+ * Rewrite plaintext-carrier encrypted_content parts of agent_message items
+ * to input_text, keeping the agent_message shape itself. For upstreams
+ * that accept agent_message but attempt to decrypt every encrypted_content
+ * part (the Codex backend): a task spawned by a non-OpenAI parent reaches
+ * the child as plaintext inside encrypted_content, and forwarding it
+ * verbatim fails with "Encrypted function output content could not be
+ * decrypted or decoded". Genuine OpenAI Fernet payloads stay untouched.
+ */
+export function normalizeResponsesAgentMessages(input) {
+  if (!Array.isArray(input)) return input;
+  let changed = false;
+  const out = input.map((item) => {
+    if (item?.type !== RESPONSES_ITEM.AGENT_MESSAGE || !Array.isArray(item.content)) return item;
+    const normalized = normalizeResponsesAgentMessage(item);
+    if (!normalized.content.some((part, index) => part !== item.content[index])) return item;
+    changed = true;
+    return { ...item, content: normalized.content };
+  });
+  return changed ? out : input;
+}
+
 function reasoningHasReadableText(item) {
   const blocks = [
     ...(Array.isArray(item.summary) ? item.summary : []),

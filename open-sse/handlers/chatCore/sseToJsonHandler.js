@@ -1,6 +1,6 @@
 import { convertResponsesStreamToJson } from "../../transformer/streamToJsonConverter.js";
 import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
-import { restoreMuseCustomToolCalls } from "../../utils/museCloaking.js";
+import { restoreMuseCustomToolCalls, restoreMuseNamespaceCalls } from "../../utils/museCloaking.js";
 import { createErrorResult } from "../../utils/error.js";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
 import { FORMATS } from "../../translator/formats.js";
@@ -234,7 +234,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
 
       // Client is Responses API → return as-is
       if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
-        return { success: true, response: new Response(JSON.stringify(restoreToolNames(restoreMuseCustomToolCalls(jsonResponse, customToolNames), toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+        return { success: true, response: new Response(JSON.stringify(restoreToolNames(restoreMuseCustomToolCalls(provider === "muse" ? restoreMuseNamespaceCalls(jsonResponse, toolNameMap) : jsonResponse, customToolNames), toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
       }
 
       // Build client-format response.
