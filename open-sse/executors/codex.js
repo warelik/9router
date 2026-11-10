@@ -6,7 +6,7 @@ import {
   refreshProviderCredentials,
   shouldRefreshCredentials,
 } from "../services/oauthCredentialManager.js";
-import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
+import { normalizeResponsesInput, normalizeResponsesAgentMessages } from "../translator/formats/responsesApi.js";
 import { fetchImageAsBase64 } from "../translator/concerns/image.js";
 import { getModelUpstreamId, getProviderModels } from "../config/providerModels.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
@@ -468,6 +468,10 @@ export class CodexExecutor extends BaseExecutor {
     // Convert string input to array format (Codex API requires input as array)
     const normalized = normalizeResponsesInput(body.input);
     if (normalized) body.input = normalized;
+    // A child spawned by a non-OpenAI parent carries its task as plaintext
+    // inside an encrypted_content part; the Codex backend would try to
+    // decrypt the plaintext and reject the turn. Surface it as text.
+    body.input = normalizeResponsesAgentMessages(body.input);
     const upstreamModel = getModelUpstreamId("cx", body.model || model);
     // Register hosted search before choosing transport; Lite cannot execute it.
     const autoWebSearch = body._autoCodexWebSearch === true;
