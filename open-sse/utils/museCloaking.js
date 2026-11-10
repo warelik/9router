@@ -120,7 +120,12 @@ function customToolAsFunction(tool) {
 }
 
 // Returns { tools, changed }; the input list and its tools are never mutated.
-function normalizeMuseToolList(tools, customToolNames, namespace = null) {
+// Every namespaced child is also recorded in namespaceToolNames under its
+// flattened `namespace.child` spelling: Meta answers namespace calls in
+// exactly that dotted form without a namespace field, which strict
+// Responses clients (Codex) refuse to route ("unsupported call"). The
+// descriptors let the shared name restorer split them back.
+function normalizeMuseToolList(tools, customToolNames, namespaceToolNames, namespace = null) {
   if (!Array.isArray(tools)) return { tools, changed: false };
   let changed = false;
   const out = tools.map(tool => {
@@ -131,8 +136,19 @@ function normalizeMuseToolList(tools, customToolNames, namespace = null) {
       delete next.search_content_types;
       changed = true;
     }
+    if (namespace && (next.type === RESPONSES_TOOL.FUNCTION || next.type === RESPONSES_TOOL.CUSTOM)
+      && typeof next.name === "string" && next.name) {
+      const dotted = `${namespace}.${next.name}`;
+      if (!namespaceToolNames.has(dotted)) {
+        namespaceToolNames.set(dotted, {
+          name: next.name,
+          namespace,
+          type: next.type === RESPONSES_TOOL.CUSTOM ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION,
+        });
+      }
+    }
     if (next.type === RESPONSES_TOOL.NAMESPACE && Array.isArray(next.tools)) {
-      const children = normalizeMuseToolList(next.tools, customToolNames, next.name);
+      const children = normalizeMuseToolList(next.tools, customToolNames, namespaceToolNames, next.name);
       if (children.changed) {
         changed = true;
         return { ...next, tools: children.tools };
@@ -176,12 +192,13 @@ function normalizeMuseToolChoice(choice, customToolNames) {
  */
 export function normalizeMuseResponsesTools(body) {
   const customToolNames = new Set();
-  if (!body || typeof body !== "object" || Array.isArray(body)) return { body, customToolNames };
+  const namespaceToolNames = new Map();
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { body, customToolNames, namespaceToolNames };
 
   let changed = false;
   const out = { ...body };
 
-  const tools = normalizeMuseToolList(body.tools, customToolNames);
+  const tools = normalizeMuseToolList(body.tools, customToolNames, namespaceToolNames);
   if (tools.changed) { out.tools = tools.tools; changed = true; }
 
   if (Array.isArray(body.input)) {
@@ -189,7 +206,7 @@ export function normalizeMuseResponsesTools(body) {
     const input = body.input.map(item => {
       if (!item || typeof item !== "object" || Array.isArray(item)) return item;
       if (item.type === RESPONSES_ITEM.ADDITIONAL_TOOLS) {
-        const declared = normalizeMuseToolList(item.tools, customToolNames);
+        const declared = normalizeMuseToolList(item.tools, customToolNames, namespaceToolNames);
         if (!declared.changed) return item;
         inputChanged = true;
         return { ...item, tools: declared.tools };
@@ -219,7 +236,7 @@ export function normalizeMuseResponsesTools(body) {
   const choice = normalizeMuseToolChoice(body.tool_choice, customToolNames);
   if (choice.changed) { out.tool_choice = choice.choice; changed = true; }
 
-  return { body: changed ? out : body, customToolNames };
+  return { body: changed ? out : body, customToolNames, namespaceToolNames };
 }
 
 /** The freeform input inside a converted function call's arguments. */
@@ -234,9 +251,15 @@ export function extractMuseCustomInput(argumentsText) {
 
 /** True when a function_call item is one of the converted custom tools. */
 export function isMuseCustomToolCall(item, customToolNames) {
-  return item?.type === RESPONSES_ITEM.FUNCTION_CALL
-    && typeof item.name === "string"
-    && customToolNames?.has(museCustomToolKey(item.name, item.namespace)) === true;
+  if (item?.type !== RESPONSES_ITEM.FUNCTION_CALL || typeof item.name !== "string") return false;
+  if (customToolNames?.has(museCustomToolKey(item.name, item.namespace))) return true;
+  // Meta flattens a namespaced call into the dotted name without a
+  // namespace field; its identity key is the same pair joined by "/".
+  if (!item.namespace) {
+    const dot = item.name.indexOf(".");
+    if (dot > 0 && customToolNames?.has(`${item.name.slice(0, dot)}/${item.name.slice(dot + 1)}`)) return true;
+  }
+  return false;
 }
 
 function museCustomItem(item) {
