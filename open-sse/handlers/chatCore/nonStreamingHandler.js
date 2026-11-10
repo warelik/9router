@@ -14,6 +14,7 @@ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, sav
 import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
 import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
+import { restoreMuseCustomToolCalls } from "../../utils/museCloaking.js";
 import { ROLE, RESPONSES_ITEM, OPENAI_FINISH, GEMINI_FINISH } from "../../translator/schema/index.js";
 import { storeGeminiTurnSignature, storeGeminiThoughtSignature, storeGeminiServerParts, storeGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
 import { toOpenAIFinish } from "../../translator/concerns/finishReason.js";
@@ -447,7 +448,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
 
   return {
     success: true,
-    response: new Response(JSON.stringify(restoreToolNames(translatedResponse, toolNameMap)), {
+    response: new Response(JSON.stringify(restoreToolNames(restoreMuseCustomToolCalls(translatedResponse, customToolNames), toolNameMap)), {
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", ...upstreamResponseHeaders(providerResponse.headers) }
     })
   };
