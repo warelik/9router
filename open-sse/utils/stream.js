@@ -11,6 +11,7 @@ import {
   isValidNativeGeminiResponse,
 } from "./streamHelpers.js";
 import { restoreToolNames } from "./opencodeFingerprint.js";
+import { convertMuseCustomStreamEvent } from "./museCloaking.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
@@ -139,6 +140,17 @@ export function createSSEStream(options = {}) {
   // client as-is: strict OpenAI-compatible SDKs abort the turn on a
   // tool_call without a string id (#4992).
   const seenToolCallIds = new Map();
+
+  // Muse custom tools travel upstream as functions (see
+  // normalizeMuseResponsesTools); on this no-translation path their calls
+  // are converted back per event, which needs their wire names plus a
+  // per-item argument buffer. An `event:` line is held until its data line
+  // is seen, because conversion may suppress or rename the event.
+  const passthroughCustomToolNames = mode === STREAM_MODE.PASSTHROUGH && customToolNames
+    ? new Set(customToolNames)
+    : null;
+  const museCustomCallItems = new Map();
+  let pendingPassthroughEventLine = null;
 
   // Per-stream decoder with stream:true to correctly handle multi-byte chars split across chunks
   const decoder = new TextDecoder("utf-8", { fatal: false });
@@ -397,9 +409,19 @@ export function createSSEStream(options = {}) {
 
         // Passthrough mode: normalize and forward
         if (mode === STREAM_MODE.PASSTHROUGH) {
+          if (passthroughCustomToolNames?.size && trimmed.startsWith("event:")) {
+            if (pendingPassthroughEventLine !== null) {
+              const held = pendingPassthroughEventLine + "\n";
+              reqLogger?.appendConvertedChunk?.(held);
+              controller.enqueue(sharedEncoder.encode(held));
+            }
+            pendingPassthroughEventLine = line;
+            continue;
+          }
           let output;
           let injectedUsage = false;
           let responsesTerminal = false;
+          let customConverted = false;
 
           if (trimmed.startsWith("data:") && trimmed.slice(5).trim() !== "[DONE]") {
             try {
@@ -411,6 +433,32 @@ export function createSSEStream(options = {}) {
               // strict OpenAI-compatible clients. Mint/reuse one before the
               // chunk reaches the client.
               const toolCallIdFixed = ensureStreamToolCallIds(parsed, seenToolCallIds);
+
+              // Converted Muse custom calls: argument deltas are buffered
+              // (event dropped together with its held `event:` line), and a
+              // completed call is emitted as custom_tool_call_input events.
+              if (passthroughCustomToolNames?.size) {
+                const convertedEvents = convertMuseCustomStreamEvent(parsed, passthroughCustomToolNames, museCustomCallItems);
+                if (convertedEvents.length === 0) {
+                  pendingPassthroughEventLine = null;
+                  continue;
+                }
+                if (convertedEvents.length > 1) {
+                  const hadEventLine = pendingPassthroughEventLine !== null;
+                  pendingPassthroughEventLine = null;
+                  for (const convertedEvent of convertedEvents) {
+                    const restoredEvent = toolNameMap?.size ? restoreToolNames(convertedEvent, toolNameMap) : convertedEvent;
+                    const framed = `${hadEventLine ? `event: ${restoredEvent.type}\n` : ""}data: ${JSON.stringify(restoredEvent)}\n`;
+                    reqLogger?.appendConvertedChunk?.(framed);
+                    controller.enqueue(sharedEncoder.encode(framed));
+                  }
+                  continue;
+                }
+                if (convertedEvents[0] !== parsed) {
+                  parsed = convertedEvents[0];
+                  customConverted = true;
+                }
+              }
 
               // The fingerprint pass renames a colliding caller tool to an alias
               // (read -> read_client). On this path nothing restored it, so the
@@ -475,6 +523,7 @@ export function createSSEStream(options = {}) {
               }
 
               if (!hasValuableContent(parsed, FORMATS.OPENAI)) {
+                pendingPassthroughEventLine = null;
                 continue;
               }
 
@@ -509,7 +558,7 @@ export function createSSEStream(options = {}) {
                 parsed.usage = filterUsageForFormat(buffered, FORMATS.OPENAI);
                 output = `data: ${JSON.stringify(parsed)}\n`;
                 injectedUsage = true;
-              } else if (idFixed || fieldsInjected || toolCallIdFixed || toolNameRestored) {
+              } else if (idFixed || fieldsInjected || toolCallIdFixed || toolNameRestored || customConverted) {
                 output = `data: ${JSON.stringify(parsed)}\n`;
                 injectedUsage = true;
               }
@@ -517,6 +566,7 @@ export function createSSEStream(options = {}) {
               // Skip non-JSON data lines silently — don't forward garbage to clients.
               // Upstream providers sometimes return plain-text errors (HTML, rate-limit
               // messages) in the SSE stream that would break downstream JSON decoders.
+              pendingPassthroughEventLine = null;
               continue;
             }
           }
@@ -529,6 +579,12 @@ export function createSSEStream(options = {}) {
             }
           }
 
+          if (pendingPassthroughEventLine !== null) {
+            const eventLine = pendingPassthroughEventLine + "\n";
+            pendingPassthroughEventLine = null;
+            reqLogger?.appendConvertedChunk?.(eventLine);
+            controller.enqueue(sharedEncoder.encode(eventLine));
+          }
           reqLogger?.appendConvertedChunk?.(output);
           controller.enqueue(sharedEncoder.encode(output));
           // Responses clients (codex CLI) close on response.completed instead of [DONE]
@@ -817,6 +873,10 @@ export function createSSEStream(options = {}) {
             }
             output = restoreSseEvent([output], toolNameMap);
             if (!output.endsWith("\n")) output += "\n\n";
+            if (pendingPassthroughEventLine !== null) {
+              controller.enqueue(sharedEncoder.encode(pendingPassthroughEventLine + "\n"));
+              pendingPassthroughEventLine = null;
+            }
             reqLogger?.appendConvertedChunk?.(output);
             controller.enqueue(sharedEncoder.encode(output));
           }
@@ -966,7 +1026,7 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
   });
 }
 
-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null, onNativeResponseSuccess = null) {
+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null, onNativeResponseSuccess = null, customToolNames = null) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
     sourceFormat,
@@ -976,6 +1036,7 @@ export function createPassthroughStreamWithLogger(provider = null, reqLogger = n
     provider,
     reqLogger,
     toolNameMap,
+    customToolNames,
     model,
     connectionId,
     body,
