@@ -1,0 +1,294 @@
+From 32fe188ed62581b5f7e4ba09ee832696e39ea968 Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Tue, 10 Nov 2026 08:53:37 +0000
+Subject: [PATCH] Route bare namespace calls and plaintext subagent tasks
+ across providers
+
+Live verification of 0014 showed Meta answers namespace calls in
+two flattened shapes: sometimes the dotted name, sometimes the
+bare child name with no namespace at all ("wait_agent"). Codex
+rejects the bare form as an unsupported call. Qualify a bare call
+to its dotted descriptor key when exactly one declared namespace
+child carries that name, so the shared restorer can split it on
+every response path; converted custom tools are recognized in the
+bare form too.
+
+The same live run exposed the mirror problem on the child side: a
+task spawned by a non-OpenAI parent reaches a Codex-provider child
+as plaintext inside an agent_message encrypted_content part, and
+the Codex backend rejects the turn trying to decrypt the
+plaintext ("Encrypted function output content could not be
+decrypted or decoded"). Surface non-Fernet carriers as input_text
+in the Codex executor, keeping genuine OpenAI Fernet payloads
+opaque for the backend to decrypt.
+---
+ open-sse/executors/codex.js                   |  6 ++-
+ .../handlers/chatCore/nonStreamingHandler.js  |  4 +-
+ .../handlers/chatCore/sseToJsonHandler.js     |  4 +-
+ open-sse/translator/formats/responsesApi.js   | 22 +++++++++
+ open-sse/utils/museCloaking.js                | 48 +++++++++++++++++++
+ open-sse/utils/stream.js                      |  4 +-
+ tests/unit/muse-custom-tools.test.js          | 41 ++++++++++++++++
+ 7 files changed, 123 insertions(+), 6 deletions(-)
+
+diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
+index b1335a9..ee6f429 100644
+--- a/open-sse/executors/codex.js
++++ b/open-sse/executors/codex.js
+@@ -6,7 +6,7 @@ import {
+   refreshProviderCredentials,
+   shouldRefreshCredentials,
+ } from "../services/oauthCredentialManager.js";
+-import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
++import { normalizeResponsesInput, normalizeResponsesAgentMessages } from "../translator/formats/responsesApi.js";
+ import { fetchImageAsBase64 } from "../translator/concerns/image.js";
+ import { getModelUpstreamId, getProviderModels } from "../config/providerModels.js";
+ import { getThinkingLevels } from "../providers/thinkingLevels.js";
+@@ -468,6 +468,10 @@ export class CodexExecutor extends BaseExecutor {
+     // Convert string input to array format (Codex API requires input as array)
+     const normalized = normalizeResponsesInput(body.input);
+     if (normalized) body.input = normalized;
++    // A child spawned by a non-OpenAI parent carries its task as plaintext
++    // inside an encrypted_content part; the Codex backend would try to
++    // decrypt the plaintext and reject the turn. Surface it as text.
++    body.input = normalizeResponsesAgentMessages(body.input);
+     const upstreamModel = getModelUpstreamId("cx", body.model || model);
+     // Register hosted search before choosing transport; Lite cannot execute it.
+     const autoWebSearch = body._autoCodexWebSearch === true;
+diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
+index c4b5e1e..ebde406 100644
+--- a/open-sse/handlers/chatCore/nonStreamingHandler.js
++++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
+@@ -14,7 +14,7 @@ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, sav
+ import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+ import { decloakToolNames } from "../../utils/claudeCloaking.js";
+ import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
+-import { restoreMuseCustomToolCalls } from "../../utils/museCloaking.js";
++import { restoreMuseCustomToolCalls, restoreMuseNamespaceCalls } from "../../utils/museCloaking.js";
+ import { ROLE, RESPONSES_ITEM, OPENAI_FINISH, GEMINI_FINISH } from "../../translator/schema/index.js";
+ import { storeGeminiTurnSignature, storeGeminiThoughtSignature, storeGeminiServerParts, storeGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
+ import { toOpenAIFinish } from "../../translator/concerns/finishReason.js";
+@@ -448,7 +448,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
+ 
+   return {
+     success: true,
+-    response: new Response(JSON.stringify(restoreToolNames(restoreMuseCustomToolCalls(translatedResponse, customToolNames), toolNameMap)), {
++    response: new Response(JSON.stringify(restoreToolNames(restoreMuseCustomToolCalls(provider === "muse" ? restoreMuseNamespaceCalls(translatedResponse, toolNameMap) : translatedResponse, customToolNames), toolNameMap)), {
+       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", ...upstreamResponseHeaders(providerResponse.headers) }
+     })
+   };
+diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
+index 78689ef..f243ddc 100644
+--- a/open-sse/handlers/chatCore/sseToJsonHandler.js
++++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
+@@ -1,6 +1,6 @@
+ import { convertResponsesStreamToJson } from "../../transformer/streamToJsonConverter.js";
+ import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
+-import { restoreMuseCustomToolCalls } from "../../utils/museCloaking.js";
++import { restoreMuseCustomToolCalls, restoreMuseNamespaceCalls } from "../../utils/museCloaking.js";
+ import { createErrorResult } from "../../utils/error.js";
+ import { HTTP_STATUS } from "../../config/runtimeConfig.js";
+ import { FORMATS } from "../../translator/formats.js";
+@@ -234,7 +234,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
+ 
+       // Client is Responses API → return as-is
+       if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
+-        return { success: true, response: new Response(JSON.stringify(restoreToolNames(restoreMuseCustomToolCalls(jsonResponse, customToolNames), toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
++        return { success: true, response: new Response(JSON.stringify(restoreToolNames(restoreMuseCustomToolCalls(provider === "muse" ? restoreMuseNamespaceCalls(jsonResponse, toolNameMap) : jsonResponse, customToolNames), toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+       }
+ 
+       // Build client-format response.
+diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
+index e89b54b..9f007d2 100644
+--- a/open-sse/translator/formats/responsesApi.js
++++ b/open-sse/translator/formats/responsesApi.js
+@@ -50,6 +50,28 @@ export function normalizeResponsesAgentMessage(item, { dropOpaqueContent = false
+   return { ...item, type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content: normalizedContent };
+ }
+ 
++/**
++ * Rewrite plaintext-carrier encrypted_content parts of agent_message items
++ * to input_text, keeping the agent_message shape itself. For upstreams
++ * that accept agent_message but attempt to decrypt every encrypted_content
++ * part (the Codex backend): a task spawned by a non-OpenAI parent reaches
++ * the child as plaintext inside encrypted_content, and forwarding it
++ * verbatim fails with "Encrypted function output content could not be
++ * decrypted or decoded". Genuine OpenAI Fernet payloads stay untouched.
++ */
++export function normalizeResponsesAgentMessages(input) {
++  if (!Array.isArray(input)) return input;
++  let changed = false;
++  const out = input.map((item) => {
++    if (item?.type !== RESPONSES_ITEM.AGENT_MESSAGE || !Array.isArray(item.content)) return item;
++    const normalized = normalizeResponsesAgentMessage(item);
++    if (!normalized.content.some((part, index) => part !== item.content[index])) return item;
++    changed = true;
++    return { ...item, content: normalized.content };
++  });
++  return changed ? out : input;
++}
++
+ function reasoningHasReadableText(item) {
+   const blocks = [
+     ...(Array.isArray(item.summary) ? item.summary : []),
+diff --git a/open-sse/utils/museCloaking.js b/open-sse/utils/museCloaking.js
+index f1cd6d9..e246092 100644
+--- a/open-sse/utils/museCloaking.js
++++ b/open-sse/utils/museCloaking.js
+@@ -258,6 +258,14 @@ export function isMuseCustomToolCall(item, customToolNames) {
+   if (!item.namespace) {
+     const dot = item.name.indexOf(".");
+     if (dot > 0 && customToolNames?.has(`${item.name.slice(0, dot)}/${item.name.slice(dot + 1)}`)) return true;
++    // And, variability permitting, the model sometimes replies with the
++    // bare child name instead; it is the custom tool only when exactly one
++    // recorded namespace child carries that name.
++    if (dot < 0 && customToolNames) {
++      let matches = 0;
++      for (const key of customToolNames) if (key.endsWith(`/${item.name}`)) matches += 1;
++      if (matches === 1) return true;
++    }
+   }
+   return false;
+ }
+@@ -268,6 +276,46 @@ function museCustomItem(item) {
+   return converted;
+ }
+ 
++/**
++ * Rewrite a bare namespace-child call ("spawn_agent") to the dotted key
++ * its namespace descriptor is filed under ("collaboration.spawn_agent"),
++ * in place, so the shared restorer can split it back into name +
++ * namespace right after. Only a uniquely matching child qualifies.
++ */
++export function qualifyMuseBareNamespaceCall(item, toolNameMap) {
++  if (!item || typeof item !== "object"
++    || (item.type !== RESPONSES_ITEM.FUNCTION_CALL && item.type !== RESPONSES_ITEM.CUSTOM_TOOL_CALL)
++    || typeof item.name !== "string" || !item.name
++    || item.namespace || item.name.includes(".") || !toolNameMap) return;
++  let dotted = null;
++  for (const [key, descriptor] of toolNameMap) {
++    if (descriptor && typeof descriptor === "object" && descriptor.name === item.name) {
++      if (dotted) return; // ambiguous: the bare name belongs to several namespaces
++      dotted = key;
++    }
++  }
++  if (dotted) item.name = dotted;
++}
++
++/**
++ * Qualify every bare namespace-child call in a payload (in place) so the
++ * shared restorer splits it into name + namespace right after. Returns the
++ * payload for chaining ahead of restoreToolNames.
++ */
++export function restoreMuseNamespaceCalls(payload, toolNameMap) {
++  if (!payload || typeof payload !== "object" || !toolNameMap?.size) return payload;
++  if (Array.isArray(payload)) {
++    for (const item of payload) restoreMuseNamespaceCalls(item, toolNameMap);
++    return payload;
++  }
++  qualifyMuseBareNamespaceCall(payload, toolNameMap);
++  for (const key of ["output", "item", "response", "data"]) {
++    const value = payload[key];
++    if (value && typeof value === "object") restoreMuseNamespaceCalls(value, toolNameMap);
++  }
++  return payload;
++}
++
+ /**
+  * Convert function_call items of converted custom tools back to
+  * custom_tool_call in a JSON payload (a Response body, a lifecycle event's
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index 5d5fec0..719f337 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -11,7 +11,7 @@ import {
+   isValidNativeGeminiResponse,
+ } from "./streamHelpers.js";
+ import { restoreToolNames } from "./opencodeFingerprint.js";
+-import { convertMuseCustomStreamEvent } from "./museCloaking.js";
++import { convertMuseCustomStreamEvent, restoreMuseNamespaceCalls } from "./museCloaking.js";
+ import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
+ import { dbg, isDebugEnabled } from "./debugLog.js";
+ 
+@@ -149,6 +149,7 @@ export function createSSEStream(options = {}) {
+   const passthroughCustomToolNames = mode === STREAM_MODE.PASSTHROUGH && customToolNames
+     ? new Set(customToolNames)
+     : null;
++  const musePassthrough = mode === STREAM_MODE.PASSTHROUGH && provider === "muse";
+   const museCustomCallItems = new Map();
+   let pendingPassthroughEventLine = null;
+ 
+@@ -466,6 +467,7 @@ export function createSSEStream(options = {}) {
+               // "Model tried to call unavailable tool 'read_client'" (#4986).
+               let toolNameRestored = false;
+               if (toolNameMap?.size) {
++                if (musePassthrough) restoreMuseNamespaceCalls(parsed, toolNameMap);
+                 const restored = restoreToolNames(parsed, toolNameMap);
+                 if (restored !== parsed) {
+                   parsed = restored;
+diff --git a/tests/unit/muse-custom-tools.test.js b/tests/unit/muse-custom-tools.test.js
+index 9251fca..b268470 100644
+--- a/tests/unit/muse-custom-tools.test.js
++++ b/tests/unit/muse-custom-tools.test.js
+@@ -204,6 +204,8 @@ describe("Muse custom tool restore (non-streaming)", () => {
+         output: [
+           { type: "function_call", id: "fc_2", call_id: "call_2", name: "collaboration.spawn_agent", arguments: '{"message":"hi"}' },
+           { type: "function_call", id: "fc_3", call_id: "call_3", name: "collaboration.send_patch", arguments: PATCH_ARGS },
++          // Meta also sometimes answers with the bare child name.
++          { type: "function_call", id: "fc_4", call_id: "call_4", name: "spawn_agent", arguments: '{"message":"again"}' },
+         ],
+         usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+       }), { status: 200, headers: { "content-type": "application/json" } }),
+@@ -229,6 +231,10 @@ describe("Muse custom tool restore (non-streaming)", () => {
+       type: "custom_tool_call", id: "fc_3", call_id: "call_3",
+       name: "send_patch", namespace: "collaboration", input: PATCH,
+     });
++    expect(body.output[2]).toEqual({
++      type: "function_call", id: "fc_4", call_id: "call_4",
++      name: "spawn_agent", namespace: "collaboration", arguments: '{"message":"again"}',
++    });
+   });
+ });
+ 
+@@ -394,3 +400,38 @@ describe("Muse portable Responses input (multi-agent histories)", () => {
+     expect(out[2]).toBe(metaReasoning);
+   });
+ });
++
++describe("Hybrid spawn: a Muse parent's task reaching a Codex-provider child", () => {
++  it("surfaces the plaintext task carrier instead of letting the backend decrypt it", async () => {
++    const { CodexExecutor } = await import("../../open-sse/executors/codex.js");
++    const executor = new CodexExecutor();
++    const body = executor.transformRequest("gpt-6.1-terra", {
++      model: "gpt-6.1-terra",
++      instructions: "child instructions",
++      tools: [],
++      input: [
++        { type: "message", role: "user", content: [{ type: "input_text", text: "context" }] },
++        {
++          type: "agent_message", author: "/root", recipient: "/root/child",
++          content: [
++            { type: "input_text", text: "Message Type: NEW_TASK\nPayload:\n" },
++            { type: "encrypted_content", encrypted_content: "Say hello in Russian." },
++          ],
++        },
++        {
++          type: "agent_message", author: "/root", recipient: "/root/other",
++          content: [{ type: "encrypted_content", encrypted_content: "gAAAAABh-real-openai-fernet" }],
++        },
++      ],
++    }, true, { connectionId: "fixture", accessToken: "fixture-token" });
++
++    const [plain, fernet] = body.input.filter(item => item.type === "agent_message");
++    expect(plain.content).toEqual([
++      { type: "input_text", text: "Message Type: NEW_TASK\nPayload:\n" },
++      { type: "input_text", text: "Say hello in Russian." },
++    ]);
++    expect(fernet.content).toEqual([
++      { type: "encrypted_content", encrypted_content: "gAAAAABh-real-openai-fernet" },
++    ]);
++  });
++});
+-- 
+2.55.0
+
