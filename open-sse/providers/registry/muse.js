@@ -51,6 +51,11 @@ export default {
       auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["museHeaders"] },
       // Strict Responses API: rejects top-level reasoning_effort, needs reasoning:{effort,summary}.
       thinkingFormat: "openai-responses",
+      // Strict input schema: Codex multi-agent items (agent_message,
+      // call_id-less delegation outputs, Fernet reasoning) are rejected as
+      // unsupported input types — rewrite them to portable shapes.
+      // Provider-native encrypted reasoning (non-Fernet) is preserved.
+      quirks: { portableResponsesInput: true },
     },
   ],
   models: [
