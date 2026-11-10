@@ -1,0 +1,281 @@
+From 800da94b09f7a6b35ac069dc72b45cbf475b7715 Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Tue, 10 Nov 2026 08:24:09 +0000
+Subject: [PATCH] Split Meta's flattened namespace calls back for Responses
+ clients
+
+Meta accepts namespace tool declarations but answers their calls
+flattened into one dotted name with no namespace field
+("collaboration.spawn_agent"). Codex's tool router rejects that
+shape as an unsupported call, so the client could not spawn or
+manage subagents even after the request-side fixes. Meta does
+accept the spec form in history, so only the reply needs repair:
+record a restorer descriptor for every declared namespace child
+under its dotted spelling, and let the shared name restorer split
+the call back into name + namespace on the JSON, SSE->JSON and
+streaming paths. Converted namespaced custom tools are recognized
+in their dotted form too, so their input is still unwrapped
+before the split.
+---
+ open-sse/translator/index.js         | 10 +++++
+ open-sse/utils/museCloaking.js       | 41 +++++++++++++----
+ tests/unit/muse-cloaking.test.js     |  7 ++-
+ tests/unit/muse-custom-tools.test.js | 66 +++++++++++++++++++++++++---
+ 4 files changed, 109 insertions(+), 15 deletions(-)
+
+diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
+index 137abd0..fd9ca40 100644
+--- a/open-sse/translator/index.js
++++ b/open-sse/translator/index.js
+@@ -260,6 +260,16 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+     if (museCustomToolNames.size > 0) {
+       result._customToolNames = [...new Set([...(result._customToolNames || []), ...museCustomToolNames])];
+     }
++    // Meta answers namespace calls flattened ("collaboration.spawn_agent",
++    // no namespace field); the descriptors let the shared restorer split
++    // them back into name + namespace on every response path.
++    if (normalized.namespaceToolNames?.size > 0) {
++      const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
++      for (const [dotted, descriptor] of normalized.namespaceToolNames) {
++        if (!merged.has(dotted)) merged.set(dotted, descriptor);
++      }
++      result._toolNameMap = merged;
++    }
+   }
+ 
+   if (sourceToolNameMap) {
+diff --git a/open-sse/utils/museCloaking.js b/open-sse/utils/museCloaking.js
+index bcb76d9..f1cd6d9 100644
+--- a/open-sse/utils/museCloaking.js
++++ b/open-sse/utils/museCloaking.js
+@@ -120,7 +120,12 @@ function customToolAsFunction(tool) {
+ }
+ 
+ // Returns { tools, changed }; the input list and its tools are never mutated.
+-function normalizeMuseToolList(tools, customToolNames, namespace = null) {
++// Every namespaced child is also recorded in namespaceToolNames under its
++// flattened `namespace.child` spelling: Meta answers namespace calls in
++// exactly that dotted form without a namespace field, which strict
++// Responses clients (Codex) refuse to route ("unsupported call"). The
++// descriptors let the shared name restorer split them back.
++function normalizeMuseToolList(tools, customToolNames, namespaceToolNames, namespace = null) {
+   if (!Array.isArray(tools)) return { tools, changed: false };
+   let changed = false;
+   const out = tools.map(tool => {
+@@ -131,8 +136,19 @@ function normalizeMuseToolList(tools, customToolNames, namespace = null) {
+       delete next.search_content_types;
+       changed = true;
+     }
++    if (namespace && (next.type === RESPONSES_TOOL.FUNCTION || next.type === RESPONSES_TOOL.CUSTOM)
++      && typeof next.name === "string" && next.name) {
++      const dotted = `${namespace}.${next.name}`;
++      if (!namespaceToolNames.has(dotted)) {
++        namespaceToolNames.set(dotted, {
++          name: next.name,
++          namespace,
++          type: next.type === RESPONSES_TOOL.CUSTOM ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION,
++        });
++      }
++    }
+     if (next.type === RESPONSES_TOOL.NAMESPACE && Array.isArray(next.tools)) {
+-      const children = normalizeMuseToolList(next.tools, customToolNames, next.name);
++      const children = normalizeMuseToolList(next.tools, customToolNames, namespaceToolNames, next.name);
+       if (children.changed) {
+         changed = true;
+         return { ...next, tools: children.tools };
+@@ -176,12 +192,13 @@ function normalizeMuseToolChoice(choice, customToolNames) {
+  */
+ export function normalizeMuseResponsesTools(body) {
+   const customToolNames = new Set();
+-  if (!body || typeof body !== "object" || Array.isArray(body)) return { body, customToolNames };
++  const namespaceToolNames = new Map();
++  if (!body || typeof body !== "object" || Array.isArray(body)) return { body, customToolNames, namespaceToolNames };
+ 
+   let changed = false;
+   const out = { ...body };
+ 
+-  const tools = normalizeMuseToolList(body.tools, customToolNames);
++  const tools = normalizeMuseToolList(body.tools, customToolNames, namespaceToolNames);
+   if (tools.changed) { out.tools = tools.tools; changed = true; }
+ 
+   if (Array.isArray(body.input)) {
+@@ -189,7 +206,7 @@ export function normalizeMuseResponsesTools(body) {
+     const input = body.input.map(item => {
+       if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+       if (item.type === RESPONSES_ITEM.ADDITIONAL_TOOLS) {
+-        const declared = normalizeMuseToolList(item.tools, customToolNames);
++        const declared = normalizeMuseToolList(item.tools, customToolNames, namespaceToolNames);
+         if (!declared.changed) return item;
+         inputChanged = true;
+         return { ...item, tools: declared.tools };
+@@ -219,7 +236,7 @@ export function normalizeMuseResponsesTools(body) {
+   const choice = normalizeMuseToolChoice(body.tool_choice, customToolNames);
+   if (choice.changed) { out.tool_choice = choice.choice; changed = true; }
+ 
+-  return { body: changed ? out : body, customToolNames };
++  return { body: changed ? out : body, customToolNames, namespaceToolNames };
+ }
+ 
+ /** The freeform input inside a converted function call's arguments. */
+@@ -234,9 +251,15 @@ export function extractMuseCustomInput(argumentsText) {
+ 
+ /** True when a function_call item is one of the converted custom tools. */
+ export function isMuseCustomToolCall(item, customToolNames) {
+-  return item?.type === RESPONSES_ITEM.FUNCTION_CALL
+-    && typeof item.name === "string"
+-    && customToolNames?.has(museCustomToolKey(item.name, item.namespace)) === true;
++  if (item?.type !== RESPONSES_ITEM.FUNCTION_CALL || typeof item.name !== "string") return false;
++  if (customToolNames?.has(museCustomToolKey(item.name, item.namespace))) return true;
++  // Meta flattens a namespaced call into the dotted name without a
++  // namespace field; its identity key is the same pair joined by "/".
++  if (!item.namespace) {
++    const dot = item.name.indexOf(".");
++    if (dot > 0 && customToolNames?.has(`${item.name.slice(0, dot)}/${item.name.slice(dot + 1)}`)) return true;
++  }
++  return false;
+ }
+ 
+ function museCustomItem(item) {
+diff --git a/tests/unit/muse-cloaking.test.js b/tests/unit/muse-cloaking.test.js
+index cc1e807..1a51550 100644
+--- a/tests/unit/muse-cloaking.test.js
++++ b/tests/unit/muse-cloaking.test.js
+@@ -88,7 +88,12 @@ describe("Muse Code request cloaking", () => {
+     );
+     expect(result.tools.map(tool => tool.name)).toEqual(nativeRequest().tools.map(tool => tool.name));
+     expect(result.input[0].name).toBe("read_file");
+-    expect(result._toolNameMap).toBeUndefined();
++    // No cloaking aliases; the map carries only namespace descriptors used
++    // to split Meta's flattened namespace calls back on the way out.
++    expect([...(result._toolNameMap?.values() || [])].every(value => typeof value === "object")).toBe(true);
++    expect(result._toolNameMap?.get("collaboration.read_file")).toEqual({
++      name: "read_file", namespace: "collaboration", type: "function",
++    });
+   });
+ 
+   it("allocates unique bounded aliases and rewrites allowed_tools without mutating hosted entries", () => {
+diff --git a/tests/unit/muse-custom-tools.test.js b/tests/unit/muse-custom-tools.test.js
+index 4db0ce8..9251fca 100644
+--- a/tests/unit/muse-custom-tools.test.js
++++ b/tests/unit/muse-custom-tools.test.js
+@@ -105,7 +105,7 @@ describe("Muse request tool normalization", () => {
+   });
+ 
+   it("strips search_content_types everywhere and rewrites custom tools as functions", () => {
+-    const { upstreamRequest, customToolNames } = derive();
++    const { upstreamRequest, customToolNames, toolNameMap } = derive();
+ 
+     expect(JSON.stringify(upstreamRequest)).not.toContain("search_content_types");
+     expect(upstreamRequest.tools[2]).toEqual({ type: "web_search", external_web_access: true });
+@@ -144,6 +144,15 @@ describe("Muse request tool normalization", () => {
+     expect(customToolNames).toContain("apply_patch_muse");
+     expect(customToolNames).toContain("deferred_patch");
+     expect(customToolNames).toContain("collaboration/send_patch");
++
++    // Meta flattens namespace calls in its replies; the descriptors are
++    // what the response restorers split them back with.
++    expect(toolNameMap.get("collaboration.spawn_agent")).toEqual({
++      name: "spawn_agent", namespace: "collaboration", type: "function",
++    });
++    expect(toolNameMap.get("collaboration.send_patch")).toEqual({
++      name: "send_patch", namespace: "collaboration", type: "custom",
++    });
+   });
+ 
+   it("normalizes pay-as-you-go requests without cloaking their names", () => {
+@@ -186,6 +195,41 @@ describe("Muse custom tool restore (non-streaming)", () => {
+       type: "custom_tool_call", id: "fc_1", call_id: "call_1", name: "apply_patch", input: PATCH,
+     });
+   });
++
++  it("splits Meta's flattened namespace calls back into name + namespace", async () => {
++    const { toolNameMap, customToolNames } = derive();
++    const result = await handleNonStreamingResponse({
++      providerResponse: new Response(JSON.stringify({
++        id: "resp_2", object: "response", status: "completed",
++        output: [
++          { type: "function_call", id: "fc_2", call_id: "call_2", name: "collaboration.spawn_agent", arguments: '{"message":"hi"}' },
++          { type: "function_call", id: "fc_3", call_id: "call_3", name: "collaboration.send_patch", arguments: PATCH_ARGS },
++        ],
++        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
++      }), { status: 200, headers: { "content-type": "application/json" } }),
++      provider: "muse",
++      model: MODEL,
++      sourceFormat: FORMATS.OPENAI_RESPONSES,
++      targetFormat: FORMATS.OPENAI_RESPONSES,
++      body: codexRequest(),
++      stream: false,
++      requestStartTime: Date.now(),
++      toolNameMap,
++      customToolNames,
++      reqLogger: { logProviderResponse() {}, logConvertedResponse() {} },
++      trackDone() {},
++      appendLog() {},
++    });
++    const body = await result.response.json();
++    expect(body.output[0]).toEqual({
++      type: "function_call", id: "fc_2", call_id: "call_2",
++      name: "spawn_agent", namespace: "collaboration", arguments: '{"message":"hi"}',
++    });
++    expect(body.output[1]).toEqual({
++      type: "custom_tool_call", id: "fc_3", call_id: "call_3",
++      name: "send_patch", namespace: "collaboration", input: PATCH,
++    });
++  });
+ });
+ 
+ const frame = event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+@@ -196,6 +240,7 @@ const parseEvents = wire => wire.split("\n")
+ function customStreamEvents() {
+   const item = providerItem("apply_patch_muse");
+   const fnItem = { type: "function_call", id: "fc_2", call_id: "call_2", name: "read_file_muse", arguments: '{"Path":"x"}' };
++  const nsItem = { type: "function_call", id: "fc_3", call_id: "call_3", name: "collaboration.spawn_agent", arguments: '{"message":"hi"}' };
+   return [
+     { type: "response.created", sequence_number: 0, response: { id: "resp_s", object: "response", status: "in_progress", output: [] } },
+     { type: "response.output_item.added", sequence_number: 1, output_index: 0, item: { ...item, arguments: "" } },
+@@ -207,11 +252,15 @@ function customStreamEvents() {
+     { type: "response.function_call_arguments.delta", sequence_number: 7, item_id: "fc_2", output_index: 1, delta: '{"Path":"x"}' },
+     { type: "response.function_call_arguments.done", sequence_number: 8, item_id: "fc_2", output_index: 1, arguments: '{"Path":"x"}' },
+     { type: "response.output_item.done", sequence_number: 9, output_index: 1, item: fnItem },
++    { type: "response.output_item.added", sequence_number: 10, output_index: 2, item: { ...nsItem, arguments: "" } },
++    { type: "response.function_call_arguments.delta", sequence_number: 11, item_id: "fc_3", output_index: 2, delta: '{"message":"hi"}' },
++    { type: "response.function_call_arguments.done", sequence_number: 12, item_id: "fc_3", output_index: 2, arguments: '{"message":"hi"}' },
++    { type: "response.output_item.done", sequence_number: 13, output_index: 2, item: nsItem },
+     {
+-      type: "response.completed", sequence_number: 10,
++      type: "response.completed", sequence_number: 14,
+       response: {
+         id: "resp_s", object: "response", status: "completed",
+-        output: [item, fnItem],
++        output: [item, fnItem, nsItem],
+         usage: { input_tokens: 9, output_tokens: 4, total_tokens: 13 },
+       },
+     },
+@@ -261,15 +310,22 @@ describe("Muse custom tool restore (streaming passthrough)", () => {
+ 
+     // The ordinary function call beside it streams through untouched.
+     const fnDeltas = output.filter(event => event.type === "response.function_call_arguments.delta");
+-    expect(fnDeltas).toHaveLength(1);
+-    expect(fnDeltas[0].item_id).toBe("fc_2");
++    expect(fnDeltas.map(event => event.item_id)).toEqual(["fc_2", "fc_3"]);
+     expect(raw).toContain("event: response.function_call_arguments.delta");
+ 
++    // Meta's flattened namespace call is split back for the client router.
++    const nsAdded = output.find(event => event.type === "response.output_item.added" && event.item?.call_id === "call_3");
++    expect(nsAdded.item).toMatchObject({ type: "function_call", name: "spawn_agent", namespace: "collaboration" });
++
+     const done = output.find(event => event.type === "response.output_item.done" && event.item?.call_id === "call_1");
+     expect(done.item).toMatchObject({ type: "custom_tool_call", name: "apply_patch", input: PATCH });
+     const completed = output.find(event => event.type === "response.completed");
+     expect(completed.response.output[0]).toMatchObject({ type: "custom_tool_call", name: "apply_patch", input: PATCH });
+     expect(completed.response.output[1]).toMatchObject({ type: "function_call", name: "read_file", arguments: '{"Path":"x"}' });
++    expect(completed.response.output[2]).toMatchObject({
++      type: "function_call", name: "spawn_agent", namespace: "collaboration", arguments: '{"message":"hi"}',
++    });
++    expect(raw).not.toContain("collaboration.spawn_agent");
+ 
+     expect(raw).toContain("event: response.custom_tool_call_input.delta");
+     expect(raw).toContain("event: response.custom_tool_call_input.done");
+-- 
+2.55.0
+
