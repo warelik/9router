@@ -258,6 +258,14 @@ export function isMuseCustomToolCall(item, customToolNames) {
   if (!item.namespace) {
     const dot = item.name.indexOf(".");
     if (dot > 0 && customToolNames?.has(`${item.name.slice(0, dot)}/${item.name.slice(dot + 1)}`)) return true;
+    // And, variability permitting, the model sometimes replies with the
+    // bare child name instead; it is the custom tool only when exactly one
+    // recorded namespace child carries that name.
+    if (dot < 0 && customToolNames) {
+      let matches = 0;
+      for (const key of customToolNames) if (key.endsWith(`/${item.name}`)) matches += 1;
+      if (matches === 1) return true;
+    }
   }
   return false;
 }
@@ -266,6 +274,46 @@ function museCustomItem(item) {
   const converted = { ...item, type: RESPONSES_ITEM.CUSTOM_TOOL_CALL, input: extractMuseCustomInput(item.arguments) };
   delete converted.arguments;
   return converted;
+}
+
+/**
+ * Rewrite a bare namespace-child call ("spawn_agent") to the dotted key
+ * its namespace descriptor is filed under ("collaboration.spawn_agent"),
+ * in place, so the shared restorer can split it back into name +
+ * namespace right after. Only a uniquely matching child qualifies.
+ */
+export function qualifyMuseBareNamespaceCall(item, toolNameMap) {
+  if (!item || typeof item !== "object"
+    || (item.type !== RESPONSES_ITEM.FUNCTION_CALL && item.type !== RESPONSES_ITEM.CUSTOM_TOOL_CALL)
+    || typeof item.name !== "string" || !item.name
+    || item.namespace || item.name.includes(".") || !toolNameMap) return;
+  let dotted = null;
+  for (const [key, descriptor] of toolNameMap) {
+    if (descriptor && typeof descriptor === "object" && descriptor.name === item.name) {
+      if (dotted) return; // ambiguous: the bare name belongs to several namespaces
+      dotted = key;
+    }
+  }
+  if (dotted) item.name = dotted;
+}
+
+/**
+ * Qualify every bare namespace-child call in a payload (in place) so the
+ * shared restorer splits it into name + namespace right after. Returns the
+ * payload for chaining ahead of restoreToolNames.
+ */
+export function restoreMuseNamespaceCalls(payload, toolNameMap) {
+  if (!payload || typeof payload !== "object" || !toolNameMap?.size) return payload;
+  if (Array.isArray(payload)) {
+    for (const item of payload) restoreMuseNamespaceCalls(item, toolNameMap);
+    return payload;
+  }
+  qualifyMuseBareNamespaceCall(payload, toolNameMap);
+  for (const key of ["output", "item", "response", "data"]) {
+    const value = payload[key];
+    if (value && typeof value === "object") restoreMuseNamespaceCalls(value, toolNameMap);
+  }
+  return payload;
 }
 
 /**

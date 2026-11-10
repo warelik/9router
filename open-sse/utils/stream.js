@@ -11,7 +11,7 @@ import {
   isValidNativeGeminiResponse,
 } from "./streamHelpers.js";
 import { restoreToolNames } from "./opencodeFingerprint.js";
-import { convertMuseCustomStreamEvent } from "./museCloaking.js";
+import { convertMuseCustomStreamEvent, restoreMuseNamespaceCalls } from "./museCloaking.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
@@ -149,6 +149,7 @@ export function createSSEStream(options = {}) {
   const passthroughCustomToolNames = mode === STREAM_MODE.PASSTHROUGH && customToolNames
     ? new Set(customToolNames)
     : null;
+  const musePassthrough = mode === STREAM_MODE.PASSTHROUGH && provider === "muse";
   const museCustomCallItems = new Map();
   let pendingPassthroughEventLine = null;
 
@@ -469,6 +470,7 @@ export function createSSEStream(options = {}) {
               // "Model tried to call unavailable tool 'read_client'" (#4986).
               let toolNameRestored = false;
               if (toolNameMap?.size) {
+                if (musePassthrough) restoreMuseNamespaceCalls(parsed, toolNameMap);
                 const restored = restoreToolNames(parsed, toolNameMap);
                 if (restored !== parsed) {
                   parsed = restored;
