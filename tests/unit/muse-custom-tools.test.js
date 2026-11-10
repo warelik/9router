@@ -302,3 +302,39 @@ describe("Muse custom tool restore (streaming passthrough)", () => {
     expect(body.output[0]).toMatchObject({ type: "custom_tool_call", name: "apply_patch", call_id: "call_1", input: PATCH });
   });
 });
+
+describe("Muse portable Responses input (multi-agent histories)", () => {
+  it("declares the strict-input quirk on the Responses transport only", async () => {
+    const { resolveTransport } = await import("../../open-sse/services/provider.js");
+    expect(resolveTransport("muse", "openai-responses")?.quirks?.portableResponsesInput).toBe(true);
+    expect(resolveTransport("muse", "openai")?.quirks?.portableResponsesInput).toBeUndefined();
+  });
+
+  it("rewrites agent_message for Meta while keeping its native reasoning", async () => {
+    const { toPortableResponsesInput } = await import("../../open-sse/translator/formats/responsesApi.js");
+    const metaReasoning = {
+      type: "reasoning", id: "rs_meta", status: "completed", summary: [],
+      encrypted_content: "Q-PaDgFdLdBPCAXOYA7lSpfH-meta-native",
+    };
+    const out = toPortableResponsesInput([
+      {
+        type: "agent_message", author: "/root/child", recipient: "/root",
+        content: [
+          { type: "input_text", text: "child: done" },
+          { type: "encrypted_content", encrypted_content: "gAAAAABh-codex-fernet" },
+        ],
+      },
+      { type: "function_call_output", name: "send_message_to_thread", namespace: "codex_tui", output: "delegated" },
+      metaReasoning,
+    ]);
+    expect(out[0]).toEqual({
+      type: "message", role: "user",
+      content: [{ type: "input_text", text: "child: done" }],
+    });
+    expect(out[1]).toEqual({
+      type: "message", role: "user",
+      content: [{ type: "input_text", text: "delegated" }],
+    });
+    expect(out[2]).toBe(metaReasoning);
+  });
+});
