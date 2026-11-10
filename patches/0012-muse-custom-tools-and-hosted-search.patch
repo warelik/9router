@@ -1,0 +1,873 @@
+From ddc6d07243a01e7a84ca1fdfcceab7e91adaff8c Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Tue, 10 Nov 2026 07:32:17 +0000
+Subject: [PATCH] Accept Codex custom tools and hosted search on the Muse
+ Responses lane
+
+Codex declares the capabilities of the built-in OpenAI model it was
+configured from, so every routed model receives a freeform `custom`
+apply_patch tool and a web_search tool carrying
+search_content_types ["text","image"]. Meta's Responses executor
+rejects both before the first token: search_content_types is accepted
+on no tool shape (web_search_preview included), and `custom` tools
+are not supported at all. Every Codex turn against a Muse model
+failed with one of those 400s, main turns on the search field and
+title-generation turns on the custom tool.
+
+For the Muse Responses lane, strip search_content_types from tool
+declarations and send custom tools as ordinary functions with one
+raw `input` string, the same shape the Responses->Chat translator
+uses: declarations (including namespaced children and
+additional_tools), history calls and outputs, and tool_choice. The
+converted identities ride _customToolNames under their wire names
+(post-cloaking), and every response path presents the calls back as
+custom_tool_call with the unwrapped input: non-streaming JSON, the
+forced SSE->JSON conversion, and the streaming passthrough, where
+function argument fragments are buffered and emitted once as
+custom_tool_call_input delta+done. Ordinary function calls and all
+non-Muse passthrough traffic are unchanged.
+---
+ .../handlers/chatCore/nonStreamingHandler.js  |   3 +-
+ .../handlers/chatCore/sseToJsonHandler.js     |   3 +-
+ .../handlers/chatCore/streamingHandler.js     |   4 +-
+ open-sse/translator/index.js                  |  42 ++-
+ open-sse/utils/museCloaking.js                | 248 ++++++++++++++
+ open-sse/utils/stream.js                      |  65 +++-
+ tests/unit/muse-custom-tools.test.js          | 304 ++++++++++++++++++
+ 7 files changed, 653 insertions(+), 16 deletions(-)
+ create mode 100644 tests/unit/muse-custom-tools.test.js
+
+diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
+index c3dbc3b..c4b5e1e 100644
+--- a/open-sse/handlers/chatCore/nonStreamingHandler.js
++++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
+@@ -14,6 +14,7 @@ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, sav
+ import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+ import { decloakToolNames } from "../../utils/claudeCloaking.js";
+ import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
++import { restoreMuseCustomToolCalls } from "../../utils/museCloaking.js";
+ import { ROLE, RESPONSES_ITEM, OPENAI_FINISH, GEMINI_FINISH } from "../../translator/schema/index.js";
+ import { storeGeminiTurnSignature, storeGeminiThoughtSignature, storeGeminiServerParts, storeGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
+ import { toOpenAIFinish } from "../../translator/concerns/finishReason.js";
+@@ -447,7 +448,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
+ 
+   return {
+     success: true,
+-    response: new Response(JSON.stringify(restoreToolNames(translatedResponse, toolNameMap)), {
++    response: new Response(JSON.stringify(restoreToolNames(restoreMuseCustomToolCalls(translatedResponse, customToolNames), toolNameMap)), {
+       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", ...upstreamResponseHeaders(providerResponse.headers) }
+     })
+   };
+diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
+index 3bcd7f8..78689ef 100644
+--- a/open-sse/handlers/chatCore/sseToJsonHandler.js
++++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
+@@ -1,5 +1,6 @@
+ import { convertResponsesStreamToJson } from "../../transformer/streamToJsonConverter.js";
+ import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
++import { restoreMuseCustomToolCalls } from "../../utils/museCloaking.js";
+ import { createErrorResult } from "../../utils/error.js";
+ import { HTTP_STATUS } from "../../config/runtimeConfig.js";
+ import { FORMATS } from "../../translator/formats.js";
+@@ -233,7 +234,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
+ 
+       // Client is Responses API → return as-is
+       if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
+-        return { success: true, response: new Response(JSON.stringify(restoreToolNames(jsonResponse, toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
++        return { success: true, response: new Response(JSON.stringify(restoreToolNames(restoreMuseCustomToolCalls(jsonResponse, customToolNames), toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+       }
+ 
+       // Build client-format response.
+diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
+index 094ae16..ca9e689 100644
+--- a/open-sse/handlers/chatCore/streamingHandler.js
++++ b/open-sse/handlers/chatCore/streamingHandler.js
+@@ -46,7 +46,9 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
+   // The passthrough path has no format translation, so the fingerprint's tool
+   // rename map (read -> read_client) has to be handed over explicitly —
+   // otherwise the client receives a call to a tool it never declared (#4986).
+-  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, toolNameMap, sourceFormat, nativeJson, nativeResponseProjection, onNativeResponseSuccess);
++  // Muse custom tools were sent upstream as functions; the passthrough needs
++  // their wire names to present the calls back as custom_tool_call items.
++  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, toolNameMap, sourceFormat, nativeJson, nativeResponseProjection, onNativeResponseSuccess, provider === "muse" ? customToolNames : null);
+ }
+ 
+ /**
+diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
+index 768e305..137abd0 100644
+--- a/open-sse/translator/index.js
++++ b/open-sse/translator/index.js
+@@ -3,7 +3,7 @@ import { OPENAI_TOOL_CHOICE_NONE } from "./schema/index.js";
+ import { ensureToolCallIds, fixMissingToolResponses, isGeminiFamilyTarget } from "./concerns/toolCall.js";
+ import { prepareClaudeRequest, ensureTrailingUserTurn } from "./formats/claude.js";
+ import { cloakClaudeTools, decloakStreamChunk } from "../utils/claudeCloaking.js";
+-import { cloakMuseTools, isMuseCodeSubscription } from "../utils/museCloaking.js";
++import { cloakMuseTools, isMuseCodeSubscription, normalizeMuseResponsesTools } from "../utils/museCloaking.js";
+ import { restoreToolNames } from "../utils/opencodeFingerprint.js";
+ import { filterToOpenAIFormat } from "./formats/openai.js";
+ import { adaptAIStudioStructuredOutput } from "./formats/gemini.js";
+@@ -229,16 +229,36 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+     }
+   }
+ 
+-  // Muse Code subscription attestation rejects builtin names carrying foreign
+-  // schemas. Rename client function/custom tools after conversion to Responses;
+-  // the shared restorer uses the same per-request map on every response path.
+-  if (provider === "muse" && targetFormat === FORMATS.OPENAI_RESPONSES && isMuseCodeSubscription(credentials)) {
+-    const { body: cloakedBody, toolNameMap } = cloakMuseTools(result);
+-    result = cloakedBody;
+-    if (toolNameMap?.size > 0) {
+-      const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
+-      for (const [key, value] of toolNameMap) merged.set(key, value);
+-      result._toolNameMap = merged;
++  // Meta's Responses executor accepts only a subset of the Codex tool
++  // dialect: `search_content_types` is rejected on every search tool shape
++  // and `custom` tools outright. Rewrite both into the accepted forms for
++  // every Muse credential (the API-key lane reaches the same endpoint);
++  // the converted custom identities ride _customToolNames to the response
++  // restorers, under their wire names.
++  //
++  // Muse Code subscription attestation additionally rejects builtin names
++  // carrying foreign schemas. Rename client function/custom tools after
++  // conversion to Responses; the shared restorer uses the same per-request
++  // map on every response path.
++  if (provider === "muse" && targetFormat === FORMATS.OPENAI_RESPONSES) {
++    const normalized = normalizeMuseResponsesTools(result);
++    result = normalized.body;
++    let museCustomToolNames = normalized.customToolNames;
++    if (isMuseCodeSubscription(credentials)) {
++      const { body: cloakedBody, toolNameMap } = cloakMuseTools(result);
++      result = cloakedBody;
++      if (toolNameMap?.size > 0) {
++        const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
++        for (const [key, value] of toolNameMap) merged.set(key, value);
++        result._toolNameMap = merged;
++        if (museCustomToolNames.size > 0) {
++          const aliasByOriginal = new Map([...toolNameMap].map(([alias, original]) => [original, alias]));
++          museCustomToolNames = new Set([...museCustomToolNames].map(key => aliasByOriginal.get(key) ?? key));
++        }
++      }
++    }
++    if (museCustomToolNames.size > 0) {
++      result._customToolNames = [...new Set([...(result._customToolNames || []), ...museCustomToolNames])];
+     }
+   }
+ 
+diff --git a/open-sse/utils/museCloaking.js b/open-sse/utils/museCloaking.js
+index 28b277c..bcb76d9 100644
+--- a/open-sse/utils/museCloaking.js
++++ b/open-sse/utils/museCloaking.js
+@@ -75,3 +75,251 @@ export function cloakMuseTools(body) {
+ 
+   return { body: cloakedBody, toolNameMap };
+ }
++
++// --- Muse Responses tool normalization -------------------------------------
++//
++// Meta's Responses executor is a strict subset of the Codex dialect:
++//   * `search_content_types` is rejected on every tool shape ("only supported
++//     for web_search_preview tools" on web_search, and "not supported by the
++//     current Responses web_search executor" on web_search_preview itself),
++//     while a bare web_search tool is accepted. Codex sends the field
++//     whenever the model catalog declares text_and_image search.
++//   * `custom` tools are not supported at all ("`custom` tools are not
++//     supported on this endpoint"), which rejects Codex's freeform
++//     apply_patch declaration before the first token.
++//
++// Custom tools are therefore sent as ordinary function tools carrying one
++// raw `input` string — the same shape the Responses→Chat translator uses —
++// and the replies are converted back with restoreMuseCustomToolCalls (JSON
++// bodies) and convertMuseCustomStreamEvent (SSE). Identity travels as
++// `customToolNames`: the wire name for a top-level tool, or
++// `namespace/name` for a namespaced child (namespaces keep their children,
++// only the child's type changes).
++
++/** Identity key of a custom tool: its name, namespaced when it has one. */
++export function museCustomToolKey(name, namespace) {
++  return typeof namespace === "string" && namespace ? `${namespace}/${name}` : name;
++}
++
++function customToolAsFunction(tool) {
++  const formatHint = [tool.format?.syntax, tool.format?.definition].filter(Boolean).join("\n");
++  return {
++    type: RESPONSES_TOOL.FUNCTION,
++    name: tool.name,
++    description: [String(tool.description || ""), formatHint].filter(Boolean).join("\n\n"),
++    parameters: {
++      type: "object",
++      properties: {
++        input: { type: "string", description: "Raw freeform input for this custom tool" },
++      },
++      required: ["input"],
++      additionalProperties: false,
++    },
++    strict: false,
++  };
++}
++
++// Returns { tools, changed }; the input list and its tools are never mutated.
++function normalizeMuseToolList(tools, customToolNames, namespace = null) {
++  if (!Array.isArray(tools)) return { tools, changed: false };
++  let changed = false;
++  const out = tools.map(tool => {
++    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return tool;
++    let next = tool;
++    if (Object.hasOwn(next, "search_content_types")) {
++      next = { ...next };
++      delete next.search_content_types;
++      changed = true;
++    }
++    if (next.type === RESPONSES_TOOL.NAMESPACE && Array.isArray(next.tools)) {
++      const children = normalizeMuseToolList(next.tools, customToolNames, next.name);
++      if (children.changed) {
++        changed = true;
++        return { ...next, tools: children.tools };
++      }
++      return next;
++    }
++    if (next.type === RESPONSES_TOOL.CUSTOM && typeof next.name === "string" && next.name) {
++      customToolNames.add(museCustomToolKey(next.name, namespace));
++      changed = true;
++      return customToolAsFunction(next);
++    }
++    return next;
++  });
++  return { tools: changed ? out : tools, changed };
++}
++
++function normalizeMuseToolChoice(choice, customToolNames) {
++  if (!choice || typeof choice !== "object" || Array.isArray(choice)) return { choice, changed: false };
++  if (choice.type === RESPONSES_TOOL.CUSTOM && typeof choice.name === "string") {
++    customToolNames.add(museCustomToolKey(choice.name, choice.namespace));
++    return { choice: { ...choice, type: RESPONSES_TOOL.FUNCTION }, changed: true };
++  }
++  if (choice.type === RESPONSES_TOOL.ALLOWED_TOOLS && Array.isArray(choice.tools)) {
++    let changed = false;
++    const tools = choice.tools.map(entry => {
++      const normalized = normalizeMuseToolChoice(entry, customToolNames);
++      changed = changed || normalized.changed;
++      return normalized.choice;
++    });
++    return { choice: changed ? { ...choice, tools } : choice, changed };
++  }
++  return { choice, changed: false };
++}
++
++/**
++ * Rewrite a Responses request into the subset Meta accepts: hosted search
++ * tools lose `search_content_types`, custom tools (declarations, history
++ * calls/outputs and tool_choice) become their function form. Returns the
++ * client-side custom identities; the caller maps top-level names through
++ * any later renaming (cloaking) before handing the set to the restorers.
++ */
++export function normalizeMuseResponsesTools(body) {
++  const customToolNames = new Set();
++  if (!body || typeof body !== "object" || Array.isArray(body)) return { body, customToolNames };
++
++  let changed = false;
++  const out = { ...body };
++
++  const tools = normalizeMuseToolList(body.tools, customToolNames);
++  if (tools.changed) { out.tools = tools.tools; changed = true; }
++
++  if (Array.isArray(body.input)) {
++    let inputChanged = false;
++    const input = body.input.map(item => {
++      if (!item || typeof item !== "object" || Array.isArray(item)) return item;
++      if (item.type === RESPONSES_ITEM.ADDITIONAL_TOOLS) {
++        const declared = normalizeMuseToolList(item.tools, customToolNames);
++        if (!declared.changed) return item;
++        inputChanged = true;
++        return { ...item, tools: declared.tools };
++      }
++      if (item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL) {
++        if (typeof item.name === "string" && item.name) {
++          customToolNames.add(museCustomToolKey(item.name, item.namespace));
++        }
++        inputChanged = true;
++        const converted = {
++          ...item,
++          type: RESPONSES_ITEM.FUNCTION_CALL,
++          arguments: JSON.stringify({ input: typeof item.input === "string" ? item.input : JSON.stringify(item.input ?? "") }),
++        };
++        delete converted.input;
++        return converted;
++      }
++      if (item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL_OUTPUT) {
++        inputChanged = true;
++        return { ...item, type: RESPONSES_ITEM.FUNCTION_CALL_OUTPUT };
++      }
++      return item;
++    });
++    if (inputChanged) { out.input = input; changed = true; }
++  }
++
++  const choice = normalizeMuseToolChoice(body.tool_choice, customToolNames);
++  if (choice.changed) { out.tool_choice = choice.choice; changed = true; }
++
++  return { body: changed ? out : body, customToolNames };
++}
++
++/** The freeform input inside a converted function call's arguments. */
++export function extractMuseCustomInput(argumentsText) {
++  if (typeof argumentsText !== "string") return "";
++  try {
++    const parsed = JSON.parse(argumentsText);
++    if (parsed && typeof parsed === "object" && typeof parsed.input === "string") return parsed.input;
++  } catch { /* incomplete or raw freeform input */ }
++  return argumentsText;
++}
++
++/** True when a function_call item is one of the converted custom tools. */
++export function isMuseCustomToolCall(item, customToolNames) {
++  return item?.type === RESPONSES_ITEM.FUNCTION_CALL
++    && typeof item.name === "string"
++    && customToolNames?.has(museCustomToolKey(item.name, item.namespace)) === true;
++}
++
++function museCustomItem(item) {
++  const converted = { ...item, type: RESPONSES_ITEM.CUSTOM_TOOL_CALL, input: extractMuseCustomInput(item.arguments) };
++  delete converted.arguments;
++  return converted;
++}
++
++/**
++ * Convert function_call items of converted custom tools back to
++ * custom_tool_call in a JSON payload (a Response body, a lifecycle event's
++ * response.output, a lone output item). Payloads sharing no converted call
++ * are returned by identity.
++ */
++export function restoreMuseCustomToolCalls(payload, customToolNames) {
++  if (!customToolNames?.size || !payload) return payload;
++  if (Array.isArray(payload)) {
++    let changed = false;
++    const out = payload.map(item => {
++      const restored = restoreMuseCustomToolCalls(item, customToolNames);
++      changed = changed || restored !== item;
++      return restored;
++    });
++    return changed ? out : payload;
++  }
++  if (typeof payload !== "object") return payload;
++  if (isMuseCustomToolCall(payload, customToolNames)) return museCustomItem(payload);
++
++  let out = payload;
++  const put = (key, value) => {
++    if (out === payload) out = { ...payload };
++    out[key] = value;
++  };
++  for (const key of ["output", "item", "response", "data"]) {
++    const value = payload[key];
++    if (value && typeof value === "object") {
++      const restored = restoreMuseCustomToolCalls(value, customToolNames);
++      if (restored !== value) put(key, restored);
++    }
++  }
++  return out;
++}
++
++/**
++ * Convert one upstream Responses SSE event for the passthrough stream.
++ * `pending` is a per-stream Map of item_id → accumulated function arguments
++ * for converted calls: their argument deltas are JSON fragments of the
++ * `{input}` wrapper, so they are buffered and emitted once, unwrapped, as
++ * custom_tool_call_input delta+done when the arguments complete — mirroring
++ * the translated stream. Returns the events to forward (possibly none);
++ * unconverted events are returned by identity.
++ */
++export function convertMuseCustomStreamEvent(event, customToolNames, pending) {
++  if (!event || typeof event !== "object" || !customToolNames?.size) return [event];
++
++  switch (event.type) {
++    case "response.output_item.added": {
++      if (!isMuseCustomToolCall(event.item, customToolNames)) return [event];
++      if (typeof event.item.id === "string") pending.set(event.item.id, "");
++      return [{ ...event, item: { ...museCustomItem(event.item), input: "" } }];
++    }
++    case "response.function_call_arguments.delta": {
++      if (!pending.has(event.item_id)) return [event];
++      if (typeof event.delta === "string") pending.set(event.item_id, pending.get(event.item_id) + event.delta);
++      return [];
++    }
++    case "response.function_call_arguments.done": {
++      if (!pending.has(event.item_id)) return [event];
++      const input = extractMuseCustomInput(typeof event.arguments === "string" ? event.arguments : pending.get(event.item_id));
++      const { arguments: _arguments, delta: _delta, ...common } = event;
++      return [
++        { ...common, type: "response.custom_tool_call_input.delta", delta: input },
++        { ...common, type: "response.custom_tool_call_input.done", input },
++      ];
++    }
++    case "response.output_item.done": {
++      if (typeof event.item?.id === "string") pending.delete(event.item.id);
++      if (!isMuseCustomToolCall(event.item, customToolNames)) return [event];
++      return [{ ...event, item: museCustomItem(event.item) }];
++    }
++    default: {
++      const restored = restoreMuseCustomToolCalls(event, customToolNames);
++      return [restored];
++    }
++  }
++}
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index 0f2b994..5d5fec0 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -11,6 +11,7 @@ import {
+   isValidNativeGeminiResponse,
+ } from "./streamHelpers.js";
+ import { restoreToolNames } from "./opencodeFingerprint.js";
++import { convertMuseCustomStreamEvent } from "./museCloaking.js";
+ import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
+ import { dbg, isDebugEnabled } from "./debugLog.js";
+ 
+@@ -140,6 +141,17 @@ export function createSSEStream(options = {}) {
+   // tool_call without a string id (#4992).
+   const seenToolCallIds = new Map();
+ 
++  // Muse custom tools travel upstream as functions (see
++  // normalizeMuseResponsesTools); on this no-translation path their calls
++  // are converted back per event, which needs their wire names plus a
++  // per-item argument buffer. An `event:` line is held until its data line
++  // is seen, because conversion may suppress or rename the event.
++  const passthroughCustomToolNames = mode === STREAM_MODE.PASSTHROUGH && customToolNames
++    ? new Set(customToolNames)
++    : null;
++  const museCustomCallItems = new Map();
++  let pendingPassthroughEventLine = null;
++
+   // Per-stream decoder with stream:true to correctly handle multi-byte chars split across chunks
+   const decoder = new TextDecoder("utf-8", { fatal: false });
+ 
+@@ -397,9 +409,19 @@ export function createSSEStream(options = {}) {
+ 
+         // Passthrough mode: normalize and forward
+         if (mode === STREAM_MODE.PASSTHROUGH) {
++          if (passthroughCustomToolNames?.size && trimmed.startsWith("event:")) {
++            if (pendingPassthroughEventLine !== null) {
++              const held = pendingPassthroughEventLine + "\n";
++              reqLogger?.appendConvertedChunk?.(held);
++              controller.enqueue(sharedEncoder.encode(held));
++            }
++            pendingPassthroughEventLine = line;
++            continue;
++          }
+           let output;
+           let injectedUsage = false;
+           let responsesTerminal = false;
++          let customConverted = false;
+ 
+           if (trimmed.startsWith("data:") && trimmed.slice(5).trim() !== "[DONE]") {
+             try {
+@@ -412,6 +434,32 @@ export function createSSEStream(options = {}) {
+               // chunk reaches the client.
+               const toolCallIdFixed = ensureStreamToolCallIds(parsed, seenToolCallIds);
+ 
++              // Converted Muse custom calls: argument deltas are buffered
++              // (event dropped together with its held `event:` line), and a
++              // completed call is emitted as custom_tool_call_input events.
++              if (passthroughCustomToolNames?.size) {
++                const convertedEvents = convertMuseCustomStreamEvent(parsed, passthroughCustomToolNames, museCustomCallItems);
++                if (convertedEvents.length === 0) {
++                  pendingPassthroughEventLine = null;
++                  continue;
++                }
++                if (convertedEvents.length > 1) {
++                  const hadEventLine = pendingPassthroughEventLine !== null;
++                  pendingPassthroughEventLine = null;
++                  for (const convertedEvent of convertedEvents) {
++                    const restoredEvent = toolNameMap?.size ? restoreToolNames(convertedEvent, toolNameMap) : convertedEvent;
++                    const framed = `${hadEventLine ? `event: ${restoredEvent.type}\n` : ""}data: ${JSON.stringify(restoredEvent)}\n`;
++                    reqLogger?.appendConvertedChunk?.(framed);
++                    controller.enqueue(sharedEncoder.encode(framed));
++                  }
++                  continue;
++                }
++                if (convertedEvents[0] !== parsed) {
++                  parsed = convertedEvents[0];
++                  customConverted = true;
++                }
++              }
++
+               // The fingerprint pass renames a colliding caller tool to an alias
+               // (read -> read_client). On this path nothing restored it, so the
+               // client received a call to a tool it never declared and answered
+@@ -475,6 +523,7 @@ export function createSSEStream(options = {}) {
+               }
+ 
+               if (!hasValuableContent(parsed, FORMATS.OPENAI)) {
++                pendingPassthroughEventLine = null;
+                 continue;
+               }
+ 
+@@ -509,7 +558,7 @@ export function createSSEStream(options = {}) {
+                 parsed.usage = filterUsageForFormat(buffered, FORMATS.OPENAI);
+                 output = `data: ${JSON.stringify(parsed)}\n`;
+                 injectedUsage = true;
+-              } else if (idFixed || fieldsInjected || toolCallIdFixed || toolNameRestored) {
++              } else if (idFixed || fieldsInjected || toolCallIdFixed || toolNameRestored || customConverted) {
+                 output = `data: ${JSON.stringify(parsed)}\n`;
+                 injectedUsage = true;
+               }
+@@ -517,6 +566,7 @@ export function createSSEStream(options = {}) {
+               // Skip non-JSON data lines silently — don't forward garbage to clients.
+               // Upstream providers sometimes return plain-text errors (HTML, rate-limit
+               // messages) in the SSE stream that would break downstream JSON decoders.
++              pendingPassthroughEventLine = null;
+               continue;
+             }
+           }
+@@ -529,6 +579,12 @@ export function createSSEStream(options = {}) {
+             }
+           }
+ 
++          if (pendingPassthroughEventLine !== null) {
++            const eventLine = pendingPassthroughEventLine + "\n";
++            pendingPassthroughEventLine = null;
++            reqLogger?.appendConvertedChunk?.(eventLine);
++            controller.enqueue(sharedEncoder.encode(eventLine));
++          }
+           reqLogger?.appendConvertedChunk?.(output);
+           controller.enqueue(sharedEncoder.encode(output));
+           // Responses clients (codex CLI) close on response.completed instead of [DONE]
+@@ -817,6 +873,10 @@ export function createSSEStream(options = {}) {
+             }
+             output = restoreSseEvent([output], toolNameMap);
+             if (!output.endsWith("\n")) output += "\n\n";
++            if (pendingPassthroughEventLine !== null) {
++              controller.enqueue(sharedEncoder.encode(pendingPassthroughEventLine + "\n"));
++              pendingPassthroughEventLine = null;
++            }
+             reqLogger?.appendConvertedChunk?.(output);
+             controller.enqueue(sharedEncoder.encode(output));
+           }
+@@ -966,7 +1026,7 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
+   });
+ }
+ 
+-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null, onNativeResponseSuccess = null) {
++export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null, onNativeResponseSuccess = null, customToolNames = null) {
+   return createSSEStream({
+     mode: STREAM_MODE.PASSTHROUGH,
+     sourceFormat,
+@@ -976,6 +1036,7 @@ export function createPassthroughStreamWithLogger(provider = null, reqLogger = n
+     provider,
+     reqLogger,
+     toolNameMap,
++    customToolNames,
+     model,
+     connectionId,
+     body,
+diff --git a/tests/unit/muse-custom-tools.test.js b/tests/unit/muse-custom-tools.test.js
+new file mode 100644
+index 0000000..cd22261
+--- /dev/null
++++ b/tests/unit/muse-custom-tools.test.js
+@@ -0,0 +1,304 @@
++/**
++ * Meta's Responses executor rejects two shapes Codex sends for every model
++ * whose catalog entry is inherited from an OpenAI model:
++ *   - `{"type":"web_search","search_content_types":["text","image"]}`
++ *     → 400 "`tools[].search_content_types` is only supported for
++ *       web_search_preview tools" (and web_search_preview with the field is
++ *       rejected too: "not supported by the current Responses web_search
++ *       executor"); a bare web_search tool is accepted.
++ *   - the freeform `{"type":"custom","name":"apply_patch",...}` tool
++ *     → 400 "`custom` tools are not supported on this endpoint".
++ *
++ * The Muse lane therefore strips search_content_types and sends custom
++ * tools as functions with one raw `input` string (the Responses→Chat
++ * shape), converting the calls back to custom_tool_call on every response
++ * path: non-streaming JSON, forced SSE→JSON, and the passthrough stream
++ * Codex actually consumes.
++ */
++import { describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++  saveUsageStats: vi.fn(),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", async importOriginal => ({
++  ...await importOriginal(),
++  buildRequestDetail: () => ({}),
++  extractRequestConfig: (body, stream) => ({ body, stream }),
++  saveUsageStats: () => {},
++  formatDoneLine: () => "",
++}));
++
++import "../translator/registerAll.js";
++import { handleStreamingResponse } from "../../open-sse/handlers/chatCore/streamingHandler.js";
++import { handleNonStreamingResponse } from "../../open-sse/handlers/chatCore/nonStreamingHandler.js";
++import { handleForcedSSEToJson } from "../../open-sse/handlers/chatCore/sseToJsonHandler.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { normalizeMuseResponsesTools } from "../../open-sse/utils/museCloaking.js";
++import { createStreamController } from "../../open-sse/utils/streamHandler.js";
++
++const MODEL = "muse-wonder-full-1.0-contributor";
++const OAUTH = { accessToken: "test-only-muse-oauth" };
++const PATCH = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch";
++const PATCH_ARGS = JSON.stringify({ input: PATCH });
++
++function codexRequest() {
++  return {
++    model: MODEL,
++    input: [
++      {
++        type: "additional_tools",
++        tools: [
++          { type: "custom", name: "deferred_patch" },
++          { type: "web_search", search_content_types: ["text", "image"] },
++        ],
++      },
++      { type: "custom_tool_call", call_id: "call_prev", name: "apply_patch", input: PATCH },
++      { type: "custom_tool_call_output", call_id: "call_prev", output: "patched" },
++      { type: "message", role: "user", content: [{ type: "input_text", text: "again" }] },
++    ],
++    tools: [
++      { type: "function", name: "read_file", description: "read", strict: false, parameters: { type: "object", properties: {} } },
++      {
++        type: "custom", name: "apply_patch", description: "edit files",
++        format: { type: "grammar", syntax: "lark", definition: "start: begin_patch" },
++      },
++      { type: "web_search", external_web_access: true, search_content_types: ["text", "image"] },
++      { type: "web_search_preview", search_content_types: ["text"] },
++      {
++        type: "namespace", name: "collaboration", description: "sub-agents",
++        tools: [
++          { type: "function", name: "spawn_agent", parameters: { type: "object", properties: {} } },
++          { type: "custom", name: "send_patch", description: "raw patch" },
++        ],
++      },
++    ],
++    tool_choice: { type: "custom", name: "apply_patch" },
++  };
++}
++
++function derive(credentials = OAUTH) {
++  const result = translateRequest(
++    FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, MODEL, codexRequest(), true, credentials, "muse",
++  );
++  return {
++    upstreamRequest: result,
++    toolNameMap: result._toolNameMap,
++    customToolNames: new Set(result._customToolNames || []),
++  };
++}
++
++describe("Muse request tool normalization", () => {
++  it("does not mutate the caller's body", () => {
++    const request = codexRequest();
++    const snapshot = structuredClone(request);
++    const { body } = normalizeMuseResponsesTools(request);
++    expect(body).not.toBe(request);
++    expect(request).toEqual(snapshot);
++  });
++
++  it("strips search_content_types everywhere and rewrites custom tools as functions", () => {
++    const { upstreamRequest, customToolNames } = derive();
++
++    expect(JSON.stringify(upstreamRequest)).not.toContain("search_content_types");
++    expect(upstreamRequest.tools[2]).toEqual({ type: "web_search", external_web_access: true });
++    expect(upstreamRequest.tools[3]).toEqual({ type: "web_search_preview" });
++
++    const patch = upstreamRequest.tools[1];
++    expect(patch.type).toBe("function");
++    expect(patch.name).toBe("apply_patch_muse");
++    expect(patch.description).toContain("edit files");
++    expect(patch.description).toContain("start: begin_patch");
++    expect(patch.parameters).toEqual({
++      type: "object",
++      properties: { input: { type: "string", description: "Raw freeform input for this custom tool" } },
++      required: ["input"],
++      additionalProperties: false,
++    });
++    expect(patch.format).toBeUndefined();
++
++    const namespace = upstreamRequest.tools[4];
++    expect(namespace.tools[0]).toMatchObject({ type: "function", name: "spawn_agent" });
++    expect(namespace.tools[1]).toMatchObject({ type: "function", name: "send_patch" });
++
++    const deferred = upstreamRequest.input[0];
++    // Cloaking renames body.tools only; deferred declarations keep their name.
++    expect(deferred.tools[0]).toMatchObject({ type: "function", name: "deferred_patch" });
++    expect(deferred.tools[1]).toEqual({ type: "web_search" });
++
++    expect(upstreamRequest.input[1]).toEqual({
++      type: "function_call", call_id: "call_prev", name: "apply_patch_muse", arguments: PATCH_ARGS,
++    });
++    expect(upstreamRequest.input[2]).toEqual({
++      type: "function_call_output", call_id: "call_prev", output: "patched",
++    });
++    expect(upstreamRequest.tool_choice).toEqual({ type: "function", name: "apply_patch_muse" });
++
++    expect(customToolNames).toContain("apply_patch_muse");
++    expect(customToolNames).toContain("deferred_patch");
++    expect(customToolNames).toContain("collaboration/send_patch");
++  });
++
++  it("normalizes pay-as-you-go requests without cloaking their names", () => {
++    const { upstreamRequest, customToolNames } = derive({ apiKey: "test-only-payg-key" });
++    expect(upstreamRequest.tools[1]).toMatchObject({ type: "function", name: "apply_patch" });
++    expect(upstreamRequest.input[1].name).toBe("apply_patch");
++    expect(JSON.stringify(upstreamRequest)).not.toContain("search_content_types");
++    expect(customToolNames).toContain("apply_patch");
++  });
++});
++
++function providerItem(name, args = PATCH_ARGS) {
++  return { type: "function_call", id: "fc_1", call_id: "call_1", name, arguments: args };
++}
++
++describe("Muse custom tool restore (non-streaming)", () => {
++  it("returns a custom_tool_call with the unwrapped raw input", async () => {
++    const { toolNameMap, customToolNames } = derive();
++    const result = await handleNonStreamingResponse({
++      providerResponse: new Response(JSON.stringify({
++        id: "resp_1", object: "response", status: "completed",
++        output: [providerItem("apply_patch_muse")],
++        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
++      }), { status: 200, headers: { "content-type": "application/json" } }),
++      provider: "muse",
++      model: MODEL,
++      sourceFormat: FORMATS.OPENAI_RESPONSES,
++      targetFormat: FORMATS.OPENAI_RESPONSES,
++      body: codexRequest(),
++      stream: false,
++      requestStartTime: Date.now(),
++      toolNameMap,
++      customToolNames,
++      reqLogger: { logProviderResponse() {}, logConvertedResponse() {} },
++      trackDone() {},
++      appendLog() {},
++    });
++    const body = await result.response.json();
++    expect(body.output[0]).toEqual({
++      type: "custom_tool_call", id: "fc_1", call_id: "call_1", name: "apply_patch", input: PATCH,
++    });
++  });
++});
++
++const frame = event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
++const parseEvents = wire => wire.split("\n")
++  .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
++  .map(line => JSON.parse(line.slice(6)));
++
++function customStreamEvents() {
++  const item = providerItem("apply_patch_muse");
++  const fnItem = { type: "function_call", id: "fc_2", call_id: "call_2", name: "read_file_muse", arguments: '{"Path":"x"}' };
++  return [
++    { type: "response.created", sequence_number: 0, response: { id: "resp_s", object: "response", status: "in_progress", output: [] } },
++    { type: "response.output_item.added", sequence_number: 1, output_index: 0, item: { ...item, arguments: "" } },
++    { type: "response.function_call_arguments.delta", sequence_number: 2, item_id: "fc_1", output_index: 0, delta: PATCH_ARGS.slice(0, 12) },
++    { type: "response.function_call_arguments.delta", sequence_number: 3, item_id: "fc_1", output_index: 0, delta: PATCH_ARGS.slice(12) },
++    { type: "response.function_call_arguments.done", sequence_number: 4, item_id: "fc_1", output_index: 0, arguments: PATCH_ARGS },
++    { type: "response.output_item.done", sequence_number: 5, output_index: 0, item },
++    { type: "response.output_item.added", sequence_number: 6, output_index: 1, item: { ...fnItem, arguments: "" } },
++    { type: "response.function_call_arguments.delta", sequence_number: 7, item_id: "fc_2", output_index: 1, delta: '{"Path":"x"}' },
++    { type: "response.function_call_arguments.done", sequence_number: 8, item_id: "fc_2", output_index: 1, arguments: '{"Path":"x"}' },
++    { type: "response.output_item.done", sequence_number: 9, output_index: 1, item: fnItem },
++    {
++      type: "response.completed", sequence_number: 10,
++      response: {
++        id: "resp_s", object: "response", status: "completed",
++        output: [item, fnItem],
++        usage: { input_tokens: 9, output_tokens: 4, total_tokens: 13 },
++      },
++    },
++  ];
++}
++
++async function runStream(fragmented) {
++  const { toolNameMap, customToolNames } = derive();
++  const bytes = new TextEncoder().encode(customStreamEvents().map(frame).join(""));
++  const chunks = fragmented ? [...bytes].map(byte => Uint8Array.of(byte)) : [bytes];
++  const providerResponse = new Response(new ReadableStream({
++    start(controller) {
++      for (const chunk of chunks) controller.enqueue(chunk);
++      controller.close();
++    },
++  }), { headers: { "content-type": "text/event-stream" } });
++  const result = await handleStreamingResponse({
++    providerResponse,
++    provider: "muse",
++    model: MODEL,
++    sourceFormat: FORMATS.OPENAI_RESPONSES,
++    targetFormat: FORMATS.OPENAI_RESPONSES,
++    body: codexRequest(),
++    stream: true,
++    requestStartTime: Date.now(),
++    toolNameMap,
++    customToolNames,
++    streamController: createStreamController({ provider: "muse", model: MODEL }),
++  });
++  return result.response.text();
++}
++
++describe("Muse custom tool restore (streaming passthrough)", () => {
++  it.each([false, true])("buffers custom argument fragments and emits custom_tool_call_input (fragmented=%s)", async fragmented => {
++    const raw = await runStream(fragmented);
++    const output = parseEvents(raw);
++
++    const added = output.find(event => event.type === "response.output_item.added" && event.item?.call_id === "call_1");
++    expect(added.item).toMatchObject({ type: "custom_tool_call", name: "apply_patch", input: "" });
++    expect(added.item.arguments).toBeUndefined();
++
++    const kinds = output.map(event => event.type);
++    expect(kinds.filter(type => type === "response.custom_tool_call_input.delta")).toHaveLength(1);
++    expect(kinds.filter(type => type === "response.custom_tool_call_input.done")).toHaveLength(1);
++    expect(output.find(event => event.type === "response.custom_tool_call_input.delta")?.delta).toBe(PATCH);
++    expect(output.find(event => event.type === "response.custom_tool_call_input.done")?.input).toBe(PATCH);
++
++    // The ordinary function call beside it streams through untouched.
++    const fnDeltas = output.filter(event => event.type === "response.function_call_arguments.delta");
++    expect(fnDeltas).toHaveLength(1);
++    expect(fnDeltas[0].item_id).toBe("fc_2");
++    expect(raw).toContain("event: response.function_call_arguments.delta");
++
++    const done = output.find(event => event.type === "response.output_item.done" && event.item?.call_id === "call_1");
++    expect(done.item).toMatchObject({ type: "custom_tool_call", name: "apply_patch", input: PATCH });
++    const completed = output.find(event => event.type === "response.completed");
++    expect(completed.response.output[0]).toMatchObject({ type: "custom_tool_call", name: "apply_patch", input: PATCH });
++    expect(completed.response.output[1]).toMatchObject({ type: "function_call", name: "read_file", arguments: '{"Path":"x"}' });
++
++    expect(raw).toContain("event: response.custom_tool_call_input.delta");
++    expect(raw).toContain("event: response.custom_tool_call_input.done");
++    expect(raw).not.toContain("apply_patch_muse");
++    expect(raw).not.toContain("read_file_muse");
++  });
++
++  it("restores the call when a JSON client is served from the SSE stream", async () => {
++    const { toolNameMap, customToolNames } = derive();
++    const item = providerItem("apply_patch_muse");
++    const events = [
++      { type: "response.output_item.done", output_index: 0, item },
++      { type: "response.completed", response: { status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } },
++    ];
++    const result = await handleForcedSSEToJson({
++      providerResponse: new Response(events.map(frame).join(""), { headers: { "content-type": "text/event-stream" } }),
++      provider: "muse",
++      model: MODEL,
++      sourceFormat: FORMATS.OPENAI_RESPONSES,
++      targetFormat: FORMATS.OPENAI_RESPONSES,
++      body: codexRequest(),
++      stream: false,
++      requestStartTime: Date.now(),
++      toolNameMap,
++      customToolNames,
++      trackDone() {},
++      appendLog() {},
++    });
++    const body = await result.response.json();
++    expect(body.output[0]).toMatchObject({ type: "custom_tool_call", name: "apply_patch", call_id: "call_1", input: PATCH });
++  });
++});
+-- 
+2.55.0
+
