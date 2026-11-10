@@ -260,6 +260,16 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     if (museCustomToolNames.size > 0) {
       result._customToolNames = [...new Set([...(result._customToolNames || []), ...museCustomToolNames])];
     }
+    // Meta answers namespace calls flattened ("collaboration.spawn_agent",
+    // no namespace field); the descriptors let the shared restorer split
+    // them back into name + namespace on every response path.
+    if (normalized.namespaceToolNames?.size > 0) {
+      const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
+      for (const [dotted, descriptor] of normalized.namespaceToolNames) {
+        if (!merged.has(dotted)) merged.set(dotted, descriptor);
+      }
+      result._toolNameMap = merged;
+    }
   }
 
   if (sourceToolNameMap) {

@@ -105,7 +105,7 @@ describe("Muse request tool normalization", () => {
   });
 
   it("strips search_content_types everywhere and rewrites custom tools as functions", () => {
-    const { upstreamRequest, customToolNames } = derive();
+    const { upstreamRequest, customToolNames, toolNameMap } = derive();
 
     expect(JSON.stringify(upstreamRequest)).not.toContain("search_content_types");
     expect(upstreamRequest.tools[2]).toEqual({ type: "web_search", external_web_access: true });
@@ -144,6 +144,15 @@ describe("Muse request tool normalization", () => {
     expect(customToolNames).toContain("apply_patch_muse");
     expect(customToolNames).toContain("deferred_patch");
     expect(customToolNames).toContain("collaboration/send_patch");
+
+    // Meta flattens namespace calls in its replies; the descriptors are
+    // what the response restorers split them back with.
+    expect(toolNameMap.get("collaboration.spawn_agent")).toEqual({
+      name: "spawn_agent", namespace: "collaboration", type: "function",
+    });
+    expect(toolNameMap.get("collaboration.send_patch")).toEqual({
+      name: "send_patch", namespace: "collaboration", type: "custom",
+    });
   });
 
   it("normalizes pay-as-you-go requests without cloaking their names", () => {
@@ -186,6 +195,41 @@ describe("Muse custom tool restore (non-streaming)", () => {
       type: "custom_tool_call", id: "fc_1", call_id: "call_1", name: "apply_patch", input: PATCH,
     });
   });
+
+  it("splits Meta's flattened namespace calls back into name + namespace", async () => {
+    const { toolNameMap, customToolNames } = derive();
+    const result = await handleNonStreamingResponse({
+      providerResponse: new Response(JSON.stringify({
+        id: "resp_2", object: "response", status: "completed",
+        output: [
+          { type: "function_call", id: "fc_2", call_id: "call_2", name: "collaboration.spawn_agent", arguments: '{"message":"hi"}' },
+          { type: "function_call", id: "fc_3", call_id: "call_3", name: "collaboration.send_patch", arguments: PATCH_ARGS },
+        ],
+        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+      provider: "muse",
+      model: MODEL,
+      sourceFormat: FORMATS.OPENAI_RESPONSES,
+      targetFormat: FORMATS.OPENAI_RESPONSES,
+      body: codexRequest(),
+      stream: false,
+      requestStartTime: Date.now(),
+      toolNameMap,
+      customToolNames,
+      reqLogger: { logProviderResponse() {}, logConvertedResponse() {} },
+      trackDone() {},
+      appendLog() {},
+    });
+    const body = await result.response.json();
+    expect(body.output[0]).toEqual({
+      type: "function_call", id: "fc_2", call_id: "call_2",
+      name: "spawn_agent", namespace: "collaboration", arguments: '{"message":"hi"}',
+    });
+    expect(body.output[1]).toEqual({
+      type: "custom_tool_call", id: "fc_3", call_id: "call_3",
+      name: "send_patch", namespace: "collaboration", input: PATCH,
+    });
+  });
 });
 
 const frame = event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
@@ -196,6 +240,7 @@ const parseEvents = wire => wire.split("\n")
 function customStreamEvents() {
   const item = providerItem("apply_patch_muse");
   const fnItem = { type: "function_call", id: "fc_2", call_id: "call_2", name: "read_file_muse", arguments: '{"Path":"x"}' };
+  const nsItem = { type: "function_call", id: "fc_3", call_id: "call_3", name: "collaboration.spawn_agent", arguments: '{"message":"hi"}' };
   return [
     { type: "response.created", sequence_number: 0, response: { id: "resp_s", object: "response", status: "in_progress", output: [] } },
     { type: "response.output_item.added", sequence_number: 1, output_index: 0, item: { ...item, arguments: "" } },
@@ -207,11 +252,15 @@ function customStreamEvents() {
     { type: "response.function_call_arguments.delta", sequence_number: 7, item_id: "fc_2", output_index: 1, delta: '{"Path":"x"}' },
     { type: "response.function_call_arguments.done", sequence_number: 8, item_id: "fc_2", output_index: 1, arguments: '{"Path":"x"}' },
     { type: "response.output_item.done", sequence_number: 9, output_index: 1, item: fnItem },
+    { type: "response.output_item.added", sequence_number: 10, output_index: 2, item: { ...nsItem, arguments: "" } },
+    { type: "response.function_call_arguments.delta", sequence_number: 11, item_id: "fc_3", output_index: 2, delta: '{"message":"hi"}' },
+    { type: "response.function_call_arguments.done", sequence_number: 12, item_id: "fc_3", output_index: 2, arguments: '{"message":"hi"}' },
+    { type: "response.output_item.done", sequence_number: 13, output_index: 2, item: nsItem },
     {
-      type: "response.completed", sequence_number: 10,
+      type: "response.completed", sequence_number: 14,
       response: {
         id: "resp_s", object: "response", status: "completed",
-        output: [item, fnItem],
+        output: [item, fnItem, nsItem],
         usage: { input_tokens: 9, output_tokens: 4, total_tokens: 13 },
       },
     },
@@ -261,15 +310,22 @@ describe("Muse custom tool restore (streaming passthrough)", () => {
 
     // The ordinary function call beside it streams through untouched.
     const fnDeltas = output.filter(event => event.type === "response.function_call_arguments.delta");
-    expect(fnDeltas).toHaveLength(1);
-    expect(fnDeltas[0].item_id).toBe("fc_2");
+    expect(fnDeltas.map(event => event.item_id)).toEqual(["fc_2", "fc_3"]);
     expect(raw).toContain("event: response.function_call_arguments.delta");
+
+    // Meta's flattened namespace call is split back for the client router.
+    const nsAdded = output.find(event => event.type === "response.output_item.added" && event.item?.call_id === "call_3");
+    expect(nsAdded.item).toMatchObject({ type: "function_call", name: "spawn_agent", namespace: "collaboration" });
 
     const done = output.find(event => event.type === "response.output_item.done" && event.item?.call_id === "call_1");
     expect(done.item).toMatchObject({ type: "custom_tool_call", name: "apply_patch", input: PATCH });
     const completed = output.find(event => event.type === "response.completed");
     expect(completed.response.output[0]).toMatchObject({ type: "custom_tool_call", name: "apply_patch", input: PATCH });
     expect(completed.response.output[1]).toMatchObject({ type: "function_call", name: "read_file", arguments: '{"Path":"x"}' });
+    expect(completed.response.output[2]).toMatchObject({
+      type: "function_call", name: "spawn_agent", namespace: "collaboration", arguments: '{"message":"hi"}',
+    });
+    expect(raw).not.toContain("collaboration.spawn_agent");
 
     expect(raw).toContain("event: response.custom_tool_call_input.delta");
     expect(raw).toContain("event: response.custom_tool_call_input.done");
