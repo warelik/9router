@@ -82,6 +82,7 @@
     "tests/unit/combo-transient-no-sleep.test.js",
     "tests/unit/docker-publish-source-recipe.test.js",
     "tests/unit/downstream-translator-history-regressions.test.js",
+    "tests/unit/gemini-native-combo-effort.test.js",
     "tests/unit/muse-cloaking.test.js",
     "tests/unit/muse-custom-tools.test.js",
     "tests/unit/muse-foreign-reasoning-retry.test.js",

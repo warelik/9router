@@ -1,0 +1,971 @@
+From 976abb0c88b9f066a6ee04df3afa5a7bbb16fa77 Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Fri, 13 Nov 2026 08:43:22 +0000
+Subject: [PATCH] Route native Gemini combos with effort suffixes and numeric
+ thinkingLevel
+
+---
+ open-sse/services/combo.js                    |  24 ++
+ open-sse/services/emptyFailover.js            |  25 ++
+ .../translator/concerns/thinkingUnified.js    |  91 +++-
+ src/app/api/v1beta/models/[...path]/route.js  |  27 +-
+ src/sse/handlers/chat.js                      | 104 +++--
+ src/sse/services/keyAccess.js                 |  20 +-
+ src/sse/services/model.js                     |  22 +-
+ tests/unit/gemini-native-combo-effort.test.js | 390 ++++++++++++++++++
+ 8 files changed, 659 insertions(+), 44 deletions(-)
+ create mode 100644 tests/unit/gemini-native-combo-effort.test.js
+
+diff --git a/open-sse/services/combo.js b/open-sse/services/combo.js
+index b96a2ef..65207b6 100644
+--- a/open-sse/services/combo.js
++++ b/open-sse/services/combo.js
+@@ -331,6 +331,30 @@ export function isZeroContentResponse(data) {
+     }
+   }
+ 
++  // Gemini generateContent format
++  const geminiCandidates = Array.isArray(data.candidates)
++    ? data.candidates
++    : (Array.isArray(data.response?.candidates) ? data.response.candidates : null);
++  if (geminiCandidates) {
++    if (geminiCandidates.length === 0) return true;
++    const candidate = geminiCandidates[0];
++    if (!candidate) return true;
++    const parts = Array.isArray(candidate.content?.parts) ? candidate.content.parts : [];
++    const hasContent = parts.some((p) =>
++      (typeof p?.text === "string" && p.text.trim().length > 0 && p.thought !== true)
++      || Boolean(p?.functionCall)
++      || Boolean(p?.inlineData?.data)
++      || Boolean(p?.fileData?.fileUri)
++      || Boolean(p?.executableCode)
++      || Boolean(p?.codeExecutionResult)
++    );
++    const finish = String(candidate.finishReason || "").toUpperCase();
++    const isContentFilter = finish === "SAFETY" || finish === "RECITATION" || finish === "BLOCKLIST" || finish === "PROHIBITED_CONTENT";
++    if (!hasContent && !isContentFilter && finish !== "STOP" && finish !== "MAX_TOKENS") {
++      return true;
++    }
++  }
++
+   return false;
+ }
+ 
+diff --git a/open-sse/services/emptyFailover.js b/open-sse/services/emptyFailover.js
+index 5e8d164..bc5ea7b 100644
+--- a/open-sse/services/emptyFailover.js
++++ b/open-sse/services/emptyFailover.js
+@@ -108,9 +108,34 @@ function inspectResponsesEvent(obj) {
+ 
+ // Inspect one complete client-format SSE line (parsed with the shared parseSSELine) and report
+ // whether it carries content and/or a finish reason. Non-data lines and "[DONE]" carry nothing.
++function geminiPartHasClientContent(part) {
++  if (!part || typeof part !== "object") return false;
++  if (nonEmptyString(part.text) && part.thought !== true) return true;
++  if (part.functionCall || part.executableCode || part.codeExecutionResult) return true;
++  if (nonEmptyString(part.inlineData?.data) || nonEmptyString(part.fileData?.fileUri)) return true;
++  return false;
++}
++
++function inspectGeminiEvent(obj) {
++  const candidates = Array.isArray(obj.candidates) ? obj.candidates : obj.response?.candidates;
++  let content = false, finishReason = null;
++  for (const candidate of candidates || []) {
++    for (const part of candidate?.content?.parts || []) {
++      if (geminiPartHasClientContent(part)) content = true;
++    }
++    if (candidate?.finishReason) {
++      finishReason = toOpenAIFinish(candidate.finishReason, FORMATS.GEMINI);
++    }
++  }
++  return { content, finishReason };
++}
++
+ export function inspectSSELine(line) {
+   const parsed = parseSSELine(line.trimStart());
+   if (!parsed || parsed.done) return { content: false, finishReason: null };
++  if (Array.isArray(parsed.candidates) || Array.isArray(parsed.response?.candidates)) {
++    return inspectGeminiEvent(parsed);
++  }
+   if (typeof parsed.type === "string" && !Array.isArray(parsed.choices)) {
+     return parsed.type.startsWith(RESPONSES_EVENT_PREFIX) ? inspectResponsesEvent(parsed) : inspectClaudeEvent(parsed);
+   }
+diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
+index 6a56daf..5bb5f50 100644
+--- a/open-sse/translator/concerns/thinkingUnified.js
++++ b/open-sse/translator/concerns/thinkingUnified.js
+@@ -47,6 +47,63 @@ export function parseSuffix(model) {
+   return { cleanModel, override: null };
+ }
+ 
++// Extract a recognized trailing thinking suffix "(value)" using parseSuffix rules.
++// Non-thinking parentheticals such as "(preview)" or "(free)" return suffix: null.
++export function extractThinkingSuffix(model) {
++  const { cleanModel, override } = parseSuffix(model);
++  if (!override || !cleanModel) return { cleanModel: model, suffix: null };
++  const m = model.match(/\(([^()]+)\)\s*$/);
++  return { cleanModel, suffix: m ? m[1].trim().toLowerCase() : null };
++}
++
++// Apply an outer thinking suffix onto a target model string, replacing any
++// existing recognized thinking suffix so combos never produce "model(high)(medium)".
++export function withThinkingSuffix(model, suffix) {
++  if (!suffix || typeof model !== "string" || !model) return model;
++  const { cleanModel, suffix: existing } = extractThinkingSuffix(model);
++  const base = existing ? cleanModel : model;
++  return `${base}(${suffix})`;
++}
++
++// Cloud Code / Antigravity catalog integer thinkingLevel enum (1..6).
++const CLOUD_CODE_THINKING_LEVELS = Object.freeze({
++  1: "low",
++  2: "medium",
++  3: "high",
++  4: "minimal",
++  5: "xhigh",
++  6: "max",
++});
++
++function normalizeClientThinkingLevel(value) {
++  if (typeof value === "number" && Number.isInteger(value)) {
++    return CLOUD_CODE_THINKING_LEVELS[value] || null;
++  }
++  if (typeof value === "string" && value.trim()) {
++    const lower = value.trim().toLowerCase();
++    if (lower === "thinking_level_unspecified" || lower === "unspecified") return null;
++    if (lower === "extra_high" || lower === "extra-high") return "xhigh";
++    return lower;
++  }
++  return null;
++}
++
++function clientThinkingNeedsNormalization(clientThinking) {
++  if (!clientThinking || typeof clientThinking !== "object") return false;
++  for (const key of ["thinkingLevel", "thinking_level"]) {
++    if (!Object.hasOwn(clientThinking, key)) continue;
++    const val = clientThinking[key];
++    if (typeof val === "number") return true;
++    if (typeof val === "string") {
++      const lower = val.trim().toLowerCase();
++      if (lower === "extra_high" || lower === "extra-high" || lower === "thinking_level_unspecified" || lower === "unspecified") {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
+ // Extract unified thinking intent from a request body (post-translation, mixed shapes).
+ // Returns { mode, budget?, level? } or null when no thinking intent present.
+ export function extractThinking(body) {
+@@ -82,10 +139,13 @@ export function extractThinking(body) {
+   }
+ 
+   // Gemini shape (top-level, generationConfig, or request envelope)
+-  const tc = body.thinkingConfig || body.generationConfig?.thinkingConfig || body.request?.generationConfig?.thinkingConfig;
++  const tc = body.thinkingConfig || body.generationConfig?.thinkingConfig || body.request?.generationConfig?.thinkingConfig
++    || body.thinking_config || body.generation_config?.thinking_config || body.request?.generation_config?.thinking_config;
+   if (tc && typeof tc === "object") {
+-    if (typeof tc.thinkingLevel === "string") return { mode: "level", level: tc.thinkingLevel.toLowerCase() };
+-    const tb = Number(tc.thinkingBudget);
++    const rawLevel = tc.thinkingLevel ?? tc.thinking_level;
++    const normLevel = normalizeClientThinkingLevel(rawLevel);
++    if (normLevel) return { mode: "level", level: normLevel };
++    const tb = Number(tc.thinkingBudget ?? tc.thinking_budget);
+     if (Number.isFinite(tb)) {
+       if (tb === 0) return { mode: "none" };
+       if (tb < 0) return { mode: "auto" };
+@@ -496,13 +556,26 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
+   const thinkingKey = generation.thinking_config ? "thinking_config" : "thinkingConfig";
+   const clientThinking = generation[thinkingKey] || {};
+   const explicit = NATIVE_GEMINI_THINKING_KEYS.some(key => Object.hasOwn(clientThinking, key));
+-  if (!override && explicit) return body;
++  const needsNormalization = clientThinkingNeedsNormalization(clientThinking);
++  if (!override && explicit && !needsNormalization) return body;
++
++  const normalizedClientLevel = needsNormalization
++    ? normalizeClientThinkingLevel(clientThinking.thinkingLevel ?? clientThinking.thinking_level)
++    : null;
+   const mode = providerThinking?.mode;
+-  const intent = override || (!mode || mode === "auto" ? null
+-    : mode === "on" ? { mode: "budget", budget: DEFAULT_PROVIDER_THINKING_BUDGET }
+-    : mode === "off" || mode === "none" ? { mode: "none" }
+-    : { mode: "level", level: mode });
+-  if (!intent) return body;
++  const intent = override
++    || (normalizedClientLevel ? { mode: "level", level: normalizedClientLevel } : null)
++    || (!mode || mode === "auto" ? null
++      : mode === "on" ? { mode: "budget", budget: DEFAULT_PROVIDER_THINKING_BUDGET }
++      : mode === "off" || mode === "none" ? { mode: "none" }
++      : { mode: "level", level: mode });
++  if (!intent) {
++    if (!needsNormalization) return body;
++    const thinking = { ...clientThinking };
++    delete thinking.thinkingLevel;
++    delete thinking.thinking_level;
++    return { ...body, [generationKey]: { ...generation, [thinkingKey]: thinking } };
++  }
+ 
+   // Reuse the capability-aware mapping, without its translated-request output
+   // floor or its replacement of client-native options such as includeThoughts.
+diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
+index 203cac0..c893640 100644
+--- a/src/app/api/v1beta/models/[...path]/route.js
++++ b/src/app/api/v1beta/models/[...path]/route.js
+@@ -29,6 +29,30 @@ async function ensureInitialized() {
+   }
+ }
+ 
++async function isNativeGeminiTarget(model, info = null, seen = new Set()) {
++  if (typeof model !== "string" || !model || seen.size > 6) return false;
++  const resolved = info || await getModelInfo(model);
++  if (!resolved) return false;
++  if (resolved.provider) {
++    return getTargetFormat(resolved.provider) === "gemini"
++      || (resolved.provider === "antigravity"
++        && typeof supportsNativeGemini === "function"
++        && supportsNativeGemini(resolved.provider, resolved.model));
++  }
++  const key = resolved.model || model;
++  if (seen.has(key)) return false;
++  const nextSeen = new Set(seen);
++  nextSeen.add(key);
++  const members = Array.isArray(resolved.comboModels)
++    ? resolved.comboModels
++    : (typeof getComboModels === "function" ? await getComboModels(model) : null);
++  if (!Array.isArray(members) || members.length === 0) return false;
++  for (const member of members) {
++    if (!(await isNativeGeminiTarget(member, null, nextSeen))) return false;
++  }
++  return true;
++}
++
+ /**
+  * Handle CORS preflight
+  */
+@@ -99,8 +123,7 @@ async function postGeminiRequest(request, { params }) {
+     const stream = action === ":streamGenerateContent";
+ 
+     const modelInfo = await getModelInfo(model);
+-    const native = modelInfo.provider && (getTargetFormat(modelInfo.provider) === "gemini"
+-      || (modelInfo.provider === "antigravity" && supportsNativeGemini(modelInfo.provider, modelInfo.model)));
++    const native = Boolean(await isNativeGeminiTarget(model, modelInfo));
+ 
+     // Keep the native request intact. The shared handler selects translation
+     // only when the chosen provider speaks a different wire format.
+diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
+index 155bb6f..6e67101 100644
+--- a/src/sse/handlers/chat.js
++++ b/src/sse/handlers/chat.js
+@@ -78,6 +78,7 @@ async function responseErrorForClient(response, options, fallbackMessage = "Requ
+   let message = fallbackMessage;
+   try {
+     const body = await response.clone().json();
++    if (typeof body?.error?.code === "number" && typeof body?.error?.status === "string") return response;
+     if (typeof body?.error?.message === "string" && body.error.message) message = body.error.message;
+   } catch { /* Keep the caller's bounded fallback message. */ }
+   return nativeGeminiErrorResponse(response.status, message, response.headers);
+@@ -88,6 +89,38 @@ function chatCoreErrorResponse(result, options) {
+   return nativeGeminiErrorResponse(result.status, result.error, result.response?.headers);
+ }
+ 
++const RECOGNIZED_THINKING_SUFFIXES = new Set([
++  "none", "off", "auto", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
++]);
++
++function splitRecognizedThinkingSuffix(modelStr) {
++  if (typeof modelStr !== "string") return { cleanModel: modelStr, suffix: null };
++  const m = modelStr.match(/^(.*)\(([^()]+)\)\s*$/);
++  if (!m) return { cleanModel: modelStr, suffix: null };
++  const cleanModel = m[1].trim();
++  const raw = m[2].trim().toLowerCase();
++  if (!cleanModel || (!RECOGNIZED_THINKING_SUFFIXES.has(raw) && !/^\d+$/.test(raw))) {
++    return { cleanModel: modelStr, suffix: null };
++  }
++  return { cleanModel, suffix: raw };
++}
++
++function resolveComboInvocation(modelStr, resolvedInfo = null) {
++  const { cleanModel, suffix } = splitRecognizedThinkingSuffix(modelStr);
++  if (resolvedInfo && !resolvedInfo.provider && typeof resolvedInfo.model === "string" && resolvedInfo.model) {
++    if (resolvedInfo.model === modelStr) return { comboName: modelStr, comboSuffix: null };
++    if (resolvedInfo.model === cleanModel) return { comboName: resolvedInfo.model, comboSuffix: suffix };
++  }
++  return { comboName: cleanModel, comboSuffix: suffix };
++}
++
++function applyComboThinkingSuffix(member, suffix) {
++  if (!suffix || typeof member !== "string" || !member) return member;
++  const { cleanModel, suffix: existing } = splitRecognizedThinkingSuffix(member);
++  const base = existing ? cleanModel : member;
++  return `${base}(${suffix})`;
++}
++
+ /**
+  * Handle chat completion request
+  * Supports: OpenAI, Claude, Gemini, OpenAI Responses API formats
+@@ -207,16 +240,21 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+   // Check if model is a combo (has multiple models with fallback)
+   const comboModels = await getComboModels(modelStr);
+   if (comboModels) {
++    // Resolve outer combo name + recognized thinking suffix so strategies and
++    // member effort honor the "(effort)" written on the combo name.
++    const comboInfo = await getModelInfo(modelStr);
++    const { comboName, comboSuffix } = resolveComboInvocation(modelStr, comboInfo);
+     // Check for combo-specific strategy first, fallback to global
+     const comboStrategies = settings.comboStrategies || {};
+-    const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
++    const comboCfgTop = comboStrategies[comboName] || comboStrategies[modelStr] || {};
++    const comboSpecificStrategy = comboCfgTop.fallbackStrategy;
+     const comboStrategy = comboSpecificStrategy || settings.comboStrategy || "fallback";
+     const augmentedModels = await filterAdapterModels(keyAccess, augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, settings), comboModels);
+     const adapterAdded = augmentedModels.filter((m) => !comboModels.includes(m));
+ 
+     if (comboStrategy === "fusion") {
+       log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
+-      return handleFusionChat({
++      return responseErrorForClient(await handleFusionChat({
+         body,
+         models: comboModels,
+         handleSingleModel: (b, m, isPanel) => {
+@@ -225,27 +263,35 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
+             cleanRawReq = { ...clientRawRequest, body: cleanBody };
+           }
+-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options);
++          return handleSingleModelChat(b, applyComboThinkingSuffix(m, comboSuffix), cleanRawReq, request, apiKey, null, options);
+         },
+         log,
+-        comboName: modelStr,
+-        judgeModel: comboStrategies[modelStr]?.judgeModel,
+-        tuning: comboStrategies[modelStr]?.fusionTuning,
+-      });
++        comboName,
++        judgeModel: comboCfgTop.judgeModel,
++        tuning: comboCfgTop.fusionTuning,
++      }), options, "All combo models unavailable");
+     }
+ 
+     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
+-    const comboCfg = comboStrategies[modelStr] || {};
++    const comboCfg = comboCfgTop;
+     log.info("CHAT", `Combo "${modelStr}" with ${augmentedModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
+-    return handleComboChat({
++    return responseErrorForClient(await handleComboChat({
+       body,
+       models: augmentedModels,
+       handleSingleModel: withCapacityAdapterStripping(
+-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
++        (b, m) => handleSingleModelChat(
++          b,
++          adapterAdded.includes(m) ? m : applyComboThinkingSuffix(m, comboSuffix),
++          clientRawRequest,
++          request,
++          apiKey,
++          null,
++          options
++        ),
+         adapterAdded
+       ),
+       log,
+-      comboName: modelStr,
++      comboName,
+       comboStrategy,
+       comboStickyLimit,
+       sessionId,
+@@ -260,7 +306,7 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+             log,
+           })
+         : null,
+-    });
++    }), options, "All combo models unavailable");
+   }
+ 
+   // Single model request — may still switch to a capacity-adapter model if the
+@@ -295,10 +341,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+   if (!modelInfo.provider) {
+     const comboModels = await getComboModels(modelStr);
+     if (comboModels) {
++      const { comboName, comboSuffix } = resolveComboInvocation(modelStr, modelInfo);
+       const chatSettings = await getSettings();
+       // Check for combo-specific strategy first, fallback to global
+       const comboStrategies = chatSettings.comboStrategies || {};
+-      const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
++      const comboCfgTop = comboStrategies[comboName] || comboStrategies[modelStr] || {};
++      const comboSpecificStrategy = comboCfgTop.fallbackStrategy;
+       const comboStrategy = comboSpecificStrategy || chatSettings.comboStrategy || "fallback";
+       const requiredCapabilities = detectRequiredCapabilities(body);
+       // Nested combo (a combo member that is itself a combo): the access decision
+@@ -309,7 +357,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+ 
+       if (comboStrategy === "fusion") {
+         log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
+-        return handleFusionChat({
++        return responseErrorForClient(await handleFusionChat({
+           body,
+           models: comboModels,
+           handleSingleModel: (b, m, isPanel) => {
+@@ -318,29 +366,37 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
+               cleanRawReq = { ...clientRawRequest, body: cleanBody };
+             }
+-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options);
++            return handleSingleModelChat(b, applyComboThinkingSuffix(m, comboSuffix), cleanRawReq, request, apiKey, null, options);
+           },
+           log,
+-          comboName: modelStr,
+-          judgeModel: comboStrategies[modelStr]?.judgeModel,
+-          tuning: comboStrategies[modelStr]?.fusionTuning,
+-        });
++          comboName,
++          judgeModel: comboCfgTop.judgeModel,
++          tuning: comboCfgTop.fusionTuning,
++        }), options, "All combo models unavailable");
+       }
+ 
+       const comboStickyLimit = chatSettings.comboStickyRoundRobinLimit;
+-      const comboCfg = comboStrategies[modelStr] || {};
++      const comboCfg = comboCfgTop;
+       const nestedSession = resolveSessionIdentity({ headers: clientRawRequest?.headers, body });
+       const nestedSessionId = nestedSession?.sessionId || null;
+       log.info("CHAT", `Combo "${modelStr}" with ${augmentedModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
+-      return handleComboChat({
++      return responseErrorForClient(await handleComboChat({
+         body,
+         models: augmentedModels,
+         handleSingleModel: withCapacityAdapterStripping(
+-          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
++          (b, m) => handleSingleModelChat(
++            b,
++            adapterAdded.includes(m) ? m : applyComboThinkingSuffix(m, comboSuffix),
++            clientRawRequest,
++            request,
++            apiKey,
++            null,
++            options
++          ),
+           adapterAdded
+         ),
+         log,
+-        comboName: modelStr,
++        comboName,
+         comboStrategy,
+         comboStickyLimit,
+         sessionId: nestedSessionId,
+@@ -355,7 +411,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+               log,
+             })
+           : null,
+-      });
++      }), options, "All combo models unavailable");
+     }
+     log.warn("CHAT", "Invalid model format", { model: modelStr });
+     return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Invalid model format", options);
+diff --git a/src/sse/services/keyAccess.js b/src/sse/services/keyAccess.js
+index 6de0e32..5643f49 100644
+--- a/src/sse/services/keyAccess.js
++++ b/src/sse/services/keyAccess.js
+@@ -26,6 +26,7 @@ import { getApiKeyByKey } from "@/lib/db/repos/apiKeysRepo.js";
+ import { getCombos } from "@/lib/db/repos/combosRepo.js";
+ import { getModelInfo, getComboModels } from "./model.js";
+ import { resolveProviderId } from "@/shared/constants/providers.js";
++import { extractThinkingSuffix } from "open-sse/translator/concerns/thinkingUnified.js";
+ import {
+   KEY_ACCESS_COMBO_OWNER,
+   KEY_ACCESS_PROVIDER_AS_MODEL_KINDS,
+@@ -107,8 +108,10 @@ async function isModelStringAllowed(ctx, requested) {
+   const sets = await getAllowSets(ctx);
+   const info = await getModelInfo(requested);
+   // provider null ⇔ an existing combo with no members (routes nowhere).
+-  if (!info?.provider) return sets.combos.has(lower(requested));
+-  return sets.models.has(canonicalModel(info.provider, info.model));
++  if (!info?.provider) return sets.combos.has(lower(info?.model || requested));
++  const { cleanModel } = extractThinkingSuffix(info.model);
++  return sets.models.has(canonicalModel(info.provider, info.model))
++    || sets.models.has(canonicalModel(info.provider, cleanModel));
+ }
+ 
+ export function keyAccessDeniedResponse(ctx, requested) {
+@@ -126,9 +129,12 @@ export async function enforceKeyAccess(ctx, requested) {
+   if (typeof requested !== "string" || !requested) return keyAccessDeniedResponse(ctx, String(requested ?? ""));
+   const sets = await getAllowSets(ctx);
+   const comboModels = await getComboModels(requested);
+-  const allowed = comboModels
+-    ? sets.combos.has(lower(requested))
+-    : await isModelStringAllowed(ctx, requested);
++  if (comboModels) {
++    const info = await getModelInfo(requested);
++    const comboName = (!info?.provider && info?.model) ? info.model : extractThinkingSuffix(requested).cleanModel;
++    return sets.combos.has(lower(comboName)) ? null : keyAccessDeniedResponse(ctx, requested);
++  }
++  const allowed = await isModelStringAllowed(ctx, requested);
+   return allowed ? null : keyAccessDeniedResponse(ctx, requested);
+ }
+ 
+@@ -143,7 +149,9 @@ export async function enforceKeyAccessResolved(ctx, requested, provider, model)
+   const label = requested || (provider ? `${provider}/${model ?? ""}` : "");
+   if (!provider || !model) return keyAccessDeniedResponse(ctx, label);
+   const sets = await getAllowSets(ctx);
+-  return sets.models.has(canonicalModel(provider, model)) ? null : keyAccessDeniedResponse(ctx, label);
++  return sets.models.has(canonicalModel(provider, model))
++    || sets.models.has(canonicalModel(provider, extractThinkingSuffix(model).cleanModel))
++    ? null : keyAccessDeniedResponse(ctx, label);
+ }
+ 
+ /**
+diff --git a/src/sse/services/model.js b/src/sse/services/model.js
+index ba4cc6c..15cb24a 100644
+--- a/src/sse/services/model.js
++++ b/src/sse/services/model.js
+@@ -1,6 +1,7 @@
+ // Re-export from open-sse with localDb integration
+ import { getModelAliases, getComboByName, getProviderNodes } from "@/lib/localDb";
+ import { parseModel as parseModelCore, resolveModelAliasFromMap, getModelInfoCore } from "open-sse/services/model.js";
++import { extractThinkingSuffix } from "open-sse/translator/concerns/thinkingUnified.js";
+ import REGISTRY from "open-sse/providers/registry/index.js";
+ 
+ // Local provider alias overrides (HMR-friendly, applied on top of open-sse map)
+@@ -24,6 +25,17 @@ export function parseModel(modelStr) {
+   return parsed;
+ }
+ 
++async function resolveCombo(modelStr) {
++  if (typeof modelStr !== "string" || !modelStr || modelStr.includes("/")) return null;
++  const exact = await getComboByName(modelStr);
++  if (exact) return exact;
++  const { cleanModel, suffix } = extractThinkingSuffix(modelStr);
++  if (suffix && cleanModel && !cleanModel.includes("/")) {
++    return await getComboByName(cleanModel);
++  }
++  return null;
++}
++
+ /**
+  * Resolve model alias from localDb
+  */
+@@ -68,11 +80,15 @@ export async function getModelInfo(modelStr) {
+ 
+   // Check if this is a combo name before resolving as alias
+   // This prevents combo names from being incorrectly routed to providers
+-  const combo = await getComboByName(parsed.model);
++  const combo = await resolveCombo(parsed.model);
+   if (combo) {
+     // Return null provider to signal this should be handled as combo
+     // The caller (handleChat) will detect this and handle it as combo
+-    return { provider: null, model: parsed.model };
++    return {
++      provider: null,
++      model: combo.name,
++      ...(Array.isArray(combo.models) ? { comboModels: combo.models } : {}),
++    };
+   }
+ 
+   return getModelInfoCore(modelStr, getModelAliases);
+@@ -86,7 +102,7 @@ export async function getComboModels(modelStr) {
+   // Only check if it's not in provider/model format
+   if (modelStr.includes("/")) return null;
+ 
+-  const combo = await getComboByName(modelStr);
++  const combo = await resolveCombo(modelStr);
+   if (combo && combo.models && combo.models.length > 0) {
+     return combo.models;
+   }
+diff --git a/tests/unit/gemini-native-combo-effort.test.js b/tests/unit/gemini-native-combo-effort.test.js
+new file mode 100644
+index 0000000..a388b6c
+--- /dev/null
++++ b/tests/unit/gemini-native-combo-effort.test.js
+@@ -0,0 +1,390 @@
++// Regression: native Gemini combos with a trailing "(effort)" suffix, Cloud Code
++// numeric thinkingLevel normalization, combo SSE peek for Gemini candidates, and
++// per-key access for suffixed targets. Offline only: provider network, combos DB
++// and credentials are mocked; real model resolution, key-access engine, combo
++// handling, chat core (for Antigravity) and thinking normalization run for real.
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import fs from "node:fs";
++import path from "node:path";
++import vm from "node:vm";
++import { createHash } from "node:crypto";
++import { fileURLToPath } from "node:url";
++
++const { network, executorInstances, fx } = vi.hoisted(() => ({
++  network: vi.fn(),
++  executorInstances: new Map(),
++  fx: {
++    combos: [
++      { id: "ccarbon", name: ".gemini-carbon", models: ["ag/gemini-4-carbon-high"] },
++      { id: "chydro", name: ".gemini-hydrogen", models: ["ag/gemini-4-hydrogen-xhigh"] },
++      { id: "cflash", name: ".gemini-flash-lite", models: ["aistudio/gemini-3.5-flash-lite", "gemini/gemini-3.5-flash-lite"] },
++      { id: "cmain", name: "Main", models: ["openai/model-a", "openai/model-b"] },
++      { id: "cother", name: "other", models: ["openai/model-c"] },
++    ],
++    nodes: [],
++    aliases: {},
++    keys: {},
++  },
++}));
++
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: network }));
++vi.mock("../../open-sse/executors/index.js", async () => {
++  const { AntigravityExecutor } = await import("../../open-sse/executors/antigravity.js");
++  return {
++    getExecutor(provider) {
++      if (provider !== "antigravity") throw new Error(`Unexpected fixture provider: ${provider}`);
++      if (!executorInstances.has(provider)) executorInstances.set(provider, new AntigravityExecutor());
++      return executorInstances.get(provider);
++    },
++  };
++});
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: async () => new Proxy({}, {
++    get: (_target, name) => name === "then" ? undefined : vi.fn(),
++  }),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++vi.mock("@/lib/localDb", () => ({
++  getModelAliases: async () => fx.aliases,
++  getComboByName: async (name) => fx.combos.find((c) => c.name === name) || null,
++  getProviderNodes: async (filter = {}) => fx.nodes.filter((n) => !filter.type || n.type === filter.type),
++  getSettings: async () => ({ requireApiKey: false }),
++}));
++vi.mock("@/lib/db/repos/combosRepo.js", () => ({ getCombos: async () => fx.combos }));
++vi.mock("@/lib/db/repos/apiKeysRepo.js", () => ({ getApiKeyByKey: async (k) => fx.keys[k] || null }));
++vi.mock("@/sse/utils/logger.js", () => ({ warn: vi.fn(), info: vi.fn(), debug: vi.fn(), error: vi.fn() }));
++
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++const { FORMATS } = await import("../../open-sse/translator/formats.js");
++const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
++const { resolveSessionIdentity } = await import("../../open-sse/utils/sessionManager.js");
++const modelSvc = await import("../../src/sse/services/model.js");
++const keyAccessEngine = await import("../../src/sse/services/keyAccess.js");
++const thinkingUnified = await import("../../open-sse/translator/concerns/thinkingUnified.js");
++const emptyFailover = await import("../../open-sse/services/emptyFailover.js");
++const comboSvc = await import("../../open-sse/services/combo.js");
++
++const root = fileURLToPath(new URL("../../", import.meta.url));
++const quiet = Object.fromEntries(["debug", "info", "warn", "error", "line", "errorLine"].map(name => [name, vi.fn()]));
++
++function nativeBody(overrides = {}) {
++  return {
++    systemInstruction: { parts: [{ text: "Follow the task protocol." }] },
++    contents: [
++      { role: "user", parts: [{ text: "Use the tool result and continue." }] },
++      { role: "model", parts: [
++        { text: "Earlier reasoning.", thought: true },
++        { functionCall: { id: "call-1", name: "lookup_record", args: { key: "x" } }, thoughtSignature: "sig-1" },
++      ] },
++      { role: "user", parts: [
++        { functionResponse: { id: "call-1", name: "lookup_record", response: { value: 1 } } },
++      ] },
++    ],
++    tools: [{ functionDeclarations: [{ name: "lookup_record", parameters: { type: "OBJECT", properties: { key: { type: "STRING" } } } }] }],
++    generationConfig: { maxOutputTokens: 3072, thinkingConfig: { thinkingLevel: "HIGH", includeThoughts: true } },
++    ...overrides,
++  };
++}
++
++function nativeChunk(text = "completed") {
++  return { candidates: [{ index: 0, content: { role: "model", parts: [{ text }] }, finishReason: "STOP" }] };
++}
++function sseFrame(value) { return `data: ${JSON.stringify(value)}\r\n\r\n`; }
++function wireRequest(index = -1) { return JSON.parse(network.mock.calls.at(index)[1].body); }
++
++function moduleSource(relative) {
++  return fs.readFileSync(path.join(root, relative), "utf8")
++    .replace(/^import[\s\S]*?;\s*$/gm, "")
++    .replace(/^export /gm, "");
++}
++
++// Route harness modeled on antigravity-native-gemini.test.js, but with REAL
++// model resolution over the mocked combos DB, REAL handleComboChat, and REAL
++// handleChatCore (for antigravity members). aistudio/gemini members are served
++// by a controllable stub that mimics native-Gemini chatCore output shape so the
++// combo peek path (emptyFailover) is exercised against Gemini candidates SSE.
++function loadRouteHarness({ flashImpl } = {}) {
++  const flashCalls = [];
++  const services = {
++    handleChatCore: vi.fn(async (options) => {
++      const provider = options.modelInfo?.provider;
++      if (provider === "aistudio" || provider === "gemini") {
++        flashCalls.push(options);
++        if (options.credentials) options.credentials.nativeGeminiPassthrough = true;
++        if (flashImpl) return flashImpl(options);
++        return { success: true, response: new Response(sseFrame(nativeChunk(`from-${provider}`)), { headers: { "Content-Type": "text/event-stream" } }), nativeResponse: true };
++      }
++      return handleChatCore(options);
++    }),
++    getSettings: vi.fn(async () => ({ requireApiKey: false, comboStrategy: "fallback" })),
++    getProviderCredentials: vi.fn(async () => ({ accessToken: "offline-token", apiKey: "offline-token", projectId: "fixture-project", connectionId: "route-fixture", providerSpecificData: {} })),
++    getModelInfo: vi.fn((m) => modelSvc.getModelInfo(m)),
++    isValidApiKey: vi.fn(async () => true),
++    getKeyAccessContext: vi.fn(async () => null),
++    enforceKeyAccess: vi.fn(async () => null),
++    enforceKeyAccessResolved: vi.fn(async () => null),
++    filterAdapterModels: vi.fn(async (_keyAccess, models) => models),
++    markAccountUnavailable: vi.fn(async () => ({ shouldFallback: false })),
++    clearAccountError: vi.fn(async () => {}),
++    handleAntigravityQuotaError: vi.fn(async () => null),
++    clearAntigravityStrikes: vi.fn(),
++    getComboModels: vi.fn((m) => modelSvc.getComboModels(m)),
++    handleComboChat: comboSvc.handleComboChat,
++    handleFusionChat: comboSvc.handleFusionChat,
++    detectRequiredCapabilities: comboSvc.detectRequiredCapabilities,
++    augmentModelsWithCapacityAdapter: models => models,
++    withCapacityAdapterStripping: callback => callback,
++    getActiveAdapterStrategy: vi.fn(),
++    handleBypassRequest: () => null,
++    checkAndRefreshToken: vi.fn(async (_provider, credentials) => credentials),
++    updateProviderCredentials: vi.fn(async () => {}),
++    getProjectIdForConnection: vi.fn(async () => "fixture-project"),
++    getPxpipeTransform: vi.fn(async () => null),
++    appendPxpipeEvent: vi.fn(),
++    detectFormatByEndpoint: vi.fn(() => null),
++    stripModelContextMarker: model => ({ model, contextMarker: null }),
++    upstreamResponseHeaders: headers => Object.fromEntries(headers || []),
++    errorResponse: (status, message, headers) => Response.json({ error: { message } }, { status, headers }),
++    unavailableResponse: (status, message) => Response.json({ error: { message } }, { status }),
++    fetch: vi.fn(),
++  };
++  const logger = Object.fromEntries(["log", "debug", "info", "warn", "error"].map(name => [name, vi.fn()]));
++  logger.maskKey = () => "masked-fixture-key";
++  const context = {
++    ...services,
++    console: logger,
++    log: logger,
++    Request, Response, Headers, URL, Buffer, AbortController, ReadableStream,
++    TextEncoder, TextDecoder, TransformStream, setTimeout, clearTimeout,
++    GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS: 50,
++    PROVIDER_MODELS: { gemini: [], "gemini-tts-models": [] },
++    HTTP_STATUS: { BAD_REQUEST: 400, UNAUTHORIZED: 401, NOT_FOUND: 404, SERVER_ERROR: 500, SERVICE_UNAVAILABLE: 503 },
++    ACCOUNT_WAIT_DEADLINE_MS: 0,
++    FORMATS: { GEMINI: "gemini", OPENAI: "openai" },
++    DEFAULT_HEADROOM_URL: "http://unused.test",
++    getTargetFormat, supportsNativeGemini, resolveSessionIdentity,
++    initTranslators: async () => {},
++    proxyAwareFetch: (...args) => services.fetch(...args),
++  };
++  Object.assign(context, { createHash, isLocalRequest: () => false, hasValidCliToken: async () => false });
++  vm.createContext(context);
++  const auth = fs.readFileSync(path.join(root, "src/sse/services/auth.js"), "utf8");
++  const start = auth.indexOf("export function extractApiKey(");
++  const end = auth.indexOf("/**", start);
++  vm.runInContext(auth.slice(start, end).replace("export ", ""), context);
++  const ka = fs.readFileSync(path.join(root, "src/sse/services/keyAccess.js"), "utf8");
++  const keyStart = ka.indexOf("export function extractClientApiKey(");
++  const keyEnd = ka.indexOf("/**", keyStart);
++  if (keyStart < 0 || keyEnd <= keyStart) throw new Error("Real client-key accessor is missing");
++  vm.runInContext(ka.slice(keyStart, keyEnd).replace("export ", ""), context);
++  vm.runInContext(moduleSource("src/sse/handlers/chat.js"), context);
++  vm.runInContext(moduleSource("src/app/api/v1beta/models/[...path]/route.js"), context);
++  return { context, services, flashCalls };
++}
++
++async function postCombo(context, comboWithAction, body) {
++  const url = `https://router.test/v1beta/models/${comboWithAction}?alt=sse`;
++  const request = new Request(url, {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify(body),
++  });
++  return context.POST(request, { params: Promise.resolve({ path: comboWithAction.split("/") }) });
++}
++
++describe("model resolution: combos with thinking suffix", () => {
++  it("resolves suffixed combos to the stored combo name and members", async () => {
++    expect(await modelSvc.getComboModels(".gemini-carbon(medium)")).toEqual(["ag/gemini-4-carbon-high"]);
++    expect(await modelSvc.getComboModels(".gemini-hydrogen(xhigh)")).toEqual(["ag/gemini-4-hydrogen-xhigh"]);
++    expect(await modelSvc.getComboModels(".gemini-flash-lite(8192)")).toEqual(["aistudio/gemini-3.5-flash-lite", "gemini/gemini-3.5-flash-lite"]);
++    expect(await modelSvc.getModelInfo(".gemini-carbon(medium)")).toMatchObject({ provider: null, model: ".gemini-carbon" });
++    expect((await modelSvc.getModelInfo(".gemini-carbon(medium)")).comboModels).toEqual(["ag/gemini-4-carbon-high"]);
++    expect(await modelSvc.getComboModels(".gemini-carbon(preview)")).toBeNull();
++  });
++
++  it("keeps exact combo-name matching and ignores non-thinking parentheticals", async () => {
++    expect(await modelSvc.getModelInfo("Main(medium)")).toMatchObject({ provider: null, model: "Main" });
++    expect(await modelSvc.getComboModels("Main(medium)")).toEqual(["openai/model-a", "openai/model-b"]);
++    // Case variant must NOT route to the combo (exact lookup), mirroring key-access bypass checks.
++    expect(await modelSvc.getComboModels("MAIN(medium)")).toBeNull();
++    const mainUpper = await modelSvc.getModelInfo("MAIN(medium)");
++    expect(mainUpper.provider).not.toBeNull();
++    expect(await modelSvc.getComboModels("Preview(beta)")).toBeNull();
++  });
++
++  it("extractThinkingSuffix only strips recognized thinking values", () => {
++    expect(thinkingUnified.extractThinkingSuffix(".gemini-carbon(medium)")).toEqual({ cleanModel: ".gemini-carbon", suffix: "medium" });
++    expect(thinkingUnified.extractThinkingSuffix(".gemini-flash-lite(8192)")).toEqual({ cleanModel: ".gemini-flash-lite", suffix: "8192" });
++    expect(thinkingUnified.extractThinkingSuffix("Preview(beta)")).toEqual({ cleanModel: "Preview(beta)", suffix: null });
++    expect(thinkingUnified.withThinkingSuffix("ag/gemini-4-carbon-high(high)", "medium")).toBe("ag/gemini-4-carbon-high(medium)");
++    expect(thinkingUnified.withThinkingSuffix("ag/gemini-4-carbon-high", "medium")).toBe("ag/gemini-4-carbon-high(medium)");
++  });
++});
++
++describe("key access: suffixed combos and models", () => {
++  function key(id, access) { fx.keys[`sk-${id}`] = { id, name: `key-${id}`, isActive: true, access }; }
++  const req = (k) => new Request("http://localhost/v1/chat/completions", { method: "POST", headers: k ? { Authorization: `Bearer ${k}` } : {} });
++  const ctxFor = (k) => keyAccessEngine.getKeyAccessContext(req(k));
++  async function status(k, model) {
++    const r = await keyAccessEngine.enforceKeyAccess(await ctxFor(k), model);
++    return r ? r.status : 200;
++  }
++  beforeEach(() => {
++    fx.keys = {};
++    key("combo", { restricted: true, allow: ["main"] });
++    key("cx", { restricted: true, allow: ["cx/gpt-5"] });
++  });
++
++  it("allows a listed combo with an effort suffix and denies lookalikes", async () => {
++    expect(await status("sk-combo", "Main(medium)")).toBe(200);
++    expect(await status("sk-combo", "MAIN(medium)")).toBe(403);
++    expect(await status("sk-combo", "other(medium)")).toBe(403);
++    expect(await status("sk-combo", "Main")).toBe(200);
++    expect(await status("sk-combo", "MAIN")).toBe(403);
++  });
++
++  it("allows a listed model with an effort suffix and denies other models", async () => {
++    expect(await status("sk-cx", "cx/gpt-5(high)")).toBe(200);
++    expect(await status("sk-cx", "cx/gpt-5")).toBe(200);
++    expect(await status("sk-cx", "cx/gpt-5-mini(high)")).toBe(403);
++  });
++});
++
++describe("thinking normalization: Cloud Code numeric thinkingLevel", () => {
++  it("extractThinking reads integer 1..6 and EXTRA_HIGH", () => {
++    expect(thinkingUnified.extractThinking({ generationConfig: { thinkingConfig: { thinkingLevel: 5, includeThoughts: true } } }))
++      .toEqual({ mode: "level", level: "xhigh" });
++    expect(thinkingUnified.extractThinking({ generationConfig: { thinkingConfig: { thinkingLevel: "EXTRA_HIGH" } } }))
++      .toEqual({ mode: "level", level: "xhigh" });
++    expect(thinkingUnified.extractThinking({ generation_config: { thinking_config: { thinking_level: 2 } } }))
++      .toEqual({ mode: "level", level: "medium" });
++    expect(thinkingUnified.extractThinking({ generationConfig: { thinkingConfig: { thinkingLevel: 0 } } })).toBeNull();
++  });
++
++  it("applyNativeGeminiThinking normalizes numeric 5 to HIGH for gemini-4 and never leaks the number", () => {
++    const out = thinkingUnified.applyNativeGeminiThinking(
++      "gemini-4-hydrogen-xhigh",
++      { generationConfig: { thinkingConfig: { thinkingLevel: 5, includeThoughts: true } } },
++      "antigravity", null);
++    expect(out.generationConfig.thinkingConfig.thinkingLevel).toBe("HIGH");
++    // Suffix override on the member wins over the client numeric level.
++    const overridden = thinkingUnified.applyNativeGeminiThinking(
++      "gemini-4-carbon-high(medium)",
++      { generationConfig: { thinkingConfig: { thinkingLevel: 5, includeThoughts: true } } },
++      "antigravity", null);
++    expect(overridden.generationConfig.thinkingConfig.thinkingLevel).toBe("MEDIUM");
++    // Standard explicit client fields without normalization needs stay untouched.
++    const untouched = { generationConfig: { thinkingConfig: { thinkingLevel: "LOW", includeThoughts: false } } };
++    expect(thinkingUnified.applyNativeGeminiThinking("gemini-4-carbon-low", untouched, "antigravity", null)).toBe(untouched);
++  });
++
++  it("empty peek understands Gemini candidates SSE and thought-only abort frames", () => {
++    const okLine = `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`;
++    expect(emptyFailover.inspectSSELine(okLine)).toEqual({ content: true, finishReason: "stop" });
++    const abortLine = `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"thinking","thought":true}]},"finishReason":"MALFORMED_FUNCTION_CALL"}]}`;
++    expect(emptyFailover.inspectSSELine(abortLine).content).toBe(false);
++    expect(emptyFailover.isNoRetryFinish(emptyFailover.inspectSSELine(abortLine).finishReason)).toBe(false);
++    expect(comboSvc.isZeroContentResponse({ candidates: [{ content: { parts: [] }, finishReason: "MALFORMED_FUNCTION_CALL" }] })).toBe(true);
++    expect(comboSvc.isZeroContentResponse(nativeChunk("ok"))).toBe(false);
++  });
++});
++
++describe("native Gemini combo routing end-to-end", () => {
++  beforeEach(() => {
++    network.mockReset();
++    executorInstances.clear();
++    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("DIRECT_NETWORK_FORBIDDEN"); }));
++  });
++  afterEach(() => vi.unstubAllGlobals());
++
++  it(".gemini-carbon(medium) streams through native Antigravity passthrough with MEDIUM effort", async () => {
++    network.mockImplementation(async () => new Response(
++      sseFrame({ response: nativeChunk("carbon-ok") }),
++      { headers: { "Content-Type": "text/event-stream" } }));
++    const { context, services } = loadRouteHarness();
++    const response = await postCombo(context, ".gemini-carbon(medium):streamGenerateContent", nativeBody());
++    expect(response.status).toBe(200);
++    const text = await response.text();
++    expect(text).toContain("carbon-ok");
++    expect(network).toHaveBeenCalledOnce();
++    const wire = wireRequest();
++    expect(wire.model).toBe("gemini-4-carbon-high");
++    expect(wire.request.generationConfig.thinkingConfig.thinkingLevel).toBe("MEDIUM");
++    // Native passthrough preserves tools / calls / signatures byte-meaningfully.
++    expect(wire.request.tools[0].functionDeclarations.map((fn) => fn.name)).toContain("lookup_record");
++    expect(wire.request.contents[1].parts).toContainEqual({
++      functionCall: { id: "call-1", name: "lookup_record", args: { key: "x" } }, thoughtSignature: "sig-1",
++    });
++    expect(wire.request.contents[2].parts).toContainEqual({
++      functionResponse: { id: "call-1", name: "lookup_record", response: { value: 1 } },
++    });
++    expect(services.handleChatCore.mock.calls[0][0].credentials.nativeGeminiPassthrough).toBe(true);
++    expect(services.handleChatCore.mock.calls[0][0].sourceFormatOverride).toBe("gemini");
++  });
++
++  it(".gemini-hydrogen(xhigh) with numeric thinkingLevel 5 maps to HIGH", async () => {
++    network.mockImplementation(async () => new Response(
++      sseFrame({ response: nativeChunk("hydrogen-ok") }),
++      { headers: { "Content-Type": "text/event-stream" } }));
++    const { context } = loadRouteHarness();
++    const body = nativeBody({ generationConfig: { maxOutputTokens: 3072, thinkingConfig: { thinkingLevel: 5, includeThoughts: true } } });
++    const response = await postCombo(context, ".gemini-hydrogen(xhigh):streamGenerateContent", body);
++    expect(response.status).toBe(200);
++    expect(await response.text()).toContain("hydrogen-ok");
++    const wire = wireRequest();
++    expect(wire.model).toBe("gemini-4-hydrogen-xhigh");
++    expect(wire.request.generationConfig.thinkingConfig.thinkingLevel).toBe("HIGH");
++  });
++
++  it(".gemini-flash-lite(high) does not call the second member after a content frame", async () => {
++    const { context, flashCalls } = loadRouteHarness();
++    const response = await postCombo(context, ".gemini-flash-lite(high):streamGenerateContent", nativeBody());
++    expect(response.status).toBe(200);
++    expect(await response.text()).toContain("from-aistudio");
++    expect(flashCalls.map((c) => c.modelInfo.provider)).toEqual(["aistudio"]);
++    // Outer "(high)" reached the member as its thinking suffix.
++    expect(flashCalls[0].body.model).toBe("aistudio/gemini-3.5-flash-lite(high)");
++  });
++
++  it(".gemini-flash-lite(high) fails over after a thought-only MALFORMED_FUNCTION_CALL stream", async () => {
++    let attempt = 0;
++    const abortChunk = { candidates: [{ content: { role: "model", parts: [{ text: "thinking", thought: true }] }, finishReason: "MALFORMED_FUNCTION_CALL" }] };
++    const { context, flashCalls } = loadRouteHarness({
++      flashImpl: async (options) => {
++        attempt += 1;
++        if (attempt === 1) {
++          return { success: true, nativeResponse: true, response: new Response(sseFrame(abortChunk), { headers: { "Content-Type": "text/event-stream" } }) };
++        }
++        return { success: true, nativeResponse: true, response: new Response(sseFrame(nativeChunk("second-member-ok")), { headers: { "Content-Type": "text/event-stream" } }) };
++      },
++    });
++    const response = await postCombo(context, ".gemini-flash-lite(high):streamGenerateContent", nativeBody());
++    expect(response.status).toBe(200);
++    expect(await response.text()).toContain("second-member-ok");
++    expect(flashCalls.map((c) => c.modelInfo.provider)).toEqual(["aistudio", "gemini"]);
++  });
++
++  it("all members failing yields a Gemini error envelope", async () => {
++    const { context, services } = loadRouteHarness({
++      flashImpl: async () => ({
++        success: false, status: 503, error: "No active credentials for provider: aistudio",
++        response: Response.json({ error: { message: "No active credentials for provider: aistudio" } }, { status: 503 }),
++      }),
++    });
++    const response = await postCombo(context, ".gemini-flash-lite(high):streamGenerateContent", nativeBody());
++    expect(response.status).toBe(503);
++    const body = await response.json();
++    expect(body.error.code).toBe(503);
++    expect(body.error.status).toBe("UNAVAILABLE");
++    expect(body.error.message).toContain("No active credentials");
++    expect(services.handleChatCore).toHaveBeenCalled();
++  });
++});
+-- 
+2.55.0
+
