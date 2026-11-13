@@ -108,9 +108,34 @@ function inspectResponsesEvent(obj) {
 
 // Inspect one complete client-format SSE line (parsed with the shared parseSSELine) and report
 // whether it carries content and/or a finish reason. Non-data lines and "[DONE]" carry nothing.
+function geminiPartHasClientContent(part) {
+  if (!part || typeof part !== "object") return false;
+  if (nonEmptyString(part.text) && part.thought !== true) return true;
+  if (part.functionCall || part.executableCode || part.codeExecutionResult) return true;
+  if (nonEmptyString(part.inlineData?.data) || nonEmptyString(part.fileData?.fileUri)) return true;
+  return false;
+}
+
+function inspectGeminiEvent(obj) {
+  const candidates = Array.isArray(obj.candidates) ? obj.candidates : obj.response?.candidates;
+  let content = false, finishReason = null;
+  for (const candidate of candidates || []) {
+    for (const part of candidate?.content?.parts || []) {
+      if (geminiPartHasClientContent(part)) content = true;
+    }
+    if (candidate?.finishReason) {
+      finishReason = toOpenAIFinish(candidate.finishReason, FORMATS.GEMINI);
+    }
+  }
+  return { content, finishReason };
+}
+
 export function inspectSSELine(line) {
   const parsed = parseSSELine(line.trimStart());
   if (!parsed || parsed.done) return { content: false, finishReason: null };
+  if (Array.isArray(parsed.candidates) || Array.isArray(parsed.response?.candidates)) {
+    return inspectGeminiEvent(parsed);
+  }
   if (typeof parsed.type === "string" && !Array.isArray(parsed.choices)) {
     return parsed.type.startsWith(RESPONSES_EVENT_PREFIX) ? inspectResponsesEvent(parsed) : inspectClaudeEvent(parsed);
   }
