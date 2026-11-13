@@ -47,6 +47,63 @@ export function parseSuffix(model) {
   return { cleanModel, override: null };
 }
 
+// Extract a recognized trailing thinking suffix "(value)" using parseSuffix rules.
+// Non-thinking parentheticals such as "(preview)" or "(free)" return suffix: null.
+export function extractThinkingSuffix(model) {
+  const { cleanModel, override } = parseSuffix(model);
+  if (!override || !cleanModel) return { cleanModel: model, suffix: null };
+  const m = model.match(/\(([^()]+)\)\s*$/);
+  return { cleanModel, suffix: m ? m[1].trim().toLowerCase() : null };
+}
+
+// Apply an outer thinking suffix onto a target model string, replacing any
+// existing recognized thinking suffix so combos never produce "model(high)(medium)".
+export function withThinkingSuffix(model, suffix) {
+  if (!suffix || typeof model !== "string" || !model) return model;
+  const { cleanModel, suffix: existing } = extractThinkingSuffix(model);
+  const base = existing ? cleanModel : model;
+  return `${base}(${suffix})`;
+}
+
+// Cloud Code / Antigravity catalog integer thinkingLevel enum (1..6).
+const CLOUD_CODE_THINKING_LEVELS = Object.freeze({
+  1: "low",
+  2: "medium",
+  3: "high",
+  4: "minimal",
+  5: "xhigh",
+  6: "max",
+});
+
+function normalizeClientThinkingLevel(value) {
+  if (typeof value === "number" && Number.isInteger(value)) {
+    return CLOUD_CODE_THINKING_LEVELS[value] || null;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const lower = value.trim().toLowerCase();
+    if (lower === "thinking_level_unspecified" || lower === "unspecified") return null;
+    if (lower === "extra_high" || lower === "extra-high") return "xhigh";
+    return lower;
+  }
+  return null;
+}
+
+function clientThinkingNeedsNormalization(clientThinking) {
+  if (!clientThinking || typeof clientThinking !== "object") return false;
+  for (const key of ["thinkingLevel", "thinking_level"]) {
+    if (!Object.hasOwn(clientThinking, key)) continue;
+    const val = clientThinking[key];
+    if (typeof val === "number") return true;
+    if (typeof val === "string") {
+      const lower = val.trim().toLowerCase();
+      if (lower === "extra_high" || lower === "extra-high" || lower === "thinking_level_unspecified" || lower === "unspecified") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // Extract unified thinking intent from a request body (post-translation, mixed shapes).
 // Returns { mode, budget?, level? } or null when no thinking intent present.
 export function extractThinking(body) {
@@ -82,10 +139,13 @@ export function extractThinking(body) {
   }
 
   // Gemini shape (top-level, generationConfig, or request envelope)
-  const tc = body.thinkingConfig || body.generationConfig?.thinkingConfig || body.request?.generationConfig?.thinkingConfig;
+  const tc = body.thinkingConfig || body.generationConfig?.thinkingConfig || body.request?.generationConfig?.thinkingConfig
+    || body.thinking_config || body.generation_config?.thinking_config || body.request?.generation_config?.thinking_config;
   if (tc && typeof tc === "object") {
-    if (typeof tc.thinkingLevel === "string") return { mode: "level", level: tc.thinkingLevel.toLowerCase() };
-    const tb = Number(tc.thinkingBudget);
+    const rawLevel = tc.thinkingLevel ?? tc.thinking_level;
+    const normLevel = normalizeClientThinkingLevel(rawLevel);
+    if (normLevel) return { mode: "level", level: normLevel };
+    const tb = Number(tc.thinkingBudget ?? tc.thinking_budget);
     if (Number.isFinite(tb)) {
       if (tb === 0) return { mode: "none" };
       if (tb < 0) return { mode: "auto" };
@@ -496,13 +556,26 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
   const thinkingKey = generation.thinking_config ? "thinking_config" : "thinkingConfig";
   const clientThinking = generation[thinkingKey] || {};
   const explicit = NATIVE_GEMINI_THINKING_KEYS.some(key => Object.hasOwn(clientThinking, key));
-  if (!override && explicit) return body;
+  const needsNormalization = clientThinkingNeedsNormalization(clientThinking);
+  if (!override && explicit && !needsNormalization) return body;
+
+  const normalizedClientLevel = needsNormalization
+    ? normalizeClientThinkingLevel(clientThinking.thinkingLevel ?? clientThinking.thinking_level)
+    : null;
   const mode = providerThinking?.mode;
-  const intent = override || (!mode || mode === "auto" ? null
-    : mode === "on" ? { mode: "budget", budget: DEFAULT_PROVIDER_THINKING_BUDGET }
-    : mode === "off" || mode === "none" ? { mode: "none" }
-    : { mode: "level", level: mode });
-  if (!intent) return body;
+  const intent = override
+    || (normalizedClientLevel ? { mode: "level", level: normalizedClientLevel } : null)
+    || (!mode || mode === "auto" ? null
+      : mode === "on" ? { mode: "budget", budget: DEFAULT_PROVIDER_THINKING_BUDGET }
+      : mode === "off" || mode === "none" ? { mode: "none" }
+      : { mode: "level", level: mode });
+  if (!intent) {
+    if (!needsNormalization) return body;
+    const thinking = { ...clientThinking };
+    delete thinking.thinkingLevel;
+    delete thinking.thinking_level;
+    return { ...body, [generationKey]: { ...generation, [thinkingKey]: thinking } };
+  }
 
   // Reuse the capability-aware mapping, without its translated-request output
   // floor or its replacement of client-native options such as includeThoughts.

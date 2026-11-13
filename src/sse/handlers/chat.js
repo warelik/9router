@@ -78,6 +78,7 @@ async function responseErrorForClient(response, options, fallbackMessage = "Requ
   let message = fallbackMessage;
   try {
     const body = await response.clone().json();
+    if (typeof body?.error?.code === "number" && typeof body?.error?.status === "string") return response;
     if (typeof body?.error?.message === "string" && body.error.message) message = body.error.message;
   } catch { /* Keep the caller's bounded fallback message. */ }
   return nativeGeminiErrorResponse(response.status, message, response.headers);
@@ -86,6 +87,38 @@ async function responseErrorForClient(response, options, fallbackMessage = "Requ
 function chatCoreErrorResponse(result, options) {
   if (!isNativeGeminiRequest(options) || result.nativeResponse === true) return result.response;
   return nativeGeminiErrorResponse(result.status, result.error, result.response?.headers);
+}
+
+const RECOGNIZED_THINKING_SUFFIXES = new Set([
+  "none", "off", "auto", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+]);
+
+function splitRecognizedThinkingSuffix(modelStr) {
+  if (typeof modelStr !== "string") return { cleanModel: modelStr, suffix: null };
+  const m = modelStr.match(/^(.*)\(([^()]+)\)\s*$/);
+  if (!m) return { cleanModel: modelStr, suffix: null };
+  const cleanModel = m[1].trim();
+  const raw = m[2].trim().toLowerCase();
+  if (!cleanModel || (!RECOGNIZED_THINKING_SUFFIXES.has(raw) && !/^\d+$/.test(raw))) {
+    return { cleanModel: modelStr, suffix: null };
+  }
+  return { cleanModel, suffix: raw };
+}
+
+function resolveComboInvocation(modelStr, resolvedInfo = null) {
+  const { cleanModel, suffix } = splitRecognizedThinkingSuffix(modelStr);
+  if (resolvedInfo && !resolvedInfo.provider && typeof resolvedInfo.model === "string" && resolvedInfo.model) {
+    if (resolvedInfo.model === modelStr) return { comboName: modelStr, comboSuffix: null };
+    if (resolvedInfo.model === cleanModel) return { comboName: resolvedInfo.model, comboSuffix: suffix };
+  }
+  return { comboName: cleanModel, comboSuffix: suffix };
+}
+
+function applyComboThinkingSuffix(member, suffix) {
+  if (!suffix || typeof member !== "string" || !member) return member;
+  const { cleanModel, suffix: existing } = splitRecognizedThinkingSuffix(member);
+  const base = existing ? cleanModel : member;
+  return `${base}(${suffix})`;
 }
 
 /**
@@ -207,16 +240,21 @@ export async function handleChat(request, clientRawRequest = null, options = {})
   // Check if model is a combo (has multiple models with fallback)
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
+    // Resolve outer combo name + recognized thinking suffix so strategies and
+    // member effort honor the "(effort)" written on the combo name.
+    const comboInfo = await getModelInfo(modelStr);
+    const { comboName, comboSuffix } = resolveComboInvocation(modelStr, comboInfo);
     // Check for combo-specific strategy first, fallback to global
     const comboStrategies = settings.comboStrategies || {};
-    const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
+    const comboCfgTop = comboStrategies[comboName] || comboStrategies[modelStr] || {};
+    const comboSpecificStrategy = comboCfgTop.fallbackStrategy;
     const comboStrategy = comboSpecificStrategy || settings.comboStrategy || "fallback";
     const augmentedModels = await filterAdapterModels(keyAccess, augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, settings), comboModels);
     const adapterAdded = augmentedModels.filter((m) => !comboModels.includes(m));
 
     if (comboStrategy === "fusion") {
       log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
-      return handleFusionChat({
+      return responseErrorForClient(await handleFusionChat({
         body,
         models: comboModels,
         handleSingleModel: (b, m, isPanel) => {
@@ -225,27 +263,35 @@ export async function handleChat(request, clientRawRequest = null, options = {})
             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
             cleanRawReq = { ...clientRawRequest, body: cleanBody };
           }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options);
+          return handleSingleModelChat(b, applyComboThinkingSuffix(m, comboSuffix), cleanRawReq, request, apiKey, null, options);
         },
         log,
-        comboName: modelStr,
-        judgeModel: comboStrategies[modelStr]?.judgeModel,
-        tuning: comboStrategies[modelStr]?.fusionTuning,
-      });
+        comboName,
+        judgeModel: comboCfgTop.judgeModel,
+        tuning: comboCfgTop.fusionTuning,
+      }), options, "All combo models unavailable");
     }
 
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
-    const comboCfg = comboStrategies[modelStr] || {};
+    const comboCfg = comboCfgTop;
     log.info("CHAT", `Combo "${modelStr}" with ${augmentedModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
-    return handleComboChat({
+    return responseErrorForClient(await handleComboChat({
       body,
       models: augmentedModels,
       handleSingleModel: withCapacityAdapterStripping(
-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
+        (b, m) => handleSingleModelChat(
+          b,
+          adapterAdded.includes(m) ? m : applyComboThinkingSuffix(m, comboSuffix),
+          clientRawRequest,
+          request,
+          apiKey,
+          null,
+          options
+        ),
         adapterAdded
       ),
       log,
-      comboName: modelStr,
+      comboName,
       comboStrategy,
       comboStickyLimit,
       sessionId,
@@ -260,7 +306,7 @@ export async function handleChat(request, clientRawRequest = null, options = {})
             log,
           })
         : null,
-    });
+    }), options, "All combo models unavailable");
   }
 
   // Single model request — may still switch to a capacity-adapter model if the
@@ -295,10 +341,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   if (!modelInfo.provider) {
     const comboModels = await getComboModels(modelStr);
     if (comboModels) {
+      const { comboName, comboSuffix } = resolveComboInvocation(modelStr, modelInfo);
       const chatSettings = await getSettings();
       // Check for combo-specific strategy first, fallback to global
       const comboStrategies = chatSettings.comboStrategies || {};
-      const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
+      const comboCfgTop = comboStrategies[comboName] || comboStrategies[modelStr] || {};
+      const comboSpecificStrategy = comboCfgTop.fallbackStrategy;
       const comboStrategy = comboSpecificStrategy || chatSettings.comboStrategy || "fallback";
       const requiredCapabilities = detectRequiredCapabilities(body);
       // Nested combo (a combo member that is itself a combo): the access decision
@@ -309,7 +357,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
       if (comboStrategy === "fusion") {
         log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
-        return handleFusionChat({
+        return responseErrorForClient(await handleFusionChat({
           body,
           models: comboModels,
           handleSingleModel: (b, m, isPanel) => {
@@ -318,29 +366,37 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
               cleanRawReq = { ...clientRawRequest, body: cleanBody };
             }
-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options);
+            return handleSingleModelChat(b, applyComboThinkingSuffix(m, comboSuffix), cleanRawReq, request, apiKey, null, options);
           },
           log,
-          comboName: modelStr,
-          judgeModel: comboStrategies[modelStr]?.judgeModel,
-          tuning: comboStrategies[modelStr]?.fusionTuning,
-        });
+          comboName,
+          judgeModel: comboCfgTop.judgeModel,
+          tuning: comboCfgTop.fusionTuning,
+        }), options, "All combo models unavailable");
       }
 
       const comboStickyLimit = chatSettings.comboStickyRoundRobinLimit;
-      const comboCfg = comboStrategies[modelStr] || {};
+      const comboCfg = comboCfgTop;
       const nestedSession = resolveSessionIdentity({ headers: clientRawRequest?.headers, body });
       const nestedSessionId = nestedSession?.sessionId || null;
       log.info("CHAT", `Combo "${modelStr}" with ${augmentedModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
-      return handleComboChat({
+      return responseErrorForClient(await handleComboChat({
         body,
         models: augmentedModels,
         handleSingleModel: withCapacityAdapterStripping(
-          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
+          (b, m) => handleSingleModelChat(
+            b,
+            adapterAdded.includes(m) ? m : applyComboThinkingSuffix(m, comboSuffix),
+            clientRawRequest,
+            request,
+            apiKey,
+            null,
+            options
+          ),
           adapterAdded
         ),
         log,
-        comboName: modelStr,
+        comboName,
         comboStrategy,
         comboStickyLimit,
         sessionId: nestedSessionId,
@@ -355,7 +411,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
               log,
             })
           : null,
-      });
+      }), options, "All combo models unavailable");
     }
     log.warn("CHAT", "Invalid model format", { model: modelStr });
     return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Invalid model format", options);

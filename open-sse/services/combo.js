@@ -331,6 +331,30 @@ export function isZeroContentResponse(data) {
     }
   }
 
+  // Gemini generateContent format
+  const geminiCandidates = Array.isArray(data.candidates)
+    ? data.candidates
+    : (Array.isArray(data.response?.candidates) ? data.response.candidates : null);
+  if (geminiCandidates) {
+    if (geminiCandidates.length === 0) return true;
+    const candidate = geminiCandidates[0];
+    if (!candidate) return true;
+    const parts = Array.isArray(candidate.content?.parts) ? candidate.content.parts : [];
+    const hasContent = parts.some((p) =>
+      (typeof p?.text === "string" && p.text.trim().length > 0 && p.thought !== true)
+      || Boolean(p?.functionCall)
+      || Boolean(p?.inlineData?.data)
+      || Boolean(p?.fileData?.fileUri)
+      || Boolean(p?.executableCode)
+      || Boolean(p?.codeExecutionResult)
+    );
+    const finish = String(candidate.finishReason || "").toUpperCase();
+    const isContentFilter = finish === "SAFETY" || finish === "RECITATION" || finish === "BLOCKLIST" || finish === "PROHIBITED_CONTENT";
+    if (!hasContent && !isContentFilter && finish !== "STOP" && finish !== "MAX_TOKENS") {
+      return true;
+    }
+  }
+
   return false;
 }
 

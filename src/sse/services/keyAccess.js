@@ -26,6 +26,7 @@ import { getApiKeyByKey } from "@/lib/db/repos/apiKeysRepo.js";
 import { getCombos } from "@/lib/db/repos/combosRepo.js";
 import { getModelInfo, getComboModels } from "./model.js";
 import { resolveProviderId } from "@/shared/constants/providers.js";
+import { extractThinkingSuffix } from "open-sse/translator/concerns/thinkingUnified.js";
 import {
   KEY_ACCESS_COMBO_OWNER,
   KEY_ACCESS_PROVIDER_AS_MODEL_KINDS,
@@ -107,8 +108,10 @@ async function isModelStringAllowed(ctx, requested) {
   const sets = await getAllowSets(ctx);
   const info = await getModelInfo(requested);
   // provider null ⇔ an existing combo with no members (routes nowhere).
-  if (!info?.provider) return sets.combos.has(lower(requested));
-  return sets.models.has(canonicalModel(info.provider, info.model));
+  if (!info?.provider) return sets.combos.has(lower(info?.model || requested));
+  const { cleanModel } = extractThinkingSuffix(info.model);
+  return sets.models.has(canonicalModel(info.provider, info.model))
+    || sets.models.has(canonicalModel(info.provider, cleanModel));
 }
 
 export function keyAccessDeniedResponse(ctx, requested) {
@@ -126,9 +129,12 @@ export async function enforceKeyAccess(ctx, requested) {
   if (typeof requested !== "string" || !requested) return keyAccessDeniedResponse(ctx, String(requested ?? ""));
   const sets = await getAllowSets(ctx);
   const comboModels = await getComboModels(requested);
-  const allowed = comboModels
-    ? sets.combos.has(lower(requested))
-    : await isModelStringAllowed(ctx, requested);
+  if (comboModels) {
+    const info = await getModelInfo(requested);
+    const comboName = (!info?.provider && info?.model) ? info.model : extractThinkingSuffix(requested).cleanModel;
+    return sets.combos.has(lower(comboName)) ? null : keyAccessDeniedResponse(ctx, requested);
+  }
+  const allowed = await isModelStringAllowed(ctx, requested);
   return allowed ? null : keyAccessDeniedResponse(ctx, requested);
 }
 
@@ -143,7 +149,9 @@ export async function enforceKeyAccessResolved(ctx, requested, provider, model) 
   const label = requested || (provider ? `${provider}/${model ?? ""}` : "");
   if (!provider || !model) return keyAccessDeniedResponse(ctx, label);
   const sets = await getAllowSets(ctx);
-  return sets.models.has(canonicalModel(provider, model)) ? null : keyAccessDeniedResponse(ctx, label);
+  return sets.models.has(canonicalModel(provider, model))
+    || sets.models.has(canonicalModel(provider, extractThinkingSuffix(model).cleanModel))
+    ? null : keyAccessDeniedResponse(ctx, label);
 }
 
 /**
