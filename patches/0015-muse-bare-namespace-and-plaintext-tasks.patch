@@ -1,4 +1,4 @@
-From 32fe188ed62581b5f7e4ba09ee832696e39ea968 Mon Sep 17 00:00:00 2001
+From 15b2ce964d3b63a234eab93fb2749d1dcfc6e865 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 10 Nov 2026 08:53:37 +0000
 Subject: [PATCH] Route bare namespace calls and plaintext subagent tasks
@@ -32,7 +32,7 @@ opaque for the backend to decrypt.
  7 files changed, 123 insertions(+), 6 deletions(-)
 
 diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
-index b1335a9..ee6f429 100644
+index b1335a9423b64ae688ad471d09f0588f2d7630d4..ee6f429ccfc889ea01345292bafb806af7bdc484 100644
 --- a/open-sse/executors/codex.js
 +++ b/open-sse/executors/codex.js
 @@ -6,7 +6,7 @@ import {
@@ -56,7 +56,7 @@ index b1335a9..ee6f429 100644
      // Register hosted search before choosing transport; Lite cannot execute it.
      const autoWebSearch = body._autoCodexWebSearch === true;
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index c4b5e1e..ebde406 100644
+index c4b5e1e2178cdf65bc2835fbeef7e04bfbf60893..ebde4067319413b32ed84350c8cc636416ce8794 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
 @@ -14,7 +14,7 @@ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, sav
@@ -78,7 +78,7 @@ index c4b5e1e..ebde406 100644
      })
    };
 diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
-index 78689ef..f243ddc 100644
+index 78689eff47d08a488808c00d89ba207622a6fbb6..f243ddca8be0fdd1322ef14771bf9f4b663e118d 100644
 --- a/open-sse/handlers/chatCore/sseToJsonHandler.js
 +++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
 @@ -1,6 +1,6 @@
@@ -99,7 +99,7 @@ index 78689ef..f243ddc 100644
  
        // Build client-format response.
 diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
-index e89b54b..9f007d2 100644
+index e89b54b4c26bc31167412c4696996eb36996ff54..9f007d2452cae47128ff88995666c56deb16e3ee 100644
 --- a/open-sse/translator/formats/responsesApi.js
 +++ b/open-sse/translator/formats/responsesApi.js
 @@ -50,6 +50,28 @@ export function normalizeResponsesAgentMessage(item, { dropOpaqueContent = false
@@ -132,7 +132,7 @@ index e89b54b..9f007d2 100644
    const blocks = [
      ...(Array.isArray(item.summary) ? item.summary : []),
 diff --git a/open-sse/utils/museCloaking.js b/open-sse/utils/museCloaking.js
-index f1cd6d9..e246092 100644
+index f1cd6d910e231e726c6416841e043b81c266963f..e2460925bd99858390d7ed306c42b6c71c252aa2 100644
 --- a/open-sse/utils/museCloaking.js
 +++ b/open-sse/utils/museCloaking.js
 @@ -258,6 +258,14 @@ export function isMuseCustomToolCall(item, customToolNames) {
@@ -198,7 +198,7 @@ index f1cd6d9..e246092 100644
   * Convert function_call items of converted custom tools back to
   * custom_tool_call in a JSON payload (a Response body, a lifecycle event's
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 5d5fec0..719f337 100644
+index 6547fbdb4ebeeece14c149f9ebd5b8198d63a5b2..bc8f5efd8f8d32afb018818ef23647ad75c2eb00 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -11,7 +11,7 @@ import {
@@ -218,7 +218,7 @@ index 5d5fec0..719f337 100644
    const museCustomCallItems = new Map();
    let pendingPassthroughEventLine = null;
  
-@@ -466,6 +467,7 @@ export function createSSEStream(options = {}) {
+@@ -469,6 +470,7 @@ export function createSSEStream(options = {}) {
                // "Model tried to call unavailable tool 'read_client'" (#4986).
                let toolNameRestored = false;
                if (toolNameMap?.size) {
@@ -227,7 +227,7 @@ index 5d5fec0..719f337 100644
                  if (restored !== parsed) {
                    parsed = restored;
 diff --git a/tests/unit/muse-custom-tools.test.js b/tests/unit/muse-custom-tools.test.js
-index 9251fca..b268470 100644
+index 9251fca4c15e787bef71edb06d58b5b1d10edaf2..b26847001580cf62d27dda65df66c8ab34ed37ba 100644
 --- a/tests/unit/muse-custom-tools.test.js
 +++ b/tests/unit/muse-custom-tools.test.js
 @@ -204,6 +204,8 @@ describe("Muse custom tool restore (non-streaming)", () => {
@@ -290,5 +290,5 @@ index 9251fca..b268470 100644
 +  });
 +});
 -- 
-2.55.0
+2.54.0
 

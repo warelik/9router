@@ -1,8 +1,7 @@
-From 7815efd2a208ff36b6d6a15642ef45c97db23fbc Mon Sep 17 00:00:00 2001
+From 934cf7bd033771fa99b4aed4e20c421f0a606413 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:41 +0000
 Subject: [PATCH] Account availability, combo waiting and cooldowns
-
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -32,7 +31,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/gemini-native-entry-contract.test.js
 
 diff --git a/open-sse/config/errorConfig.js b/open-sse/config/errorConfig.js
-index 5273a80..8ef4ea6 100644
+index 10356373eecf9bd63810aeaa216946498fa22ede..539bc8a2bcbf525bd3eb12ccaf6c629a0789c76c 100644
 --- a/open-sse/config/errorConfig.js
 +++ b/open-sse/config/errorConfig.js
 @@ -36,6 +36,14 @@ export const BACKOFF_CONFIG = {
@@ -50,7 +49,7 @@ index 5273a80..8ef4ea6 100644
  export const TRANSIENT_COOLDOWN_MS = 30 * 1000;
  
  // Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h)
-@@ -79,6 +87,12 @@ export const ERROR_RULES = [
+@@ -82,6 +90,12 @@ export const ERROR_RULES = [
    { status: 403, cooldownMs: COOLDOWN.long },
    { status: 404, cooldownMs: COOLDOWN.long },
    { status: 429, backoff: true },
@@ -64,7 +63,7 @@ index 5273a80..8ef4ea6 100644
  
  // Backward compat: COOLDOWN_MS object (used by index.js re-export)
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index 4354091..4451539 100644
+index 858da16892e3a1f8e4dad83c9c913841c4c94d0c..b08d78fca0613a58b02a86027d16fe12501893cf 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
 @@ -1,3 +1,5 @@
@@ -81,7 +80,7 @@ index 4354091..4451539 100644
    SERVER_ERROR: 500,
    BAD_GATEWAY: 502,
    SERVICE_UNAVAILABLE: 503,
-@@ -69,9 +72,41 @@ export const GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS = envMs("GEMINI_NATIVE_TTS_FETCH
+@@ -114,9 +117,41 @@ export const GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS = envMs("GEMINI_NATIVE_TTS_FETCH
  // Default token limits
  export const DEFAULT_MAX_TOKENS = 64000;
  export const DEFAULT_MIN_TOKENS = 32000;
@@ -123,7 +122,7 @@ index 4354091..4451539 100644
  // Retry config for 429 responses (legacy - kept for backward compatibility)
  export const RETRY_CONFIG = {
    maxAttempts: 2,
-@@ -80,13 +115,41 @@ export const RETRY_CONFIG = {
+@@ -125,13 +160,41 @@ export const RETRY_CONFIG = {
  
  // Default retry config by status code: { attempts, delayMs }
  // Backward compat: if value is a number, treated as attempts with RETRY_CONFIG.delayMs
@@ -168,7 +167,7 @@ index 4354091..4451539 100644
  // Normalize a retry entry to { attempts, delayMs }
  export function resolveRetryEntry(entry) {
    if (entry == null) return { attempts: 0, delayMs: RETRY_CONFIG.delayMs };
-@@ -101,3 +164,39 @@ export function resolveRetryEntry(entry) {
+@@ -146,3 +209,39 @@ export function resolveRetryEntry(entry) {
  export const SKIP_PATTERNS = [
    "Please write a 5-10 word title for the following conversation:"
  ];
@@ -209,7 +208,7 @@ index 4354091..4451539 100644
 +export const AISTUDIO_NATIVE_GEMINI_API_VERSION = "v1beta";
 +export const GEMINI_DEFAULT_FILE_MIME_TYPE = "application/octet-stream";
 diff --git a/open-sse/services/accountFallback.js b/open-sse/services/accountFallback.js
-index 08df099..991988c 100644
+index 2e3987f739f54a60bbc17f817a058cdcd71c9b8e..d9a0c3b154cbe368e82ca8a2babc101fffa4275b 100644
 --- a/open-sse/services/accountFallback.js
 +++ b/open-sse/services/accountFallback.js
 @@ -1,4 +1,4 @@
@@ -231,18 +230,21 @@ index 08df099..991988c 100644
    const lowerError = errorText
      ? (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase()
      : "";
-@@ -37,18 +43,18 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
+@@ -37,11 +43,11 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
      if (rule.text && lowerError && lowerError.includes(rule.text)) {
        if (rule.backoff) {
          const newLevel = Math.min(backoffLevel + 1, BACKOFF_CONFIG.maxLevel);
 -        return { shouldFallback: true, cooldownMs: getQuotaCooldown(newLevel), newBackoffLevel: newLevel };
 +        return { shouldFallback: true, cooldownMs: scaleCooldown(getQuotaCooldown(newLevel)), newBackoffLevel: newLevel };
        }
--      return { shouldFallback: true, cooldownMs: rule.cooldownMs };
-+      return { shouldFallback: true, cooldownMs: scaleCooldown(rule.cooldownMs) };
+       return {
+         shouldFallback: true,
+-        cooldownMs: rule.cooldownMs,
++        cooldownMs: scaleCooldown(rule.cooldownMs),
+         modelScoped: Boolean(rule.modelScoped),
+       };
      }
- 
-     // Status-based rule: match HTTP status code
+@@ -50,9 +56,9 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
      if (rule.status && rule.status === status) {
        if (rule.backoff) {
          const newLevel = Math.min(backoffLevel + 1, BACKOFF_CONFIG.maxLevel);
@@ -254,7 +256,7 @@ index 08df099..991988c 100644
      }
    }
  
-@@ -67,7 +73,7 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
+@@ -71,7 +77,7 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
    }
  
    // Default: transient cooldown for any unmatched error
@@ -264,7 +266,7 @@ index 08df099..991988c 100644
  
  /**
 diff --git a/open-sse/services/combo.js b/open-sse/services/combo.js
-index c1ec690..b96a2ef 100644
+index c1ec6906b6eb8058ca27878392dbcefbcc24bc54..b96a2efacae69609ba8bea975c7f8633b72d345d 100644
 --- a/open-sse/services/combo.js
 +++ b/open-sse/services/combo.js
 @@ -3,6 +3,7 @@
@@ -389,7 +391,7 @@ index c1ec690..b96a2ef 100644
  
    if (earliestRetryAfter) {
 diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
-index 18e5a01..155bb6f 100644
+index 18e5a0117fcdfaf8645f4181f80fc99e5f02f317..155bb6fd9e83bb19f2aed9b2bc8d4a458f29c238 100644
 --- a/src/sse/handlers/chat.js
 +++ b/src/sse/handlers/chat.js
 @@ -1,4 +1,6 @@
@@ -718,7 +720,7 @@ index 18e5a01..155bb6f 100644
    }
  }
 diff --git a/src/sse/services/auth.js b/src/sse/services/auth.js
-index 035d969..aea5340 100644
+index 035d969f74498a5e104ee84171d13bbaae1a5e31..aea5340ef2cdee7b178d0de5037b726229d5112b 100644
 --- a/src/sse/services/auth.js
 +++ b/src/sse/services/auth.js
 @@ -2,6 +2,7 @@ import { getProviderConnections, validateApiKey, updateProviderConnection, getSe
@@ -805,7 +807,7 @@ index 035d969..aea5340 100644
        apiKey: connection.apiKey,
 diff --git a/tests/unit/account-cooldown-division.test.js b/tests/unit/account-cooldown-division.test.js
 new file mode 100644
-index 0000000..b28d72c
+index 0000000000000000000000000000000000000000..b28d72c0812c2da517f74c6bd4ac29a4c15ca0b5
 --- /dev/null
 +++ b/tests/unit/account-cooldown-division.test.js
 @@ -0,0 +1,45 @@
@@ -856,7 +858,7 @@ index 0000000..b28d72c
 +});
 diff --git a/tests/unit/antigravity-native-disabled-functions.test.js b/tests/unit/antigravity-native-disabled-functions.test.js
 new file mode 100644
-index 0000000..d22374e
+index 0000000000000000000000000000000000000000..d22374ebeccb338727831818c5e40bc74fa3368c
 --- /dev/null
 +++ b/tests/unit/antigravity-native-disabled-functions.test.js
 @@ -0,0 +1,381 @@
@@ -1243,7 +1245,7 @@ index 0000000..d22374e
 +});
 diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
 new file mode 100644
-index 0000000..e631c1d
+index 0000000000000000000000000000000000000000..e631c1d54c294e983b7544b6be6d3d653c6bff10
 --- /dev/null
 +++ b/tests/unit/antigravity-native-gemini.test.js
 @@ -0,0 +1,738 @@
@@ -1987,7 +1989,7 @@ index 0000000..e631c1d
 +});
 diff --git a/tests/unit/antigravity-native-json-output.test.js b/tests/unit/antigravity-native-json-output.test.js
 new file mode 100644
-index 0000000..44a7339
+index 0000000000000000000000000000000000000000..44a7339a76d82538fa75863bc01b3558285ec3d8
 --- /dev/null
 +++ b/tests/unit/antigravity-native-json-output.test.js
 @@ -0,0 +1,608 @@
@@ -2601,7 +2603,7 @@ index 0000000..44a7339
 +});
 diff --git a/tests/unit/combo-hold-deadline.test.js b/tests/unit/combo-hold-deadline.test.js
 new file mode 100644
-index 0000000..50cd690
+index 0000000000000000000000000000000000000000..50cd69080e87fd1e1a05c9c4357ea7e08f254504
 --- /dev/null
 +++ b/tests/unit/combo-hold-deadline.test.js
 @@ -0,0 +1,88 @@
@@ -2695,7 +2697,7 @@ index 0000000..50cd690
 +});
 diff --git a/tests/unit/combo-transient-no-sleep.test.js b/tests/unit/combo-transient-no-sleep.test.js
 new file mode 100644
-index 0000000..65a79c8
+index 0000000000000000000000000000000000000000..65a79c804e6514539ba816c1bc1be5efd7780d2e
 --- /dev/null
 +++ b/tests/unit/combo-transient-no-sleep.test.js
 @@ -0,0 +1,63 @@
@@ -2764,7 +2766,7 @@ index 0000000..65a79c8
 +});
 diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
 new file mode 100644
-index 0000000..7cc7aba
+index 0000000000000000000000000000000000000000..7cc7aba6387353ceafcc21344e2f9f7a5f73fa5d
 --- /dev/null
 +++ b/tests/unit/gemini-native-entry-contract.test.js
 @@ -0,0 +1,381 @@
@@ -3150,5 +3152,5 @@ index 0000000..7cc7aba
 +  });
 +});
 -- 
-2.55.0
+2.54.0
 

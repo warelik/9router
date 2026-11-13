@@ -1,8 +1,7 @@
-From 43639af092b5bfcef45609cf73ad3fe0937165a4 Mon Sep 17 00:00:00 2001
+From 0626c01f88256de001fb88ee7056bda17d1cc190 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:31 +0000
 Subject: [PATCH] Claude and Kiro transports, thinking streams and signatures
-
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -29,7 +28,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/claude-signature-versioned-form.test.js
 
 diff --git a/open-sse/translator/formats/claude.js b/open-sse/translator/formats/claude.js
-index 8d8adab..4713c04 100644
+index 1ca50c81c655ff984c4f663a9e77cff925849bab..da82ae38e7d19b1a4d2935b75a8cc70d55eb1157 100644
 --- a/open-sse/translator/formats/claude.js
 +++ b/open-sse/translator/formats/claude.js
 @@ -4,7 +4,7 @@ import { ROLE, CLAUDE_BLOCK } from "../schema/index.js";
@@ -54,7 +53,7 @@ index 8d8adab..4713c04 100644
            }
            continue;
          }
-@@ -640,9 +641,10 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
+@@ -643,9 +644,10 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
              if (isThinking) {
                if (!String(block.thinking ?? "").trim()) continue;
                if (isClaudeNative) {
@@ -68,7 +67,7 @@ index 8d8adab..4713c04 100644
                } else if (deepSeekServed) {
                  hasKeptThinking = true;
 diff --git a/open-sse/translator/response/kiro-to-claude.js b/open-sse/translator/response/kiro-to-claude.js
-index d9fc0aa..40d9919 100644
+index d9fc0aab5cbc381d295cca6ca8f3e4fdcf0f79ad..40d9919fd78af252ec76dd545dfd9ff57b4e29ab 100644
 --- a/open-sse/translator/response/kiro-to-claude.js
 +++ b/open-sse/translator/response/kiro-to-claude.js
 @@ -15,17 +15,49 @@
@@ -234,7 +233,7 @@ index d9fc0aa..40d9919 100644
      state.finishReason = choice.finish_reason;
      const finalUsage = state.usage || { input_tokens: 0, output_tokens: 0 };
 diff --git a/open-sse/translator/response/openai-to-claude.js b/open-sse/translator/response/openai-to-claude.js
-index 3998cc8..257d162 100644
+index 3998cc8454053d5ec667873ed65c8ab455f36d51..257d162eef702021cb9a0fe3e6f14b11019c5e93 100644
 --- a/open-sse/translator/response/openai-to-claude.js
 +++ b/open-sse/translator/response/openai-to-claude.js
 @@ -46,10 +46,46 @@ function isValidPdfPagesArg(filePath, pages) {
@@ -397,17 +396,17 @@ index 3998cc8..257d162 100644
      // Mark finish for later usage injection in stream.js
      state.finishReason = choice.finish_reason;
 diff --git a/open-sse/utils/claudeCloaking.js b/open-sse/utils/claudeCloaking.js
-index 60e40b7..de5b523 100644
+index 0f535bd3ea4d1ff61de49b12e5d192ee558f67f2..106118fd61f43d4b0ec2b063b605054c1749e243 100644
 --- a/open-sse/utils/claudeCloaking.js
 +++ b/open-sse/utils/claudeCloaking.js
 @@ -1,5 +1,6 @@
  import { createHash, randomBytes, randomUUID } from "crypto";
  import { CLAUDE_TOOL_SUFFIX, CC_DEFAULT_TOOLS } from "../config/appConstants.js";
 +import { resolveToolName } from "./opencodeFingerprint.js";
- import { CLAUDE_CLI_VERSION } from "../providers/shared.js";
- 
- const CC_ENTRYPOINT = "sdk-cli";
-@@ -121,7 +122,7 @@ export function decloakToolNames(body, toolNameMap) {
+ import "../providers/shared.js";
+ import { getClaudeCliVersion } from "./claudeCliVersion.js";
+ import { CLAUDE_BLOCK } from "../translator/schema/blocks.js";
+@@ -137,7 +138,7 @@ export function decloakToolNames(body, toolNameMap) {
    const content = body.content.map(block => {
      if (block?.type !== "tool_use") return block;
      if (toolNameMap?.has(block.name)) {
@@ -416,7 +415,7 @@ index 60e40b7..de5b523 100644
      }
      // toolNameMap missing/stale for this name — fall back to suffix stripping
      // rather than forwarding an unresolvable "<tool>_ide" name to the client.
-@@ -155,7 +156,8 @@ export function decloakStreamChunk(chunk, toolNameMap) {
+@@ -171,7 +172,8 @@ export function decloakStreamChunk(chunk, toolNameMap) {
    if (chunk.type !== "content_block_start") return chunk;
    const block = chunk.content_block;
    if (block?.type !== "tool_use" || typeof block.name !== "string") return chunk;
@@ -427,7 +426,7 @@ index 60e40b7..de5b523 100644
    return { ...chunk, content_block: { ...block, name: original } };
  }
 diff --git a/open-sse/utils/claudeSignature.js b/open-sse/utils/claudeSignature.js
-index 1a18696..17b9cd0 100644
+index 1a18696722ff31b263af9d7cc7f6c42057521686..17b9cd08bd3b339c03baa4bf8caa5bf0861149d9 100644
 --- a/open-sse/utils/claudeSignature.js
 +++ b/open-sse/utils/claudeSignature.js
 @@ -1,41 +1,117 @@
@@ -567,7 +566,7 @@ index 1a18696..17b9cd0 100644
 +}
 diff --git a/tests/translator/claude-adaptive-display.test.js b/tests/translator/claude-adaptive-display.test.js
 new file mode 100644
-index 0000000..390c3f9
+index 0000000000000000000000000000000000000000..390c3f9ab7a9a3f106d04ccd932ec3ee79a65fae
 --- /dev/null
 +++ b/tests/translator/claude-adaptive-display.test.js
 @@ -0,0 +1,70 @@
@@ -643,7 +642,7 @@ index 0000000..390c3f9
 +});
 diff --git a/tests/translator/parallel-tool-blocks-sequential.test.js b/tests/translator/parallel-tool-blocks-sequential.test.js
 new file mode 100644
-index 0000000..4345f3e
+index 0000000000000000000000000000000000000000..4345f3ecd85981ed47df9f1e5b1f174379cf2b75
 --- /dev/null
 +++ b/tests/translator/parallel-tool-blocks-sequential.test.js
 @@ -0,0 +1,136 @@
@@ -785,7 +784,7 @@ index 0000000..4345f3e
 +});
 diff --git a/tests/unit/claude-same-format-stream.test.js b/tests/unit/claude-same-format-stream.test.js
 new file mode 100644
-index 0000000..eb42c44
+index 0000000000000000000000000000000000000000..eb42c44ad9858e0a7497a97e9ddafc4d1f90f692
 --- /dev/null
 +++ b/tests/unit/claude-same-format-stream.test.js
 @@ -0,0 +1,217 @@
@@ -1008,7 +1007,7 @@ index 0000000..eb42c44
 +});
 diff --git a/tests/unit/claude-signature-foreign-opaque.test.js b/tests/unit/claude-signature-foreign-opaque.test.js
 new file mode 100644
-index 0000000..9717158
+index 0000000000000000000000000000000000000000..9717158f63a9dd3979f0f68d23d204967faba132
 --- /dev/null
 +++ b/tests/unit/claude-signature-foreign-opaque.test.js
 @@ -0,0 +1,69 @@
@@ -1083,7 +1082,7 @@ index 0000000..9717158
 +});
 diff --git a/tests/unit/claude-signature-versioned-form.test.js b/tests/unit/claude-signature-versioned-form.test.js
 new file mode 100644
-index 0000000..ab81dbc
+index 0000000000000000000000000000000000000000..ab81dbc76f06ae146616f33ef3d1ac5b045c7853
 --- /dev/null
 +++ b/tests/unit/claude-signature-versioned-form.test.js
 @@ -0,0 +1,138 @@
@@ -1226,5 +1225,5 @@ index 0000000..ab81dbc
 +  });
 +});
 -- 
-2.55.0
+2.54.0
 

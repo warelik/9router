@@ -1,4 +1,4 @@
-From ddc6d07243a01e7a84ca1fdfcceab7e91adaff8c Mon Sep 17 00:00:00 2001
+From 445b14484cc0d41a48f1ce0a4d5577dc83627ebe Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 10 Nov 2026 07:32:17 +0000
 Subject: [PATCH] Accept Codex custom tools and hosted search on the Muse
@@ -38,7 +38,7 @@ non-Muse passthrough traffic are unchanged.
  create mode 100644 tests/unit/muse-custom-tools.test.js
 
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index c3dbc3b..c4b5e1e 100644
+index c3dbc3b0095bef7506530cba21944d13e7190be5..c4b5e1e2178cdf65bc2835fbeef7e04bfbf60893 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
 @@ -14,6 +14,7 @@ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, sav
@@ -59,7 +59,7 @@ index c3dbc3b..c4b5e1e 100644
      })
    };
 diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
-index 3bcd7f8..78689ef 100644
+index 3bcd7f813ee78c187a7e724d47976be2e166be8d..78689eff47d08a488808c00d89ba207622a6fbb6 100644
 --- a/open-sse/handlers/chatCore/sseToJsonHandler.js
 +++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
 @@ -1,5 +1,6 @@
@@ -79,7 +79,7 @@ index 3bcd7f8..78689ef 100644
  
        // Build client-format response.
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index 094ae16..ca9e689 100644
+index 094ae16f7cb74f99ee470bd9ab18a47616689c38..ca9e689095d86bcd0a2e282fbf91d3f61f26278f 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -46,7 +46,9 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
@@ -94,7 +94,7 @@ index 094ae16..ca9e689 100644
  
  /**
 diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
-index 768e305..137abd0 100644
+index 768e305d3259a0eaf7391f3d94ced7f69f5103ed..137abd0c57eb4c1b98b6c5c3d521631312725337 100644
 --- a/open-sse/translator/index.js
 +++ b/open-sse/translator/index.js
 @@ -3,7 +3,7 @@ import { OPENAI_TOOL_CHOICE_NONE } from "./schema/index.js";
@@ -154,7 +154,7 @@ index 768e305..137abd0 100644
    }
  
 diff --git a/open-sse/utils/museCloaking.js b/open-sse/utils/museCloaking.js
-index 28b277c..bcb76d9 100644
+index 28b277c8a80779ca300b123589b55648b7e87533..bcb76d949ed98543c203d171669138115fcce9bf 100644
 --- a/open-sse/utils/museCloaking.js
 +++ b/open-sse/utils/museCloaking.js
 @@ -75,3 +75,251 @@ export function cloakMuseTools(body) {
@@ -410,7 +410,7 @@ index 28b277c..bcb76d9 100644
 +  }
 +}
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 0f2b994..5d5fec0 100644
+index 80914b3d41f54d53581813556a5ec6f072cbdf55..6547fbdb4ebeeece14c149f9ebd5b8198d63a5b2 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -11,6 +11,7 @@ import {
@@ -457,9 +457,9 @@ index 0f2b994..5d5fec0 100644
            let responsesTerminal = false;
 +          let customConverted = false;
  
-           if (trimmed.startsWith("data:") && trimmed.slice(5).trim() !== "[DONE]") {
-             try {
-@@ -412,6 +434,32 @@ export function createSSEStream(options = {}) {
+           // Upstream already sent the sentinel; flush() must not append a second one.
+           if (trimmed.startsWith("data:") && trimmed.slice(5).trim() === "[DONE]") streamDoneSent = true;
+@@ -415,6 +437,32 @@ export function createSSEStream(options = {}) {
                // chunk reaches the client.
                const toolCallIdFixed = ensureStreamToolCallIds(parsed, seenToolCallIds);
  
@@ -492,7 +492,7 @@ index 0f2b994..5d5fec0 100644
                // The fingerprint pass renames a colliding caller tool to an alias
                // (read -> read_client). On this path nothing restored it, so the
                // client received a call to a tool it never declared and answered
-@@ -475,6 +523,7 @@ export function createSSEStream(options = {}) {
+@@ -478,6 +526,7 @@ export function createSSEStream(options = {}) {
                }
  
                if (!hasValuableContent(parsed, FORMATS.OPENAI)) {
@@ -500,7 +500,7 @@ index 0f2b994..5d5fec0 100644
                  continue;
                }
  
-@@ -509,7 +558,7 @@ export function createSSEStream(options = {}) {
+@@ -512,7 +561,7 @@ export function createSSEStream(options = {}) {
                  parsed.usage = filterUsageForFormat(buffered, FORMATS.OPENAI);
                  output = `data: ${JSON.stringify(parsed)}\n`;
                  injectedUsage = true;
@@ -509,7 +509,7 @@ index 0f2b994..5d5fec0 100644
                  output = `data: ${JSON.stringify(parsed)}\n`;
                  injectedUsage = true;
                }
-@@ -517,6 +566,7 @@ export function createSSEStream(options = {}) {
+@@ -520,6 +569,7 @@ export function createSSEStream(options = {}) {
                // Skip non-JSON data lines silently — don't forward garbage to clients.
                // Upstream providers sometimes return plain-text errors (HTML, rate-limit
                // messages) in the SSE stream that would break downstream JSON decoders.
@@ -517,7 +517,7 @@ index 0f2b994..5d5fec0 100644
                continue;
              }
            }
-@@ -529,6 +579,12 @@ export function createSSEStream(options = {}) {
+@@ -532,6 +582,12 @@ export function createSSEStream(options = {}) {
              }
            }
  
@@ -530,7 +530,7 @@ index 0f2b994..5d5fec0 100644
            reqLogger?.appendConvertedChunk?.(output);
            controller.enqueue(sharedEncoder.encode(output));
            // Responses clients (codex CLI) close on response.completed instead of [DONE]
-@@ -817,6 +873,10 @@ export function createSSEStream(options = {}) {
+@@ -825,6 +881,10 @@ export function createSSEStream(options = {}) {
              }
              output = restoreSseEvent([output], toolNameMap);
              if (!output.endsWith("\n")) output += "\n\n";
@@ -541,7 +541,7 @@ index 0f2b994..5d5fec0 100644
              reqLogger?.appendConvertedChunk?.(output);
              controller.enqueue(sharedEncoder.encode(output));
            }
-@@ -966,7 +1026,7 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
+@@ -974,7 +1034,7 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
    });
  }
  
@@ -550,7 +550,7 @@ index 0f2b994..5d5fec0 100644
    return createSSEStream({
      mode: STREAM_MODE.PASSTHROUGH,
      sourceFormat,
-@@ -976,6 +1036,7 @@ export function createPassthroughStreamWithLogger(provider = null, reqLogger = n
+@@ -984,6 +1044,7 @@ export function createPassthroughStreamWithLogger(provider = null, reqLogger = n
      provider,
      reqLogger,
      toolNameMap,
@@ -560,7 +560,7 @@ index 0f2b994..5d5fec0 100644
      body,
 diff --git a/tests/unit/muse-custom-tools.test.js b/tests/unit/muse-custom-tools.test.js
 new file mode 100644
-index 0000000..cd22261
+index 0000000000000000000000000000000000000000..cd222615507cbdb54a21deaf3361551ca772faf5
 --- /dev/null
 +++ b/tests/unit/muse-custom-tools.test.js
 @@ -0,0 +1,304 @@
@@ -869,5 +869,5 @@ index 0000000..cd22261
 +  });
 +});
 -- 
-2.55.0
+2.54.0
 

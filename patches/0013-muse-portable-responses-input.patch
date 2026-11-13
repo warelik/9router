@@ -1,4 +1,4 @@
-From 830e5179d74a2ed85ff1b51868b7e1e3285794a1 Mon Sep 17 00:00:00 2001
+From 4d2ee6274188eb9cb15ffd1a0d8c94f018dfdbd1 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 10 Nov 2026 07:50:20 +0000
 Subject: [PATCH] Rewrite Codex multi-agent history for the strict Muse input
@@ -19,7 +19,7 @@ Fernet) round-trips untouched.
  2 files changed, 41 insertions(+)
 
 diff --git a/open-sse/providers/registry/muse.js b/open-sse/providers/registry/muse.js
-index 08c9173..ed187a1 100644
+index 08c9173880896112cc2dda978f4d965ab52ee27c..ed187a1483ff65cc59d6e0882b6f06cd31c5b3b4 100644
 --- a/open-sse/providers/registry/muse.js
 +++ b/open-sse/providers/registry/muse.js
 @@ -51,6 +51,11 @@ export default {
@@ -35,7 +35,7 @@ index 08c9173..ed187a1 100644
    ],
    models: [
 diff --git a/tests/unit/muse-custom-tools.test.js b/tests/unit/muse-custom-tools.test.js
-index cd22261..4db0ce8 100644
+index cd222615507cbdb54a21deaf3361551ca772faf5..4db0ce8c58199c11c4279cddfc7f26a58d3accac 100644
 --- a/tests/unit/muse-custom-tools.test.js
 +++ b/tests/unit/muse-custom-tools.test.js
 @@ -302,3 +302,39 @@ describe("Muse custom tool restore (streaming passthrough)", () => {
@@ -79,5 +79,5 @@ index cd22261..4db0ce8 100644
 +  });
 +});
 -- 
-2.55.0
+2.54.0
 

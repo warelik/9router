@@ -1,4 +1,4 @@
-From 800da94b09f7a6b35ac069dc72b45cbf475b7715 Mon Sep 17 00:00:00 2001
+From 5e5602fd8e66832b69be34849a016f7447727fc0 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 10 Nov 2026 08:24:09 +0000
 Subject: [PATCH] Split Meta's flattened namespace calls back for Responses
@@ -24,7 +24,7 @@ before the split.
  4 files changed, 109 insertions(+), 15 deletions(-)
 
 diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
-index 137abd0..fd9ca40 100644
+index 137abd0c57eb4c1b98b6c5c3d521631312725337..fd9ca402ef86fffeffaec35beef10080ea238adb 100644
 --- a/open-sse/translator/index.js
 +++ b/open-sse/translator/index.js
 @@ -260,6 +260,16 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
@@ -45,7 +45,7 @@ index 137abd0..fd9ca40 100644
  
    if (sourceToolNameMap) {
 diff --git a/open-sse/utils/museCloaking.js b/open-sse/utils/museCloaking.js
-index bcb76d9..f1cd6d9 100644
+index bcb76d949ed98543c203d171669138115fcce9bf..f1cd6d910e231e726c6416841e043b81c266963f 100644
 --- a/open-sse/utils/museCloaking.js
 +++ b/open-sse/utils/museCloaking.js
 @@ -120,7 +120,12 @@ function customToolAsFunction(tool) {
@@ -137,7 +137,7 @@ index bcb76d9..f1cd6d9 100644
  
  function museCustomItem(item) {
 diff --git a/tests/unit/muse-cloaking.test.js b/tests/unit/muse-cloaking.test.js
-index cc1e807..1a51550 100644
+index cc1e807e1dde131f8998a8332c0af60367e464b9..1a51550999d9bfb7fff939d13826696ae83df76e 100644
 --- a/tests/unit/muse-cloaking.test.js
 +++ b/tests/unit/muse-cloaking.test.js
 @@ -88,7 +88,12 @@ describe("Muse Code request cloaking", () => {
@@ -155,7 +155,7 @@ index cc1e807..1a51550 100644
  
    it("allocates unique bounded aliases and rewrites allowed_tools without mutating hosted entries", () => {
 diff --git a/tests/unit/muse-custom-tools.test.js b/tests/unit/muse-custom-tools.test.js
-index 4db0ce8..9251fca 100644
+index 4db0ce8c58199c11c4279cddfc7f26a58d3accac..9251fca4c15e787bef71edb06d58b5b1d10edaf2 100644
 --- a/tests/unit/muse-custom-tools.test.js
 +++ b/tests/unit/muse-custom-tools.test.js
 @@ -105,7 +105,7 @@ describe("Muse request tool normalization", () => {
@@ -277,5 +277,5 @@ index 4db0ce8..9251fca 100644
      expect(raw).toContain("event: response.custom_tool_call_input.delta");
      expect(raw).toContain("event: response.custom_tool_call_input.done");
 -- 
-2.55.0
+2.54.0
 

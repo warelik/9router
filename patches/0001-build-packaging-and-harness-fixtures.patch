@@ -1,4 +1,4 @@
-From 5dd9d8453de02e949ffb04634c605025208f2a31 Mon Sep 17 00:00:00 2001
+From 6a0e5157f197602205cfa28e2ce7fd35ab2e72e3 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:20 +0000
 Subject: [PATCH] Build inputs, packaging and regression harness fixtures
@@ -16,20 +16,20 @@ Consolidated from the following original patches (file custody by final owner):
 ---
  .github/workflows/docker-publish.yml          |   10 -
  Dockerfile                                    |    6 +-
- npm-shrinkwrap.json                           | 9652 +++++++++++++++++
+ npm-shrinkwrap.json                           | 9529 +++++++++++++++++
  tests/helpers/isolatedDataDir.js              |   20 +
  tests/translator/golden-url-header.test.js    |   18 +-
  .../unit/docker-publish-source-recipe.test.js |   53 +
  tests/unit/gemini-native-api-version.test.js  |  203 +
  tests/unit/gemini-native-endpoint.test.js     |   94 +-
- 8 files changed, 10038 insertions(+), 18 deletions(-)
+ 8 files changed, 9915 insertions(+), 18 deletions(-)
  create mode 100644 npm-shrinkwrap.json
  create mode 100644 tests/helpers/isolatedDataDir.js
  create mode 100644 tests/unit/docker-publish-source-recipe.test.js
  create mode 100644 tests/unit/gemini-native-api-version.test.js
 
 diff --git a/.github/workflows/docker-publish.yml b/.github/workflows/docker-publish.yml
-index 64be9c1c..7387d501 100644
+index 64be9c1ce33fe1cf1be14b02fe8f06459e3750be..7387d5019246b600d6173ef70e91dfd864f9a0a5 100644
 --- a/.github/workflows/docker-publish.yml
 +++ b/.github/workflows/docker-publish.yml
 @@ -152,15 +152,6 @@ jobs:
@@ -57,7 +57,7 @@ index 64be9c1c..7387d501 100644
            outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
            build-args: |
 diff --git a/Dockerfile b/Dockerfile
-index 24641323..8601ae0a 100644
+index 24641323b4dc29092331f8aa222c46d2a1212c9f..8601ae0ab3916f896a3e70bff38f69ec1e60f4ab 100644
 --- a/Dockerfile
 +++ b/Dockerfile
 @@ -1,5 +1,5 @@
@@ -81,10 +81,10 @@ index 24641323..8601ae0a 100644
        --fetch-retry-factor=2 \
 diff --git a/npm-shrinkwrap.json b/npm-shrinkwrap.json
 new file mode 100644
-index 00000000..2aff3904
+index 0000000000000000000000000000000000000000..874f926f812f7288e3994f2e6eb3aa2ea794e857
 --- /dev/null
 +++ b/npm-shrinkwrap.json
-@@ -0,0 +1,9652 @@
+@@ -0,0 +1,9529 @@
 +{
 +  "name": "9router-app",
 +  "version": "0.5.116",
@@ -122,7 +122,7 @@ index 00000000..2aff3904
 +        "recharts": "^3.7.0",
 +        "socks-proxy-agent": "^8.0.5",
 +        "sql.js": "^1.14.1",
-+        "undici": "^8.12.3",
++        "undici": "^7.30.2",
 +        "uuid": "^13.0.0",
 +        "zustand": "^5.0.10"
 +      },
@@ -134,6 +134,9 @@ index 00000000..2aff3904
 +        "postcss": "^8.5.6",
 +        "tailwindcss": "^4",
 +        "wreq-js": "^3.2.0"
++      },
++      "engines": {
++        "node": ">=20.18.1"
 +      },
 +      "optionalDependencies": {
 +        "@aws-sdk/credential-providers": "^3.1135.0",
@@ -1154,9 +1157,6 @@ index 00000000..2aff3904
 +      "cpu": [
 +        "arm"
 +      ],
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "LGPL-3.0-or-later",
 +      "optional": true,
 +      "os": [
@@ -1172,9 +1172,6 @@ index 00000000..2aff3904
 +      "integrity": "sha512-Y3dgX/6lE2QhQb+Gxy0WZxfg9MEm/JBjamZpS2IklP7xIQoKN4hzAm7KcMVGtaVDt3neE9OKBC7vAfonA/Lr1A==",
 +      "cpu": [
 +        "arm64"
-+      ],
-+      "libc": [
-+        "glibc"
 +      ],
 +      "license": "LGPL-3.0-or-later",
 +      "optional": true,
@@ -1192,9 +1189,6 @@ index 00000000..2aff3904
 +      "cpu": [
 +        "ppc64"
 +      ],
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "LGPL-3.0-or-later",
 +      "optional": true,
 +      "os": [
@@ -1210,9 +1204,6 @@ index 00000000..2aff3904
 +      "integrity": "sha512-aHkkIEHPRdQEegJN20MLmGtxYD9R2wQr3Cwpddnu5+YKMt6Uzax7S9h5gpZTo8wyrGuZSlfQ63OevL5mTyOC7Q==",
 +      "cpu": [
 +        "riscv64"
-+      ],
-+      "libc": [
-+        "glibc"
 +      ],
 +      "license": "LGPL-3.0-or-later",
 +      "optional": true,
@@ -1230,9 +1221,6 @@ index 00000000..2aff3904
 +      "cpu": [
 +        "s390x"
 +      ],
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "LGPL-3.0-or-later",
 +      "optional": true,
 +      "os": [
@@ -1248,9 +1236,6 @@ index 00000000..2aff3904
 +      "integrity": "sha512-GJ//SSXbnwSDes02umB3nDJLFcQzw8a18V8fyhqr6tV515tOEMdImjjxj1AoafMRz56F3PHgftnj1QEKSU1zkw==",
 +      "cpu": [
 +        "x64"
-+      ],
-+      "libc": [
-+        "glibc"
 +      ],
 +      "license": "LGPL-3.0-or-later",
 +      "optional": true,
@@ -1268,9 +1253,6 @@ index 00000000..2aff3904
 +      "cpu": [
 +        "arm64"
 +      ],
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "LGPL-3.0-or-later",
 +      "optional": true,
 +      "os": [
@@ -1287,9 +1269,6 @@ index 00000000..2aff3904
 +      "cpu": [
 +        "x64"
 +      ],
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "LGPL-3.0-or-later",
 +      "optional": true,
 +      "os": [
@@ -1305,9 +1284,6 @@ index 00000000..2aff3904
 +      "integrity": "sha512-LEaXK2WdXVK5ykcw0buWyPMsmLLL2vpHLD6yrNSW+JGEL3BZPA4tpKN6iaMc4AxTTAoaX/sU1rOL51lcIz48ZQ==",
 +      "cpu": [
 +        "arm"
-+      ],
-+      "libc": [
-+        "glibc"
 +      ],
 +      "license": "Apache-2.0",
 +      "optional": true,
@@ -1331,9 +1307,6 @@ index 00000000..2aff3904
 +      "cpu": [
 +        "arm64"
 +      ],
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "Apache-2.0",
 +      "optional": true,
 +      "os": [
@@ -1355,9 +1328,6 @@ index 00000000..2aff3904
 +      "integrity": "sha512-QVxAAq8evVRI9ia2vqgwrmWucn5Dfv+JdWzj75pD8omHLPSP7f8p20O8jxzjCcuCEQEOtYOZUmX1hkiZ0kdevA==",
 +      "cpu": [
 +        "ppc64"
-+      ],
-+      "libc": [
-+        "glibc"
 +      ],
 +      "license": "Apache-2.0",
 +      "optional": true,
@@ -1381,9 +1351,6 @@ index 00000000..2aff3904
 +      "cpu": [
 +        "riscv64"
 +      ],
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "Apache-2.0",
 +      "optional": true,
 +      "os": [
@@ -1405,9 +1372,6 @@ index 00000000..2aff3904
 +      "integrity": "sha512-UZasTOFiYzotTsGOCu42BfUzP6Tu6Do/947iRm1RsLKvlllxwGcn4RN27LibGWceix4Y+Pmw3jsnTcCQIgWjqA==",
 +      "cpu": [
 +        "s390x"
-+      ],
-+      "libc": [
-+        "glibc"
 +      ],
 +      "license": "Apache-2.0",
 +      "optional": true,
@@ -1431,9 +1395,6 @@ index 00000000..2aff3904
 +      "cpu": [
 +        "x64"
 +      ],
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "Apache-2.0",
 +      "optional": true,
 +      "os": [
@@ -1456,9 +1417,6 @@ index 00000000..2aff3904
 +      "cpu": [
 +        "arm64"
 +      ],
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "Apache-2.0",
 +      "optional": true,
 +      "os": [
@@ -1480,9 +1438,6 @@ index 00000000..2aff3904
 +      "integrity": "sha512-4KOphqB035HrVdqLZfCgMzzERrQkkzOwRhl4OAkRO1YCldbaFjySXMaK534Mo0V+LndnlJk+sbUyLeU0ULyD1A==",
 +      "cpu": [
 +        "x64"
-+      ],
-+      "libc": [
-+        "musl"
 +      ],
 +      "license": "Apache-2.0",
 +      "optional": true,
@@ -1774,9 +1729,6 @@ index 00000000..2aff3904
 +      "cpu": [
 +        "arm64"
 +      ],
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -1792,9 +1744,6 @@ index 00000000..2aff3904
 +      "integrity": "sha512-T1PNmfbPcxr5ndtWUL/3wQtLXsz808lq6sc2GrNT5k2oquF7UyqZddHSuAewHVsWsGXe6nsl9HoN1YNriVjuSg==",
 +      "cpu": [
 +        "arm64"
-+      ],
-+      "libc": [
-+        "musl"
 +      ],
 +      "license": "MIT",
 +      "optional": true,
@@ -1812,9 +1761,6 @@ index 00000000..2aff3904
 +      "cpu": [
 +        "x64"
 +      ],
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -1830,9 +1776,6 @@ index 00000000..2aff3904
 +      "integrity": "sha512-yY2uh1YhX6ufuYy2FCbw1dqblbhI57GLYAJfCkqD9auTv6pLrH67Uccjc3QMKBeCYAG6lkgu08ExmX1bbjejjQ==",
 +      "cpu": [
 +        "x64"
-+      ],
-+      "libc": [
-+        "musl"
 +      ],
 +      "license": "MIT",
 +      "optional": true,
@@ -2233,9 +2176,6 @@ index 00000000..2aff3904
 +        "arm64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -2253,9 +2193,6 @@ index 00000000..2aff3904
 +        "arm64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -2273,9 +2210,6 @@ index 00000000..2aff3904
 +        "x64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -2293,9 +2227,6 @@ index 00000000..2aff3904
 +        "x64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3040,9 +2971,6 @@ index 00000000..2aff3904
 +        "arm64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3057,9 +2985,6 @@ index 00000000..2aff3904
 +        "arm64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3074,9 +2999,6 @@ index 00000000..2aff3904
 +        "loong64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3091,9 +3013,6 @@ index 00000000..2aff3904
 +        "loong64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3108,9 +3027,6 @@ index 00000000..2aff3904
 +        "ppc64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3125,9 +3041,6 @@ index 00000000..2aff3904
 +        "riscv64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3142,9 +3055,6 @@ index 00000000..2aff3904
 +        "riscv64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3159,9 +3069,6 @@ index 00000000..2aff3904
 +        "s390x"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3176,9 +3083,6 @@ index 00000000..2aff3904
 +        "x64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3193,9 +3097,6 @@ index 00000000..2aff3904
 +        "x64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3347,9 +3248,6 @@ index 00000000..2aff3904
 +        "arm64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3367,9 +3265,6 @@ index 00000000..2aff3904
 +        "arm64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3387,9 +3282,6 @@ index 00000000..2aff3904
 +        "x64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -3407,9 +3299,6 @@ index 00000000..2aff3904
 +        "x64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "MIT",
 +      "optional": true,
 +      "os": [
@@ -6882,9 +6771,6 @@ index 00000000..2aff3904
 +        "arm64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MPL-2.0",
 +      "optional": true,
 +      "os": [
@@ -6906,9 +6792,6 @@ index 00000000..2aff3904
 +        "arm64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "MPL-2.0",
 +      "optional": true,
 +      "os": [
@@ -6930,9 +6813,6 @@ index 00000000..2aff3904
 +        "x64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "glibc"
-+      ],
 +      "license": "MPL-2.0",
 +      "optional": true,
 +      "os": [
@@ -6954,9 +6834,6 @@ index 00000000..2aff3904
 +        "x64"
 +      ],
 +      "dev": true,
-+      "libc": [
-+        "musl"
-+      ],
 +      "license": "MPL-2.0",
 +      "optional": true,
 +      "os": [
@@ -9243,12 +9120,12 @@ index 00000000..2aff3904
 +      }
 +    },
 +    "node_modules/undici": {
-+      "version": "8.12.4",
-+      "resolved": "https://registry.npmjs.org/undici/-/undici-8.12.4.tgz",
-+      "integrity": "sha512-8Mx+uNKKER2bA4AdtedkqRbwUCIJFr2nJckXRe5yrDqzePqwLP7VNcctN8/XdmDSbF7mS+jJKIszlL+vbam1VA==",
++      "version": "7.30.2",
++      "resolved": "https://registry.npmjs.org/undici/-/undici-7.30.2.tgz",
++      "integrity": "sha512-mLyPQnHwUxaM/rideoK/+KL8DaAJLRl4aBCfmX444aCSLnIaomqPLtNRe2jdCYcsk5wZzXrDIQC8ZeYNRAYyIA==",
 +      "license": "MIT",
 +      "engines": {
-+        "node": ">=22.19.0"
++        "node": ">=20.18.1"
 +      }
 +    },
 +    "node_modules/undici-types": {
@@ -9739,7 +9616,7 @@ index 00000000..2aff3904
 +}
 diff --git a/tests/helpers/isolatedDataDir.js b/tests/helpers/isolatedDataDir.js
 new file mode 100644
-index 00000000..1a2eea40
+index 0000000000000000000000000000000000000000..1a2eea402bfd32206e07a76e811f65ebd36ffd27
 --- /dev/null
 +++ b/tests/helpers/isolatedDataDir.js
 @@ -0,0 +1,20 @@
@@ -9764,7 +9641,7 @@ index 00000000..1a2eea40
 +  };
 +}
 diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
-index d88e67f1..f9b3a1fb 100644
+index d88e67f1d3ffb6a4f22d8f484342d0242b57963d..f9b3a1fbc4cbba04a0859419cac0cf1cabbd0c78 100644
 --- a/tests/translator/golden-url-header.test.js
 +++ b/tests/translator/golden-url-header.test.js
 @@ -21,10 +21,16 @@ const SPECIALIZED = new Set([
@@ -9804,7 +9681,7 @@ index d88e67f1..f9b3a1fb 100644
    }
 diff --git a/tests/unit/docker-publish-source-recipe.test.js b/tests/unit/docker-publish-source-recipe.test.js
 new file mode 100644
-index 00000000..bae2f872
+index 0000000000000000000000000000000000000000..bae2f87255ae9768dc39ded82dec0feb45b69e73
 --- /dev/null
 +++ b/tests/unit/docker-publish-source-recipe.test.js
 @@ -0,0 +1,53 @@
@@ -9863,7 +9740,7 @@ index 00000000..bae2f872
 +});
 diff --git a/tests/unit/gemini-native-api-version.test.js b/tests/unit/gemini-native-api-version.test.js
 new file mode 100644
-index 00000000..31c06c46
+index 0000000000000000000000000000000000000000..31c06c46c60874a1727be86b124973f997643dba
 --- /dev/null
 +++ b/tests/unit/gemini-native-api-version.test.js
 @@ -0,0 +1,203 @@
@@ -10071,7 +9948,7 @@ index 00000000..31c06c46
 +
 +});
 diff --git a/tests/unit/gemini-native-endpoint.test.js b/tests/unit/gemini-native-endpoint.test.js
-index 83a8716c..9a487101 100644
+index 83a8716ca80d4ad98298abe8def49154caa63f21..9a48710163a09d347cf717e0b17cd8b9b1c962ef 100644
 --- a/tests/unit/gemini-native-endpoint.test.js
 +++ b/tests/unit/gemini-native-endpoint.test.js
 @@ -1,4 +1,5 @@
@@ -10221,5 +10098,5 @@ index 83a8716c..9a487101 100644
      await POST(makeGeminiRequest("openai/gpt-4o-mini-tts:generateContent", audioBody()), {
        params: Promise.resolve({ path: ["openai", "gpt-4o-mini-tts:generateContent"] }),
 -- 
-2.55.0
+2.54.0
 

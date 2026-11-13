@@ -1,4 +1,4 @@
-From b35016213e186c7edf232443f0fc3e6c3c607192 Mon Sep 17 00:00:00 2001
+From 0fbb1491a3c7b26cdc5085733a79959675f2a5a7 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sun, 8 Nov 2026 19:08:27 +0000
 Subject: [PATCH] Recover Muse foreign reasoning past the first retry
@@ -25,13 +25,13 @@ foreign/expired rejection is classified caller-scoped for Muse
  3 files changed, 228 insertions(+), 53 deletions(-)
 
 diff --git a/open-sse/config/errorConfig.js b/open-sse/config/errorConfig.js
-index 8ef4ea68..7203cb33 100644
+index 539bc8a2bcbf525bd3eb12ccaf6c629a0789c76c..1e3400063032d367a8299bf1891284011129df9d 100644
 --- a/open-sse/config/errorConfig.js
 +++ b/open-sse/config/errorConfig.js
-@@ -70,6 +70,14 @@ export const ERROR_RULES = [
-   // Intl gateway blocks affect the account/IP, so let the connection back off.
-   { provider: "codebuddy-intl", text: "request illegal", backoff: true },
-   { provider: "codebuddy-intl", text: "conversation id missing", backoff: true },
+@@ -73,6 +73,14 @@ export const ERROR_RULES = [
+   // NVIDIA NIM returns 400 with "degraded" when specific model cluster is unhealthy.
+   // Lock only the degraded model (modelScoped: true) without locking the API key.
+   { provider: "nvidia", text: "degraded", cooldownMs: 15 * 60 * 1000, modelScoped: true },
 +  // Muse reasoning continuity is bound to the caller that issued it: a 400
 +  // naming a foreign or expired reasoning item indicts this credential for
 +  // this history, not the request itself — another account (the issuer)
@@ -44,7 +44,7 @@ index 8ef4ea68..7203cb33 100644
    { text: "request not allowed",      cooldownMs: COOLDOWN.short },
    { text: "improperly formed request", cooldownMs: COOLDOWN.long },
 diff --git a/open-sse/executors/muse.js b/open-sse/executors/muse.js
-index 1363d1df..2bec85ca 100644
+index 1363d1df898fc6d92cd668860698f025ccaf2b41..2bec85cac868c15c0d0670dc01f64f7ed79a1ea7 100644
 --- a/open-sse/executors/muse.js
 +++ b/open-sse/executors/muse.js
 @@ -6,6 +6,7 @@ const FOREIGN_REASONING_ERROR = "reasoning `encrypted_content` was not issued to
@@ -250,7 +250,7 @@ index 1363d1df..2bec85ca 100644
    }
  }
 diff --git a/tests/unit/muse-foreign-reasoning-retry.test.js b/tests/unit/muse-foreign-reasoning-retry.test.js
-index ab37f410..03a78fb7 100644
+index ab37f410a7b266d2f41fca490418971fb9f4d16b..03a78fb730fe0a212eba48e97261d05837b95e17 100644
 --- a/tests/unit/muse-foreign-reasoning-retry.test.js
 +++ b/tests/unit/muse-foreign-reasoning-retry.test.js
 @@ -5,8 +5,9 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
@@ -379,5 +379,5 @@ index ab37f410..03a78fb7 100644
 +  });
  });
 -- 
-2.55.0
+2.54.0
 

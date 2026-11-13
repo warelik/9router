@@ -1,4 +1,4 @@
-From e8e8ceac6f3730f387142bc6ad834532732cf86b Mon Sep 17 00:00:00 2001
+From 6f6b5d47bb8ace9c2b2bdf6ccd8768aa3b2b8791 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:23 +0000
 Subject: [PATCH] Responses transport and portable collaboration
@@ -37,7 +37,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/undeclared-responses-sse.test.js
 
 diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
-index 5a723981..3bcd7f81 100644
+index 5a7239811153ee959576ad55e11cfb0d90047d5a..3bcd7f813ee78c187a7e724d47976be2e166be8d 100644
 --- a/open-sse/handlers/chatCore/sseToJsonHandler.js
 +++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
 @@ -8,6 +8,7 @@ import { PROVIDERS } from "../../config/providers.js";
@@ -76,7 +76,7 @@ index 5a723981..3bcd7f81 100644
      console.error("[ChatCore] Chat Completions SSE→JSON failed:", err);
      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Failed to convert streaming response to JSON");
 diff --git a/open-sse/providers/registry/kimi.js b/open-sse/providers/registry/kimi.js
-index 88f6e386..e90fe5a5 100644
+index 88f6e3865986fda0b9879d1728d2cad996932fd3..e90fe5a513f379d2f8cdf75a437e7dfbed813332 100644
 --- a/open-sse/providers/registry/kimi.js
 +++ b/open-sse/providers/registry/kimi.js
 @@ -56,6 +56,9 @@ export default {
@@ -91,7 +91,7 @@ index 88f6e386..e90fe5a5 100644
    ],
 diff --git a/open-sse/translator/concerns/portableCollaboration.js b/open-sse/translator/concerns/portableCollaboration.js
 new file mode 100644
-index 00000000..63155983
+index 0000000000000000000000000000000000000000..6315598307bd6d9b4c76d1e7a81c277cb0cc7dc3
 --- /dev/null
 +++ b/open-sse/translator/concerns/portableCollaboration.js
 @@ -0,0 +1,89 @@
@@ -185,7 +185,7 @@ index 00000000..63155983
 +  return { body: toolNameMap.size ? rewritten : body, toolNameMap };
 +}
 diff --git a/open-sse/utils/responsesStreamHelpers.js b/open-sse/utils/responsesStreamHelpers.js
-index eaacdcd0..6a1e94c2 100644
+index eaacdcd0559948f94aabd3712bc95788478ad9b7..6a1e94c22e964445db2ba5133328b72058a6737c 100644
 --- a/open-sse/utils/responsesStreamHelpers.js
 +++ b/open-sse/utils/responsesStreamHelpers.js
 @@ -7,6 +7,7 @@ const OPENAI_RESPONSES_TERMINAL_EVENTS = new Set([
@@ -206,7 +206,7 @@ index eaacdcd0..6a1e94c2 100644
  
  const sharedEncoder = new TextEncoder();
 diff --git a/tests/unit/cli-connect.test.js b/tests/unit/cli-connect.test.js
-index 3695a4b6..7da8ede2 100644
+index 3695a4b6676b7001f2fd4592e33248a755a6bc2f..7da8ede21c066050f766236c3efe30c101eebb7c 100644
 --- a/tests/unit/cli-connect.test.js
 +++ b/tests/unit/cli-connect.test.js
 @@ -194,10 +194,12 @@ describe("connect run()", () => {
@@ -223,7 +223,7 @@ index 3695a4b6..7da8ede2 100644
    });
  
 diff --git a/tests/unit/kimi-responses-transport.test.js b/tests/unit/kimi-responses-transport.test.js
-index faffc086..4d80dd8f 100644
+index faffc08602aaa0991b59cda6c78e6aa52b169a67..4d80dd8fd44798c6ec0d40ecfda2937bcbd44917 100644
 --- a/tests/unit/kimi-responses-transport.test.js
 +++ b/tests/unit/kimi-responses-transport.test.js
 @@ -3,8 +3,8 @@
@@ -255,7 +255,7 @@ index faffc086..4d80dd8f 100644
  });
 diff --git a/tests/unit/openai-responses-agent-messages.test.js b/tests/unit/openai-responses-agent-messages.test.js
 new file mode 100644
-index 00000000..7d6b9cbe
+index 0000000000000000000000000000000000000000..7d6b9cbe3a1f9b37d52b08d0b63ed3e08f96b905
 --- /dev/null
 +++ b/tests/unit/openai-responses-agent-messages.test.js
 @@ -0,0 +1,240 @@
@@ -501,7 +501,7 @@ index 00000000..7d6b9cbe
 +});
 diff --git a/tests/unit/openai-responses-namespaces.test.js b/tests/unit/openai-responses-namespaces.test.js
 new file mode 100644
-index 00000000..645f7eb2
+index 0000000000000000000000000000000000000000..645f7eb293e79fe83d5d9ac04662fb521e96b276
 --- /dev/null
 +++ b/tests/unit/openai-responses-namespaces.test.js
 @@ -0,0 +1,444 @@
@@ -950,7 +950,7 @@ index 00000000..645f7eb2
 +  });
 +});
 diff --git a/tests/unit/opencode-go-transport-routing.test.js b/tests/unit/opencode-go-transport-routing.test.js
-index 8b67ad49..8f3d0a6b 100644
+index 8b67ad491de9383664dbe04685c52e9fc305a2ff..8f3d0a6ba850b039c33a2d2a7a74ac24e69e07c8 100644
 --- a/tests/unit/opencode-go-transport-routing.test.js
 +++ b/tests/unit/opencode-go-transport-routing.test.js
 @@ -10,8 +10,8 @@
@@ -1048,7 +1048,7 @@ index 8b67ad49..8f3d0a6b 100644
  
 diff --git a/tests/unit/responses-reasoning-wire.test.js b/tests/unit/responses-reasoning-wire.test.js
 new file mode 100644
-index 00000000..40cd5125
+index 0000000000000000000000000000000000000000..40cd5125ed329ea7841809d0e00913ef0f3db244
 --- /dev/null
 +++ b/tests/unit/responses-reasoning-wire.test.js
 @@ -0,0 +1,414 @@
@@ -1468,7 +1468,7 @@ index 00000000..40cd5125
 +});
 diff --git a/tests/unit/responses-thinking-option-preservation.test.js b/tests/unit/responses-thinking-option-preservation.test.js
 new file mode 100644
-index 00000000..19b385e7
+index 0000000000000000000000000000000000000000..19b385e764453415c13fe600bbe09256ce3d7613
 --- /dev/null
 +++ b/tests/unit/responses-thinking-option-preservation.test.js
 @@ -0,0 +1,71 @@
@@ -1545,7 +1545,7 @@ index 00000000..19b385e7
 +});
 diff --git a/tests/unit/undeclared-responses-sse.test.js b/tests/unit/undeclared-responses-sse.test.js
 new file mode 100644
-index 00000000..8a0e19b6
+index 0000000000000000000000000000000000000000..8a0e19b6674f6b4c601bcbc0dbf91efb9a89c4db
 --- /dev/null
 +++ b/tests/unit/undeclared-responses-sse.test.js
 @@ -0,0 +1,206 @@
@@ -1756,5 +1756,5 @@ index 00000000..8a0e19b6
 +  });
 +});
 -- 
-2.55.0
+2.54.0
 

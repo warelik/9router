@@ -1,4 +1,4 @@
-From dd44fbd1a087443101ca4339504f9ab1172f9399 Mon Sep 17 00:00:00 2001
+From f8e9cdc989295f8af5feb89a509ac7bde3016625 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Mon, 9 Nov 2026 10:10:45 +0000
 Subject: [PATCH] Fix multipart uploads through the bundled Undici proxy fetch
@@ -13,13 +13,13 @@ Rebuild only foreign-realm FormData bodies with package Undici's FormData immedi
  create mode 100644 tests/unit/proxy-fetch-formdata-compat.test.js
 
 diff --git a/open-sse/utils/proxyFetch.js b/open-sse/utils/proxyFetch.js
-index a2a00ca7..a85144ff 100644
+index 86a699070a98038986cea98b73573056c6f74069..3680417441e649b39f2929800c07bfbddcd67765 100644
 --- a/open-sse/utils/proxyFetch.js
 +++ b/open-sse/utils/proxyFetch.js
-@@ -31,10 +31,48 @@ export function isStaleSocketError(error) {
- // dispatchers created by a different undici copy (UND_ERR_INVALID_ARG on the
- // bundled-in-Node global fetch), so originalFetch/globalThis.fetch is not an
- // option once we build our own Agents.
+@@ -38,10 +38,48 @@ export function isStaleSocketError(error) {
+ // Always fetch through the package's own undici instance so fetch and the
+ // Agents below come from the same copy — dispatcher options are only guaranteed
+ // to match within one undici version.
 -let undiciFetch = null;
 +let undiciModule = null;
 +
@@ -70,7 +70,7 @@ index a2a00ca7..a85144ff 100644
  // ─── TLS fingerprinting via got-scraping (browser-like JA3) ───────────────
 diff --git a/tests/unit/proxy-fetch-formdata-compat.test.js b/tests/unit/proxy-fetch-formdata-compat.test.js
 new file mode 100644
-index 00000000..3ca1768a
+index 0000000000000000000000000000000000000000..3ca1768a16b900e6ffe138985a24e053a83817c9
 --- /dev/null
 +++ b/tests/unit/proxy-fetch-formdata-compat.test.js
 @@ -0,0 +1,100 @@
@@ -175,5 +175,5 @@ index 00000000..3ca1768a
 +  });
 +});
 -- 
-2.55.0
+2.54.0
 

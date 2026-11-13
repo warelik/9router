@@ -1,8 +1,7 @@
-From 8469d4ea9d7999bdd8f799ac6f75ffeec5ecd09f Mon Sep 17 00:00:00 2001
+From 1aa658c1338ca342c7cb2e6793d9aa7526db3ae7 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:51 +0000
 Subject: [PATCH] Cloudflare AI and SystemOne provider
-
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -15,7 +14,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/systemone-core.test.js
 
 diff --git a/open-sse/handlers/systemoneCore.js b/open-sse/handlers/systemoneCore.js
-index e84b36a..c9edcfe 100644
+index e84b36adde98d979a4a87f726fa2f82c9d43b734..c9edcfe7193b30992a34fece43ee43909ee399ad 100644
 --- a/open-sse/handlers/systemoneCore.js
 +++ b/open-sse/handlers/systemoneCore.js
 @@ -27,6 +27,9 @@ export function buildSystemoneUrl(override, cfg) {
@@ -52,7 +51,7 @@ index e84b36a..c9edcfe 100644
  
    const usage = responseBody?.usage;
 diff --git a/open-sse/providers/registry/cloudflare-ai.js b/open-sse/providers/registry/cloudflare-ai.js
-index d998c92..d1ab31a 100644
+index d998c9243bde83d59cb347c1747f5ef02b4967a6..d1ab31a45bca51b4bd0113d27b5d07b4826d0886 100644
 --- a/open-sse/providers/registry/cloudflare-ai.js
 +++ b/open-sse/providers/registry/cloudflare-ai.js
 @@ -58,6 +58,7 @@ export default {
@@ -65,7 +64,7 @@ index d998c92..d1ab31a 100644
  };
 diff --git a/tests/unit/systemone-core.test.js b/tests/unit/systemone-core.test.js
 new file mode 100644
-index 0000000..80299c6
+index 0000000000000000000000000000000000000000..80299c612f2f848bcd828f5e3121fb4256bd9978
 --- /dev/null
 +++ b/tests/unit/systemone-core.test.js
 @@ -0,0 +1,83 @@
@@ -153,5 +152,5 @@ index 0000000..80299c6
 +  });
 +});
 -- 
-2.55.0
+2.54.0
 

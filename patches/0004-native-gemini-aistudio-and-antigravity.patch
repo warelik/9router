@@ -1,4 +1,4 @@
-From 830ca3c7b544ccfd7cd965799efdb0d4f3b536d5 Mon Sep 17 00:00:00 2001
+From edff6e7d93450d21f6085f8ba380d469bbbf9755 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:27 +0000
 Subject: [PATCH] Native Gemini, AIStudio and Antigravity routes
@@ -88,7 +88,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/translated-chat-stream-done.test.js
 
 diff --git a/next.config.mjs b/next.config.mjs
-index 05e6be59..a8a71d57 100644
+index 05e6be5911fdf368fafa676eb0fedc193c87f4af..a8a71d57ddd938042eee9c344fe9976371bae042 100644
 --- a/next.config.mjs
 +++ b/next.config.mjs
 @@ -100,6 +100,14 @@ const nextConfig = {
@@ -107,7 +107,7 @@ index 05e6be59..a8a71d57 100644
          source: "/v1/:path*",
          destination: "/api/v1/:path*"
 diff --git a/open-sse/executors/base.js b/open-sse/executors/base.js
-index 239c97ad..109e0eb0 100644
+index 239c97ade676d0df6b4e69b735a217d79d6aba09..109e0eb097493e7e6bf72b0bab971c5953907522 100644
 --- a/open-sse/executors/base.js
 +++ b/open-sse/executors/base.js
 @@ -177,6 +177,10 @@ export class BaseExecutor {
@@ -122,27 +122,27 @@ index 239c97ad..109e0eb0 100644
          const isConnectTimeout = connectCtrl.signal.aborted && error.name === "AbortError";
          dbg("FETCH", `${this.provider.toUpperCase()} ✖ ${error.name}: ${error.message}${isConnectTimeout ? " (connect timeout)" : ""}`);
 diff --git a/open-sse/providers/registry/index.js b/open-sse/providers/registry/index.js
-index 41dc6605..10f7e8c1 100644
+index 993c581deb62e77adb3f2d41415c670d3880da66..88360e5e29c18d70794e3a49d2597589cba2d1ba 100644
 --- a/open-sse/providers/registry/index.js
 +++ b/open-sse/providers/registry/index.js
 @@ -139,6 +139,7 @@ import p135 from "./minimax-code-global.js";
  import p136 from "./bedrock.js";
  import p137 from "./bedrock-xai.js";
  import p138 from "./nous.js";
-+import p154 from "./aistudio.js";
++import pAistudio from "./aistudio.js";
  import p140 from "./deepseek-web.js";
  import p143 from "./gemini-web.js";
  import p144 from "./muse-web.js";
-@@ -286,6 +287,7 @@ export default [
+@@ -288,6 +289,7 @@ export default [
    p136,
    p137,
    p138,
-+  p154,
++  pAistudio,
    p140,
    p143,
    p144,
 diff --git a/open-sse/translator/formats/gemini.js b/open-sse/translator/formats/gemini.js
-index efdc64ac..af0b4624 100644
+index 74dd5a3359b4e188a5905385c8ca282441ab9f6b..4eed372c1987f42f3b693a6525180ee4a75043ce 100644
 --- a/open-sse/translator/formats/gemini.js
 +++ b/open-sse/translator/formats/gemini.js
 @@ -1,8 +1,10 @@
@@ -597,7 +597,7 @@ index efdc64ac..af0b4624 100644
  
 -
 diff --git a/open-sse/translator/request/openai-to-gemini.js b/open-sse/translator/request/openai-to-gemini.js
-index 182abf93..b42a48f8 100644
+index 182abf939e51cc1b460d8248d66227dcffd67d6f..b42a48f8e9767ea8986bbfa17515073feaed9d1e 100644
 --- a/open-sse/translator/request/openai-to-gemini.js
 +++ b/open-sse/translator/request/openai-to-gemini.js
 @@ -2,7 +2,8 @@ import { register } from "../index.js";
@@ -1132,7 +1132,7 @@ index 182abf93..b42a48f8 100644
 +register(FORMATS.OPENAI, FORMATS.GEMINI_CLI, (model, body, stream, credentials) => wrapInCloudCodeEnvelope(model, openaiToGeminiCLIRequest(model, body, stream, credentials), credentials), null);
  register(FORMATS.OPENAI, FORMATS.ANTIGRAVITY, openaiToAntigravityRequest, null);
 diff --git a/open-sse/translator/response/gemini-to-openai.js b/open-sse/translator/response/gemini-to-openai.js
-index 14c47939..1e9da0b0 100644
+index 14c479392db533ca5c8bc40dd31ba76a72c0dac4..1e9da0b0043b05b8a0ae8a1ef83d5cb524d37888 100644
 --- a/open-sse/translator/response/gemini-to-openai.js
 +++ b/open-sse/translator/response/gemini-to-openai.js
 @@ -6,7 +6,8 @@ import { toOpenAIUsage } from "../concerns/usage.js";
@@ -1252,10 +1252,10 @@ index 14c47939..1e9da0b0 100644
      if (finishReason === OPENAI_FINISH.STOP && state.geminiToolCallCount > 0) {
        finishReason = OPENAI_FINISH.TOOL_CALLS;
 diff --git a/open-sse/utils/proxyFetch.js b/open-sse/utils/proxyFetch.js
-index 40eb81b2..a2a00ca7 100644
+index 199423c50f33a7080b78fe9b9810fcbdcb1a45e0..86a699070a98038986cea98b73573056c6f74069 100644
 --- a/open-sse/utils/proxyFetch.js
 +++ b/open-sse/utils/proxyFetch.js
-@@ -478,6 +478,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
+@@ -530,6 +530,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
        try {
          return await fetchWithTlsFallback(url, options, proxyUrl, forceFreshSocket);
        } catch (proxyError) {
@@ -1263,7 +1263,7 @@ index 40eb81b2..a2a00ca7 100644
          if (proxyOptions?.strictProxy === true) {
            throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
          }
-@@ -498,6 +499,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
+@@ -550,6 +551,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
      try {
        return await fetchWithTlsFallback(url, options, proxyUrl, forceFreshSocket);
      } catch (proxyError) {
@@ -1272,7 +1272,7 @@ index 40eb81b2..a2a00ca7 100644
        if (proxyOptions?.strictProxy === true) {
          throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
 diff --git a/open-sse/utils/sessionManager.js b/open-sse/utils/sessionManager.js
-index 4f701b88..8fb60815 100644
+index 4f701b88dbb16c264e64c3bdd9b3de0ba91b911c..8fb608154fe0983c529f405575ca9db0cd7a1287 100644
 --- a/open-sse/utils/sessionManager.js
 +++ b/open-sse/utils/sessionManager.js
 @@ -220,6 +220,22 @@ export function resolveSessionIdentity({ headers, body, connectionId, workspaceI
@@ -1299,7 +1299,7 @@ index 4f701b88..8fb60815 100644
      return resolveSessionIdentity(opts).sessionId;
  }
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 7123de6f..0f2b994e 100644
+index c93be704608331825fa99ecc862ccefacb46538f..80914b3d41f54d53581813556a5ec6f072cbdf55 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -1,15 +1,20 @@
@@ -1648,7 +1648,7 @@ index 7123de6f..0f2b994e 100644
          const trimmed = line.trim();
          if (isDebugEnabled && trimmed) {
            sseLineCount++;
-@@ -404,7 +626,7 @@ export function createSSEStream(options = {}) {
+@@ -407,7 +629,7 @@ export function createSSEStream(options = {}) {
  
          // Responses same-format passthrough: re-emit with original event framing
          if (keepsOpenAIResponsesFormat && openAIResponsesEventName) {
@@ -1657,7 +1657,7 @@ index 7123de6f..0f2b994e 100644
            reqLogger?.appendConvertedChunk?.(output);
            controller.enqueue(sharedEncoder.encode(output));
            currentOpenAIResponsesEvent = null;
-@@ -468,20 +690,133 @@ export function createSSEStream(options = {}) {
+@@ -471,15 +693,126 @@ export function createSSEStream(options = {}) {
        }
      },
  
@@ -1784,8 +1784,10 @@ index 7123de6f..0f2b994e 100644
 +            await finalizeStream();
 +            return;
 +          }
-           if (buffer) {
-             let output = buffer;
+           // An unterminated trailing "data: [DONE]" is the upstream sentinel: don't
+           // forward it raw (it would glue onto the properly framed one appended
+           // below, #5592).
+@@ -490,6 +823,8 @@ export function createSSEStream(options = {}) {
              if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
                output = "data: " + buffer.slice(5);
              }
@@ -1794,7 +1796,7 @@ index 7123de6f..0f2b994e 100644
              reqLogger?.appendConvertedChunk?.(output);
              controller.enqueue(sharedEncoder.encode(output));
            }
-@@ -490,15 +825,13 @@ export function createSSEStream(options = {}) {
+@@ -498,15 +833,13 @@ export function createSSEStream(options = {}) {
            // Some clients (e.g. OpenClaw) expect the OpenAI-style sentinel:
            //   data: [DONE]\n\n
            // Without it they can hang until timeout and trigger failover.
@@ -1812,7 +1814,7 @@ index 7123de6f..0f2b994e 100644
            return;
          }
  
-@@ -533,6 +866,7 @@ export function createSSEStream(options = {}) {
+@@ -541,6 +874,7 @@ export function createSSEStream(options = {}) {
                  const output = formatSSE(item, sourceFormat);
                  reqLogger?.appendConvertedChunk?.(output);
                  controller.enqueue(sharedEncoder.encode(output));
@@ -1820,7 +1822,7 @@ index 7123de6f..0f2b994e 100644
                }
              }
            }
-@@ -553,6 +887,7 @@ export function createSSEStream(options = {}) {
+@@ -561,6 +895,7 @@ export function createSSEStream(options = {}) {
              const output = formatSSE(item, sourceFormat);
              reqLogger?.appendConvertedChunk?.(output);
              controller.enqueue(sharedEncoder.encode(output));
@@ -1828,7 +1830,7 @@ index 7123de6f..0f2b994e 100644
            }
          }
  
-@@ -573,16 +908,44 @@ export function createSSEStream(options = {}) {
+@@ -581,16 +916,44 @@ export function createSSEStream(options = {}) {
            streamDoneSent = true;
          }
  
@@ -1876,7 +1878,7 @@ index 7123de6f..0f2b994e 100644
    return createSSEStream({
      mode: STREAM_MODE.TRANSLATE,
      targetFormat,
-@@ -596,13 +959,20 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
+@@ -604,13 +967,20 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
      body,
      onStreamComplete,
      apiKey,
@@ -1900,7 +1902,7 @@ index 7123de6f..0f2b994e 100644
      reqLogger,
      toolNameMap,
 diff --git a/open-sse/utils/usageTracking.js b/open-sse/utils/usageTracking.js
-index 62a5cc76..09643fa5 100644
+index 62a5cc76ba373155b83bb8563509c6b3b05fa916..09643fa534e5ed84cb99423222a167d1157ce8d9 100644
 --- a/open-sse/utils/usageTracking.js
 +++ b/open-sse/utils/usageTracking.js
 @@ -83,7 +83,7 @@ export function filterUsageForFormat(usage, targetFormat) {
@@ -1913,7 +1915,7 @@ index 62a5cc76..09643fa5 100644
        'estimated'
      ],
 diff --git a/src/app/api/providers/[id]/models/route.js b/src/app/api/providers/[id]/models/route.js
-index 609402dc..5b00b0e9 100644
+index 0dccc73b611dc30d9c88235c34f196fd8a0b2f80..e333973bb735c9265804af19a0103ca0eebed196 100644
 --- a/src/app/api/providers/[id]/models/route.js
 +++ b/src/app/api/providers/[id]/models/route.js
 @@ -9,6 +9,7 @@ import { resolveKiroModels } from "open-sse/services/kiroModels.js";
@@ -1924,7 +1926,7 @@ index 609402dc..5b00b0e9 100644
  import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
  import { resolveCursorModels } from "open-sse/services/cursorModels.js";
  import { resolveZedModels } from "open-sse/shared/zedAuth.js";
-@@ -179,6 +180,11 @@ function buildQoderModelsResolver(providerId) {
+@@ -180,6 +181,11 @@ function buildQoderModelsResolver(providerId) {
  
  // Provider models endpoints configuration
  const PROVIDER_MODELS_CONFIG = {
@@ -1937,7 +1939,7 @@ index 609402dc..5b00b0e9 100644
      url: "https://api.meta.ai/v1/models",
      method: "GET",
 diff --git a/src/app/api/providers/[id]/test/testUtils.js b/src/app/api/providers/[id]/test/testUtils.js
-index 689364ae..8da7463b 100644
+index a031a0549391288c3698f1cc541ba5a289cf1228..c8eb0125d57ed7860855f794978f43a42ab1817a 100644
 --- a/src/app/api/providers/[id]/test/testUtils.js
 +++ b/src/app/api/providers/[id]/test/testUtils.js
 @@ -801,6 +801,7 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
@@ -1946,13 +1948,13 @@ index 689364ae..8da7463b 100644
        case "bai":
 +      case "aistudio":
        case "muse":
-       case "runcrate": {
-         const cfg = PROVIDERS[connection.provider];
+       case "runcrate":
+       case "synthetic": {
 diff --git a/src/app/api/providers/validate/route.js b/src/app/api/providers/validate/route.js
-index cc74ab26..d6ae2e42 100644
+index 478dd99671ccb51d875d31573bd82e56838f99ce..f48c23aa8c35a77580b70d4a2c5345b9bc30f99e 100644
 --- a/src/app/api/providers/validate/route.js
 +++ b/src/app/api/providers/validate/route.js
-@@ -382,6 +382,7 @@ export async function POST(request) {
+@@ -398,6 +398,7 @@ export async function POST(request) {
            break;
          }
  
@@ -1961,7 +1963,7 @@ index cc74ab26..d6ae2e42 100644
          case "groq":
          case "xai":
 diff --git a/src/app/api/v1/models/[...model]/route.js b/src/app/api/v1/models/[...model]/route.js
-index 77df20f3..8ffcecc0 100644
+index 77df20f3cad7eeaa3a74092d22df5d55c854c7d5..8ffcecc0b7806c0c0fab3fc4331a8873957338c6 100644
 --- a/src/app/api/v1/models/[...model]/route.js
 +++ b/src/app/api/v1/models/[...model]/route.js
 @@ -17,12 +17,26 @@ export async function OPTIONS() {
@@ -1994,7 +1996,7 @@ index 77df20f3..8ffcecc0 100644
    return Response.json(data, {
      ...options,
 diff --git a/src/app/api/v1/models/route.js b/src/app/api/v1/models/route.js
-index 83ee968e..4d9a694d 100644
+index d9804038511914433bb605a6124b7c01db507e06..e295ac5fb07011e79410b0d04bc1e0418fb53700 100644
 --- a/src/app/api/v1/models/route.js
 +++ b/src/app/api/v1/models/route.js
 @@ -17,6 +17,7 @@ import { resolveCopilotModels } from "open-sse/services/copilotModels.js";
@@ -2003,9 +2005,9 @@ index 83ee968e..4d9a694d 100644
  import { resolveCursorModels } from "open-sse/services/cursorModels.js";
 +import { resolveAIStudioModels } from "open-sse/services/aistudioModels.js";
  import { resolveZedModels } from "open-sse/shared/zedAuth.js";
+ import { resolveCommandCodeModels } from "open-sse/services/commandcodeModels.js";
  import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
- import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
-@@ -63,6 +64,12 @@ function comboSeatCapabilities(seat) {
+@@ -65,6 +66,12 @@ function comboSeatCapabilities(seat) {
  // returns { models: [{ id, name? }, ...] } | null on failure.
  // Adding a provider here makes /v1/models prefer the live catalog for it.
  const LIVE_MODEL_RESOLVERS = {
@@ -2020,14 +2022,14 @@ index 83ee968e..4d9a694d 100644
        accessToken: conn.accessToken,
 diff --git a/src/app/api/v1alpha/models/[...path]/route.js b/src/app/api/v1alpha/models/[...path]/route.js
 new file mode 100644
-index 00000000..a4a2e714
+index 0000000000000000000000000000000000000000..a4a2e71468eb0073a7b667151974d70f5eca29af
 --- /dev/null
 +++ b/src/app/api/v1alpha/models/[...path]/route.js
 @@ -0,0 +1,2 @@
 +// Alpha generation uses the same native request, auth and streaming handler.
 +export { POST, OPTIONS } from "../../../v1beta/models/[...path]/route.js";
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index 19925a5c..203cac04 100644
+index 19925a5c17698630bee887211f266138868f4d78..203cac04e63d956d62bfb526eed69ea45915f6ea 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -9,7 +9,10 @@ import { getSettings } from "@/lib/localDb";
@@ -2319,7 +2321,7 @@ index 19925a5c..203cac04 100644
        credentials.connectionId,
        upstreamResponse.status,
 diff --git a/src/dashboardGuard.js b/src/dashboardGuard.js
-index 5b817750..2c65331a 100644
+index 5b817750fb8f5962cdf2ae6b71c46a8fb6313413..2c65331ae9250c81aa208a04e03eb7bad6e92fc2 100644
 --- a/src/dashboardGuard.js
 +++ b/src/dashboardGuard.js
 @@ -13,7 +13,7 @@ async function getCliToken() {
@@ -2352,7 +2354,7 @@ index 5b817750..2c65331a 100644
  
  async function hasValidApiKey(request) {
 diff --git a/src/sse/services/keyAccess.js b/src/sse/services/keyAccess.js
-index 4450fdc7..6de0e321 100644
+index 4450fdc74222f89d925f11fad357175a545c34c8..6de0e3219730d8d92ca329df641ddcd1865648f7 100644
 --- a/src/sse/services/keyAccess.js
 +++ b/src/sse/services/keyAccess.js
 @@ -41,7 +41,7 @@ const canonicalModel = (provider, model) => lower(`${provider}/${model}`);
@@ -2375,10 +2377,10 @@ index 4450fdc7..6de0e321 100644
      return null;
    }
 diff --git a/tests/translator/__snapshots__/golden-request.test.js.snap b/tests/translator/__snapshots__/golden-request.test.js.snap
-index 8bcab641..bf1d55df 100644
+index 7dfd4c5bb7ddeaec433eae9b681bdec6cc4958cb..6e4baee3aa581d43561b69bf141d8eb57168e3b2 100644
 --- a/tests/translator/__snapshots__/golden-request.test.js.snap
 +++ b/tests/translator/__snapshots__/golden-request.test.js.snap
-@@ -167,9 +167,7 @@ exports[`GOLDEN request: OpenAI → Gemini > full body (system/image/tool/tool_r
+@@ -168,9 +168,7 @@ exports[`GOLDEN request: OpenAI → Gemini > full body (system/image/tool/tool_r
              "id": "call_1",
              "name": "get_weather",
              "response": {
@@ -2390,7 +2392,7 @@ index 8bcab641..bf1d55df 100644
            },
          },
 diff --git a/tests/translator/bugs-gemini-cursor-commandcode.test.js b/tests/translator/bugs-gemini-cursor-commandcode.test.js
-index a4080e78..5e92bdf8 100644
+index a4080e78dfd48bf0fb05e608976c6139b1efd62c..5e92bdf89f891ea9092b607e818b3274bd35ea42 100644
 --- a/tests/translator/bugs-gemini-cursor-commandcode.test.js
 +++ b/tests/translator/bugs-gemini-cursor-commandcode.test.js
 @@ -9,9 +9,9 @@ const O2C = (body) => translateRequest(FORMATS.OPENAI, FORMATS.CURSOR, "m", body
@@ -2415,7 +2417,7 @@ index a4080e78..5e92bdf8 100644
  });
  
 diff --git a/tests/translator/golden-request.test.js b/tests/translator/golden-request.test.js
-index 21cf49f7..5a12ae26 100644
+index 21cf49f7f2260a4aa6348dc5cf3ff934e68f9a70..5a12ae26ca4498c1b216f71efe8d67e92fc078a1 100644
 --- a/tests/translator/golden-request.test.js
 +++ b/tests/translator/golden-request.test.js
 @@ -93,6 +93,24 @@ describe("GOLDEN request: OpenAI → Gemini", () => {
@@ -2445,7 +2447,7 @@ index 21cf49f7..5a12ae26 100644
  describe("GOLDEN request: OpenAI → Kiro", () => {
 diff --git a/tests/unit/aistudio-discovery.test.js b/tests/unit/aistudio-discovery.test.js
 new file mode 100644
-index 00000000..79e87264
+index 0000000000000000000000000000000000000000..79e87264cb169b62bc2156f5ad63f82bb88a89bb
 --- /dev/null
 +++ b/tests/unit/aistudio-discovery.test.js
 @@ -0,0 +1,239 @@
@@ -2690,7 +2692,7 @@ index 00000000..79e87264
 +});
 diff --git a/tests/unit/aistudio-native-response-format.test.js b/tests/unit/aistudio-native-response-format.test.js
 new file mode 100644
-index 00000000..3b542347
+index 0000000000000000000000000000000000000000..3b542347cbfad22c1d57af538687d37901e6685e
 --- /dev/null
 +++ b/tests/unit/aistudio-native-response-format.test.js
 @@ -0,0 +1,191 @@
@@ -2887,7 +2889,7 @@ index 00000000..3b542347
 +});
 diff --git a/tests/unit/aistudio-provider.test.js b/tests/unit/aistudio-provider.test.js
 new file mode 100644
-index 00000000..a443db61
+index 0000000000000000000000000000000000000000..a443db612c75324b0431e522614a9ed011821ad5
 --- /dev/null
 +++ b/tests/unit/aistudio-provider.test.js
 @@ -0,0 +1,78 @@
@@ -2971,7 +2973,7 @@ index 00000000..a443db61
 +});
 diff --git a/tests/unit/antigravity-native-sdk-heartbeat.test.js b/tests/unit/antigravity-native-sdk-heartbeat.test.js
 new file mode 100644
-index 00000000..e3acccd7
+index 0000000000000000000000000000000000000000..e3acccd70564234a81449e6384521e4303edf875
 --- /dev/null
 +++ b/tests/unit/antigravity-native-sdk-heartbeat.test.js
 @@ -0,0 +1,38 @@
@@ -3015,7 +3017,7 @@ index 00000000..e3acccd7
 +});
 diff --git a/tests/unit/downstream-translator-history-regressions.test.js b/tests/unit/downstream-translator-history-regressions.test.js
 new file mode 100644
-index 00000000..6c895f3d
+index 0000000000000000000000000000000000000000..6c895f3da97148705e4e97f4f6b15d3e60560413
 --- /dev/null
 +++ b/tests/unit/downstream-translator-history-regressions.test.js
 @@ -0,0 +1,153 @@
@@ -3173,7 +3175,7 @@ index 00000000..6c895f3d
 +  });
 +});
 diff --git a/tests/unit/gemini-contents-normalization.test.js b/tests/unit/gemini-contents-normalization.test.js
-index 6b8a94c8..e446e522 100644
+index 6b8a94c882f1c1406e321969d47364c1c0da4da1..e446e5222a6bcb89b897344ae9b20729b6f5733b 100644
 --- a/tests/unit/gemini-contents-normalization.test.js
 +++ b/tests/unit/gemini-contents-normalization.test.js
 @@ -190,7 +190,7 @@ describe("functionResponse `$ref` sanitization", () => {
@@ -3188,7 +3190,7 @@ index 6b8a94c8..e446e522 100644
 -
 diff --git a/tests/unit/gemini-native-alpha-contract.test.js b/tests/unit/gemini-native-alpha-contract.test.js
 new file mode 100644
-index 00000000..5904adc6
+index 0000000000000000000000000000000000000000..5904adc6125a25f33aec64d51e698e9735225eaa
 --- /dev/null
 +++ b/tests/unit/gemini-native-alpha-contract.test.js
 @@ -0,0 +1,221 @@
@@ -3415,7 +3417,7 @@ index 00000000..5904adc6
 +});
 diff --git a/tests/unit/gemini-native-proxy-abort.test.js b/tests/unit/gemini-native-proxy-abort.test.js
 new file mode 100644
-index 00000000..580d7b0a
+index 0000000000000000000000000000000000000000..580d7b0a65b6841521e6a8331da33bad497f61a5
 --- /dev/null
 +++ b/tests/unit/gemini-native-proxy-abort.test.js
 @@ -0,0 +1,88 @@
@@ -3509,7 +3511,7 @@ index 00000000..580d7b0a
 +});
 diff --git a/tests/unit/gemini-native-stream.test.js b/tests/unit/gemini-native-stream.test.js
 new file mode 100644
-index 00000000..35a17d9e
+index 0000000000000000000000000000000000000000..35a17d9eebe6660039d5630685bc7bb4f2392a90
 --- /dev/null
 +++ b/tests/unit/gemini-native-stream.test.js
 @@ -0,0 +1,1005 @@
@@ -4520,7 +4522,7 @@ index 00000000..35a17d9e
 +});
 diff --git a/tests/unit/gemini-nonstream-source-format.test.js b/tests/unit/gemini-nonstream-source-format.test.js
 new file mode 100644
-index 00000000..225c30b1
+index 0000000000000000000000000000000000000000..225c30b16a8b5676df84df2f8a7c5c18c6cacc5e
 --- /dev/null
 +++ b/tests/unit/gemini-nonstream-source-format.test.js
 @@ -0,0 +1,65 @@
@@ -4591,7 +4593,7 @@ index 00000000..225c30b1
 +});
 diff --git a/tests/unit/gemini-server-parts-isolation.test.js b/tests/unit/gemini-server-parts-isolation.test.js
 new file mode 100644
-index 00000000..e2949f2e
+index 0000000000000000000000000000000000000000..e2949f2e39499d48f7d0e29ae13b01657a42831c
 --- /dev/null
 +++ b/tests/unit/gemini-server-parts-isolation.test.js
 @@ -0,0 +1,130 @@
@@ -4727,7 +4729,7 @@ index 00000000..e2949f2e
 +});
 diff --git a/tests/unit/gemini-tool-call-id-fifo.test.js b/tests/unit/gemini-tool-call-id-fifo.test.js
 new file mode 100644
-index 00000000..c1930f9f
+index 0000000000000000000000000000000000000000..c1930f9f44598f06f5cc6d102655c63f29d73e98
 --- /dev/null
 +++ b/tests/unit/gemini-tool-call-id-fifo.test.js
 @@ -0,0 +1,118 @@
@@ -4851,7 +4853,7 @@ index 00000000..c1930f9f
 +});
 diff --git a/tests/unit/gemini-turn-signature.test.js b/tests/unit/gemini-turn-signature.test.js
 new file mode 100644
-index 00000000..5053c4a8
+index 0000000000000000000000000000000000000000..5053c4a899731209cf62219348b2dcfd00a9a14d
 --- /dev/null
 +++ b/tests/unit/gemini-turn-signature.test.js
 @@ -0,0 +1,195 @@
@@ -5052,7 +5054,7 @@ index 00000000..5053c4a8
 +});
 diff --git a/tests/unit/native-public-gemini-rewrite.test.js b/tests/unit/native-public-gemini-rewrite.test.js
 new file mode 100644
-index 00000000..faa3a3d9
+index 0000000000000000000000000000000000000000..faa3a3d9472a8728d9ce974517beba50d79d42db
 --- /dev/null
 +++ b/tests/unit/native-public-gemini-rewrite.test.js
 @@ -0,0 +1,133 @@
@@ -5191,7 +5193,7 @@ index 00000000..faa3a3d9
 +});
 diff --git a/tests/unit/translated-chat-stream-done.test.js b/tests/unit/translated-chat-stream-done.test.js
 new file mode 100644
-index 00000000..63b74532
+index 0000000000000000000000000000000000000000..63b74532755c23b2b45e2e4737db25b2e949f467
 --- /dev/null
 +++ b/tests/unit/translated-chat-stream-done.test.js
 @@ -0,0 +1,57 @@
@@ -5253,7 +5255,7 @@ index 00000000..63b74532
 +  });
 +});
 diff --git a/tests/unit/zed-completions-wire.test.js b/tests/unit/zed-completions-wire.test.js
-index 5be982ae..88e47879 100644
+index 38f04d810f29b331e3e13a44303018689ac4a086..640105d984eecd9f978ca6069d0ce23252f2db00 100644
 --- a/tests/unit/zed-completions-wire.test.js
 +++ b/tests/unit/zed-completions-wire.test.js
 @@ -5,6 +5,13 @@
@@ -5308,9 +5310,9 @@ index 5be982ae..88e47879 100644
  beforeEach(() => {
    vi.clearAllMocks();
  });
-@@ -118,4 +149,200 @@ describe("completion payload shaping", () => {
-       "safetySettings",
-     );
+@@ -161,4 +192,200 @@ describe("completion payload shaping", () => {
+       expect(typeof block.is_error).toBe("boolean");
+     }
    });
 +
 +  it("keeps all instruction text in systemInstruction and never leaks translator metadata into provider_request", async () => {
@@ -5510,5 +5512,5 @@ index 5be982ae..88e47879 100644
 +  });
  });
 -- 
-2.55.0
+2.54.0
 
