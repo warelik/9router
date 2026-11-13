@@ -29,6 +29,30 @@ async function ensureInitialized() {
   }
 }
 
+async function isNativeGeminiTarget(model, info = null, seen = new Set()) {
+  if (typeof model !== "string" || !model || seen.size > 6) return false;
+  const resolved = info || await getModelInfo(model);
+  if (!resolved) return false;
+  if (resolved.provider) {
+    return getTargetFormat(resolved.provider) === "gemini"
+      || (resolved.provider === "antigravity"
+        && typeof supportsNativeGemini === "function"
+        && supportsNativeGemini(resolved.provider, resolved.model));
+  }
+  const key = resolved.model || model;
+  if (seen.has(key)) return false;
+  const nextSeen = new Set(seen);
+  nextSeen.add(key);
+  const members = Array.isArray(resolved.comboModels)
+    ? resolved.comboModels
+    : (typeof getComboModels === "function" ? await getComboModels(model) : null);
+  if (!Array.isArray(members) || members.length === 0) return false;
+  for (const member of members) {
+    if (!(await isNativeGeminiTarget(member, null, nextSeen))) return false;
+  }
+  return true;
+}
+
 /**
  * Handle CORS preflight
  */
@@ -99,8 +123,7 @@ async function postGeminiRequest(request, { params }) {
     const stream = action === ":streamGenerateContent";
 
     const modelInfo = await getModelInfo(model);
-    const native = modelInfo.provider && (getTargetFormat(modelInfo.provider) === "gemini"
-      || (modelInfo.provider === "antigravity" && supportsNativeGemini(modelInfo.provider, modelInfo.model)));
+    const native = Boolean(await isNativeGeminiTarget(model, modelInfo));
 
     // Keep the native request intact. The shared handler selects translation
     // only when the chosen provider speaks a different wire format.
