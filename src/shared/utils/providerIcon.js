@@ -15,6 +15,8 @@ const ICON_ALIASES = {
   "deepseek-web": "deepseek",
   "muse-web": "muse",
   "gemini-web": "gemini",
+  "gemini-web2api": "gemini",
+  "aistudio": "gemini",
   "chatgpt-web": "openai",
 };
 
