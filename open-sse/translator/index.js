@@ -177,6 +177,9 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     delete result._webSearch;
     const webSearchEnabled = wantsWebSearch && targetFormat === FORMATS.GEMINI && (provider === "gemini" || provider === "aistudio")
       && getCapabilitiesForModel(provider, stripThinkingSuffix(String(model ?? ""))).serverSideToolInvocations === true;
+    if (wantsWebSearch && targetFormat === FORMATS.GEMINI && provider === "gemini-web2api") {
+      result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
+    }
     if (webSearchEnabled) {
       result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
       result.toolConfig = {
