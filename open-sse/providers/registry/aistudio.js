@@ -1,4 +1,4 @@
-// AIStudioToAPI (https://github.com/iBUHub/AIStudioToAPI): a local bridge that drives Google AI
+// AIStudio2API (https://github.com/Mag1cFall/AIStudio2API): a local bridge that drives Google AI
 // Studio in a browser. Only its Gemini-native `/v1beta` surface returns the real
 // `thoughtSignature` of a thinking turn; its OpenAI and Claude surfaces drop it (or fake it), and
 // without it the model cannot use its own earlier reasoning. So this provider talks Gemini wire.
@@ -10,13 +10,13 @@ export default {
   priority: 60,
   alias: "aistudio",
   display: {
-    name: "AIStudioToAPI",
+    name: "AIStudio2API",
     icon: "diamond",
     color: "#4285F4",
     textIcon: "AS",
-    website: "https://github.com/iBUHub/AIStudioToAPI",
+    website: "https://github.com/Mag1cFall/AIStudio2API",
     notice: {
-      text: "Local bridge on 127.0.0.1:7860 (Gemini-native wire). The API key is one of API_KEYS from the bridge's env file.",
+      text: "Local bridge on 127.0.0.1:7860 (Gemini-native wire). The API key is PROXY_API_KEY from the bridge's env file.",
     },
   },
   category: "apikey",

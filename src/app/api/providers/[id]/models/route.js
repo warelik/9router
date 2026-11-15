@@ -218,6 +218,12 @@ const PROVIDER_MODELS_CONFIG = {
       proxyOptions: await resolveConnectionProxyConfig(connection.providerSpecificData || {}),
     }),
   },
+  "gemini-web2api": {
+    customResolver: async (connection) => resolveAIStudioModels(connection, {
+      provider: "gemini-web2api",
+      proxyOptions: await resolveConnectionProxyConfig(connection.providerSpecificData || {}),
+    }),
+  },
   "muse": {
     url: "https://api.meta.ai/v1/models",
     method: "GET",
