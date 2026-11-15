@@ -72,6 +72,13 @@ const LIVE_MODEL_RESOLVERS = {
     });
     return result?.models?.length ? { models: result.models } : null;
   },
+  "gemini-web2api": async (conn) => {
+    const result = await resolveAIStudioModels(conn, {
+      provider: "gemini-web2api",
+      proxyOptions: await resolveConnectionProxyConfig(conn.providerSpecificData || {}),
+    });
+    return result?.models?.length ? { models: result.models } : null;
+  },
   kiro: async (conn) => {
     const result = await resolveKiroModels({
       accessToken: conn.accessToken,
