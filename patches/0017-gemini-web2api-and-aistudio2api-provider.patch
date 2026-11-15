@@ -1,0 +1,549 @@
+From 8ac3d50b927d5fa1472583ba9f5c6ca605116b45 Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Sun, 15 Nov 2026 17:18:28 +0000
+Subject: [PATCH] Add Gemini-Web2API provider and refresh AIStudio2API metadata
+
+---
+ open-sse/handlers/chatCore.js                 |   4 +-
+ open-sse/providers/registry/aistudio.js       |   8 +-
+ open-sse/providers/registry/gemini-web2api.js |  38 +++
+ open-sse/providers/registry/index.js          |   2 +
+ open-sse/services/aistudioModels.js           |   7 +-
+ open-sse/translator/index.js                  |   3 +
+ src/app/api/providers/[id]/models/route.js    |   6 +
+ src/app/api/providers/[id]/test/testUtils.js  |   1 +
+ src/app/api/providers/validate/route.js       |   1 +
+ src/app/api/v1/models/route.js                |   7 +
+ src/shared/utils/providerIcon.js              |   2 +
+ tests/translator/golden-url-header.test.js    |   4 +-
+ tests/unit/gemini-web2api-provider.test.js    | 295 ++++++++++++++++++
+ 13 files changed, 369 insertions(+), 9 deletions(-)
+ create mode 100644 open-sse/providers/registry/gemini-web2api.js
+ create mode 100644 tests/unit/gemini-web2api-provider.test.js
+
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index a95232a3f104fde49effb9a0b6f36bf87a3b9a47..69745fee816755cb24d0b009cda13d985d177aba 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -225,8 +225,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+       query: clientRawRequest?.queryParams,
+       headers: clientRawRequest?.headers || {},
+       // Client and provider versions are separate routing decisions. The
+-      // browser-authenticated AIStudio generation API uses its beta wire.
+-      apiVersion: provider === "aistudio" ? AISTUDIO_NATIVE_GEMINI_API_VERSION : clientRawRequest?.apiVersion,
++      // local browser-authenticated Gemini bridges use their beta wire.
++      apiVersion: (provider === "aistudio" || provider === "gemini-web2api") ? AISTUDIO_NATIVE_GEMINI_API_VERSION : clientRawRequest?.apiVersion,
+     };
+   }
+ 
+diff --git a/open-sse/providers/registry/aistudio.js b/open-sse/providers/registry/aistudio.js
+index 2eeed51b64712e5c3d35d509e01e5243c9f470bc..f33cad851f2ac91b4f8f9781f1d4ff039dfc6553 100644
+--- a/open-sse/providers/registry/aistudio.js
++++ b/open-sse/providers/registry/aistudio.js
+@@ -1,4 +1,4 @@
+-// AIStudioToAPI (https://github.com/iBUHub/AIStudioToAPI): a local bridge that drives Google AI
++// AIStudio2API (https://github.com/Mag1cFall/AIStudio2API): a local bridge that drives Google AI
+ // Studio in a browser. Only its Gemini-native `/v1beta` surface returns the real
+ // `thoughtSignature` of a thinking turn; its OpenAI and Claude surfaces drop it (or fake it), and
+ // without it the model cannot use its own earlier reasoning. So this provider talks Gemini wire.
+@@ -10,13 +10,13 @@ export default {
+   priority: 60,
+   alias: "aistudio",
+   display: {
+-    name: "AIStudioToAPI",
++    name: "AIStudio2API",
+     icon: "diamond",
+     color: "#4285F4",
+     textIcon: "AS",
+-    website: "https://github.com/iBUHub/AIStudioToAPI",
++    website: "https://github.com/Mag1cFall/AIStudio2API",
+     notice: {
+-      text: "Local bridge on 127.0.0.1:7860 (Gemini-native wire). The API key is one of API_KEYS from the bridge's env file.",
++      text: "Local bridge on 127.0.0.1:7860 (Gemini-native wire). The API key is PROXY_API_KEY from the bridge's env file.",
+     },
+   },
+   category: "apikey",
+diff --git a/open-sse/providers/registry/gemini-web2api.js b/open-sse/providers/registry/gemini-web2api.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2e9de61df1b9832c8c1a81eeefccfc532175cc8
+--- /dev/null
++++ b/open-sse/providers/registry/gemini-web2api.js
+@@ -0,0 +1,38 @@
++// Gemini-Web2API (https://github.com/Mag1cFall/Gemini-Web2API): a local bridge to Google Gemini
++// Web on 127.0.0.1:8007. Kept distinct from upstream's `gemini-web` Playwright cookie provider so
++// upstream protocol implementations remain intact. Speaks the bridge's Gemini-native `/v1beta`
++// wire and discovers its unseeded model list dynamically from `/v1/models`.
++import { FORMATS } from "../../translator/formats.js";
++
++export default {
++  id: "gemini-web2api",
++  priority: 65,
++  alias: "gemini-web2api",
++  aliases: ["g2a"],
++  display: {
++    name: "Gemini-Web2API",
++    icon: "diamond",
++    color: "#1A73E8",
++    textIcon: "G2",
++    website: "https://github.com/Mag1cFall/Gemini-Web2API",
++    notice: {
++      text: "Local bridge on 127.0.0.1:8007 (Gemini-native wire). The API key is PROXY_API_KEY from the bridge's env file.",
++    },
++  },
++  category: "apikey",
++  authType: "apikey",
++  authModes: ["apikey"],
++  transport: {
++    baseUrl: "http://127.0.0.1:8007/v1beta/models",
++    format: FORMATS.GEMINI,
++    validateUrl: "http://127.0.0.1:8007/v1/models",
++    auth: {
++      apiKey: {
++        header: "x-goog-api-key",
++        scheme: "raw",
++      },
++    },
++  },
++  models: [],
++  passthroughModels: true,
++};
+diff --git a/open-sse/providers/registry/index.js b/open-sse/providers/registry/index.js
+index 88360e5e29c18d70794e3a49d2597589cba2d1ba..74e85e6d23f3c107bcff3d09a6e81aa51934e64a 100644
+--- a/open-sse/providers/registry/index.js
++++ b/open-sse/providers/registry/index.js
+@@ -140,6 +140,7 @@ import p136 from "./bedrock.js";
+ import p137 from "./bedrock-xai.js";
+ import p138 from "./nous.js";
+ import pAistudio from "./aistudio.js";
++import pGeminiWeb2Api from "./gemini-web2api.js";
+ import p140 from "./deepseek-web.js";
+ import p143 from "./gemini-web.js";
+ import p144 from "./muse-web.js";
+@@ -290,6 +291,7 @@ export default [
+   p137,
+   p138,
+   pAistudio,
++  pGeminiWeb2Api,
+   p140,
+   p143,
+   p144,
+diff --git a/open-sse/services/aistudioModels.js b/open-sse/services/aistudioModels.js
+index cd8ec80c321825be9243259ab65d19d94ab91ae1..4f1e32062786f4ffd364aa1722f902058196bd8d 100644
+--- a/open-sse/services/aistudioModels.js
++++ b/open-sse/services/aistudioModels.js
+@@ -8,7 +8,12 @@ export async function resolveAIStudioModels(credentials, options = {}) {
+   if (!apiKey) {
+     return { error: "No valid token found", status: HTTP_STATUS.UNAUTHORIZED };
+   }
+-  const res = await proxyAwareFetch(PROVIDERS.aistudio.validateUrl, {
++  const providerId = options.provider || credentials?.provider || "aistudio";
++  const validateUrl = PROVIDERS[providerId]?.validateUrl;
++  if (!validateUrl) {
++    return { error: `Unknown bridge provider: ${providerId}`, status: HTTP_STATUS.BAD_REQUEST };
++  }
++  const res = await proxyAwareFetch(validateUrl, {
+     headers: {
+       "Authorization": `Bearer ${apiKey}`,
+       "Accept": "application/json",
+diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
+index fd9ca402ef86fffeffaec35beef10080ea238adb..13b02925ce56da59afc5f184e0bcdc496b34a6a9 100644
+--- a/open-sse/translator/index.js
++++ b/open-sse/translator/index.js
+@@ -177,6 +177,9 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+     delete result._webSearch;
+     const webSearchEnabled = wantsWebSearch && targetFormat === FORMATS.GEMINI && (provider === "gemini" || provider === "aistudio")
+       && getCapabilitiesForModel(provider, stripThinkingSuffix(String(model ?? ""))).serverSideToolInvocations === true;
++    if (wantsWebSearch && targetFormat === FORMATS.GEMINI && provider === "gemini-web2api") {
++      result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
++    }
+     if (webSearchEnabled) {
+       result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
+       result.toolConfig = {
+diff --git a/src/app/api/providers/[id]/models/route.js b/src/app/api/providers/[id]/models/route.js
+index e333973bb735c9265804af19a0103ca0eebed196..5f3866c73636776a74b32e1da423f73bc45ae03d 100644
+--- a/src/app/api/providers/[id]/models/route.js
++++ b/src/app/api/providers/[id]/models/route.js
+@@ -186,6 +186,12 @@ const PROVIDER_MODELS_CONFIG = {
+       proxyOptions: await resolveConnectionProxyConfig(connection.providerSpecificData || {}),
+     }),
+   },
++  "gemini-web2api": {
++    customResolver: async (connection) => resolveAIStudioModels(connection, {
++      provider: "gemini-web2api",
++      proxyOptions: await resolveConnectionProxyConfig(connection.providerSpecificData || {}),
++    }),
++  },
+   "muse": {
+     url: "https://api.meta.ai/v1/models",
+     method: "GET",
+diff --git a/src/app/api/providers/[id]/test/testUtils.js b/src/app/api/providers/[id]/test/testUtils.js
+index c8eb0125d57ed7860855f794978f43a42ab1817a..8a4d229869f2575d0b977f17d6b79a73a0cfa82f 100644
+--- a/src/app/api/providers/[id]/test/testUtils.js
++++ b/src/app/api/providers/[id]/test/testUtils.js
+@@ -802,6 +802,7 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
+       case "agnes":
+       case "bai":
+       case "aistudio":
++      case "gemini-web2api":
+       case "muse":
+       case "runcrate":
+       case "synthetic": {
+diff --git a/src/app/api/providers/validate/route.js b/src/app/api/providers/validate/route.js
+index f48c23aa8c35a77580b70d4a2c5345b9bc30f99e..8d8940c12f0a1f6ac6bae33020d026b50622ee3a 100644
+--- a/src/app/api/providers/validate/route.js
++++ b/src/app/api/providers/validate/route.js
+@@ -399,6 +399,7 @@ export async function POST(request) {
+         }
+ 
+         case "aistudio":
++        case "gemini-web2api":
+         case "deepseek":
+         case "groq":
+         case "xai":
+diff --git a/src/app/api/v1/models/route.js b/src/app/api/v1/models/route.js
+index e295ac5fb07011e79410b0d04bc1e0418fb53700..13d899574c66ddedfd8d040d6224037e64992681 100644
+--- a/src/app/api/v1/models/route.js
++++ b/src/app/api/v1/models/route.js
+@@ -72,6 +72,13 @@ const LIVE_MODEL_RESOLVERS = {
+     });
+     return result?.models?.length ? { models: result.models } : null;
+   },
++  "gemini-web2api": async (conn) => {
++    const result = await resolveAIStudioModels(conn, {
++      provider: "gemini-web2api",
++      proxyOptions: await resolveConnectionProxyConfig(conn.providerSpecificData || {}),
++    });
++    return result?.models?.length ? { models: result.models } : null;
++  },
+   kiro: async (conn) => {
+     const result = await resolveKiroModels({
+       accessToken: conn.accessToken,
+diff --git a/src/shared/utils/providerIcon.js b/src/shared/utils/providerIcon.js
+index d8bf5ba9257cc568dcd9bb73567f7d3ce0481dd9..4a26a7a290ea8a617e16a272e71acd46b0724f8f 100644
+--- a/src/shared/utils/providerIcon.js
++++ b/src/shared/utils/providerIcon.js
+@@ -15,6 +15,8 @@ const ICON_ALIASES = {
+   "deepseek-web": "deepseek",
+   "muse-web": "muse",
+   "gemini-web": "gemini",
++  "gemini-web2api": "gemini",
++  "aistudio": "gemini",
+   "chatgpt-web": "openai",
+ };
+ 
+diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
+index f9b3a1fbc4cbba04a0859419cac0cf1cabbd0c78..6bdd133d996244cd88943d96b84ed12233c5faa0 100644
+--- a/tests/translator/golden-url-header.test.js
++++ b/tests/translator/golden-url-header.test.js
+@@ -21,8 +21,8 @@ const SPECIALIZED = new Set([
+   "codex", "cursor", "vertex", "vertex-partner", "opencode",
+   "opencode-go", "grok-web", "perplexity-web", "ollama-local", "commandcode",
+   "xiaomi-tokenplan", "mimo-free",
+-  // Fork-only local bridge; its URL and header contract is locked by unit/aistudio-provider.test.js.
+-  "aistudio",
++  // Fork-only local bridges; their URL and header contracts are locked by unit/*-provider.test.js.
++  "aistudio", "gemini-web2api",
+ ]);
+ 
+ // Per-process / per-request values: kimi's random device name, minimax's session UUID.
+diff --git a/tests/unit/gemini-web2api-provider.test.js b/tests/unit/gemini-web2api-provider.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..dbb143c798ded8567062052a899c0acdd96cc03e
+--- /dev/null
++++ b/tests/unit/gemini-web2api-provider.test.js
+@@ -0,0 +1,295 @@
++import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
++
++const stub = vi.hoisted(() => ({
++  fetchCalls: [],
++  proxyCalls: [],
++  proxyMode: "ok",
++  connection: null,
++  connections: [],
++  customModels: [],
++  updated: [],
++  proxyConfig: { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy:3128" },
++}));
++
++vi.mock("open-sse/utils/proxyFetch.js", () => ({
++  proxyAwareFetch: async (url, options, proxyOptions) => {
++    stub.proxyCalls.push({ url: String(url), options, proxyOptions });
++    if (stub.proxyMode === "native-gemini") {
++      const reply = { candidates: [{ content: { role: "model", parts: [{ text: "G2A_OK" }] }, finishReason: "STOP" }] };
++      const isSse = options?.headers?.Accept === "text/event-stream";
++      return new Response(
++        isSse ? `data: ${JSON.stringify(reply)}\r\n\r\n` : JSON.stringify(reply),
++        { status: 200, headers: { "Content-Type": isSse ? "text/event-stream" : "application/json" } },
++      );
++    }
++    if (stub.proxyMode === "empty") return Response.json({ data: [] });
++    if (stub.proxyMode === "unauthorized") return new Response("denied", { status: 401 });
++    if (stub.proxyMode === "forbidden") return new Response("denied", { status: 403 });
++    if (stub.proxyMode === "reject") throw new Error("bridge offline");
++    return Response.json({
++      object: "list",
++      data: [{ id: "gemini-4-hydrogen" }, { id: "gemini-3.5-flash-lite", display_name: "Gemini 3.5 Flash Lite" }, { id: "" }],
++    });
++  },
++  default: async () => { throw new Error("patched fetch must not run"); },
++}));
++
++vi.mock("@/models", () => ({
++  getProviderConnectionById: async () => stub.connection,
++}));
++vi.mock("@/lib/localDb", () => ({
++  getProviderConnectionById: async () => stub.connection,
++  updateProviderConnection: async (id, data) => { stub.updated.push({ id, data }); },
++  getProviderConnections: async () => stub.connections || [],
++  getCombos: async () => [],
++  getCustomModels: async () => stub.customModels || [],
++  getModelAliases: async () => ({}),
++  getSettings: async () => ({ requireApiKey: false }),
++}));
++vi.mock("@/lib/disabledModelsDb", () => ({ getDisabledModels: async () => ({}) }));
++vi.mock("@/lib/network/connectionProxy", () => ({
++  resolveConnectionProxyConfig: async () => stub.proxyConfig || {},
++}));
++vi.mock("@/lib/network/proxyTest", () => ({ testProxyUrl: async () => ({ ok: true }) }));
++vi.mock("@/sse/services/keyAccess.js", () => ({
++  getKeyAccessContext: async () => null,
++  filterModelsListForKey: async (_ctx, data) => data,
++  extractClientApiKey: () => null,
++  enforceKeyAccessResolved: async () => null,
++}));
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: async () => new Proxy({}, { get: (_t, key) => (key === "then" ? undefined : vi.fn()) }),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++
++const REGISTRY = (await import("../../open-sse/providers/registry/index.js")).default;
++const { PROVIDERS } = await import("../../open-sse/config/providers.js");
++const { FORMATS } = await import("../../open-sse/translator/formats.js");
++const { DefaultExecutor } = await import("../../open-sse/executors/default.js");
++const { getModelInfoCore } = await import("../../open-sse/services/model.js");
++const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
++const { resolveAIStudioModels } = await import("../../open-sse/services/aistudioModels.js");
++const { initTranslators, translateRequest } = await import("../../open-sse/translator/index.js");
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++const { resolveProviderIconId } = await import("../../src/shared/utils/providerIcon.js");
++const validateRoute = await import("../../src/app/api/providers/validate/route.js");
++const { testSingleConnection } = await import("../../src/app/api/providers/[id]/test/testUtils.js");
++const dashboardModels = await import("../../src/app/api/providers/[id]/models/route.js");
++const v1Models = await import("../../src/app/api/v1/models/route.js");
++
++await initTranslators();
++
++const MODEL = "gemini-4-hydrogen";
++const EXPECT_PLAIN_HEADERS = { "Content-Type": "application/json", "x-goog-api-key": "g2a-bridge-key" };
++const EXPECT_SSE_HEADERS = { ...EXPECT_PLAIN_HEADERS, Accept: "text/event-stream" };
++
++beforeEach(() => {
++  stub.fetchCalls = [];
++  stub.proxyCalls = [];
++  stub.proxyMode = "ok";
++  stub.connection = null;
++  stub.connections = [];
++  stub.customModels = [];
++  stub.updated = [];
++  stub.proxyConfig = { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy:3128" };
++  vi.stubGlobal("fetch", async (...args) => {
++    stub.fetchCalls.push(args);
++    return new Response("ok", { status: 200 });
++  });
++});
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++});
++
++describe("gemini-web2api and aistudio local Gemini bridge contracts", () => {
++  it("registers gemini-web2api without altering upstream gemini-web and updates aistudio metadata to AIStudio2API", () => {
++    const g2aEntry = REGISTRY.find((entry) => entry.id === "gemini-web2api");
++    const aistudioEntry = REGISTRY.find((entry) => entry.id === "aistudio");
++    const upstreamGeminiWeb = REGISTRY.find((entry) => entry.id === "gemini-web");
++
++    expect(g2aEntry).toBeTruthy();
++    expect(g2aEntry.display.name).toBe("Gemini-Web2API");
++    expect(g2aEntry.display.website).toBe("https://github.com/Mag1cFall/Gemini-Web2API");
++    expect(g2aEntry.display.notice.text).toContain("127.0.0.1:8007");
++    expect(g2aEntry.display.notice.text).toContain("PROXY_API_KEY");
++    expect(g2aEntry.passthroughModels).toBe(true);
++    expect(g2aEntry.models).toEqual([]);
++
++    expect(aistudioEntry.display.name).toBe("AIStudio2API");
++    expect(aistudioEntry.display.website).toBe("https://github.com/Mag1cFall/AIStudio2API");
++    expect(aistudioEntry.display.notice.text).toContain("PROXY_API_KEY");
++
++    expect(upstreamGeminiWeb.category).toBe("webCookie");
++    expect(upstreamGeminiWeb.transport.baseUrl).toBe("https://gemini.google.com/app");
++
++    expect(PROVIDERS["gemini-web2api"].format).toBe(FORMATS.GEMINI);
++    expect(getTargetFormat("gemini-web2api", {})).toBe("gemini");
++    expect(supportsNativeGemini("gemini-web2api", MODEL)).toBe(true);
++    expect(PROVIDERS["gemini-web2api"].clientId).toBeUndefined();
++    expect(PROVIDERS["gemini-web2api"].clientSecret).toBeUndefined();
++    expect(resolveProviderIconId("gemini-web2api")).toBe("gemini");
++    expect(resolveProviderIconId("aistudio")).toBe("gemini");
++  });
++
++  it("locks streaming and non-streaming URLs, headers, aliases, and path-traversal safety", async () => {
++    const executor = new DefaultExecutor("gemini-web2api");
++    expect(PROVIDERS["gemini-web2api"].baseUrl).toBe("http://127.0.0.1:8007/v1beta/models");
++    expect(executor.buildUrl(MODEL, false, 0, {})).toBe(`http://127.0.0.1:8007/v1beta/models/${MODEL}:generateContent`);
++    expect(executor.buildUrl(MODEL, true, 0, {})).toBe(`http://127.0.0.1:8007/v1beta/models/${MODEL}:streamGenerateContent?alt=sse`);
++
++    expect(executor.buildHeaders({ apiKey: "g2a-bridge-key" }, false, executor.buildUrl(MODEL, false, 0, {}), MODEL))
++      .toEqual(EXPECT_PLAIN_HEADERS);
++    expect(executor.buildHeaders({ apiKey: "g2a-bridge-key" }, true, executor.buildUrl(MODEL, true, 0, {}), MODEL))
++      .toEqual(EXPECT_SSE_HEADERS);
++
++    for (const prefix of ["gemini-web2api", "g2a"]) {
++      const info = await getModelInfoCore(`${prefix}/${MODEL}`, {});
++      expect(info.provider).toBe("gemini-web2api");
++      expect(info.model).toBe(MODEL);
++    }
++
++    for (const [raw, normalized] of [["../../admin?x=1", "../../admin?x=1"], ["%2e%2e%2fadmin", "%2e%2e%2fadmin"], ["модель/模型", "модель/模型"]]) {
++      for (const stream of [false, true]) {
++        const url = new URL(executor.buildUrl(raw, stream, 0, {}));
++        const action = stream ? ":streamGenerateContent" : ":generateContent";
++        expect(url.origin).toBe("http://127.0.0.1:8007");
++        expect(url.pathname.startsWith("/v1beta/models/")).toBe(true);
++        expect(url.pathname.endsWith(action)).toBe(true);
++        const segment = url.pathname.slice("/v1beta/models/".length, -action.length);
++        expect(segment).not.toContain("/");
++        expect(decodeURIComponent(segment)).toBe(normalized);
++      }
++    }
++  });
++
++  it("discovers models and validates credentials against 127.0.0.1:8007/v1/models with error propagation", async () => {
++    const discovered = await resolveAIStudioModels(
++      { apiKey: "g2a-key" },
++      { provider: "gemini-web2api", proxyOptions: stub.proxyConfig },
++    );
++    expect(stub.proxyCalls).toHaveLength(1);
++    expect(stub.proxyCalls[0].url).toBe("http://127.0.0.1:8007/v1/models");
++    expect(stub.proxyCalls[0].options.headers.Authorization).toBe("Bearer g2a-key");
++    expect(discovered.models.map((m) => m.id)).toEqual(["gemini-4-hydrogen", "gemini-3.5-flash-lite"]);
++    expect(discovered.models[1].name).toBe("Gemini 3.5 Flash Lite");
++
++    expect(await resolveAIStudioModels({ apiKey: "g2a-key" }, { provider: "nonexistent-provider" }))
++      .toMatchObject({ status: 400 });
++
++    const validRes = await validateRoute.POST(new Request("http://localhost/api/providers/validate", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ provider: "gemini-web2api", apiKey: "g2a-key" }),
++    }));
++    expect((await validRes.json()).valid).toBe(true);
++    expect(String(stub.fetchCalls[0][0])).toBe("http://127.0.0.1:8007/v1/models");
++    expect(stub.fetchCalls[0][1].headers.Authorization).toBe("Bearer g2a-key");
++
++    vi.stubGlobal("fetch", async () => new Response("denied", { status: 401 }));
++    const deniedRes = await validateRoute.POST(new Request("http://localhost/api/providers/validate", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ provider: "gemini-web2api", apiKey: "bad-key" }),
++    }));
++    expect((await deniedRes.json()).valid).toBe(false);
++
++    stub.proxyCalls = [];
++    stub.connection = { id: "c-g2a", provider: "gemini-web2api", authType: "apikey", apiKey: "g2a-key", providerSpecificData: {} };
++    expect(await testSingleConnection("c-g2a")).toMatchObject({ valid: true, error: null });
++    expect(stub.proxyCalls[0].url).toBe("http://127.0.0.1:8007/v1/models");
++
++    stub.proxyMode = "forbidden";
++    expect(await testSingleConnection("c-g2a")).toMatchObject({ valid: false, error: "Invalid API key" });
++
++    stub.proxyMode = "ok";
++    stub.proxyCalls = [];
++    const dashRes = await dashboardModels.GET(
++      new Request("http://localhost/api/providers/c-g2a/models"),
++      { params: Promise.resolve({ id: "c-g2a" }) },
++    );
++    expect(dashRes.status).toBe(200);
++    expect((await dashRes.json()).models.map((m) => m.id)).toContain("gemini-4-hydrogen");
++
++    stub.proxyCalls = [];
++    stub.connections = [{ id: "c-g2a", provider: "gemini-web2api", authType: "apikey", apiKey: "g2a-key", isActive: true, providerSpecificData: {} }];
++    const v1List = await v1Models.buildModelsList(["llm"]);
++    expect(stub.proxyCalls).toHaveLength(1);
++    expect(v1List.some((row) => row.id === "gemini-web2api/gemini-4-hydrogen")).toBe(true);
++  });
++
++  it("routes native Gemini v1, v1beta, and v1alpha requests (stream + non-stream) onto 127.0.0.1:8007/v1beta without rewriting responseJsonSchema", async () => {
++    stub.proxyMode = "native-gemini";
++    const nativeInput = {
++      contents: [{ role: "user", parts: [{ text: "Return JSON" }] }],
++      generationConfig: {
++        responseMimeType: "application/json",
++        responseJsonSchema: { type: "object", properties: { ok: { type: "boolean" } }, additionalProperties: false },
++      },
++    };
++
++    for (const clientApiVersion of ["v1", "v1beta", "v1alpha"]) {
++      for (const stream of [false, true]) {
++        stub.proxyCalls = [];
++        const credentials = { apiKey: "g2a-bridge-key", connectionId: "c-g2a", providerSpecificData: {} };
++        const result = await handleChatCore({
++          body: { ...nativeInput, model: `gemini-web2api/${MODEL}`, stream },
++          modelInfo: { provider: "gemini-web2api", model: MODEL },
++          credentials,
++          sourceFormatOverride: "gemini",
++          clientRawRequest: {
++            apiVersion: clientApiVersion,
++            body: nativeInput,
++            headers: {},
++            queryParams: stream
++              ? [["alt", "sse"], ["key", "client-secret"], ["fields", "candidates"]]
++              : [["$key", "client-secret"], ["fields", "candidates"]],
++          },
++          connectionId: "c-g2a",
++          userAgent: "g2a-native-test",
++          log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
++        });
++        expect(result.response.status).toBe(200);
++        await result.response.text();
++        expect(credentials.nativeGeminiRequest.apiVersion).toBe("v1beta");
++        expect(stub.proxyCalls).toHaveLength(1);
++        const upstreamUrl = new URL(stub.proxyCalls[0].url);
++        expect(upstreamUrl.origin).toBe("http://127.0.0.1:8007");
++        expect(upstreamUrl.pathname).toBe(`/v1beta/models/${MODEL}:${stream ? "streamGenerateContent" : "generateContent"}`);
++        expect(upstreamUrl.searchParams.has("key")).toBe(false);
++        expect(upstreamUrl.searchParams.has("$key")).toBe(false);
++        expect(upstreamUrl.searchParams.get("fields")).toBe("candidates");
++        expect(stub.proxyCalls[0].options.headers["x-goog-api-key"]).toBe("g2a-bridge-key");
++        const sentBody = JSON.parse(stub.proxyCalls[0].options.body);
++        expect(sentBody.generationConfig.responseJsonSchema).toEqual(nativeInput.generationConfig.responseJsonSchema);
++        expect(sentBody.generationConfig.responseFormat).toBeUndefined();
++      }
++    }
++  });
++
++  it("translates Responses web_search to googleSearch without includeServerSideToolInvocations on gemini-web2api", () => {
++    const translated = translateRequest(
++      FORMATS.OPENAI_RESPONSES,
++      FORMATS.GEMINI,
++      MODEL,
++      {
++        model: `gemini-web2api/${MODEL}`,
++        input: [{ role: "user", content: [{ type: "input_text", text: "Search latest docs" }] }],
++        tools: [{ type: "web_search" }],
++      },
++      false,
++      null,
++      "gemini-web2api",
++    );
++    expect(translated.tools).toContainEqual({ googleSearch: {} });
++    expect(translated.toolConfig?.includeServerSideToolInvocations).toBeUndefined();
++  });
++});
