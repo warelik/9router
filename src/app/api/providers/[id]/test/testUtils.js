@@ -805,6 +805,7 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
       case "bai":
       case "aistudio":
       case "gemini-web2api":
+      case "antigravity2api":
       case "muse":
       case "runcrate":
       case "synthetic": {
