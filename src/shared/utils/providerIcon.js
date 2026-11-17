@@ -17,6 +17,7 @@ const ICON_ALIASES = {
   "gemini-web": "gemini",
   "gemini-web2api": "gemini",
   "aistudio": "gemini",
+  "antigravity2api": "antigravity",
   "chatgpt-web": "openai",
 };
 

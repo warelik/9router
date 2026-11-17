@@ -22,7 +22,7 @@ const SPECIALIZED = new Set([
   "opencode-go", "grok-web", "perplexity-web", "ollama-local", "commandcode",
   "xiaomi-tokenplan", "mimo-free",
   // Fork-only local bridges; their URL and header contracts are locked by unit/*-provider.test.js.
-  "aistudio", "gemini-web2api",
+  "aistudio", "gemini-web2api", "antigravity2api",
 ]);
 
 // Per-process / per-request values: kimi's random device name, minimax's session UUID.

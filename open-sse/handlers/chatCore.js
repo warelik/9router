@@ -226,7 +226,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       headers: clientRawRequest?.headers || {},
       // Client and provider versions are separate routing decisions. The
       // local browser-authenticated Gemini bridges use their beta wire.
-      apiVersion: (provider === "aistudio" || provider === "gemini-web2api") ? AISTUDIO_NATIVE_GEMINI_API_VERSION : clientRawRequest?.apiVersion,
+      apiVersion: (provider === "aistudio" || provider === "gemini-web2api" || provider === "antigravity2api") ? AISTUDIO_NATIVE_GEMINI_API_VERSION : clientRawRequest?.apiVersion,
     };
   }
 
