@@ -1,7 +1,7 @@
-From 27c8376279de0519f19388a94cde2f22260d3d9a Mon Sep 17 00:00:00 2001
+From 3461b091f9140954ff8d762d4543fe197b3bc382 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:46 +0000
-Subject: [PATCH] Muse provider: cloaking, reasoning recovery and pricing
+Subject: [PATCH 08/18] Muse provider: cloaking, reasoning recovery and pricing
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -13,7 +13,7 @@ Consolidated from the following original patches (file custody by final owner):
  open-sse/executors/index.js                   |   3 +
  open-sse/executors/muse.js                    | 266 +++++++++++++++
  open-sse/handlers/chatCore.js                 | 123 +++++--
- open-sse/providers/capabilities.js            |  14 +-
+ open-sse/providers/capabilities.js            |  16 +-
  open-sse/providers/pricing.js                 |   5 +
  open-sse/providers/registry/muse.js           |   8 +-
  open-sse/providers/thinkingLevels.js          |   3 +
@@ -24,7 +24,7 @@ Consolidated from the following original patches (file custody by final owner):
  tests/unit/muse-responses-wire.test.js        |  37 ++
  .../unit/provider-pricing-muse-wonder.test.js |  29 ++
  tests/unit/target-format-transport.test.js    | 317 ++++++++++++++++++
- 14 files changed, 1485 insertions(+), 41 deletions(-)
+ 14 files changed, 1486 insertions(+), 42 deletions(-)
  create mode 100644 open-sse/executors/muse.js
  create mode 100644 open-sse/utils/museCloaking.js
  create mode 100644 tests/unit/muse-cloaking.test.js
@@ -33,7 +33,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/target-format-transport.test.js
 
 diff --git a/open-sse/executors/index.js b/open-sse/executors/index.js
-index 9ed15fee13b26bab4d8a88f4457c7f92df0c87c7..cf7ca340f21a49066fde8c5f9e1249f4763874db 100644
+index 9ed15fee..cf7ca340 100644
 --- a/open-sse/executors/index.js
 +++ b/open-sse/executors/index.js
 @@ -19,6 +19,7 @@ import { PerplexityWebExecutor } from "./perplexity-web.js";
@@ -62,7 +62,7 @@ index 9ed15fee13b26bab4d8a88f4457c7f92df0c87c7..cf7ca340f21a49066fde8c5f9e1249f4
  export { OllamaLocalExecutor } from "./ollama-local.js";
 diff --git a/open-sse/executors/muse.js b/open-sse/executors/muse.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..1363d1df898fc6d92cd668860698f025ccaf2b41
+index 00000000..1363d1df
 --- /dev/null
 +++ b/open-sse/executors/muse.js
 @@ -0,0 +1,266 @@
@@ -333,7 +333,7 @@ index 0000000000000000000000000000000000000000..1363d1df898fc6d92cd668860698f025
 +
 +export default MuseExecutor;
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf87a3b9a47 100644
+index ecadce8e..80730230 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
 @@ -1,7 +1,9 @@
@@ -357,7 +357,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
  import { handleBypassRequest } from "../utils/bypassHandler.js";
  import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
  import { getExecutor } from "../executors/index.js";
-@@ -33,6 +35,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
+@@ -34,6 +36,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
  import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
  import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
  import { resolveSessionId } from "../utils/sessionManager.js";
@@ -365,19 +365,19 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
  
  /**
   * Core chat handler - shared between SSE and Worker
-@@ -61,8 +64,10 @@ export function stripContinuityFields(body) {
+@@ -62,8 +65,10 @@ export function stripContinuityFields(body) {
    return body;
  }
  
--export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
-+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onRequestFailure, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, serverPartsTenant = null, providerThinking, providerOverrides }) {
+-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, reaAllowEnabled, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
++export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onRequestFailure, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, reaAllowEnabled, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, serverPartsTenant = null, providerThinking, providerOverrides }) {
 +  if (credentials) credentials._geminiServerPartsSessionId = null;
    const { provider, model } = modelInfo;
 +  if (clientSignal?.aborted) return createErrorResult(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
    const requestStartTime = Date.now();
    // Stable per-session color so all lines of one CLI conversation share a tag
    const sessionSeed = (() => {
-@@ -100,25 +105,52 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -101,25 +106,52 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
    // translated to the Responses body (`input`) yet POSTed to the default Chat
    // Completions URL, and upstream rejects it: "unknown parameter `input`".
    const modelTargetTransport = modelTargetFormat ? resolveTransport(provider, modelTargetFormat) : null;
@@ -436,7 +436,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
      } else if (mode === "off" && !body.thinking) {
        body = { ...body, thinking: { type: "disabled" } };
      } else if (!body.reasoning_effort) {
-@@ -141,7 +173,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -142,7 +174,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
    const preTranslateRtkLine = formatRtkLog(preTranslateRtk);
    if (preTranslateRtkLine) console.log(preTranslateRtkLine);
  
@@ -445,7 +445,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
    const providerRequiresStreaming = PROVIDERS[provider]?.forceStream === true;
    let stream = providerRequiresStreaming ? true : (body.stream !== false);
  
-@@ -170,15 +202,33 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -171,15 +203,33 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
    const reqLogger = await createRequestLogger(sourceFormat, targetFormat, model);
    if (clientRawRequest) reqLogger.logClientRawRequest(clientRawRequest.endpoint, clientRawRequest.body, clientRawRequest.headers);
    reqLogger.logRawRequest(body);
@@ -480,7 +480,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
  
    // Auto-strip media blocks the model can't read (vision/audio/pdf) before translation.
    if (!passthrough) {
-@@ -199,6 +249,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -200,6 +250,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
    if (passthrough) {
      log?.debug?.("PASSTHROUGH", `${clientTool} → ${provider} | native lossless`);
      translatedBody = { ...body, model: stripThinkingSuffix(upstreamModel) };
@@ -493,7 +493,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
      if (provider === "codex") {
        const suffixThinking = {};
        applyThinking(sourceFormat, upstreamModel, suffixThinking, provider);
-@@ -214,17 +270,32 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -215,17 +271,32 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
      // Normalize newer Cowork/CC beta shapes (adaptive thinking, mid-conversation system) the API rejects
      if (clientTool === "claude") normalizeClaudePassthrough(translatedBody, translatedBody.model);
    } else {
@@ -528,7 +528,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
    }
  
    // Tool normalization: MCP-equivalent built-in dedup (Claude clients) + same-name
-@@ -342,6 +413,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -348,6 +419,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
    log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${model} | ${msgCount} msgs`);
  
    const streamController = createStreamController({
@@ -536,7 +536,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
      onDisconnect: (reason) => {
        trackPendingRequest(model, provider, connectionId, false);
        if (onDisconnect) onDisconnect(reason);
-@@ -354,6 +426,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -360,6 +432,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
      connectionProxyEnabled: credentials?.providerSpecificData?.connectionProxyEnabled === true,
      connectionProxyUrl: credentials?.providerSpecificData?.connectionProxyUrl || "",
      connectionNoProxy: credentials?.providerSpecificData?.connectionNoProxy || "",
@@ -544,7 +544,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
      vercelRelayUrl: credentials?.providerSpecificData?.vercelRelayUrl || "",
      // Strict pools must never silently fall back to a direct connection —
      // honored on the Cursor AgentService h2 path and in proxyFetch (#4333).
-@@ -394,7 +467,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -400,7 +473,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
    let providerResponseFormat = targetFormat;
    try {
      const result = await executor.execute({
@@ -553,7 +553,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
        body: translatedBody,
        stream,
        credentials,
-@@ -463,7 +536,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -469,7 +542,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
          }
          try {
            const retryResult = await executor.execute({
@@ -562,7 +562,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
              body: translatedBody,
              stream,
              credentials,
-@@ -490,6 +563,17 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -496,6 +569,17 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
  
    // Provider returned error
    if (!providerResponse.ok) {
@@ -580,7 +580,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
      trackPendingRequest(model, provider, connectionId, false, true);
      const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
      appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
-@@ -510,10 +594,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -516,10 +600,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
        log.errorLine(reqTag, "✗", `ERROR ${statusCode} · ${provider}/${model} · ${Date.now() - requestStartTime}ms${urlStr}\n    ${errMsg}`);
      }
      reqLogger.logError(new Error(message), finalBody || translatedBody);
@@ -594,7 +594,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
    const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
    const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
  
-@@ -528,7 +613,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -534,7 +619,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
  
    // True non-streaming response
    if (!stream) {
@@ -604,7 +604,7 @@ index c05dd4baa728bb14e34f71b0f1671f83ae770396..a95232a3f104fde49effb9a0b6f36bf8
      return result;
    }
 diff --git a/open-sse/providers/capabilities.js b/open-sse/providers/capabilities.js
-index a39dd42282e901207a452cb75dc96c23b07835de..f5c558bbf56738f0545ed33a84eb9880ee91b178 100644
+index b8993ce3..610285fc 100644
 --- a/open-sse/providers/capabilities.js
 +++ b/open-sse/providers/capabilities.js
 @@ -53,6 +53,7 @@ export const DEFAULT_CAPABILITIES = {
@@ -615,10 +615,13 @@ index a39dd42282e901207a452cb75dc96c23b07835de..f5c558bbf56738f0545ed33a84eb9880
    tools: true,          // function / tool calling
    reasoning: false,     // thinking / reasoning
    // thinking wire format (only meaningful when reasoning:true). null → derive from transport.format.
-@@ -522,11 +523,11 @@ export const PATTERN_CAPABILITIES = [
-   // ── Gemini (all 2.0+ multimodal + google_search grounding, 1M ctx) ─
-   { pattern: "*gemini*image*",  caps: { vision: true, imageOutput: true, contextWindow: 1048576 } },
-   // Gemini 4 (Argon): no "minimal" tier (400) and no thinkingBudget — LOW/MEDIUM/HIGH only, cannot disable.
+@@ -568,13 +569,13 @@ export const PATTERN_CAPABILITIES = [
+   // Gemini 4 Hydrogen: text/image/video/audio/PDF in, 1M unified window, 64K per request
+   // (models/gemini-4-hydrogen: inputTokenLimit 1048576, outputTokenLimit 65536). Levels in thinkingLevels.js.
+   // longDecode: a max_tokens above 64K runs CONTINUATION hops up to 1M (utils/geminiLongDecode.js).
+-  { pattern: "*gemini-4-hydrogen*", caps: { vision: true, pdf: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536, longDecode: true } },
++  { pattern: "*gemini-4-hydrogen*", caps: { vision: true, pdf: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536, longDecode: true } },
+   // Gemini 4 (Carbon/Argon): no "minimal" tier (400) and no thinkingBudget — LOW/MEDIUM/HIGH only, cannot disable.
 -  { pattern: "*gemini-4*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
 -  { pattern: "*gemini-3.8*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
 -  { pattern: "*gemini-3.7*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
@@ -632,7 +635,7 @@ index a39dd42282e901207a452cb75dc96c23b07835de..f5c558bbf56738f0545ed33a84eb9880
    { pattern: "*gemini-2.5*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-budget", thinkingRange: { min: 0, max: 24576 }, contextWindow: 1048576, maxOutput: 65536 } },
    { pattern: "*gemini-2*",      caps: { vision: true, audioInput: true, videoInput: true, search: true, contextWindow: 1048576, maxOutput: 65536 } },
    { pattern: "*gemini*",        caps: { vision: true, search: true, contextWindow: 1048576 } },
-@@ -673,7 +674,8 @@ export const PATTERN_CAPABILITIES = [
+@@ -721,7 +722,8 @@ export const PATTERN_CAPABILITIES = [
    { pattern: "*laguna*",        caps: { reasoning: true, thinkingFormat: "openai", contextWindow: 200000, maxOutput: 32000 } },
  
  
@@ -643,10 +646,10 @@ index a39dd42282e901207a452cb75dc96c23b07835de..f5c558bbf56738f0545ed33a84eb9880
    // ── Others ───────────────────────────────────────────────────────
    { pattern: "*hunyuan*",       caps: { reasoning: true, thinkingFormat: "hunyuan", contextWindow: 262144, maxOutput: 262144 } },
 diff --git a/open-sse/providers/pricing.js b/open-sse/providers/pricing.js
-index e189535a120218a22e683a362bbe5a1c055fb7ac..989a5ec2948daaaa6eb81250e8358c9ff8dfae1a 100644
+index e267eda8..82b459e2 100644
 --- a/open-sse/providers/pricing.js
 +++ b/open-sse/providers/pricing.js
-@@ -181,6 +181,11 @@ export const MODEL_PRICING = {
+@@ -183,6 +183,11 @@ export const MODEL_PRICING = {
    "muse-spark-1.1":                { input: 1.25, output: 4.25, cached: 0.15,  reasoning: 4.25,   cache_creation: 0 },
    "muse-spark-1.3-contributor":    { input: 0.10, output: 0.20, cached: 0.002, reasoning: 0.20,   cache_creation: 0 },
    "muse-spark-1.2-contributor":    { input: 0.10, output: 0.20, cached: 0.002, reasoning: 0.20,   cache_creation: 0 },
@@ -659,7 +662,7 @@ index e189535a120218a22e683a362bbe5a1c055fb7ac..989a5ec2948daaaa6eb81250e8358c9f
    // === OpenRouter fallback ===
    "auto":                         { input: 2.00,  output: 8.00,  cached: 1.00,  reasoning: 12.00,  cache_creation: 2.00  },
 diff --git a/open-sse/providers/registry/muse.js b/open-sse/providers/registry/muse.js
-index a5f2728f5fbf418e957c677018c1d2a0c00d867c..08c9173880896112cc2dda978f4d965ab52ee27c 100644
+index a5f2728f..08c91738 100644
 --- a/open-sse/providers/registry/muse.js
 +++ b/open-sse/providers/registry/muse.js
 @@ -36,9 +36,9 @@ export default {
@@ -685,21 +688,21 @@ index a5f2728f5fbf418e957c677018c1d2a0c00d867c..08c9173880896112cc2dda978f4d965a
      { id: "muse-spark-1.2", name: "Muse Spark 1.2", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
      { id: "muse-spark-1.1", name: "Muse Spark 1.1", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
 diff --git a/open-sse/providers/thinkingLevels.js b/open-sse/providers/thinkingLevels.js
-index 30ff6935030d4a81c80410a73c6690e5c12ad129..b9f1f80f8eff0e6c1204712c38b95b23acffde55 100644
+index 63198f8c..8d3f0083 100644
 --- a/open-sse/providers/thinkingLevels.js
 +++ b/open-sse/providers/thinkingLevels.js
-@@ -41,6 +41,9 @@ const CLAUDE_NO_XHIGH = ["none", "low", "medium", "high", "max"];
- 
- // Model-name pattern overrides (glob, first match wins) — more precise than format default.
- const PATTERN_THINKING = [
+@@ -45,6 +45,9 @@ const PATTERN_THINKING = [
+   // Gemini 4 Neon & Hydrogen support xhigh in addition to low/medium/high (no minimal/none).
+   { pattern: "*gemini-4-neon*", levels: ["low", "medium", "high", "xhigh"] },
+   { pattern: "*gemini-4-hydrogen*", levels: ["low", "medium", "high", "xhigh"] },
 +  // Meta documents the complete minimal..max range for Muse Wonder; reasoning
 +  // cannot be disabled (capabilities.js removes "none" from this list).
 +  { pattern: "*muse*wonder*", levels: ["minimal", "low", "medium", "high", "xhigh", "max"] },
-   // Gemini 4 (Argon) rejects "minimal" with 400 — LOW is the floor; cannot disable thinking.
+   // Gemini 4 (Argon, Carbon) rejects "minimal" with 400 — LOW is the floor; cannot disable thinking.
    { pattern: "*gemini-4*", levels: ["low", "medium", "high"] },
-   { pattern: "*claude*4.6*", levels: CLAUDE_NO_XHIGH },
+   // Antigravity Claude 5.5 supports low, medium, high, max (no xhigh, no none).
 diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
-index 02ff909390b25a0eeed05987298b846b14ecb54d..768e305d3259a0eaf7391f3d94ced7f69f5103ed 100644
+index 02ff9093..768e305d 100644
 --- a/open-sse/translator/index.js
 +++ b/open-sse/translator/index.js
 @@ -1,15 +1,19 @@
@@ -896,7 +899,7 @@ index 02ff909390b25a0eeed05987298b846b14ecb54d..768e305d3259a0eaf7391f3d94ced7f6
      // client as-is. A fragment that opens a new tool-call index without an id
 diff --git a/open-sse/utils/museCloaking.js b/open-sse/utils/museCloaking.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..28b277c8a80779ca300b123589b55648b7e87533
+index 00000000..28b277c8
 --- /dev/null
 +++ b/open-sse/utils/museCloaking.js
 @@ -0,0 +1,77 @@
@@ -979,7 +982,7 @@ index 0000000000000000000000000000000000000000..28b277c8a80779ca300b123589b55648
 +}
 diff --git a/tests/unit/muse-cloaking.test.js b/tests/unit/muse-cloaking.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..cc1e807e1dde131f8998a8332c0af60367e464b9
+index 00000000..cc1e807e
 --- /dev/null
 +++ b/tests/unit/muse-cloaking.test.js
 @@ -0,0 +1,271 @@
@@ -1256,7 +1259,7 @@ index 0000000000000000000000000000000000000000..cc1e807e1dde131f8998a8332c0af603
 +});
 diff --git a/tests/unit/muse-foreign-reasoning-retry.test.js b/tests/unit/muse-foreign-reasoning-retry.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..ab37f410a7b266d2f41fca490418971fb9f4d16b
+index 00000000..ab37f410
 --- /dev/null
 +++ b/tests/unit/muse-foreign-reasoning-retry.test.js
 @@ -0,0 +1,262 @@
@@ -1523,7 +1526,7 @@ index 0000000000000000000000000000000000000000..ab37f410a7b266d2f41fca490418971f
 +  });
 +});
 diff --git a/tests/unit/muse-responses-wire.test.js b/tests/unit/muse-responses-wire.test.js
-index 46b828d19ccaf29d219ef3fbbd334b3b8c4f5ff5..bdeef99d5f6032a8263c87fcbf8f53a44ade992b 100644
+index 46b828d1..bdeef99d 100644
 --- a/tests/unit/muse-responses-wire.test.js
 +++ b/tests/unit/muse-responses-wire.test.js
 @@ -18,6 +18,8 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelUpstreamId, PRO
@@ -1579,7 +1582,7 @@ index 46b828d19ccaf29d219ef3fbbd334b3b8c4f5ff5..bdeef99d5f6032a8263c87fcbf8f53a4
      const body = { input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }] };
 diff --git a/tests/unit/provider-pricing-muse-wonder.test.js b/tests/unit/provider-pricing-muse-wonder.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..69c37cbfc8b504b47879d54e4606f9bb8ce077ae
+index 00000000..69c37cbf
 --- /dev/null
 +++ b/tests/unit/provider-pricing-muse-wonder.test.js
 @@ -0,0 +1,29 @@
@@ -1614,7 +1617,7 @@ index 0000000000000000000000000000000000000000..69c37cbfc8b504b47879d54e4606f9bb
 +});
 diff --git a/tests/unit/target-format-transport.test.js b/tests/unit/target-format-transport.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..5dacdb8bfcdd99f70d0eb3a6f00871770bd89d3b
+index 00000000..5dacdb8b
 --- /dev/null
 +++ b/tests/unit/target-format-transport.test.js
 @@ -0,0 +1,317 @@
@@ -1936,5 +1939,5 @@ index 0000000000000000000000000000000000000000..5dacdb8bfcdd99f70d0eb3a6f0087177
 +  });
 +});
 -- 
-2.54.0
+2.55.0
 

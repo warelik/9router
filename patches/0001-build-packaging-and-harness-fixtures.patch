@@ -1,7 +1,7 @@
-From 6a0e5157f197602205cfa28e2ce7fd35ab2e72e3 Mon Sep 17 00:00:00 2001
+From 5764743840a8366c5c72f7c068ff49d3ffcc2f8b Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:20 +0000
-Subject: [PATCH] Build inputs, packaging and regression harness fixtures
+Subject: [PATCH 01/18] Build inputs, packaging and regression harness fixtures
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -29,7 +29,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/gemini-native-api-version.test.js
 
 diff --git a/.github/workflows/docker-publish.yml b/.github/workflows/docker-publish.yml
-index 64be9c1ce33fe1cf1be14b02fe8f06459e3750be..7387d5019246b600d6173ef70e91dfd864f9a0a5 100644
+index 64be9c1c..7387d501 100644
 --- a/.github/workflows/docker-publish.yml
 +++ b/.github/workflows/docker-publish.yml
 @@ -152,15 +152,6 @@ jobs:
@@ -57,7 +57,7 @@ index 64be9c1ce33fe1cf1be14b02fe8f06459e3750be..7387d5019246b600d6173ef70e91dfd8
            outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
            build-args: |
 diff --git a/Dockerfile b/Dockerfile
-index 24641323b4dc29092331f8aa222c46d2a1212c9f..8601ae0ab3916f896a3e70bff38f69ec1e60f4ab 100644
+index 24641323..8601ae0a 100644
 --- a/Dockerfile
 +++ b/Dockerfile
 @@ -1,5 +1,5 @@
@@ -81,7 +81,7 @@ index 24641323b4dc29092331f8aa222c46d2a1212c9f..8601ae0ab3916f896a3e70bff38f69ec
        --fetch-retry-factor=2 \
 diff --git a/npm-shrinkwrap.json b/npm-shrinkwrap.json
 new file mode 100644
-index 0000000000000000000000000000000000000000..874f926f812f7288e3994f2e6eb3aa2ea794e857
+index 00000000..874f926f
 --- /dev/null
 +++ b/npm-shrinkwrap.json
 @@ -0,0 +1,9529 @@
@@ -9616,7 +9616,7 @@ index 0000000000000000000000000000000000000000..874f926f812f7288e3994f2e6eb3aa2e
 +}
 diff --git a/tests/helpers/isolatedDataDir.js b/tests/helpers/isolatedDataDir.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..1a2eea402bfd32206e07a76e811f65ebd36ffd27
+index 00000000..1a2eea40
 --- /dev/null
 +++ b/tests/helpers/isolatedDataDir.js
 @@ -0,0 +1,20 @@
@@ -9641,7 +9641,7 @@ index 0000000000000000000000000000000000000000..1a2eea402bfd32206e07a76e811f65eb
 +  };
 +}
 diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
-index d88e67f1d3ffb6a4f22d8f484342d0242b57963d..f9b3a1fbc4cbba04a0859419cac0cf1cabbd0c78 100644
+index 8efdab68..ddbfeda1 100644
 --- a/tests/translator/golden-url-header.test.js
 +++ b/tests/translator/golden-url-header.test.js
 @@ -21,10 +21,16 @@ const SPECIALIZED = new Set([
@@ -9660,7 +9660,7 @@ index d88e67f1d3ffb6a4f22d8f484342d0242b57963d..f9b3a1fbc4cbba04a0859419cac0cf1c
 +  "x-request-id", "x-conversation-id", "x-conversation-request-id", "x-conversation-message-id",
 +]);
  
- // Sanitize header: khử token + field thời gian động (kimi X-Msh-Device-Id) để snapshot ổn định.
+ // Sanitize headers: strip tokens + dynamic time fields (kimi X-Msh-Device-Id) so snapshots stay stable.
  function sanitize(headers) {
 @@ -66,6 +72,16 @@ describe("GOLDEN buildHeaders (default executor providers)", () => {
          oauth: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : OAUTH_CRED, true))),
@@ -9681,7 +9681,7 @@ index d88e67f1d3ffb6a4f22d8f484342d0242b57963d..f9b3a1fbc4cbba04a0859419cac0cf1c
    }
 diff --git a/tests/unit/docker-publish-source-recipe.test.js b/tests/unit/docker-publish-source-recipe.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..bae2f87255ae9768dc39ded82dec0feb45b69e73
+index 00000000..bae2f872
 --- /dev/null
 +++ b/tests/unit/docker-publish-source-recipe.test.js
 @@ -0,0 +1,53 @@
@@ -9740,7 +9740,7 @@ index 0000000000000000000000000000000000000000..bae2f87255ae9768dc39ded82dec0feb
 +});
 diff --git a/tests/unit/gemini-native-api-version.test.js b/tests/unit/gemini-native-api-version.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..31c06c46c60874a1727be86b124973f997643dba
+index 00000000..31c06c46
 --- /dev/null
 +++ b/tests/unit/gemini-native-api-version.test.js
 @@ -0,0 +1,203 @@
@@ -9948,7 +9948,7 @@ index 0000000000000000000000000000000000000000..31c06c46c60874a1727be86b124973f9
 +
 +});
 diff --git a/tests/unit/gemini-native-endpoint.test.js b/tests/unit/gemini-native-endpoint.test.js
-index 83a8716ca80d4ad98298abe8def49154caa63f21..9a48710163a09d347cf717e0b17cd8b9b1c962ef 100644
+index 83a8716c..9a487101 100644
 --- a/tests/unit/gemini-native-endpoint.test.js
 +++ b/tests/unit/gemini-native-endpoint.test.js
 @@ -1,4 +1,5 @@
@@ -10098,5 +10098,5 @@ index 83a8716ca80d4ad98298abe8def49154caa63f21..9a48710163a09d347cf717e0b17cd8b9
      await POST(makeGeminiRequest("openai/gpt-4o-mini-tts:generateContent", audioBody()), {
        params: Promise.resolve({ path: ["openai", "gpt-4o-mini-tts:generateContent"] }),
 -- 
-2.54.0
+2.55.0
 

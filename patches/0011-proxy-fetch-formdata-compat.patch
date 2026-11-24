@@ -1,7 +1,8 @@
-From f8e9cdc989295f8af5feb89a509ac7bde3016625 Mon Sep 17 00:00:00 2001
+From 42d6b789739d4867d4058804ee61553a96f2b4f8 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Mon, 9 Nov 2026 10:10:45 +0000
-Subject: [PATCH] Fix multipart uploads through the bundled Undici proxy fetch
+Subject: [PATCH 11/18] Fix multipart uploads through the bundled Undici proxy
+ fetch
 
 The Cloudflare Worker admin deploy creates a global FormData in Node's bundled Undici realm, while proxyFetch deliberately sends requests through the package Undici instance. Package Undici does not recognize the foreign FormData as multipart and derives the first part's application/javascript+module type as the request Content-Type, so Cloudflare returns HTTP 415.
 
@@ -13,7 +14,7 @@ Rebuild only foreign-realm FormData bodies with package Undici's FormData immedi
  create mode 100644 tests/unit/proxy-fetch-formdata-compat.test.js
 
 diff --git a/open-sse/utils/proxyFetch.js b/open-sse/utils/proxyFetch.js
-index 86a699070a98038986cea98b73573056c6f74069..3680417441e649b39f2929800c07bfbddcd67765 100644
+index 86a69907..36804174 100644
 --- a/open-sse/utils/proxyFetch.js
 +++ b/open-sse/utils/proxyFetch.js
 @@ -38,10 +38,48 @@ export function isStaleSocketError(error) {
@@ -70,7 +71,7 @@ index 86a699070a98038986cea98b73573056c6f74069..3680417441e649b39f2929800c07bfbd
  // ─── TLS fingerprinting via got-scraping (browser-like JA3) ───────────────
 diff --git a/tests/unit/proxy-fetch-formdata-compat.test.js b/tests/unit/proxy-fetch-formdata-compat.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..3ca1768a16b900e6ffe138985a24e053a83817c9
+index 00000000..3ca1768a
 --- /dev/null
 +++ b/tests/unit/proxy-fetch-formdata-compat.test.js
 @@ -0,0 +1,100 @@
@@ -175,5 +176,5 @@ index 0000000000000000000000000000000000000000..3ca1768a16b900e6ffe138985a24e053
 +  });
 +});
 -- 
-2.54.0
+2.55.0
 

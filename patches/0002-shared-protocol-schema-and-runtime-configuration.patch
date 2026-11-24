@@ -1,7 +1,8 @@
-From a91b32cbefbd3070bc0ef32a9bd1d4d000520c95 Mon Sep 17 00:00:00 2001
+From 5f8ee2054ede3cd49ebebefb0677166b14e43475 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:21 +0000
-Subject: [PATCH] Centralize shared protocol schema and runtime configuration
+Subject: [PATCH 02/18] Centralize shared protocol schema and runtime
+ configuration
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -56,7 +57,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/openai-responses-web-search.test.js
 
 diff --git a/open-sse/config/defaultThinkingSignature.js b/open-sse/config/defaultThinkingSignature.js
-index 50975a43ea8aeefc9845e729d86ec261c9adbfa4..0460b52254f0ceeea16ba05700e89e53dde46ec2 100644
+index 50975a43..0460b522 100644
 --- a/open-sse/config/defaultThinkingSignature.js
 +++ b/open-sse/config/defaultThinkingSignature.js
 @@ -10,3 +10,10 @@ export const DEFAULT_THINKING_GEMINI_CLI_SIGNATURE = "CiQBjz1rX/AlslZWMe5RgBt4Tv
@@ -71,12 +72,12 @@ index 50975a43ea8aeefc9845e729d86ec261c9adbfa4..0460b52254f0ceeea16ba05700e89e53
 +
 +export const SERVER_PARTS_PREFIX = "serverparts:";
 diff --git a/open-sse/executors/antigravity.js b/open-sse/executors/antigravity.js
-index c8164e3caae9608b4daae7dd2cac4a885e950864..03c835c00b07ebc16d0f419f6f2659a783c0fde0 100644
+index 6cec9aa4..7e2c20c4 100644
 --- a/open-sse/executors/antigravity.js
 +++ b/open-sse/executors/antigravity.js
-@@ -3,11 +3,13 @@ import { BaseExecutor } from "./base.js";
- import { PROVIDERS } from "../config/providers.js";
- import { OAUTH_ENDPOINTS, ANTIGRAVITY_HEADERS, AG_DEFAULT_TOOLS, AG_TOOL_SUFFIX, ANTIGRAVITY_PROMPT_REWRITES } from "../config/appConstants.js";
+@@ -4,12 +4,14 @@ import { PROVIDERS } from "../config/providers.js";
+ import { OAUTH_ENDPOINTS, ANTIGRAVITY_HEADERS, AG_DEFAULT_TOOLS, AG_TOOL_SUFFIX, ANTIGRAVITY_PROMPT_REWRITES, ANTIGRAVITY_DEFAULT_SYSTEM } from "../config/appConstants.js";
+ import { GEMINI_ROLE } from "../translator/schema/roles.js";
  import { HTTP_STATUS } from "../config/runtimeConfig.js";
 +import { GEMINI_FUNCTION_CALLING_MODE_NONE, GEMINI_FUNCTION_CALLING_MODE_VALIDATED } from "../translator/schema/index.js";
  import { resolveSessionId, toNumericSessionId } from "../utils/sessionManager.js";
@@ -84,11 +85,12 @@ index c8164e3caae9608b4daae7dd2cac4a885e950864..03c835c00b07ebc16d0f419f6f2659a7
  import { cleanJSONSchemaForAntigravity, normalizeGeminiContents } from "../translator/formats/gemini.js";
  import { DEFAULT_THINKING_AG_SIGNATURE } from "../config/defaultThinkingSignature.js";
  import { getGeminiThoughtSignatureSync } from "../services/thoughtSignatureStore.js";
+ import { GEMINI_LONG_DECODE_MAX_OUTPUT, supportsGeminiLongDecode, wantsGeminiLongDecode, withGeminiLongDecode } from "../utils/geminiLongDecode.js";
 +import { unwrapAntigravityResponse, validateAntigravityFieldMask } from "../utils/antigravityNative.js";
  
  // Sanitize function name: Gemini requires [a-zA-Z_][a-zA-Z0-9_.:\-]{0,63}
  function sanitizeFunctionName(name) {
-@@ -55,6 +57,60 @@ const stripBlacklisted = obj => {
+@@ -107,6 +109,60 @@ const stripBlacklisted = obj => {
    for (const key of ANTIGRAVITY_REQUEST_BLACKLIST) delete obj[key];
  };
  
@@ -149,7 +151,7 @@ index c8164e3caae9608b4daae7dd2cac4a885e950864..03c835c00b07ebc16d0f419f6f2659a7
  // Image generation model name patterns
  const IMAGE_MODEL_PATTERNS = [
    /image/i,
-@@ -172,6 +228,30 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -255,6 +311,30 @@ export class AntigravityExecutor extends BaseExecutor {
    transformRequest(model, body, stream, credentials) {
      const projectId = credentials?.projectId || this.generateProjectId();
  
@@ -180,7 +182,7 @@ index c8164e3caae9608b4daae7dd2cac4a885e950864..03c835c00b07ebc16d0f419f6f2659a7
      // OpenAI clients may include stream_options even for non-streaming calls.
      // Google generateContent rejects that combination before processing the request.
      if (stream !== true) delete body.stream_options;
-@@ -232,6 +312,7 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -315,6 +395,7 @@ export class AntigravityExecutor extends BaseExecutor {
  
      // ─── Standard (non-image) request ───
      // Fix contents for Claude models via Antigravity
@@ -188,7 +190,7 @@ index c8164e3caae9608b4daae7dd2cac4a885e950864..03c835c00b07ebc16d0f419f6f2659a7
      const rawContents = (body.request?.contents || []).map(c => {
        let role = c.role;
        // functionResponse must be role "user" for Claude models
-@@ -271,7 +352,7 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -354,7 +435,7 @@ export class AntigravityExecutor extends BaseExecutor {
          parts: modifiedParts || parts || [],
        };
      });
@@ -197,7 +199,7 @@ index c8164e3caae9608b4daae7dd2cac4a885e950864..03c835c00b07ebc16d0f419f6f2659a7
  
      // Sanitize tool schemas and function names before sending to Antigravity.
      let tools = body.request?.tools;
-@@ -285,13 +366,19 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -368,13 +449,19 @@ export class AntigravityExecutor extends BaseExecutor {
            const name = sanitizeFunctionName(fn.name);
            if (seenToolNames.has(name)) continue;
            seenToolNames.add(name);
@@ -224,7 +226,7 @@ index c8164e3caae9608b4daae7dd2cac4a885e950864..03c835c00b07ebc16d0f419f6f2659a7
          }
        }
        tools = allDeclarations.length > 0 ? [{ functionDeclarations: allDeclarations }] : [];
-@@ -303,14 +390,7 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -386,14 +473,7 @@ export class AntigravityExecutor extends BaseExecutor {
      
      // Rewrite competing-client branding in system prompts (e.g. Zed's Claude prompt,
      // OpenCode naming) so Antigravity doesn't flag the request with a 429 Quota Exhausted.
@@ -238,9 +240,9 @@ index c8164e3caae9608b4daae7dd2cac4a885e950864..03c835c00b07ebc16d0f419f6f2659a7
 -    }
 +    rewriteSystemPrompt(requestWithoutTools);
  
-     const generationConfig = { ...(requestWithoutTools.generationConfig || {}) };
-     if (generationConfig.maxOutputTokens > MAX_ANTIGRAVITY_OUTPUT_TOKENS) {
-@@ -324,7 +404,7 @@ export class AntigravityExecutor extends BaseExecutor {
+     // The real client always opens the system prompt with the Antigravity identity.
+     const systemParts = requestWithoutTools.systemInstruction?.parts;
+@@ -423,7 +503,7 @@ export class AntigravityExecutor extends BaseExecutor {
        ...(tools && { tools }),
        sessionId,
        safetySettings: undefined,
@@ -249,7 +251,7 @@ index c8164e3caae9608b4daae7dd2cac4a885e950864..03c835c00b07ebc16d0f419f6f2659a7
      };
  
      // Strip blacklisted thinking fields from top-level body (set by thinkingUnified.js at root, not body.request)
-@@ -350,6 +430,19 @@ export class AntigravityExecutor extends BaseExecutor {
+@@ -449,6 +529,19 @@ export class AntigravityExecutor extends BaseExecutor {
      };
    }
  
@@ -270,24 +272,25 @@ index c8164e3caae9608b4daae7dd2cac4a885e950864..03c835c00b07ebc16d0f419f6f2659a7
      if (!credentials.refreshToken) return null;
  
 diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
-index 92252eea6bc484d41111134b116826d7856e799e..b761505eda4a063c1bb58d8d0d837fe2e4e73934 100644
+index 4ca3a0dd..b8d68843 100644
 --- a/open-sse/executors/default.js
 +++ b/open-sse/executors/default.js
-@@ -4,10 +4,13 @@ import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
+@@ -4,11 +4,14 @@ import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
  import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE, selectAnthropicBeta, mergeAnthropicBeta } from "../providers/shared.js";
  import { resolveOpenAICompatibleApiType } from "../services/provider.js";
  import { OAUTH_ENDPOINTS, buildKimiHeaders, NOUS_ATTRIBUTION } from "../config/appConstants.js";
 +import { NATIVE_GEMINI_PRIVATE_HEADERS, NATIVE_GEMINI_API_VERSIONS } from "../config/runtimeConfig.js";
  import { buildClineHeaders } from "../shared/clineAuth.js";
+ import { buildKiroIdentityHeaders } from "../shared/kiroIdentity.js";
  import { proxyAwareFetch } from "../utils/proxyFetch.js";
  import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
  import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
 +import { FORMATS } from "../translator/formats.js";
 +import { adaptAIStudioStructuredOutput } from "../translator/formats/gemini.js";
  import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
+ import { wantsGeminiLongDecode, withGeminiLongDecode } from "../utils/geminiLongDecode.js";
  
- // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
-@@ -90,6 +93,27 @@ const REFRESH_GRANTS = Object.fromEntries(
+@@ -92,6 +95,27 @@ const REFRESH_GRANTS = Object.fromEntries(
      })
  );
  
@@ -315,7 +318,7 @@ index 92252eea6bc484d41111134b116826d7856e799e..b761505eda4a063c1bb58d8d0d837fe2
  export class DefaultExecutor extends BaseExecutor {
    constructor(provider) {
      super(provider, PROVIDERS[provider] || PROVIDERS.openai);
-@@ -97,6 +121,9 @@ export class DefaultExecutor extends BaseExecutor {
+@@ -110,6 +134,9 @@ export class DefaultExecutor extends BaseExecutor {
  
    transformRequest(model, body, stream, credentials) {
      let transformed = this.applyJsonSchemaFallback(this.applyNousAttribution(model, body, stream, credentials));
@@ -325,7 +328,7 @@ index 92252eea6bc484d41111134b116826d7856e799e..b761505eda4a063c1bb58d8d0d837fe2
  
      if (transformed && typeof transformed === "object") {
        // OpenAI-compatible upstreams (NVIDIA NIM, DeepSeek) reject `stream_options` on
-@@ -112,7 +139,10 @@ export class DefaultExecutor extends BaseExecutor {
+@@ -125,7 +152,10 @@ export class DefaultExecutor extends BaseExecutor {
        stripUnsupportedParams(this.provider, model, transformed);
      }
  
@@ -337,7 +340,7 @@ index 92252eea6bc484d41111134b116826d7856e799e..b761505eda4a063c1bb58d8d0d837fe2
    }
  
    applyNousAttribution(model, body, stream, credentials) {
-@@ -177,7 +207,23 @@ export class DefaultExecutor extends BaseExecutor {
+@@ -190,7 +220,23 @@ export class DefaultExecutor extends BaseExecutor {
      }
      // gemini-format: build :streamGenerateContent / :generateContent path
      if (this.config.format === "gemini") {
@@ -362,7 +365,7 @@ index 92252eea6bc484d41111134b116826d7856e799e..b761505eda4a063c1bb58d8d0d837fe2
      }
      // urlSuffix (e.g. ?beta=true) declared per-provider in registry
      if (this.config.urlSuffix) {
-@@ -210,6 +256,16 @@ export class DefaultExecutor extends BaseExecutor {
+@@ -223,6 +269,16 @@ export class DefaultExecutor extends BaseExecutor {
      // Hooks run BEFORE auth so dynamic overlays can't clobber the token.
      for (const hook of desc.hooks || []) HEADER_HOOKS[hook]?.(headers, credentials);
      applyAuth(headers, desc, credentials);
@@ -380,7 +383,7 @@ index 92252eea6bc484d41111134b116826d7856e799e..b761505eda4a063c1bb58d8d0d837fe2
      // anthropic-compatible-* nodes serving a real Claude model sit in front of
      // Anthropic itself (a rotating multi-account proxy, a corporate gateway),
 diff --git a/open-sse/executors/zed.js b/open-sse/executors/zed.js
-index b88d2762b6c4e78de19c0866b6cf1a4192f08f5e..bfe3a2cc8d8c8e0d0b66c88ecaeba4d14a59ebbd 100644
+index b88d2762..bfe3a2cc 100644
 --- a/open-sse/executors/zed.js
 +++ b/open-sse/executors/zed.js
 @@ -17,6 +17,8 @@
@@ -480,7 +483,7 @@ index b88d2762b6c4e78de19c0866b6cf1a4192f08f5e..bfe3a2cc8d8c8e0d0b66c88ecaeba4d1
        response: wrapped,
        url: `${this.config?.llmBaseUrl || "https://cloud.zed.dev"}/completions`,
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index 38c1b980fe03cb5a452ed684ec8b55f6395dfec3..c3dbc3b0095bef7506530cba21944d13e7190be5 100644
+index 38c1b980..c3dbc3b0 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
 @@ -1,19 +1,45 @@
@@ -758,7 +761,7 @@ index 38c1b980fe03cb5a452ed684ec8b55f6395dfec3..c3dbc3b0095bef7506530cba21944d13
        if (choice?.message?.reasoning_content && choice.message.content) {
          delete choice.message.reasoning_content;
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index be7139571fd29efbc818dd226f98e29325cbef11..094ae16f7cb74f99ee470bd9ab18a47616689c38 100644
+index be713957..094ae16f 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -3,7 +3,7 @@ import { needsTranslation } from "../../translator/index.js";
@@ -973,7 +976,7 @@ index be7139571fd29efbc818dd226f98e29325cbef11..094ae16f7cb74f99ee470bd9ab18a476
    return { onStreamComplete, streamDetailId };
 diff --git a/open-sse/providers/registry/aistudio.js b/open-sse/providers/registry/aistudio.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..2eeed51b64712e5c3d35d509e01e5243c9f470bc
+index 00000000..2eeed51b
 --- /dev/null
 +++ b/open-sse/providers/registry/aistudio.js
 @@ -0,0 +1,38 @@
@@ -1017,7 +1020,7 @@ index 0000000000000000000000000000000000000000..2eeed51b64712e5c3d35d509e01e5243
 +};
 diff --git a/open-sse/services/aistudioModels.js b/open-sse/services/aistudioModels.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..cd8ec80c321825be9243259ab65d19d94ab91ae1
+index 00000000..cd8ec80c
 --- /dev/null
 +++ b/open-sse/services/aistudioModels.js
 @@ -0,0 +1,30 @@
@@ -1052,7 +1055,7 @@ index 0000000000000000000000000000000000000000..cd8ec80c321825be9243259ab65d19d9
 +  };
 +}
 diff --git a/open-sse/services/provider.js b/open-sse/services/provider.js
-index d789df37c0f8378106a7d6dfd2b25b4bb7d04930..e3368efe07b1adf8787868157a001fed419d6615 100644
+index d789df37..e3368efe 100644
 --- a/open-sse/services/provider.js
 +++ b/open-sse/services/provider.js
 @@ -1,6 +1,7 @@
@@ -1080,7 +1083,7 @@ index d789df37c0f8378106a7d6dfd2b25b4bb7d04930..e3368efe07b1adf8787868157a001fed
  // Multi-endpoint providers (transport.transports[]) pick the entry matching sourceFormat
  // to avoid lossy translation; falls back to the default transport when no match.
 diff --git a/open-sse/services/thoughtSignatureStore.js b/open-sse/services/thoughtSignatureStore.js
-index 71fb94b8f0445536b9f8b84c571cada738041f7c..f11fc828561b9a0704a52f3ba34d210e376cb10d 100644
+index 71fb94b8..f11fc828 100644
 --- a/open-sse/services/thoughtSignatureStore.js
 +++ b/open-sse/services/thoughtSignatureStore.js
 @@ -1,3 +1,5 @@
@@ -1211,7 +1214,7 @@ index 71fb94b8f0445536b9f8b84c571cada738041f7c..f11fc828561b9a0704a52f3ba34d210e
 +  return null;
 +}
 diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
-index 0d0baa27f65d2f78b7e51a2d9d6cfaac035d65cf..6a56daffe007fa90ae7efce130d1992f638330c8 100644
+index c31fab4d..fd0d00b3 100644
 --- a/open-sse/translator/concerns/thinkingUnified.js
 +++ b/open-sse/translator/concerns/thinkingUnified.js
 @@ -6,6 +6,8 @@ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
@@ -1223,7 +1226,7 @@ index 0d0baa27f65d2f78b7e51a2d9d6cfaac035d65cf..6a56daffe007fa90ae7efce130d1992f
  
  // Map a target wire-format to its native thinking format (when capability has none).
  const FORMAT_TO_NATIVE = {
-@@ -450,7 +452,7 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display, model = "",
+@@ -460,7 +462,7 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display, model = "",
  // Mutates and returns body. No-op when model has no reasoning capability.
  // `intent` is a pre-captured config (from captureThinking on the original body);
  // falls back to extracting from the current body when omitted.
@@ -1232,7 +1235,7 @@ index 0d0baa27f65d2f78b7e51a2d9d6cfaac035d65cf..6a56daffe007fa90ae7efce130d1992f
    if (!body || typeof body !== "object") return body;
  
    const { cleanModel, override } = parseSuffix(model);
-@@ -466,6 +468,16 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
+@@ -476,6 +478,16 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
  
    const fmt = resolveFormat(targetFormat, cleanModel, provider);
    const supportedLevels = getThinkingLevels(provider, cleanModel);
@@ -1249,7 +1252,7 @@ index 0d0baa27f65d2f78b7e51a2d9d6cfaac035d65cf..6a56daffe007fa90ae7efce130d1992f
    // Anthropic's `display` (summarized | omitted) decides whether thinking text
    // comes back at all; keep what the client asked for instead of resetting it.
    // An OpenAI-shaped client's ask arrives via the captured intent instead.
-@@ -474,3 +486,34 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
+@@ -484,3 +496,34 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
    applyFormat(fmt, body, cfg, caps, supportedLevels, display, cleanModel, isOpenAICompatibleNode(provider));
    return body;
  }
@@ -1285,7 +1288,7 @@ index 0d0baa27f65d2f78b7e51a2d9d6cfaac035d65cf..6a56daffe007fa90ae7efce130d1992f
 +  return { ...body, [generationKey]: { ...generation, [thinkingKey]: thinking } };
 +}
 diff --git a/open-sse/translator/concerns/toolCall.js b/open-sse/translator/concerns/toolCall.js
-index 251850c1244d46f4b418131521af779b7c050aa5..51d2372fc74e1d9c3e217c8537659fd4d7d63fd6 100644
+index 251850c1..51d2372f 100644
 --- a/open-sse/translator/concerns/toolCall.js
 +++ b/open-sse/translator/concerns/toolCall.js
 @@ -1,6 +1,7 @@
@@ -1392,7 +1395,7 @@ index 251850c1244d46f4b418131521af779b7c050aa5..51d2372fc74e1d9c3e217c8537659fd4
        }
      }
 diff --git a/open-sse/translator/formats/responsesApi.js b/open-sse/translator/formats/responsesApi.js
-index 5454f9f3f44f1d7fa428d2feae8e90f73f2a3e66..e89b54b4c26bc31167412c4696996eb36996ff54 100644
+index 5454f9f3..e89b54b4 100644
 --- a/open-sse/translator/formats/responsesApi.js
 +++ b/open-sse/translator/formats/responsesApi.js
 @@ -1,4 +1,5 @@
@@ -1505,7 +1508,7 @@ index 5454f9f3f44f1d7fa428d2feae8e90f73f2a3e66..e89b54b4c26bc31167412c4696996eb3
      // Fallback: if no type but has role property, treat as message
      const itemType = item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);
 diff --git a/open-sse/translator/request/openai-responses.js b/open-sse/translator/request/openai-responses.js
-index 5c719fd2658b36c5541c466b94c872329b52429e..1f2b4a7d3eb7952aaf0e2fc3cf672b5056b70268 100644
+index 5c719fd2..1f2b4a7d 100644
 --- a/open-sse/translator/request/openai-responses.js
 +++ b/open-sse/translator/request/openai-responses.js
 @@ -4,15 +4,18 @@
@@ -1754,7 +1757,7 @@ index 5c719fd2658b36c5541c466b94c872329b52429e..1f2b4a7d3eb7952aaf0e2fc3cf672b50
 +register(FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, (model, body, stream, credentials) =>
 +  openaiToOpenAIResponsesRequest(model, body, stream, credentials, { inferReasoningSummary: false }), null);
 diff --git a/open-sse/translator/request/openai-to-vertex.js b/open-sse/translator/request/openai-to-vertex.js
-index 8fe8e6378fe2e086a4dbdc2a35e50a4c56b2d361..702162958023e650d0751151f2998b13e54837ac 100644
+index 8fe8e637..70216295 100644
 --- a/open-sse/translator/request/openai-to-vertex.js
 +++ b/open-sse/translator/request/openai-to-vertex.js
 @@ -1,7 +1,7 @@
@@ -1776,7 +1779,7 @@ index 8fe8e6378fe2e086a4dbdc2a35e50a4c56b2d361..702162958023e650d0751151f2998b13
        }
        // Strip id from functionCall
 diff --git a/open-sse/translator/response/openai-responses.js b/open-sse/translator/response/openai-responses.js
-index 1499a2a5299de9d5d12e8bfadf1e82aafd5748a6..9f309b8b36ac85b2ef02222f9902118d70852004 100644
+index 1499a2a5..9f309b8b 100644
 --- a/open-sse/translator/response/openai-responses.js
 +++ b/open-sse/translator/response/openai-responses.js
 @@ -8,7 +8,8 @@ import { buildChunk } from "../concerns/chunk.js";
@@ -2004,7 +2007,7 @@ index 1499a2a5299de9d5d12e8bfadf1e82aafd5748a6..9f309b8b36ac85b2ef02222f9902118d
      const idx = (key && state.respToolChatIndex?.get(key)) ?? Math.max(0, (state.toolCallIndex || 1) - 1);
      const fullArgs = data.item?.arguments;
 diff --git a/open-sse/translator/schema/blocks.js b/open-sse/translator/schema/blocks.js
-index d22468f7061a8f43e5aff96e2e95ea1dce740d77..6ed8d9e8f8180ef7a68b80d00c1996e3380f4ef9 100644
+index d22468f7..6ed8d9e8 100644
 --- a/open-sse/translator/schema/blocks.js
 +++ b/open-sse/translator/schema/blocks.js
 @@ -32,21 +32,45 @@ export const CLAUDE_BLOCK = {
@@ -2055,7 +2058,7 @@ index d22468f7061a8f43e5aff96e2e95ea1dce740d77..6ed8d9e8f8180ef7a68b80d00c1996e3
  export const VALID_OPENAI_CONTENT_TYPES = [
    OPENAI_BLOCK.TEXT, OPENAI_BLOCK.IMAGE_URL, OPENAI_BLOCK.IMAGE, OPENAI_BLOCK.INPUT_AUDIO, OPENAI_BLOCK.AUDIO_URL, OPENAI_BLOCK.FILE,
 diff --git a/open-sse/translator/schema/finishReasons.js b/open-sse/translator/schema/finishReasons.js
-index d0cc62447e64d461a0f6644cca6045a3f62acf44..9143e9cf0f13b4aab14fbce0d00f49b30ae9378f 100644
+index d0cc6244..9143e9cf 100644
 --- a/open-sse/translator/schema/finishReasons.js
 +++ b/open-sse/translator/schema/finishReasons.js
 @@ -32,6 +32,7 @@ export const RESPONSES_INCOMPLETE_REASON = {
@@ -2067,7 +2070,7 @@ index d0cc62447e64d461a0f6644cca6045a3f62acf44..9143e9cf0f13b4aab14fbce0d00f49b3
    MAX_TOKENS: "MAX_TOKENS",
    SAFETY: "SAFETY",
 diff --git a/open-sse/translator/schema/index.js b/open-sse/translator/schema/index.js
-index be51a9be6498e8e640154fe283760e32da55be06..e17f101a4f59dec732adb27643cb331c267a4045 100644
+index be51a9be..e17f101a 100644
 --- a/open-sse/translator/schema/index.js
 +++ b/open-sse/translator/schema/index.js
 @@ -1,8 +1,11 @@
@@ -2085,7 +2088,7 @@ index be51a9be6498e8e640154fe283760e32da55be06..e17f101a4f59dec732adb27643cb331c
  export { CLAUDE_EVENT, CLAUDE_DELTA, RESPONSES_EVENT, RESPONSES_EVENT_PREFIX } from "./streamEvents.js";
 diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..5761ed8050a78add69f4fd248796a4cee204a150
+index 00000000..5761ed80
 --- /dev/null
 +++ b/open-sse/utils/antigravityNative.js
 @@ -0,0 +1,505 @@
@@ -2595,7 +2598,7 @@ index 0000000000000000000000000000000000000000..5761ed8050a78add69f4fd248796a4ce
 +  });
 +}
 diff --git a/open-sse/utils/opencodeFingerprint.js b/open-sse/utils/opencodeFingerprint.js
-index 0e222dec4fa6e76cfa08a60167b4e6f8bdb5912d..0dac903c79592c4b797bd4778256d7920b05537b 100644
+index 0e222dec..0dac903c 100644
 --- a/open-sse/utils/opencodeFingerprint.js
 +++ b/open-sse/utils/opencodeFingerprint.js
 @@ -1,3 +1,5 @@
@@ -2751,7 +2754,7 @@ index 0e222dec4fa6e76cfa08a60167b4e6f8bdb5912d..0dac903c79592c4b797bd4778256d792
  
    return out;
 diff --git a/open-sse/utils/sseConstants.js b/open-sse/utils/sseConstants.js
-index 680a05ca33b115910d5d2fccda3d15c76f90d0b6..a7ae516d6791883b1fd100b907f216bf67834627 100644
+index 680a05ca..a7ae516d 100644
 --- a/open-sse/utils/sseConstants.js
 +++ b/open-sse/utils/sseConstants.js
 @@ -1,5 +1,5 @@
@@ -2763,7 +2766,7 @@ index 680a05ca33b115910d5d2fccda3d15c76f90d0b6..a7ae516d6791883b1fd100b907f216bf
  export const SSE_HEADERS = {
    "Content-Type": "text/event-stream",
 diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
-index fd4d084726bb0b4217fec0380a6240f9a3e78683..571d03df0e29c3b42d6b6c0f6a2a446d038dcc84 100644
+index fd4d0847..571d03df 100644
 --- a/open-sse/utils/streamHelpers.js
 +++ b/open-sse/utils/streamHelpers.js
 @@ -2,9 +2,50 @@ import { FORMATS } from "../translator/formats.js";
@@ -2843,7 +2846,7 @@ index fd4d084726bb0b4217fec0380a6240f9a3e78683..571d03df0e29c3b42d6b6c0f6a2a446d
      : formatSSE({ error }, clientFormat) + SSE_DONE;
 diff --git a/tests/unit/chat-to-gemini-contract.test.js b/tests/unit/chat-to-gemini-contract.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..a9bb1971d6f082710f015e3ad69e1d3c94bcbd3a
+index 00000000..a9bb1971
 --- /dev/null
 +++ b/tests/unit/chat-to-gemini-contract.test.js
 @@ -0,0 +1,935 @@
@@ -3784,7 +3787,7 @@ index 0000000000000000000000000000000000000000..a9bb1971d6f082710f015e3ad69e1d3c
 +});
 diff --git a/tests/unit/codex-hosted-search-history.test.js b/tests/unit/codex-hosted-search-history.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..2b486faabb38487db305b21b48d0fc78582f3a0f
+index 00000000..2b486faa
 --- /dev/null
 +++ b/tests/unit/codex-hosted-search-history.test.js
 @@ -0,0 +1,101 @@
@@ -3891,7 +3894,7 @@ index 0000000000000000000000000000000000000000..2b486faabb38487db305b21b48d0fc78
 +});
 diff --git a/tests/unit/gemini-native-core.test.js b/tests/unit/gemini-native-core.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..3d8e7538a13cba63792bc0937a4b73f80be494d1
+index 00000000..3d8e7538
 --- /dev/null
 +++ b/tests/unit/gemini-native-core.test.js
 @@ -0,0 +1,497 @@
@@ -4394,7 +4397,7 @@ index 0000000000000000000000000000000000000000..3d8e7538a13cba63792bc0937a4b73f8
 +});
 diff --git a/tests/unit/kimi-portable-responses-input.test.js b/tests/unit/kimi-portable-responses-input.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..d8a3bb50d8b017aab72a5926d9c5c33bdda0c494
+index 00000000..d8a3bb50
 --- /dev/null
 +++ b/tests/unit/kimi-portable-responses-input.test.js
 @@ -0,0 +1,340 @@
@@ -4740,7 +4743,7 @@ index 0000000000000000000000000000000000000000..d8a3bb50d8b017aab72a5926d9c5c33b
 +});
 diff --git a/tests/unit/openai-responses-web-search.test.js b/tests/unit/openai-responses-web-search.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..32e97091245102f462b917515f40f6707d43e309
+index 00000000..32e97091
 --- /dev/null
 +++ b/tests/unit/openai-responses-web-search.test.js
 @@ -0,0 +1,463 @@
@@ -5208,5 +5211,5 @@ index 0000000000000000000000000000000000000000..32e97091245102f462b917515f40f670
 +  });
 +});
 -- 
-2.54.0
+2.55.0
 

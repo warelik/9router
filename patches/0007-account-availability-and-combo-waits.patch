@@ -1,7 +1,7 @@
-From 934cf7bd033771fa99b4aed4e20c421f0a606413 Mon Sep 17 00:00:00 2001
+From 5b93b5a85aca01c9550889cdb05d2d755f04ea62 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:41 +0000
-Subject: [PATCH] Account availability, combo waiting and cooldowns
+Subject: [PATCH 07/18] Account availability, combo waiting and cooldowns
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -31,7 +31,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/gemini-native-entry-contract.test.js
 
 diff --git a/open-sse/config/errorConfig.js b/open-sse/config/errorConfig.js
-index 10356373eecf9bd63810aeaa216946498fa22ede..539bc8a2bcbf525bd3eb12ccaf6c629a0789c76c 100644
+index 10356373..539bc8a2 100644
 --- a/open-sse/config/errorConfig.js
 +++ b/open-sse/config/errorConfig.js
 @@ -36,6 +36,14 @@ export const BACKOFF_CONFIG = {
@@ -63,7 +63,7 @@ index 10356373eecf9bd63810aeaa216946498fa22ede..539bc8a2bcbf525bd3eb12ccaf6c629a
  
  // Backward compat: COOLDOWN_MS object (used by index.js re-export)
 diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
-index 858da16892e3a1f8e4dad83c9c913841c4c94d0c..b08d78fca0613a58b02a86027d16fe12501893cf 100644
+index 858da168..b08d78fc 100644
 --- a/open-sse/config/runtimeConfig.js
 +++ b/open-sse/config/runtimeConfig.js
 @@ -1,3 +1,5 @@
@@ -208,7 +208,7 @@ index 858da16892e3a1f8e4dad83c9c913841c4c94d0c..b08d78fca0613a58b02a86027d16fe12
 +export const AISTUDIO_NATIVE_GEMINI_API_VERSION = "v1beta";
 +export const GEMINI_DEFAULT_FILE_MIME_TYPE = "application/octet-stream";
 diff --git a/open-sse/services/accountFallback.js b/open-sse/services/accountFallback.js
-index 2e3987f739f54a60bbc17f817a058cdcd71c9b8e..d9a0c3b154cbe368e82ca8a2babc101fffa4275b 100644
+index 2e3987f7..d9a0c3b1 100644
 --- a/open-sse/services/accountFallback.js
 +++ b/open-sse/services/accountFallback.js
 @@ -1,4 +1,4 @@
@@ -266,7 +266,7 @@ index 2e3987f739f54a60bbc17f817a058cdcd71c9b8e..d9a0c3b154cbe368e82ca8a2babc101f
  
  /**
 diff --git a/open-sse/services/combo.js b/open-sse/services/combo.js
-index c1ec6906b6eb8058ca27878392dbcefbcc24bc54..b96a2efacae69609ba8bea975c7f8633b72d345d 100644
+index c1ec6906..b96a2efa 100644
 --- a/open-sse/services/combo.js
 +++ b/open-sse/services/combo.js
 @@ -3,6 +3,7 @@
@@ -391,7 +391,7 @@ index c1ec6906b6eb8058ca27878392dbcefbcc24bc54..b96a2efacae69609ba8bea975c7f8633
  
    if (earliestRetryAfter) {
 diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
-index 18e5a0117fcdfaf8645f4181f80fc99e5f02f317..155bb6fd9e83bb19f2aed9b2bc8d4a458f29c238 100644
+index 9f064420..56036a4c 100644
 --- a/src/sse/handlers/chat.js
 +++ b/src/sse/handlers/chat.js
 @@ -1,4 +1,6 @@
@@ -671,7 +671,7 @@ index 18e5a0117fcdfaf8645f4181f80fc99e5f02f317..155bb6fd9e83bb19f2aed9b2bc8d4a45
      }
  
      // Account selection shown in the unified "▶" line (acc:...)
-@@ -341,8 +442,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -342,8 +443,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
        providerThinking,
        // Per-provider user overrides (custom headers / connect timeout) from settings
        providerOverrides: (chatSettings.providerOverrides || {})[provider] || null,
@@ -683,7 +683,7 @@ index 18e5a0117fcdfaf8645f4181f80fc99e5f02f317..155bb6fd9e83bb19f2aed9b2bc8d4a45
        onCredentialsRefreshed: async (newCreds) => {
          await updateProviderCredentials(credentials.connectionId, {
            ...newCreds,
-@@ -354,10 +457,23 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -355,10 +458,23 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
          await clearAccountError(credentials.connectionId, credentials, model);
          // "Consecutive" strikes: a success clears the breaker for this pair.
          clearAntigravityStrikes(credentials.connectionId, model);
@@ -707,7 +707,7 @@ index 18e5a0117fcdfaf8645f4181f80fc99e5f02f317..155bb6fd9e83bb19f2aed9b2bc8d4a45
  
      // Antigravity 409/429: refresh live quota to get exact resetAt before locking
      let quotaResetMs = null;
-@@ -382,9 +498,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -383,9 +499,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
        lastError = result.error;
        lastStatus = result.status;
        lastHeaders = upstreamResponseHeaders(result.response?.headers);
@@ -720,7 +720,7 @@ index 18e5a0117fcdfaf8645f4181f80fc99e5f02f317..155bb6fd9e83bb19f2aed9b2bc8d4a45
    }
  }
 diff --git a/src/sse/services/auth.js b/src/sse/services/auth.js
-index 035d969f74498a5e104ee84171d13bbaae1a5e31..aea5340ef2cdee7b178d0de5037b726229d5112b 100644
+index 035d969f..aea5340e 100644
 --- a/src/sse/services/auth.js
 +++ b/src/sse/services/auth.js
 @@ -2,6 +2,7 @@ import { getProviderConnections, validateApiKey, updateProviderConnection, getSe
@@ -807,7 +807,7 @@ index 035d969f74498a5e104ee84171d13bbaae1a5e31..aea5340ef2cdee7b178d0de5037b7262
        apiKey: connection.apiKey,
 diff --git a/tests/unit/account-cooldown-division.test.js b/tests/unit/account-cooldown-division.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..b28d72c0812c2da517f74c6bd4ac29a4c15ca0b5
+index 00000000..b28d72c0
 --- /dev/null
 +++ b/tests/unit/account-cooldown-division.test.js
 @@ -0,0 +1,45 @@
@@ -858,7 +858,7 @@ index 0000000000000000000000000000000000000000..b28d72c0812c2da517f74c6bd4ac29a4
 +});
 diff --git a/tests/unit/antigravity-native-disabled-functions.test.js b/tests/unit/antigravity-native-disabled-functions.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..d22374ebeccb338727831818c5e40bc74fa3368c
+index 00000000..d22374eb
 --- /dev/null
 +++ b/tests/unit/antigravity-native-disabled-functions.test.js
 @@ -0,0 +1,381 @@
@@ -1245,7 +1245,7 @@ index 0000000000000000000000000000000000000000..d22374ebeccb338727831818c5e40bc7
 +});
 diff --git a/tests/unit/antigravity-native-gemini.test.js b/tests/unit/antigravity-native-gemini.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..e631c1d54c294e983b7544b6be6d3d653c6bff10
+index 00000000..e631c1d5
 --- /dev/null
 +++ b/tests/unit/antigravity-native-gemini.test.js
 @@ -0,0 +1,738 @@
@@ -1989,7 +1989,7 @@ index 0000000000000000000000000000000000000000..e631c1d54c294e983b7544b6be6d3d65
 +});
 diff --git a/tests/unit/antigravity-native-json-output.test.js b/tests/unit/antigravity-native-json-output.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..44a7339a76d82538fa75863bc01b3558285ec3d8
+index 00000000..44a7339a
 --- /dev/null
 +++ b/tests/unit/antigravity-native-json-output.test.js
 @@ -0,0 +1,608 @@
@@ -2603,7 +2603,7 @@ index 0000000000000000000000000000000000000000..44a7339a76d82538fa75863bc01b3558
 +});
 diff --git a/tests/unit/combo-hold-deadline.test.js b/tests/unit/combo-hold-deadline.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..50cd69080e87fd1e1a05c9c4357ea7e08f254504
+index 00000000..50cd6908
 --- /dev/null
 +++ b/tests/unit/combo-hold-deadline.test.js
 @@ -0,0 +1,88 @@
@@ -2697,7 +2697,7 @@ index 0000000000000000000000000000000000000000..50cd69080e87fd1e1a05c9c4357ea7e0
 +});
 diff --git a/tests/unit/combo-transient-no-sleep.test.js b/tests/unit/combo-transient-no-sleep.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..65a79c804e6514539ba816c1bc1be5efd7780d2e
+index 00000000..65a79c80
 --- /dev/null
 +++ b/tests/unit/combo-transient-no-sleep.test.js
 @@ -0,0 +1,63 @@
@@ -2766,7 +2766,7 @@ index 0000000000000000000000000000000000000000..65a79c804e6514539ba816c1bc1be5ef
 +});
 diff --git a/tests/unit/gemini-native-entry-contract.test.js b/tests/unit/gemini-native-entry-contract.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..7cc7aba6387353ceafcc21344e2f9f7a5f73fa5d
+index 00000000..7cc7aba6
 --- /dev/null
 +++ b/tests/unit/gemini-native-entry-contract.test.js
 @@ -0,0 +1,381 @@
@@ -3152,5 +3152,5 @@ index 0000000000000000000000000000000000000000..7cc7aba6387353ceafcc21344e2f9f7a
 +  });
 +});
 -- 
-2.54.0
+2.55.0
 

@@ -1,36 +1,43 @@
-From 1aa658c1338ca342c7cb2e6793d9aa7526db3ae7 Mon Sep 17 00:00:00 2001
+From b53ebf3d87824a756075cee59b59662f0471ea0a Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:51 +0000
-Subject: [PATCH] Cloudflare AI and SystemOne provider
+Subject: [PATCH 09/18] Cloudflare AI and SystemOne provider
 
 Consolidated from the following original patches (file custody by final owner):
 
 - original #07: 0007 cloudflare-systemone
 ---
- open-sse/handlers/systemoneCore.js           | 19 +++++
+ open-sse/handlers/systemoneCore.js           | 24 ++++--
  open-sse/providers/registry/cloudflare-ai.js |  1 +
  tests/unit/systemone-core.test.js            | 83 ++++++++++++++++++++
- 3 files changed, 103 insertions(+)
+ 3 files changed, 102 insertions(+), 6 deletions(-)
  create mode 100644 tests/unit/systemone-core.test.js
 
 diff --git a/open-sse/handlers/systemoneCore.js b/open-sse/handlers/systemoneCore.js
-index e84b36adde98d979a4a87f726fa2f82c9d43b734..c9edcfe7193b30992a34fece43ee43909ee399ad 100644
+index e061ef35..2b019f93 100644
 --- a/open-sse/handlers/systemoneCore.js
 +++ b/open-sse/handlers/systemoneCore.js
-@@ -27,6 +27,9 @@ export function buildSystemoneUrl(override, cfg) {
+@@ -60,8 +60,10 @@ export function buildSystemoneUrl(override, cfg) {
+ /**
   * Core System One (Jev) handler — native decision payload pass-through.
   * URL/headers come from the registry's systemoneConfig; body and JSON response
-  * are forwarded untouched (decision models have no chat translation layer).
+- * are forwarded untouched (decision models have no chat translation layer), except that
+- * Cloudflare's { result } envelope is unwrapped.
++ * are forwarded untouched (decision models have no chat translation layer).
 + * Providers whose REST API wraps the native result in an envelope (Cloudflare
 + * /ai/run: { success, result, errors }) declare systemoneConfig.responseRoot;
 + * only that envelope is removed, the native payload itself is not changed.
   *
   * @returns {Promise<{ success: boolean, response: Response, usage?: object, status?: number, error?: string }>}
   */
-@@ -113,6 +116,22 @@ export async function handleSystemoneCore({
+@@ -149,10 +151,20 @@ export async function handleSystemoneCore({
      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
    }
  
+-  // Cloudflare's REST API wraps the answer as { result: {...}, success, errors, messages }.
+-  // Callers speak System One, so hand them the inner result like any other provider's.
+-  if (responseBody?.result?.answers && !responseBody.answers) {
+-    responseBody = responseBody.result;
 +  const responseRoot = cfg.responseRoot;
 +  if (responseRoot) {
 +    if (responseBody?.success === false) {
@@ -45,16 +52,14 @@ index e84b36adde98d979a4a87f726fa2f82c9d43b734..c9edcfe7193b30992a34fece43ee4390
 +      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid System One response from ${provider}: missing ${responseRoot}`);
 +    }
 +    responseBody = native;
-+  }
-+
-   if (onRequestSuccess) await onRequestSuccess();
+   }
  
-   const usage = responseBody?.usage;
+   if (onRequestSuccess) await onRequestSuccess();
 diff --git a/open-sse/providers/registry/cloudflare-ai.js b/open-sse/providers/registry/cloudflare-ai.js
-index d998c9243bde83d59cb347c1747f5ef02b4967a6..d1ab31a45bca51b4bd0113d27b5d07b4826d0886 100644
+index 011fe336..630528fe 100644
 --- a/open-sse/providers/registry/cloudflare-ai.js
 +++ b/open-sse/providers/registry/cloudflare-ai.js
-@@ -58,6 +58,7 @@ export default {
+@@ -56,6 +56,7 @@ export default {
      baseUrl: "https://api.cloudflare.com/client/v4/accounts/{accountId}/ai/run/{model}",
      authType: "apikey",
      authHeader: "bearer",
@@ -64,7 +69,7 @@ index d998c9243bde83d59cb347c1747f5ef02b4967a6..d1ab31a45bca51b4bd0113d27b5d07b4
  };
 diff --git a/tests/unit/systemone-core.test.js b/tests/unit/systemone-core.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..80299c612f2f848bcd828f5e3121fb4256bd9978
+index 00000000..80299c61
 --- /dev/null
 +++ b/tests/unit/systemone-core.test.js
 @@ -0,0 +1,83 @@
@@ -152,5 +157,5 @@ index 0000000000000000000000000000000000000000..80299c612f2f848bcd828f5e3121fb42
 +  });
 +});
 -- 
-2.54.0
+2.55.0
 

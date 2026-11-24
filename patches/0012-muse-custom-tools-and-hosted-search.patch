@@ -1,7 +1,7 @@
-From 445b14484cc0d41a48f1ce0a4d5577dc83627ebe Mon Sep 17 00:00:00 2001
+From 58981435aee43dc7f65588a12a19464a5f1971ea Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 10 Nov 2026 07:32:17 +0000
-Subject: [PATCH] Accept Codex custom tools and hosted search on the Muse
+Subject: [PATCH 12/18] Accept Codex custom tools and hosted search on the Muse
  Responses lane
 
 Codex declares the capabilities of the built-in OpenAI model it was
@@ -38,7 +38,7 @@ non-Muse passthrough traffic are unchanged.
  create mode 100644 tests/unit/muse-custom-tools.test.js
 
 diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
-index c3dbc3b0095bef7506530cba21944d13e7190be5..c4b5e1e2178cdf65bc2835fbeef7e04bfbf60893 100644
+index c3dbc3b0..c4b5e1e2 100644
 --- a/open-sse/handlers/chatCore/nonStreamingHandler.js
 +++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
 @@ -14,6 +14,7 @@ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, sav
@@ -59,7 +59,7 @@ index c3dbc3b0095bef7506530cba21944d13e7190be5..c4b5e1e2178cdf65bc2835fbeef7e04b
      })
    };
 diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
-index 3bcd7f813ee78c187a7e724d47976be2e166be8d..78689eff47d08a488808c00d89ba207622a6fbb6 100644
+index 3bcd7f81..78689eff 100644
 --- a/open-sse/handlers/chatCore/sseToJsonHandler.js
 +++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
 @@ -1,5 +1,6 @@
@@ -79,7 +79,7 @@ index 3bcd7f813ee78c187a7e724d47976be2e166be8d..78689eff47d08a488808c00d89ba2076
  
        // Build client-format response.
 diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
-index 094ae16f7cb74f99ee470bd9ab18a47616689c38..ca9e689095d86bcd0a2e282fbf91d3f61f26278f 100644
+index 094ae16f..ca9e6890 100644
 --- a/open-sse/handlers/chatCore/streamingHandler.js
 +++ b/open-sse/handlers/chatCore/streamingHandler.js
 @@ -46,7 +46,9 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
@@ -94,7 +94,7 @@ index 094ae16f7cb74f99ee470bd9ab18a47616689c38..ca9e689095d86bcd0a2e282fbf91d3f6
  
  /**
 diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
-index 768e305d3259a0eaf7391f3d94ced7f69f5103ed..137abd0c57eb4c1b98b6c5c3d521631312725337 100644
+index 768e305d..137abd0c 100644
 --- a/open-sse/translator/index.js
 +++ b/open-sse/translator/index.js
 @@ -3,7 +3,7 @@ import { OPENAI_TOOL_CHOICE_NONE } from "./schema/index.js";
@@ -154,7 +154,7 @@ index 768e305d3259a0eaf7391f3d94ced7f69f5103ed..137abd0c57eb4c1b98b6c5c3d5216313
    }
  
 diff --git a/open-sse/utils/museCloaking.js b/open-sse/utils/museCloaking.js
-index 28b277c8a80779ca300b123589b55648b7e87533..bcb76d949ed98543c203d171669138115fcce9bf 100644
+index 28b277c8..bcb76d94 100644
 --- a/open-sse/utils/museCloaking.js
 +++ b/open-sse/utils/museCloaking.js
 @@ -75,3 +75,251 @@ export function cloakMuseTools(body) {
@@ -410,7 +410,7 @@ index 28b277c8a80779ca300b123589b55648b7e87533..bcb76d949ed98543c203d17166913811
 +  }
 +}
 diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
-index 80914b3d41f54d53581813556a5ec6f072cbdf55..6547fbdb4ebeeece14c149f9ebd5b8198d63a5b2 100644
+index 80914b3d..6547fbdb 100644
 --- a/open-sse/utils/stream.js
 +++ b/open-sse/utils/stream.js
 @@ -11,6 +11,7 @@ import {
@@ -560,7 +560,7 @@ index 80914b3d41f54d53581813556a5ec6f072cbdf55..6547fbdb4ebeeece14c149f9ebd5b819
      body,
 diff --git a/tests/unit/muse-custom-tools.test.js b/tests/unit/muse-custom-tools.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..cd222615507cbdb54a21deaf3361551ca772faf5
+index 00000000..cd222615
 --- /dev/null
 +++ b/tests/unit/muse-custom-tools.test.js
 @@ -0,0 +1,304 @@
@@ -869,5 +869,5 @@ index 0000000000000000000000000000000000000000..cd222615507cbdb54a21deaf3361551c
 +  });
 +});
 -- 
-2.54.0
+2.55.0
 

@@ -1,8 +1,8 @@
-From f5e5783f1db76c0be05f5cd790d0e9909b9c7f3e Mon Sep 17 00:00:00 2001
+From 7481f0d42bda3a76c2db79b08ce194877046668b Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Fri, 13 Nov 2026 08:43:22 +0000
-Subject: [PATCH] Route native Gemini combos with effort suffixes and numeric
- thinkingLevel
+Subject: [PATCH 16/18] Route native Gemini combos with effort suffixes and
+ numeric thinkingLevel
 
 ---
  open-sse/services/combo.js                    |  24 ++
@@ -17,7 +17,7 @@ Subject: [PATCH] Route native Gemini combos with effort suffixes and numeric
  create mode 100644 tests/unit/gemini-native-combo-effort.test.js
 
 diff --git a/open-sse/services/combo.js b/open-sse/services/combo.js
-index b96a2efacae69609ba8bea975c7f8633b72d345d..65207b65ef9b5312e1d6ba21ecff0ef415d14c92 100644
+index b96a2efa..65207b65 100644
 --- a/open-sse/services/combo.js
 +++ b/open-sse/services/combo.js
 @@ -331,6 +331,30 @@ export function isZeroContentResponse(data) {
@@ -52,7 +52,7 @@ index b96a2efacae69609ba8bea975c7f8633b72d345d..65207b65ef9b5312e1d6ba21ecff0ef4
  }
  
 diff --git a/open-sse/services/emptyFailover.js b/open-sse/services/emptyFailover.js
-index 5e8d1646a25c8c7ea9f8b3d84f070b610ef95e17..bc5ea7b7f2d1411464fab7a2231f52395f6360d3 100644
+index 5e8d1646..bc5ea7b7 100644
 --- a/open-sse/services/emptyFailover.js
 +++ b/open-sse/services/emptyFailover.js
 @@ -108,9 +108,34 @@ function inspectResponsesEvent(obj) {
@@ -91,7 +91,7 @@ index 5e8d1646a25c8c7ea9f8b3d84f070b610ef95e17..bc5ea7b7f2d1411464fab7a2231f5239
      return parsed.type.startsWith(RESPONSES_EVENT_PREFIX) ? inspectResponsesEvent(parsed) : inspectClaudeEvent(parsed);
    }
 diff --git a/open-sse/translator/concerns/thinkingUnified.js b/open-sse/translator/concerns/thinkingUnified.js
-index 6a56daffe007fa90ae7efce130d1992f638330c8..5bb5f507c8d393b93130e4823833d2fc47674d71 100644
+index fd0d00b3..2e6de5c1 100644
 --- a/open-sse/translator/concerns/thinkingUnified.js
 +++ b/open-sse/translator/concerns/thinkingUnified.js
 @@ -47,6 +47,63 @@ export function parseSuffix(model) {
@@ -175,7 +175,7 @@ index 6a56daffe007fa90ae7efce130d1992f638330c8..5bb5f507c8d393b93130e4823833d2fc
      if (Number.isFinite(tb)) {
        if (tb === 0) return { mode: "none" };
        if (tb < 0) return { mode: "auto" };
-@@ -496,13 +556,26 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
+@@ -506,13 +566,26 @@ export function applyNativeGeminiThinking(model, body, provider, providerThinkin
    const thinkingKey = generation.thinking_config ? "thinking_config" : "thinkingConfig";
    const clientThinking = generation[thinkingKey] || {};
    const explicit = NATIVE_GEMINI_THINKING_KEYS.some(key => Object.hasOwn(clientThinking, key));
@@ -209,7 +209,7 @@ index 6a56daffe007fa90ae7efce130d1992f638330c8..5bb5f507c8d393b93130e4823833d2fc
    // Reuse the capability-aware mapping, without its translated-request output
    // floor or its replacement of client-native options such as includeThoughts.
 diff --git a/src/app/api/v1beta/models/[...path]/route.js b/src/app/api/v1beta/models/[...path]/route.js
-index 203cac04e63d956d62bfb526eed69ea45915f6ea..c893640ddc523d564e38eec4eb13347497dc9156 100644
+index 203cac04..c893640d 100644
 --- a/src/app/api/v1beta/models/[...path]/route.js
 +++ b/src/app/api/v1beta/models/[...path]/route.js
 @@ -29,6 +29,30 @@ async function ensureInitialized() {
@@ -254,7 +254,7 @@ index 203cac04e63d956d62bfb526eed69ea45915f6ea..c893640ddc523d564e38eec4eb133474
      // Keep the native request intact. The shared handler selects translation
      // only when the chosen provider speaks a different wire format.
 diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
-index 155bb6fd9e83bb19f2aed9b2bc8d4a458f29c238..6e671017af257b88346f906db8ad92948f791f75 100644
+index 56036a4c..9bec6ace 100644
 --- a/src/sse/handlers/chat.js
 +++ b/src/sse/handlers/chat.js
 @@ -78,6 +78,7 @@ async function responseErrorForClient(response, options, fallbackMessage = "Requ
@@ -462,7 +462,7 @@ index 155bb6fd9e83bb19f2aed9b2bc8d4a458f29c238..6e671017af257b88346f906db8ad9294
      log.warn("CHAT", "Invalid model format", { model: modelStr });
      return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Invalid model format", options);
 diff --git a/src/sse/services/keyAccess.js b/src/sse/services/keyAccess.js
-index 6de0e3219730d8d92ca329df641ddcd1865648f7..5643f494ab488742aa40463450dcfc4c1a30f660 100644
+index 6de0e321..5643f494 100644
 --- a/src/sse/services/keyAccess.js
 +++ b/src/sse/services/keyAccess.js
 @@ -26,6 +26,7 @@ import { getApiKeyByKey } from "@/lib/db/repos/apiKeysRepo.js";
@@ -514,7 +514,7 @@ index 6de0e3219730d8d92ca329df641ddcd1865648f7..5643f494ab488742aa40463450dcfc4c
  
  /**
 diff --git a/src/sse/services/model.js b/src/sse/services/model.js
-index 5dd25fe6c5a19a4118ff3ff347dd92709823527f..81d33b929372f6011f17067eec47909567462823 100644
+index 5dd25fe6..81d33b92 100644
 --- a/src/sse/services/model.js
 +++ b/src/sse/services/model.js
 @@ -1,6 +1,7 @@
@@ -572,7 +572,7 @@ index 5dd25fe6c5a19a4118ff3ff347dd92709823527f..81d33b929372f6011f17067eec479095
    }
 diff --git a/tests/unit/gemini-native-combo-effort.test.js b/tests/unit/gemini-native-combo-effort.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..a388b6c34db2d0710a138b13796b0798e26aa9a6
+index 00000000..a388b6c3
 --- /dev/null
 +++ b/tests/unit/gemini-native-combo-effort.test.js
 @@ -0,0 +1,390 @@
@@ -967,5 +967,5 @@ index 0000000000000000000000000000000000000000..a388b6c34db2d0710a138b13796b0798
 +  });
 +});
 -- 
-2.54.0
+2.55.0
 

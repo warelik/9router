@@ -1,7 +1,7 @@
-From 607596401dafa1208fcfedabcfdcfa6ff7e23851 Mon Sep 17 00:00:00 2001
+From f52df954d2ad87fe73882d825088fc6c75ed1725 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:35 +0000
-Subject: [PATCH] Codex Responses compatibility and stream lifecycle
+Subject: [PATCH 06/18] Codex Responses compatibility and stream lifecycle
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -29,7 +29,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/responses-output-index.test.js
 
 diff --git a/open-sse/executors/codex.js b/open-sse/executors/codex.js
-index f637307e4705cc3d407898fe5eb4f89dd66c27c0..b1335a9423b64ae688ad471d09f0588f2d7630d4 100644
+index f637307e..b1335a94 100644
 --- a/open-sse/executors/codex.js
 +++ b/open-sse/executors/codex.js
 @@ -1,4 +1,5 @@
@@ -248,7 +248,7 @@ index f637307e4705cc3d407898fe5eb4f89dd66c27c0..b1335a9423b64ae688ad471d09f0588f
          input.unshift(...prefix);
        }
 diff --git a/open-sse/translator/response/claude-to-openai.js b/open-sse/translator/response/claude-to-openai.js
-index 42a82a6670d6d0d826bca04648ab57eba3ffe2a8..3e0906e1eeada9f134ffb925a210ef92517dd359 100644
+index 42a82a66..3e0906e1 100644
 --- a/open-sse/translator/response/claude-to-openai.js
 +++ b/open-sse/translator/response/claude-to-openai.js
 @@ -5,6 +5,7 @@ import { buildChunk } from "../concerns/chunk.js";
@@ -269,7 +269,7 @@ index 42a82a6670d6d0d826bca04648ab57eba3ffe2a8..3e0906e1eeada9f134ffb925a210ef92
            index: toolCallIndex,
            id: block.id,
 diff --git a/open-sse/translator/response/kiro-to-openai.js b/open-sse/translator/response/kiro-to-openai.js
-index 8e713fd75c5519319022109ffd70c6a20efe4171..c0f2f7cfd91c1bdf9b923f5babbacd66981bd25d 100644
+index 8e713fd7..c0f2f7cf 100644
 --- a/open-sse/translator/response/kiro-to-openai.js
 +++ b/open-sse/translator/response/kiro-to-openai.js
 @@ -10,6 +10,7 @@ import { toOpenAIUsage } from "../concerns/usage.js";
@@ -290,7 +290,7 @@ index 8e713fd75c5519319022109ffd70c6a20efe4171..c0f2f7cfd91c1bdf9b923f5babbacd66
  
  export function kiroToOpenAIResponse(chunk, state) {
 diff --git a/open-sse/translator/response/openai-to-antigravity.js b/open-sse/translator/response/openai-to-antigravity.js
-index 506f8e5ce30467da85f852ba2486fa04ac4042b1..a9e11c2707e36b71c66327f9d724a69a4d0ea096 100644
+index 506f8e5c..a9e11c27 100644
 --- a/open-sse/translator/response/openai-to-antigravity.js
 +++ b/open-sse/translator/response/openai-to-antigravity.js
 @@ -1,6 +1,7 @@
@@ -311,7 +311,7 @@ index 506f8e5ce30467da85f852ba2486fa04ac4042b1..a9e11c2707e36b71c66327f9d724a69a
          functionCall: {
            name: originalName,
 diff --git a/open-sse/utils/streamHandler.js b/open-sse/utils/streamHandler.js
-index fce017062f4d7ba15a23fedd32a5e95868153f38..35f2cb6895135536fc8fee720d68a760d0108495 100644
+index fce01706..35f2cb68 100644
 --- a/open-sse/utils/streamHandler.js
 +++ b/open-sse/utils/streamHandler.js
 @@ -15,11 +15,23 @@ function getTimeString() {
@@ -473,7 +473,7 @@ index fce017062f4d7ba15a23fedd32a5e95868153f38..35f2cb6895135536fc8fee720d68a760
  }
 -
 diff --git a/tests/translator/thinking-unified.test.js b/tests/translator/thinking-unified.test.js
-index f59e2bfd12050b1797c6462e7ad6123da2b3ec28..eab7725ade06df05109206d167c00d42dd47108f 100644
+index f59e2bfd..eab7725a 100644
 --- a/tests/translator/thinking-unified.test.js
 +++ b/tests/translator/thinking-unified.test.js
 @@ -5,7 +5,9 @@ import {
@@ -507,7 +507,7 @@ index f59e2bfd12050b1797c6462e7ad6123da2b3ec28..eab7725ade06df05109206d167c00d42
 +});
 diff --git a/tests/unit/codex-legacy-item-ids.test.js b/tests/unit/codex-legacy-item-ids.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..46510c3ce854bf85398ee159ea3939be09e91970
+index 00000000..46510c3c
 --- /dev/null
 +++ b/tests/unit/codex-legacy-item-ids.test.js
 @@ -0,0 +1,58 @@
@@ -571,7 +571,7 @@ index 0000000000000000000000000000000000000000..46510c3ce854bf85398ee159ea3939be
 +});
 diff --git a/tests/unit/codex-sse-error-before-output.test.js b/tests/unit/codex-sse-error-before-output.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..ec622c6398ea6bc007f8874354c57c50698ec8d9
+index 00000000..ec622c63
 --- /dev/null
 +++ b/tests/unit/codex-sse-error-before-output.test.js
 @@ -0,0 +1,148 @@
@@ -725,7 +725,7 @@ index 0000000000000000000000000000000000000000..ec622c6398ea6bc007f8874354c57c50
 +});
 diff --git a/tests/unit/kiro-namespace-descriptors.test.js b/tests/unit/kiro-namespace-descriptors.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..a7104c887b73346993c94d299c94c9bf4b3c3b50
+index 00000000..a7104c88
 --- /dev/null
 +++ b/tests/unit/kiro-namespace-descriptors.test.js
 @@ -0,0 +1,40 @@
@@ -771,7 +771,7 @@ index 0000000000000000000000000000000000000000..a7104c887b73346993c94d299c94c9bf
 +});
 diff --git a/tests/unit/openai-responses-incomplete.test.js b/tests/unit/openai-responses-incomplete.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..7a7a2bd9c2b8d9dd72280025709e196a00d5abec
+index 00000000..7a7a2bd9
 --- /dev/null
 +++ b/tests/unit/openai-responses-incomplete.test.js
 @@ -0,0 +1,67 @@
@@ -844,7 +844,7 @@ index 0000000000000000000000000000000000000000..7a7a2bd9c2b8d9dd72280025709e196a
 +});
 diff --git a/tests/unit/responses-output-index.test.js b/tests/unit/responses-output-index.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..f5b8bfdb131776010992c3af8da7a45a11e8dcf3
+index 00000000..f5b8bfdb
 --- /dev/null
 +++ b/tests/unit/responses-output-index.test.js
 @@ -0,0 +1,78 @@
@@ -927,5 +927,5 @@ index 0000000000000000000000000000000000000000..f5b8bfdb131776010992c3af8da7a45a
 +  });
 +});
 -- 
-2.54.0
+2.55.0
 

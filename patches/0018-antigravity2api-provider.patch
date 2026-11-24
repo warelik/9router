@@ -1,7 +1,7 @@
-From 57ec06f70f34b1bf37580bc5c68e2f6266dce0c7 Mon Sep 17 00:00:00 2001
+From 93e3024199a5be7d543395f6bc788924b9bba259 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 17 Nov 2026 06:04:43 +0000
-Subject: [PATCH] Add Antigravity2API provider
+Subject: [PATCH 18/18] Add Antigravity2API provider
 
 ---
  open-sse/handlers/chatCore.js                 |   2 +-
@@ -19,10 +19,10 @@ Subject: [PATCH] Add Antigravity2API provider
  create mode 100644 tests/unit/antigravity2api-provider.test.js
 
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index 69745fee..85d380dc 100644
+index 6453ed66..ceecf88a 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
-@@ -226,7 +226,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+@@ -227,7 +227,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
        headers: clientRawRequest?.headers || {},
        // Client and provider versions are separate routing decisions. The
        // local browser-authenticated Gemini bridges use their beta wire.
@@ -76,7 +76,7 @@ index 00000000..b05eb6ba
 +  passthroughModels: true,
 +};
 diff --git a/open-sse/providers/registry/index.js b/open-sse/providers/registry/index.js
-index 74e85e6d..846380e0 100644
+index c4d4eff1..9cb60ca0 100644
 --- a/open-sse/providers/registry/index.js
 +++ b/open-sse/providers/registry/index.js
 @@ -141,6 +141,7 @@ import p137 from "./bedrock-xai.js";
@@ -87,7 +87,7 @@ index 74e85e6d..846380e0 100644
  import p140 from "./deepseek-web.js";
  import p143 from "./gemini-web.js";
  import p144 from "./muse-web.js";
-@@ -292,6 +293,7 @@ export default [
+@@ -295,6 +296,7 @@ export default [
    p138,
    pAistudio,
    pGeminiWeb2Api,
@@ -96,10 +96,10 @@ index 74e85e6d..846380e0 100644
    p143,
    p144,
 diff --git a/src/app/api/providers/[id]/models/route.js b/src/app/api/providers/[id]/models/route.js
-index 5f3866c7..44e7670a 100644
+index c218c5d7..fb947bac 100644
 --- a/src/app/api/providers/[id]/models/route.js
 +++ b/src/app/api/providers/[id]/models/route.js
-@@ -192,6 +192,12 @@ const PROVIDER_MODELS_CONFIG = {
+@@ -224,6 +224,12 @@ const PROVIDER_MODELS_CONFIG = {
        proxyOptions: await resolveConnectionProxyConfig(connection.providerSpecificData || {}),
      }),
    },
@@ -113,10 +113,10 @@ index 5f3866c7..44e7670a 100644
      url: "https://api.meta.ai/v1/models",
      method: "GET",
 diff --git a/src/app/api/providers/[id]/test/testUtils.js b/src/app/api/providers/[id]/test/testUtils.js
-index 8a4d2298..6eff1c88 100644
+index 7be19279..cf2dfe74 100644
 --- a/src/app/api/providers/[id]/test/testUtils.js
 +++ b/src/app/api/providers/[id]/test/testUtils.js
-@@ -803,6 +803,7 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
+@@ -805,6 +805,7 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
        case "bai":
        case "aistudio":
        case "gemini-web2api":
@@ -125,7 +125,7 @@ index 8a4d2298..6eff1c88 100644
        case "runcrate":
        case "synthetic": {
 diff --git a/src/app/api/providers/validate/route.js b/src/app/api/providers/validate/route.js
-index 8d8940c1..399ed250 100644
+index 242a4fa6..f9899f3b 100644
 --- a/src/app/api/providers/validate/route.js
 +++ b/src/app/api/providers/validate/route.js
 @@ -400,6 +400,7 @@ export async function POST(request) {
@@ -137,10 +137,10 @@ index 8d8940c1..399ed250 100644
          case "groq":
          case "xai":
 diff --git a/src/app/api/v1/models/route.js b/src/app/api/v1/models/route.js
-index 13d89957..f27b74da 100644
+index f3b0ed84..14dc0e97 100644
 --- a/src/app/api/v1/models/route.js
 +++ b/src/app/api/v1/models/route.js
-@@ -79,6 +79,13 @@ const LIVE_MODEL_RESOLVERS = {
+@@ -115,6 +115,13 @@ const LIVE_MODEL_RESOLVERS = {
      });
      return result?.models?.length ? { models: result.models } : null;
    },
@@ -167,7 +167,7 @@ index 4a26a7a2..286cb74c 100644
  };
  
 diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
-index 6bdd133d..eed8b1c4 100644
+index b7a87d68..9faeb80c 100644
 --- a/tests/translator/golden-url-header.test.js
 +++ b/tests/translator/golden-url-header.test.js
 @@ -22,7 +22,7 @@ const SPECIALIZED = new Set([

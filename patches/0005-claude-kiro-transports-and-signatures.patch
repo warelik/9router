@@ -1,7 +1,8 @@
-From 0626c01f88256de001fb88ee7056bda17d1cc190 Mon Sep 17 00:00:00 2001
+From 614bb0d2dd9e1dbdbc83585673087d5fdff76687 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:31 +0000
-Subject: [PATCH] Claude and Kiro transports, thinking streams and signatures
+Subject: [PATCH 05/18] Claude and Kiro transports, thinking streams and
+ signatures
 
 Consolidated from the following original patches (file custody by final owner):
 
@@ -28,7 +29,7 @@ Consolidated from the following original patches (file custody by final owner):
  create mode 100644 tests/unit/claude-signature-versioned-form.test.js
 
 diff --git a/open-sse/translator/formats/claude.js b/open-sse/translator/formats/claude.js
-index 1ca50c81c655ff984c4f663a9e77cff925849bab..da82ae38e7d19b1a4d2935b75a8cc70d55eb1157 100644
+index 1ca50c81..da82ae38 100644
 --- a/open-sse/translator/formats/claude.js
 +++ b/open-sse/translator/formats/claude.js
 @@ -4,7 +4,7 @@ import { ROLE, CLAUDE_BLOCK } from "../schema/index.js";
@@ -67,7 +68,7 @@ index 1ca50c81c655ff984c4f663a9e77cff925849bab..da82ae38e7d19b1a4d2935b75a8cc70d
                } else if (deepSeekServed) {
                  hasKeptThinking = true;
 diff --git a/open-sse/translator/response/kiro-to-claude.js b/open-sse/translator/response/kiro-to-claude.js
-index d9fc0aab5cbc381d295cca6ca8f3e4fdcf0f79ad..40d9919fd78af252ec76dd545dfd9ff57b4e29ab 100644
+index d9fc0aab..40d9919f 100644
 --- a/open-sse/translator/response/kiro-to-claude.js
 +++ b/open-sse/translator/response/kiro-to-claude.js
 @@ -15,17 +15,49 @@
@@ -233,10 +234,10 @@ index d9fc0aab5cbc381d295cca6ca8f3e4fdcf0f79ad..40d9919fd78af252ec76dd545dfd9ff5
      state.finishReason = choice.finish_reason;
      const finalUsage = state.usage || { input_tokens: 0, output_tokens: 0 };
 diff --git a/open-sse/translator/response/openai-to-claude.js b/open-sse/translator/response/openai-to-claude.js
-index 3998cc8454053d5ec667873ed65c8ab455f36d51..257d162eef702021cb9a0fe3e6f14b11019c5e93 100644
+index 4d96fb92..7efb1cf9 100644
 --- a/open-sse/translator/response/openai-to-claude.js
 +++ b/open-sse/translator/response/openai-to-claude.js
-@@ -46,10 +46,46 @@ function isValidPdfPagesArg(filePath, pages) {
+@@ -47,10 +47,46 @@ function isValidPdfPagesArg(filePath, pages) {
      /^\d+(?:-\d+)?$/.test(pages);
  }
  
@@ -284,7 +285,7 @@ index 3998cc8454053d5ec667873ed65c8ab455f36d51..257d162eef702021cb9a0fe3e6f14b11
      type: "content_block_stop",
      index: state.thinkingBlockIndex
    });
-@@ -60,7 +96,7 @@ function stopThinkingBlock(state, results) {
+@@ -61,7 +97,7 @@ function stopThinkingBlock(state, results) {
  function stopTextBlock(state, results) {
    if (!state.textBlockStarted || state.textBlockClosed) return;
    state.textBlockClosed = true;
@@ -293,7 +294,7 @@ index 3998cc8454053d5ec667873ed65c8ab455f36d51..257d162eef702021cb9a0fe3e6f14b11
      type: "content_block_stop",
      index: state.textBlockIndex
    });
-@@ -143,14 +179,14 @@ export function openaiToClaudeResponse(chunk, state) {
+@@ -144,14 +180,14 @@ export function openaiToClaudeResponse(chunk, state) {
      if (!state.thinkingBlockStarted) {
        state.thinkingBlockIndex = state.nextBlockIndex++;
        state.thinkingBlockStarted = true;
@@ -310,7 +311,7 @@ index 3998cc8454053d5ec667873ed65c8ab455f36d51..257d162eef702021cb9a0fe3e6f14b11
        type: "content_block_delta",
        index: state.thinkingBlockIndex,
        delta: { type: "thinking_delta", thinking: reasoningContent }
-@@ -165,14 +201,14 @@ export function openaiToClaudeResponse(chunk, state) {
+@@ -167,14 +203,14 @@ export function openaiToClaudeResponse(chunk, state) {
        state.textBlockIndex = state.nextBlockIndex++;
        state.textBlockStarted = true;
        state.textBlockClosed = false;
@@ -326,8 +327,8 @@ index 3998cc8454053d5ec667873ed65c8ab455f36d51..257d162eef702021cb9a0fe3e6f14b11
 +    emitBlock(state, results, {
        type: "content_block_delta",
        index: state.textBlockIndex,
-       delta: { type: "text_delta", text: delta.content }
-@@ -191,23 +227,16 @@ export function openaiToClaudeResponse(chunk, state) {
+       delta: { type: "text_delta", text: textContent }
+@@ -193,23 +229,16 @@ export function openaiToClaudeResponse(chunk, state) {
  
          const toolBlockIndex = state.nextBlockIndex++;
          state.toolCalls.set(idx, { id: tc.id, name: tc.function?.name || "", blockIndex: toolBlockIndex });
@@ -360,7 +361,7 @@ index 3998cc8454053d5ec667873ed65c8ab455f36d51..257d162eef702021cb9a0fe3e6f14b11
        }
  
        if (tc.function?.arguments) {
-@@ -226,22 +255,20 @@ export function openaiToClaudeResponse(chunk, state) {
+@@ -228,22 +257,20 @@ export function openaiToClaudeResponse(chunk, state) {
      stopThinkingBlock(state, results);
      stopTextBlock(state, results);
  
@@ -396,7 +397,7 @@ index 3998cc8454053d5ec667873ed65c8ab455f36d51..257d162eef702021cb9a0fe3e6f14b11
      // Mark finish for later usage injection in stream.js
      state.finishReason = choice.finish_reason;
 diff --git a/open-sse/utils/claudeCloaking.js b/open-sse/utils/claudeCloaking.js
-index 0f535bd3ea4d1ff61de49b12e5d192ee558f67f2..106118fd61f43d4b0ec2b063b605054c1749e243 100644
+index 0f535bd3..106118fd 100644
 --- a/open-sse/utils/claudeCloaking.js
 +++ b/open-sse/utils/claudeCloaking.js
 @@ -1,5 +1,6 @@
@@ -426,7 +427,7 @@ index 0f535bd3ea4d1ff61de49b12e5d192ee558f67f2..106118fd61f43d4b0ec2b063b605054c
    return { ...chunk, content_block: { ...block, name: original } };
  }
 diff --git a/open-sse/utils/claudeSignature.js b/open-sse/utils/claudeSignature.js
-index 1a18696722ff31b263af9d7cc7f6c42057521686..17b9cd08bd3b339c03baa4bf8caa5bf0861149d9 100644
+index 1a186967..17b9cd08 100644
 --- a/open-sse/utils/claudeSignature.js
 +++ b/open-sse/utils/claudeSignature.js
 @@ -1,41 +1,117 @@
@@ -566,7 +567,7 @@ index 1a18696722ff31b263af9d7cc7f6c42057521686..17b9cd08bd3b339c03baa4bf8caa5bf0
 +}
 diff --git a/tests/translator/claude-adaptive-display.test.js b/tests/translator/claude-adaptive-display.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..390c3f9ab7a9a3f106d04ccd932ec3ee79a65fae
+index 00000000..390c3f9a
 --- /dev/null
 +++ b/tests/translator/claude-adaptive-display.test.js
 @@ -0,0 +1,70 @@
@@ -642,7 +643,7 @@ index 0000000000000000000000000000000000000000..390c3f9ab7a9a3f106d04ccd932ec3ee
 +});
 diff --git a/tests/translator/parallel-tool-blocks-sequential.test.js b/tests/translator/parallel-tool-blocks-sequential.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..4345f3ecd85981ed47df9f1e5b1f174379cf2b75
+index 00000000..4345f3ec
 --- /dev/null
 +++ b/tests/translator/parallel-tool-blocks-sequential.test.js
 @@ -0,0 +1,136 @@
@@ -784,7 +785,7 @@ index 0000000000000000000000000000000000000000..4345f3ecd85981ed47df9f1e5b1f1743
 +});
 diff --git a/tests/unit/claude-same-format-stream.test.js b/tests/unit/claude-same-format-stream.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..eb42c44ad9858e0a7497a97e9ddafc4d1f90f692
+index 00000000..eb42c44a
 --- /dev/null
 +++ b/tests/unit/claude-same-format-stream.test.js
 @@ -0,0 +1,217 @@
@@ -1007,7 +1008,7 @@ index 0000000000000000000000000000000000000000..eb42c44ad9858e0a7497a97e9ddafc4d
 +});
 diff --git a/tests/unit/claude-signature-foreign-opaque.test.js b/tests/unit/claude-signature-foreign-opaque.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..9717158f63a9dd3979f0f68d23d204967faba132
+index 00000000..9717158f
 --- /dev/null
 +++ b/tests/unit/claude-signature-foreign-opaque.test.js
 @@ -0,0 +1,69 @@
@@ -1082,7 +1083,7 @@ index 0000000000000000000000000000000000000000..9717158f63a9dd3979f0f68d23d20496
 +});
 diff --git a/tests/unit/claude-signature-versioned-form.test.js b/tests/unit/claude-signature-versioned-form.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..ab81dbc76f06ae146616f33ef3d1ac5b045c7853
+index 00000000..ab81dbc7
 --- /dev/null
 +++ b/tests/unit/claude-signature-versioned-form.test.js
 @@ -0,0 +1,138 @@
@@ -1225,5 +1226,5 @@ index 0000000000000000000000000000000000000000..ab81dbc76f06ae146616f33ef3d1ac5b
 +  });
 +});
 -- 
-2.54.0
+2.55.0
 
