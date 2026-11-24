@@ -1,4 +1,4 @@
-From f52df954d2ad87fe73882d825088fc6c75ed1725 Mon Sep 17 00:00:00 2001
+From 7240dc8fc0b1131ea5f7e28ee044243b62220313 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:35 +0000
 Subject: [PATCH 06/18] Codex Responses compatibility and stream lifecycle

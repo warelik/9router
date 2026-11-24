@@ -1,4 +1,4 @@
-From 5a9de9c842b88b715f55c99b8ce906ffb70f19bc Mon Sep 17 00:00:00 2001
+From abc1ad7265d1abea5641397db680d41d02429b55 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 10 Nov 2026 08:24:09 +0000
 Subject: [PATCH 14/18] Split Meta's flattened namespace calls back for

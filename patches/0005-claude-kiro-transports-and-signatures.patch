@@ -1,4 +1,4 @@
-From 614bb0d2dd9e1dbdbc83585673087d5fdff76687 Mon Sep 17 00:00:00 2001
+From 68c5a4b88222cd7be105ada6e08b8a517990eaff Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:31 +0000
 Subject: [PATCH 05/18] Claude and Kiro transports, thinking streams and

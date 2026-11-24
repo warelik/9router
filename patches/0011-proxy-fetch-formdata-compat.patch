@@ -1,4 +1,4 @@
-From 42d6b789739d4867d4058804ee61553a96f2b4f8 Mon Sep 17 00:00:00 2001
+From 622ea37db37c6016df8a82999d96ffc2492f20b4 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Mon, 9 Nov 2026 10:10:45 +0000
 Subject: [PATCH 11/18] Fix multipart uploads through the bundled Undici proxy

@@ -1,4 +1,4 @@
-From 54a65829ba827370d407d6c5cbef8c04a01d760b Mon Sep 17 00:00:00 2001
+From b4e1b32139a2eca00240024d56b0f10e1d9f7092 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 10 Nov 2026 08:53:37 +0000
 Subject: [PATCH 15/18] Route bare namespace calls and plaintext subagent tasks

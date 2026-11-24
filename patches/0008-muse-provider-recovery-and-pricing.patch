@@ -1,4 +1,4 @@
-From 3461b091f9140954ff8d762d4543fe197b3bc382 Mon Sep 17 00:00:00 2001
+From 12b1063b00bd1ab1ab56bbca8137e5c8dd281ad8 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:46 +0000
 Subject: [PATCH 08/18] Muse provider: cloaking, reasoning recovery and pricing

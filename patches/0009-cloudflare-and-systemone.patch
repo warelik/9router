@@ -1,4 +1,4 @@
-From b53ebf3d87824a756075cee59b59662f0471ea0a Mon Sep 17 00:00:00 2001
+From a985814070cc965920d828cd295a7cd2f11e10b9 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:51 +0000
 Subject: [PATCH 09/18] Cloudflare AI and SystemOne provider

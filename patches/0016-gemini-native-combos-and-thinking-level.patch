@@ -1,4 +1,4 @@
-From 40cfbd9f73c61511db6dd15479413146e9db3911 Mon Sep 17 00:00:00 2001
+From 1006d03f4e53e94892c266d6fc93a839594efada Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Fri, 13 Nov 2026 08:43:22 +0000
 Subject: [PATCH 16/18] Route native Gemini combos with effort suffixes and

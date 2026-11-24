@@ -1,4 +1,4 @@
-From 58981435aee43dc7f65588a12a19464a5f1971ea Mon Sep 17 00:00:00 2001
+From d6ebeace146797ad2315499dd74ca9dcbf929077 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Tue, 10 Nov 2026 07:32:17 +0000
 Subject: [PATCH 12/18] Accept Codex custom tools and hosted search on the Muse

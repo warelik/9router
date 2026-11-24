@@ -1,4 +1,4 @@
-From 5f8ee2054ede3cd49ebebefb0677166b14e43475 Mon Sep 17 00:00:00 2001
+From 8b97da9b6e62dab6486a8bd145e2d488ead735b8 Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sat, 7 Nov 2026 17:42:21 +0000
 Subject: [PATCH 02/18] Centralize shared protocol schema and runtime

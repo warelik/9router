@@ -1,4 +1,4 @@
-From 70dab86cd3e2afd85caa9de01b07b751370ffe28 Mon Sep 17 00:00:00 2001
+From 26b6f7ba30043c57f2a5116c5b8154bbd822855c Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
 Date: Sun, 8 Nov 2026 19:08:27 +0000
 Subject: [PATCH 10/18] Recover Muse foreign reasoning past the first retry

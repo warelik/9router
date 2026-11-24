@@ -1,4 +1,4 @@
-From dbe211403e0713db8b8aca5f7a7efd83878b37e1 Mon Sep 17 00:00:00 2001
+From 792f05b03aec9cfa208ce8650ab0d4f4842a9acc Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Sun, 15 Nov 2026 17:18:28 +0000
 Subject: [PATCH 17/18] Add Gemini-Web2API provider and refresh AIStudio2API
