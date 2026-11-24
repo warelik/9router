@@ -1,4 +1,4 @@
-From 7481f0d42bda3a76c2db79b08ce194877046668b Mon Sep 17 00:00:00 2001
+From 40cfbd9f73c61511db6dd15479413146e9db3911 Mon Sep 17 00:00:00 2001
 From: warelik <warelik@gmail.com>
 Date: Fri, 13 Nov 2026 08:43:22 +0000
 Subject: [PATCH 16/18] Route native Gemini combos with effort suffixes and
@@ -572,7 +572,7 @@ index 5dd25fe6..81d33b92 100644
    }
 diff --git a/tests/unit/gemini-native-combo-effort.test.js b/tests/unit/gemini-native-combo-effort.test.js
 new file mode 100644
-index 00000000..a388b6c3
+index 00000000..680f2667
 --- /dev/null
 +++ b/tests/unit/gemini-native-combo-effort.test.js
 @@ -0,0 +1,390 @@
@@ -849,7 +849,7 @@ index 00000000..a388b6c3
 +
 +  it("applyNativeGeminiThinking normalizes numeric 5 to HIGH for gemini-4 and never leaks the number", () => {
 +    const out = thinkingUnified.applyNativeGeminiThinking(
-+      "gemini-4-hydrogen-xhigh",
++      "gemini-4-carbon-high",
 +      { generationConfig: { thinkingConfig: { thinkingLevel: 5, includeThoughts: true } } },
 +      "antigravity", null);
 +    expect(out.generationConfig.thinkingConfig.thinkingLevel).toBe("HIGH");
@@ -908,7 +908,7 @@ index 00000000..a388b6c3
 +    expect(services.handleChatCore.mock.calls[0][0].sourceFormatOverride).toBe("gemini");
 +  });
 +
-+  it(".gemini-hydrogen(xhigh) with numeric thinkingLevel 5 maps to HIGH", async () => {
++  it(".gemini-hydrogen(xhigh) with numeric thinkingLevel 5 maps to XHIGH", async () => {
 +    network.mockImplementation(async () => new Response(
 +      sseFrame({ response: nativeChunk("hydrogen-ok") }),
 +      { headers: { "Content-Type": "text/event-stream" } }));
@@ -919,7 +919,7 @@ index 00000000..a388b6c3
 +    expect(await response.text()).toContain("hydrogen-ok");
 +    const wire = wireRequest();
 +    expect(wire.model).toBe("gemini-4-hydrogen-xhigh");
-+    expect(wire.request.generationConfig.thinkingConfig.thinkingLevel).toBe("HIGH");
++    expect(wire.request.generationConfig.thinkingConfig.thinkingLevel).toBe("XHIGH");
 +  });
 +
 +  it(".gemini-flash-lite(high) does not call the second member after a content frame", async () => {
