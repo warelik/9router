@@ -140,6 +140,8 @@ import p136 from "./bedrock.js";
 import p137 from "./bedrock-xai.js";
 import p138 from "./nous.js";
 import pAistudio from "./aistudio.js";
+import pGeminiWeb2Api from "./gemini-web2api.js";
+import pAntigravity2Api from "./antigravity2api.js";
 import p140 from "./deepseek-web.js";
 import p143 from "./gemini-web.js";
 import p144 from "./muse-web.js";
@@ -293,6 +295,8 @@ export default [
   p137,
   p138,
   pAistudio,
+  pGeminiWeb2Api,
+  pAntigravity2Api,
   p140,
   p143,
   p144,

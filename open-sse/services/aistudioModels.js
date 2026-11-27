@@ -8,7 +8,12 @@ export async function resolveAIStudioModels(credentials, options = {}) {
   if (!apiKey) {
     return { error: "No valid token found", status: HTTP_STATUS.UNAUTHORIZED };
   }
-  const res = await proxyAwareFetch(PROVIDERS.aistudio.validateUrl, {
+  const providerId = options.provider || credentials?.provider || "aistudio";
+  const validateUrl = PROVIDERS[providerId]?.validateUrl;
+  if (!validateUrl) {
+    return { error: `Unknown bridge provider: ${providerId}`, status: HTTP_STATUS.BAD_REQUEST };
+  }
+  const res = await proxyAwareFetch(validateUrl, {
     headers: {
       "Authorization": `Bearer ${apiKey}`,
       "Accept": "application/json",

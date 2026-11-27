@@ -399,6 +399,8 @@ export async function POST(request) {
         }
 
         case "aistudio":
+        case "gemini-web2api":
+        case "antigravity2api":
         case "deepseek":
         case "groq":
         case "xai":
