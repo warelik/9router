@@ -239,9 +239,13 @@ describe("Muse custom tool restore (non-streaming)", () => {
 });
 
 const frame = event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
-const parseEvents = wire => wire.split("\n")
-  .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
-  .map(line => JSON.parse(line.slice(6)));
+const parseEvents = wire => wire.split(/\r?\n\r?\n/)
+  .flatMap(frame => {
+    const data = frame.split(/\r?\n/)
+      .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
+      .map(line => line.slice(6));
+    return data.length ? [JSON.parse(data.join("\n"))] : [];
+  });
 
 function customStreamEvents() {
   const item = providerItem("apply_patch_muse");

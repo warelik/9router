@@ -452,7 +452,7 @@ export function createSSEStream(options = {}) {
                   pendingPassthroughEventLine = null;
                   for (const convertedEvent of convertedEvents) {
                     const restoredEvent = toolNameMap?.size ? restoreToolNames(convertedEvent, toolNameMap) : convertedEvent;
-                    const framed = `${hadEventLine ? `event: ${restoredEvent.type}\n` : ""}data: ${JSON.stringify(restoredEvent)}\n`;
+                    const framed = `${hadEventLine ? `event: ${restoredEvent.type}\n` : ""}data: ${JSON.stringify(restoredEvent)}\n\n`;
                     reqLogger?.appendConvertedChunk?.(framed);
                     controller.enqueue(sharedEncoder.encode(framed));
                   }
