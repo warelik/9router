@@ -12,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
 import { PROVIDERS } from "../config/providers.js";
 import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
 import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
-import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET, REWRITTEN_RESPONSE_HEADERS, AISTUDIO_NATIVE_GEMINI_API_VERSION, NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES, NATIVE_GEMINI_FIELD_MASK_HEADER_NAME } from "../config/runtimeConfig.js";
+import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET, REWRITTEN_RESPONSE_HEADERS, AISTUDIO_NATIVE_GEMINI_API_VERSION } from "../config/runtimeConfig.js";
 import { handleBypassRequest } from "../utils/bypassHandler.js";
 import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { getExecutor } from "../executors/index.js";
@@ -37,6 +37,7 @@ import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseCodeSubscription } from "../utils/museCloaking.js";
+import { getNativeGeminiResponseProjection } from "../utils/streamHelpers.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -129,16 +130,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const nativeGemini = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
   // A response projection can intentionally hide the native completion field.
   // Keep this metadata out of the provider body and cache prefix.
-  const nativeResponseProjection = nativeGemini ? {
-    masks: [
-      ...(clientRawRequest?.queryParams || [])
-        .filter(([name]) => NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.includes(name))
-        .map(([, value]) => value),
-      ...Object.entries(clientRawRequest?.headers || {})
-        .filter(([name]) => name.toLowerCase() === NATIVE_GEMINI_FIELD_MASK_HEADER_NAME)
-        .map(([, value]) => value),
-    ],
-  } : null;
+  const nativeResponseProjection = nativeGemini ? getNativeGeminiResponseProjection(clientRawRequest) : null;
   // When the model guard rejects the source-matched transport, translation
   // must dispatch to the transport matching its target wire format.
   const effectiveTransport = useTransport || resolveTransport(provider, targetFormat);

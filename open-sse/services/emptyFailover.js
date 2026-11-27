@@ -20,8 +20,9 @@ import { CLAUDE_BLOCK, RESPONSES_ITEM } from "../translator/schema/blocks.js";
 import { CLAUDE_EVENT, CLAUDE_DELTA, RESPONSES_EVENT, RESPONSES_EVENT_PREFIX } from "../translator/schema/streamEvents.js";
 import { toOpenAIFinish } from "../translator/concerns/finishReason.js";
 import { FORMATS } from "../translator/formats.js";
-import { EMPTY_PEEK_DEADLINE_MS } from "../config/runtimeConfig.js";
+import { EMPTY_PEEK_DEADLINE_MS, NATIVE_GEMINI_RESPONSE_FIELDS } from "../config/runtimeConfig.js";
 import { parseSSELine } from "../utils/streamHelpers.js";
+import { parseFieldMask } from "../utils/antigravityNative.js";
 
 // OpenAI chat content test. A chunk counts as content only if it carries
 // assistant output the caller can consume:
@@ -108,34 +109,60 @@ function inspectResponsesEvent(obj) {
 
 // Inspect one complete client-format SSE line (parsed with the shared parseSSELine) and report
 // whether it carries content and/or a finish reason. Non-data lines and "[DONE]" carry nothing.
-function geminiPartHasClientContent(part) {
+function geminiPartHasClientContent(part, unary) {
   if (!part || typeof part !== "object") return false;
-  if (nonEmptyString(part.text) && part.thought !== true) return true;
+  if (nonEmptyString(part.text) && part.thought !== true && (!unary || part.text.trim())) return true;
   if (part.functionCall || part.executableCode || part.codeExecutionResult) return true;
   if (nonEmptyString(part.inlineData?.data) || nonEmptyString(part.fileData?.fileUri)) return true;
   return false;
 }
 
-function inspectGeminiEvent(obj) {
-  const candidates = Array.isArray(obj.candidates) ? obj.candidates : obj.response?.candidates;
-  let content = false, finishReason = null;
+// A usage frame is output only when the caller excluded the candidate fields.
+function projectedGeminiMetadata(response, projection) {
+  const masks = projection?.masks?.map(value => String(value ?? "").trim()).filter(Boolean);
+  if (!masks?.length) return false;
+  const fields = NATIVE_GEMINI_RESPONSE_FIELDS.filter(field => field !== "candidates" && Object.hasOwn(response, field));
+  if (!fields.length) return false;
+  try {
+    // The query grammar accepts both query and header path separators.
+    const selectors = masks.map(mask => parseFieldMask(mask, "fields"));
+    return selectors.every(selector => selector && !selector.children.has("candidates"))
+      && fields.some(field => selectors.some(selector => selector.children.has(field)));
+  } catch {
+    return false;
+  }
+}
+
+export function inspectGeminiResponse(obj, nativeResponseProjection = null, unary = false) {
+  const response = Array.isArray(obj?.candidates) || obj?.promptFeedback?.blockReason
+    ? obj : (obj?.response || obj);
+  if (!response || typeof response !== "object") return null;
+  const projected = projectedGeminiMetadata(response, nativeResponseProjection);
+  const candidates = Array.isArray(response.candidates) ? response.candidates : null;
+  const blocked = !!response.promptFeedback?.blockReason;
+  if (!candidates && !blocked && !projected && !Object.hasOwn(response, "usageMetadata")) return null;
+
+  let content = projected;
+  let finishReason = blocked ? OPENAI_FINISH.CONTENT_FILTER : null;
   for (const candidate of candidates || []) {
-    for (const part of candidate?.content?.parts || []) {
-      if (geminiPartHasClientContent(part)) content = true;
+    const parts = candidate?.content?.parts;
+    if (Array.isArray(parts) && parts.some(part => geminiPartHasClientContent(part, unary))) {
+      content = true;
     }
-    if (candidate?.finishReason) {
-      finishReason = toOpenAIFinish(candidate.finishReason, FORMATS.GEMINI);
+    if (candidate?.finishReason && !isNoRetryFinish(finishReason)) {
+      const reason = toOpenAIFinish(candidate.finishReason, FORMATS.GEMINI);
+      if (unary && /^(STOP|MAX_TOKENS)$/i.test(candidate.finishReason)) content = true;
+      finishReason = reason;
     }
   }
   return { content, finishReason };
 }
 
-export function inspectSSELine(line) {
+export function inspectSSELine(line, nativeResponseProjection = null) {
   const parsed = parseSSELine(line.trimStart());
   if (!parsed || parsed.done) return { content: false, finishReason: null };
-  if (Array.isArray(parsed.candidates) || Array.isArray(parsed.response?.candidates)) {
-    return inspectGeminiEvent(parsed);
-  }
+  const gemini = inspectGeminiResponse(parsed, nativeResponseProjection);
+  if (gemini) return gemini;
   if (typeof parsed.type === "string" && !Array.isArray(parsed.choices)) {
     return parsed.type.startsWith(RESPONSES_EVENT_PREFIX) ? inspectResponsesEvent(parsed) : inspectClaudeEvent(parsed);
   }
@@ -150,13 +177,13 @@ export function inspectSSELine(line) {
 // Scan the COMPLETE lines of a decoded SSE buffer and update the running decision.
 // The trailing fragment (a line still being received) is not parsed — it is returned in
 // `state.pending` for the caller to prepend to the next chunk. `sawContent` latches true.
-export function scanSSEBuffer(text, state = { sawContent: false, finishReason: null }) {
+export function scanSSEBuffer(text, state = { sawContent: false, finishReason: null }, nativeResponseProjection = null) {
   const lines = text.split("\n");
   state.pending = lines.pop();
   for (const line of lines) {
-    const info = inspectSSELine(line);
+    const info = inspectSSELine(line, nativeResponseProjection);
     if (info.content) state.sawContent = true;
-    if (info.finishReason) state.finishReason = info.finishReason;
+    if (info.finishReason && !isNoRetryFinish(state.finishReason)) state.finishReason = info.finishReason;
   }
   return state;
 }
@@ -174,7 +201,10 @@ export function isNoRetryFinish(finishReason) {
 // possibly-valid slow stream). Returns the decision, the buffered head bytes, the live reader,
 // and — if the deadline fired mid-read — the still-pending read() (`pendingRead`) so the caller
 // can resume from it WITHOUT abandoning the chunk it will deliver.
-export async function peekStreamForContent(body, { deadlineMs = EMPTY_PEEK_DEADLINE_MS } = {}) {
+export async function peekStreamForContent(body, {
+  deadlineMs = EMPTY_PEEK_DEADLINE_MS,
+  nativeResponseProjection = null,
+} = {}) {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const headChunks = [];
@@ -208,12 +238,12 @@ export async function peekStreamForContent(body, { deadlineMs = EMPTY_PEEK_DEADL
     const { done, value } = res;
     pendingRead = null;
     if (done) {
-      if (textBuf) scanSSEBuffer(textBuf + "\n", state); // final line without a trailing newline
+      if (textBuf) scanSSEBuffer(textBuf + "\n", state, nativeResponseProjection); // final line without a trailing newline
       return settle({ outcome: state.sawContent ? "content" : "empty", timedOut: false, head: headChunks, reader, pendingRead: null, finishReason: state.finishReason });
     }
     headChunks.push(value);
     textBuf += decoder.decode(value, { stream: true });
-    scanSSEBuffer(textBuf, state);
+    scanSSEBuffer(textBuf, state, nativeResponseProjection);
     textBuf = state.pending; // only the not-yet-complete line carries over
     if (state.sawContent) {
       return settle({ outcome: "content", timedOut: false, head: headChunks, reader, pendingRead: null, finishReason: state.finishReason });

@@ -2,9 +2,24 @@ import { FORMATS } from "../translator/formats.js";
 import { fallbackToolCallId } from "../translator/concerns/toolCall.js";
 import { buildErrorBody } from "./error.js";
 import { SSE_DONE } from "./sseConstants.js";
-import { NATIVE_GEMINI_RESPONSE_FIELDS, NATIVE_GEMINI_BRIDGE_FIELDS, NATIVE_GEMINI_FORMATS } from "../config/runtimeConfig.js";
+import {
+  NATIVE_GEMINI_RESPONSE_FIELDS, NATIVE_GEMINI_BRIDGE_FIELDS, NATIVE_GEMINI_FORMATS,
+  NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES, NATIVE_GEMINI_FIELD_MASK_HEADER_NAME,
+} from "../config/runtimeConfig.js";
 
 const sharedEncoder = new TextEncoder();
+
+// Preserve the raw client projection for response validation and combo peeking.
+export function getNativeGeminiResponseProjection(clientRawRequest) {
+  const masks = [];
+  for (const [name, value] of clientRawRequest?.queryParams || []) {
+    if (NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.includes(name)) masks.push(value);
+  }
+  for (const [name, value] of Object.entries(clientRawRequest?.headers || {})) {
+    if (name.toLowerCase() === NATIVE_GEMINI_FIELD_MASK_HEADER_NAME) masks.push(value);
+  }
+  return masks.length ? { masks } : null;
+}
 
 function nativeResponseProjectionAllowsEmpty(projection) {
   return projection?.masks?.some(value => {

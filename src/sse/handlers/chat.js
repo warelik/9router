@@ -30,6 +30,7 @@ import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
 import { extractClientApiKey, getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
 import { resolveSmartChoice } from "../services/systemoneRouter.js";
+import { getNativeGeminiResponseProjection } from "open-sse/utils/streamHelpers.js";
 
 const GEMINI_ERROR_STATUS = Object.freeze({
   400: "INVALID_ARGUMENT",
@@ -263,7 +264,7 @@ export async function handleChat(request, clientRawRequest = null, options = {})
             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
             cleanRawReq = { ...clientRawRequest, body: cleanBody };
           }
-          return handleSingleModelChat(b, applyComboThinkingSuffix(m, comboSuffix), cleanRawReq, request, apiKey, null, options);
+          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options, comboSuffix);
         },
         log,
         comboName,
@@ -278,15 +279,17 @@ export async function handleChat(request, clientRawRequest = null, options = {})
     return responseErrorForClient(await handleComboChat({
       body,
       models: augmentedModels,
+      nativeResponseProjection: isNativeGeminiRequest(options) ? getNativeGeminiResponseProjection(clientRawRequest) : null,
       handleSingleModel: withCapacityAdapterStripping(
         (b, m) => handleSingleModelChat(
           b,
-          adapterAdded.includes(m) ? m : applyComboThinkingSuffix(m, comboSuffix),
+          m,
           clientRawRequest,
           request,
           apiKey,
           null,
-          options
+          options,
+          adapterAdded.includes(m) ? null : comboSuffix
         ),
         adapterAdded
       ),
@@ -318,6 +321,7 @@ export async function handleChat(request, clientRawRequest = null, options = {})
     return handleComboChat({
       body,
       models: soloAugmented,
+      nativeResponseProjection: isNativeGeminiRequest(options) ? getNativeGeminiResponseProjection(clientRawRequest) : null,
       handleSingleModel: withCapacityAdapterStripping(
         (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
         adapterAdded
@@ -334,14 +338,15 @@ export async function handleChat(request, clientRawRequest = null, options = {})
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, options = {}) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, options = {}, inheritedComboSuffix = null) {
   const modelInfo = await getModelInfo(modelStr);
 
   // If provider is null, this might be a combo name - check and handle
   if (!modelInfo.provider) {
     const comboModels = await getComboModels(modelStr);
     if (comboModels) {
-      const { comboName, comboSuffix } = resolveComboInvocation(modelStr, modelInfo);
+      const { comboName, comboSuffix: localSuffix } = resolveComboInvocation(modelStr, modelInfo);
+      const comboSuffix = inheritedComboSuffix || localSuffix;
       const chatSettings = await getSettings();
       // Check for combo-specific strategy first, fallback to global
       const comboStrategies = chatSettings.comboStrategies || {};
@@ -366,7 +371,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
               cleanRawReq = { ...clientRawRequest, body: cleanBody };
             }
-            return handleSingleModelChat(b, applyComboThinkingSuffix(m, comboSuffix), cleanRawReq, request, apiKey, null, options);
+            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options, comboSuffix);
           },
           log,
           comboName,
@@ -383,15 +388,17 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       return responseErrorForClient(await handleComboChat({
         body,
         models: augmentedModels,
+        nativeResponseProjection: isNativeGeminiRequest(options) ? getNativeGeminiResponseProjection(clientRawRequest) : null,
         handleSingleModel: withCapacityAdapterStripping(
           (b, m) => handleSingleModelChat(
             b,
-            adapterAdded.includes(m) ? m : applyComboThinkingSuffix(m, comboSuffix),
+            m,
             clientRawRequest,
             request,
             apiKey,
             null,
-            options
+            options,
+            adapterAdded.includes(m) ? null : comboSuffix
           ),
           adapterAdded
         ),
@@ -417,7 +424,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Invalid model format", options);
   }
 
-  const { provider, model } = modelInfo;
+  const { provider } = modelInfo;
+  const model = applyComboThinkingSuffix(modelInfo.model, inheritedComboSuffix);
 
   // Routing shown in the unified "▶" line (client model → provider/model)
 

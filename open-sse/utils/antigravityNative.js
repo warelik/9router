@@ -33,7 +33,7 @@ function fieldMaskSyntaxError(source, index, reason) {
   return new Error(`Invalid ${source} field mask at position ${index + 1}: ${reason}`);
 }
 
-function parseFieldMask(rawMask, source) {
+export function parseFieldMask(rawMask, source) {
   const text = String(rawMask ?? "").trim();
   if (!text) return null;
 

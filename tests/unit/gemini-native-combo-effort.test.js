@@ -9,6 +9,11 @@ import path from "node:path";
 import vm from "node:vm";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import {
+  NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES,
+  NATIVE_GEMINI_FIELD_MASK_HEADER_NAME,
+} from "../../open-sse/config/runtimeConfig.js";
+import * as streamHelpers from "../../open-sse/utils/streamHelpers.js";
 
 const { network, executorInstances, fx } = vi.hoisted(() => ({
   network: vi.fn(),
@@ -18,8 +23,12 @@ const { network, executorInstances, fx } = vi.hoisted(() => ({
       { id: "ccarbon", name: ".gemini-carbon", models: ["ag/gemini-4-carbon-high"] },
       { id: "chydro", name: ".gemini-hydrogen", models: ["ag/gemini-4-hydrogen-xhigh"] },
       { id: "cflash", name: ".gemini-flash-lite", models: ["aistudio/gemini-3.5-flash-lite", "gemini/gemini-3.5-flash-lite"] },
+      { id: "cag-fallback", name: ".antigravity-fallback", models: ["ag/gemini-4-carbon-high", "gemini/gemini-3.5-flash-lite"] },
       { id: "cmain", name: "Main", models: ["openai/model-a", "openai/model-b"] },
       { id: "cother", name: "other", models: ["openai/model-c"] },
+      { id: "couter", name: "outer", models: ["Panel(high)"] },
+      { id: "cpanel-literal", name: "Panel(high)", models: ["aistudio/literal-model(low)"] },
+      { id: "cpanel", name: "Panel", models: ["gemini/unrelated-model"] },
     ],
     nodes: [],
     aliases: {},
@@ -168,6 +177,9 @@ function loadRouteHarness({ flashImpl } = {}) {
     PROVIDER_MODELS: { gemini: [], "gemini-tts-models": [] },
     HTTP_STATUS: { BAD_REQUEST: 400, UNAUTHORIZED: 401, NOT_FOUND: 404, SERVER_ERROR: 500, SERVICE_UNAVAILABLE: 503 },
     ACCOUNT_WAIT_DEADLINE_MS: 0,
+    NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES,
+    NATIVE_GEMINI_FIELD_MASK_HEADER_NAME,
+    getNativeGeminiResponseProjection: streamHelpers.getNativeGeminiResponseProjection,
     FORMATS: { GEMINI: "gemini", OPENAI: "openai" },
     DEFAULT_HEADROOM_URL: "http://unused.test",
     getTargetFormat, supportsNativeGemini, resolveSessionIdentity,
@@ -190,11 +202,11 @@ function loadRouteHarness({ flashImpl } = {}) {
   return { context, services, flashCalls };
 }
 
-async function postCombo(context, comboWithAction, body) {
-  const url = `https://router.test/v1beta/models/${comboWithAction}?alt=sse`;
+async function postCombo(context, comboWithAction, body, query = "alt=sse", headers = {}) {
+  const url = `https://router.test/v1beta/models/${comboWithAction}?${query}`;
   const request = new Request(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
   return context.POST(request, { params: Promise.resolve({ path: comboWithAction.split("/") }) });
@@ -386,5 +398,129 @@ describe("native Gemini combo routing end-to-end", () => {
     expect(body.error.status).toBe("UNAVAILABLE");
     expect(body.error.message).toContain("No active credentials");
     expect(services.handleChatCore).toHaveBeenCalled();
+  });
+
+  it.each([
+    [false, "aistudio", 503],
+    [true, "aistudio", 503],
+    [false, "gemini", 200],
+    [true, "gemini", 200],
+    [false, null, 200],
+    [true, null, 200],
+  ])("keeps the right response with stream=%s and empty provider %s", async (stream, emptyProvider, expectedStatus) => {
+    const empty = { candidates: [{ finishReason: "MALFORMED_FUNCTION_CALL" }] };
+    const emptyResponse = stream
+      ? () => new Response(sseFrame(empty), { headers: { "Content-Type": "text/event-stream" } })
+      : () => Response.json(empty);
+    const { context, flashCalls } = loadRouteHarness({
+      flashImpl: async ({ modelInfo }) => !emptyProvider || modelInfo.provider === emptyProvider
+        ? { success: true, nativeResponse: true, response: emptyResponse() }
+        : {
+          success: false, nativeResponse: true, status: 503, error: "Temporarily unavailable",
+          response: Response.json({ error: { code: 503, status: "UNAVAILABLE", message: "Temporarily unavailable" } }, { status: 503 }),
+        },
+    });
+    const response = await postCombo(context, `.gemini-flash-lite:${stream ? "streamGenerateContent" : "generateContent"}`, nativeBody());
+    expect(flashCalls.map(call => call.modelInfo.provider)).toEqual(["aistudio", "gemini"]);
+    expect(response.status).toBe(expectedStatus);
+    if (expectedStatus === 503) {
+      expect(await response.json()).toEqual({ error: { code: 503, status: "UNAVAILABLE", message: "Temporarily unavailable" } });
+    } else if (stream) {
+      expect(await response.text()).toBe(sseFrame(empty));
+    } else {
+      expect(await response.json()).toEqual(empty);
+    }
+  });
+
+  it.each([false, true])("preserves native prompt blocking with stream=%s", async (stream) => {
+    const blocked = { candidates: [], promptFeedback: { blockReason: "SAFETY" } };
+    const { context, flashCalls } = loadRouteHarness({
+      flashImpl: async () => ({
+        success: true, nativeResponse: true,
+        response: stream ? new Response(sseFrame({ response: blocked }), { headers: { "Content-Type": "text/event-stream" } }) : Response.json(blocked),
+      }),
+    });
+    const response = await postCombo(context, `.gemini-flash-lite:${stream ? "streamGenerateContent" : "generateContent"}`, nativeBody());
+    expect(await response.text()).toContain("SAFETY");
+    expect(flashCalls).toHaveLength(1);
+  });
+
+  it("keeps a usable candidate after an earlier candidate aborted", async () => {
+    const reply = { candidates: [{ finishReason: "MALFORMED_FUNCTION_CALL" }, nativeChunk("second candidate").candidates[0]] };
+    const { context, flashCalls } = loadRouteHarness({
+      flashImpl: async () => ({ success: true, nativeResponse: true, response: Response.json(reply) }),
+    });
+    const response = await postCombo(context, ".gemini-flash-lite:generateContent", nativeBody());
+    expect(await response.json()).toEqual(reply);
+    expect(flashCalls).toHaveLength(1);
+  });
+
+  it.each([false, true])("keeps a terminal in-band JSON stream error (wrapped=%s)", async (wrapped) => {
+    const empty = { candidates: [{ finishReason: "MALFORMED_FUNCTION_CALL" }] };
+    const failure = { error: { code: 503, status: "UNAVAILABLE", message: "Generation interrupted" } };
+    const reply = [empty, wrapped ? { response: failure } : failure];
+    network.mockImplementation(async () => new Response(sseFrame({ response: empty }) + sseFrame(failure), {
+      headers: { "Content-Type": "text/event-stream" },
+    }));
+    const { context, services } = loadRouteHarness({
+      flashImpl: async ({ modelInfo }) => ({
+        success: true, nativeResponse: true,
+        response: Response.json(modelInfo.provider === "aistudio" ? reply : [nativeChunk("fallback")]),
+      }),
+    });
+    const combo = wrapped ? ".gemini-flash-lite" : ".antigravity-fallback";
+    const response = await postCombo(context, `${combo}:streamGenerateContent`, nativeBody(), "alt=json");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(reply);
+    expect(services.handleChatCore).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["alt=sse&fields=usageMetadata", {}, 1],
+    ["alt=sse&fields=usageMetadata(totalTokenCount%2Cother)", {}, 1],
+    ["alt=sse&fields=usageMetadata.*", {}, 1],
+    ["alt=sse&fields=usageMetadata%2FtotalTokenCount", {}, 1],
+    ["alt=sse", { "x-goog-fieldmask": "usageMetadata.totalTokenCount" }, 1],
+    ["alt=sse&fields=candidates%2CusageMetadata", {}, 2],
+    ["alt=sse&fields=*%2CusageMetadata", {}, 2],
+    ["alt=sse", {}, 2],
+  ])("commits usage-only SSE only for a metadata projection (query %s, headers %j)", async (query, headers, count) => {
+    const metadata = { usageMetadata: { totalTokenCount: 10 } };
+    const { context, flashCalls } = loadRouteHarness({
+      flashImpl: async ({ modelInfo }) => ({
+        success: true, nativeResponse: true,
+        response: new Response(sseFrame(modelInfo.provider === "aistudio" ? metadata : nativeChunk("fallback")), {
+          headers: { "Content-Type": "text/event-stream" },
+        }),
+      }),
+    });
+    const response = await postCombo(context, ".gemini-flash-lite:streamGenerateContent", nativeBody(), query, headers);
+    expect(await response.text()).toContain(count === 1 ? "usageMetadata" : "fallback");
+    expect(flashCalls).toHaveLength(count);
+  });
+
+  it.each([
+    ["fields=usageMetadata", 1],
+    ["fields=candidates%2CusageMetadata", 2],
+    ["", 2],
+  ])("commits usage-only JSON only for a metadata projection (%s)", async (query, count) => {
+    const metadata = { usageMetadata: { totalTokenCount: 10 } };
+    const fallback = nativeChunk("fallback");
+    const { context, flashCalls } = loadRouteHarness({
+      flashImpl: async ({ modelInfo }) => ({
+        success: true, nativeResponse: true,
+        response: Response.json(modelInfo.provider === "aistudio" ? metadata : fallback),
+      }),
+    });
+    const response = await postCombo(context, ".gemini-flash-lite:generateContent", nativeBody(), query);
+    expect(await response.json()).toEqual(count === 1 ? metadata : fallback);
+    expect(flashCalls).toHaveLength(count);
+  });
+
+  it("resolves literal nested combo names before inheriting effort", async () => {
+    const { context, flashCalls } = loadRouteHarness();
+    const response = await postCombo(context, "outer(medium):streamGenerateContent", nativeBody());
+    expect(await response.text()).toContain("from-aistudio");
+    expect(flashCalls.map(call => call.body.model)).toEqual(["aistudio/literal-model(medium)"]);
   });
 });

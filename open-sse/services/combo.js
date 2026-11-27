@@ -8,7 +8,7 @@ import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { parseModel } from "./model.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
-import { peekStreamForContent, reconstructStream, isNoRetryFinish } from "./emptyFailover.js";
+import { peekStreamForContent, reconstructStream, isNoRetryFinish, inspectGeminiResponse } from "./emptyFailover.js";
 import {
   getStickyComboModel,
   setStickyComboModel,
@@ -19,10 +19,10 @@ import {
 // Peek a 2xx combo response for real content. Returns null for non-SSE responses (leave
 // them untouched). For SSE, returns { outcome: "content"|"empty", finishReason, response }
 // where `response` is a faithful replay of the original stream (head buffer + live reader).
-async function peekComboResponse(result, log) {
+async function peekComboResponse(result, log, nativeResponseProjection = null) {
   const ct = (result.headers.get("content-type") || "").toLowerCase();
   if (!result.body || !ct.includes("text/event-stream")) return null;
-  const peeked = await peekStreamForContent(result.body);
+  const peeked = await peekStreamForContent(result.body, { nativeResponseProjection });
   const response = new Response(reconstructStream(peeked.head, peeked.reader, peeked.pendingRead), {
     status: result.status,
     statusText: result.statusText,
@@ -299,7 +299,7 @@ export function getComboModelsFromData(modelStr, combosData) {
  * (e.g. empty assistant message with in_progress/incomplete)
  * so combo fallback can continue to the next model.
  */
-export function isZeroContentResponse(data) {
+export function isZeroContentResponse(data, nativeResponseProjection = null) {
   if (!data || typeof data !== "object") return false;
 
   // OpenAI chat format
@@ -331,28 +331,13 @@ export function isZeroContentResponse(data) {
     }
   }
 
-  // Gemini generateContent format
-  const geminiCandidates = Array.isArray(data.candidates)
-    ? data.candidates
-    : (Array.isArray(data.response?.candidates) ? data.response.candidates : null);
-  if (geminiCandidates) {
-    if (geminiCandidates.length === 0) return true;
-    const candidate = geminiCandidates[0];
-    if (!candidate) return true;
-    const parts = Array.isArray(candidate.content?.parts) ? candidate.content.parts : [];
-    const hasContent = parts.some((p) =>
-      (typeof p?.text === "string" && p.text.trim().length > 0 && p.thought !== true)
-      || Boolean(p?.functionCall)
-      || Boolean(p?.inlineData?.data)
-      || Boolean(p?.fileData?.fileUri)
-      || Boolean(p?.executableCode)
-      || Boolean(p?.codeExecutionResult)
-    );
-    const finish = String(candidate.finishReason || "").toUpperCase();
-    const isContentFilter = finish === "SAFETY" || finish === "RECITATION" || finish === "BLOCKLIST" || finish === "PROHIBITED_CONTENT";
-    if (!hasContent && !isContentFilter && finish !== "STOP" && finish !== "MAX_TOKENS") {
-      return true;
-    }
+  // Native JSON streams can carry a terminal error without changing HTTP status.
+  if (Array.isArray(data) && data.some(frame => frame?.error || frame?.response?.error)) return false;
+  const gemini = Array.isArray(data)
+    ? data.map(frame => inspectGeminiResponse(frame, nativeResponseProjection)).filter(Boolean)
+    : [inspectGeminiResponse(data, nativeResponseProjection, true)].filter(Boolean);
+  if (gemini.length) {
+    return !gemini.some(({ content, finishReason }) => content || isNoRetryFinish(finishReason));
   }
 
   return false;
@@ -402,6 +387,7 @@ export async function handleComboChat({
   resolveSmartChoice = null,
   holdDeadlineAt = null,
   clientSignal = null,
+  nativeResponseProjection = null,
 }) {
   // True when at least one member failed on its accounts (not on the request):
   // only then can waiting for an account to free up change the outcome.
@@ -504,8 +490,10 @@ export async function handleComboChat({
   }
   
   let lastError = null;
+  let lastEmptyError = null;
   let earliestRetryAfter = null;
   let lastStatus = null;
+  let skippedEmptyStream = false;
   let requestScopedResult = null;
 
   for (let i = 0; i < rotatedModels.length; i++) {
@@ -528,7 +516,7 @@ export async function handleComboChat({
       if (result.ok) {
         let peeked = null;
         try {
-          peeked = await peekComboResponse(result, log);
+          peeked = await peekComboResponse(result, log, nativeResponseProjection);
         } catch (peekErr) {
           // peekStreamForContent is written not to throw; if reconstruction/Response
           // construction ever does, result.body is already locked by getReader() and can no
@@ -550,13 +538,12 @@ export async function handleComboChat({
             if (contentType.includes("application/json")) {
               try {
                 const peekBody = await result.clone().json();
-                if (isZeroContentResponse(peekBody)) {
+                if (isZeroContentResponse(peekBody, nativeResponseProjection)) {
                   log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content, falling back to next model`);
                   if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
                     clearStickyComboSession(comboName, sessionId);
                   }
-                  lastError = "Zero usable content";
-                  lastStatus = 200;
+                  lastEmptyError = "Zero usable content";
                   continue;
                 }
               } catch {
@@ -590,8 +577,8 @@ export async function handleComboChat({
         }
         // Drain/close the discarded stream in the background so its usage logging still runs.
         peeked.response.body?.cancel?.().catch(() => {});
-        lastError = `empty generation (${reasonLabel})`;
-        if (!lastStatus) lastStatus = 502;
+        lastEmptyError = `empty generation (${reasonLabel})`;
+        skippedEmptyStream = true;
         continue;
       }
 
@@ -697,11 +684,11 @@ export async function handleComboChat({
   // the request itself is invalid, but here the providers are simply unavailable
   // or have no active credentials. 503 is more accurate and retryable by clients.
   const allDisabled = lastError && lastError.toLowerCase().includes("no credentials");
-  let status = allDisabled ? 503 : (lastStatus || 503);
+  let status = allDisabled ? 503 : (lastStatus || (skippedEmptyStream ? 502 : 503));
   // The wait deadline was configured and has now expired: report the router's
   // own 502 rather than relaying an upstream 429/503 to the client.
   if (holdDeadlineAt && (status === 429 || status === 503)) status = 502;
-  const msg = lastError || "All combo models unavailable";
+  const msg = lastError || lastEmptyError || "All combo models unavailable";
 
   if (earliestRetryAfter) {
     const retryHuman = formatRetryAfter(earliestRetryAfter);
