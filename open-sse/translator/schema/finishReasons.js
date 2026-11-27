@@ -32,6 +32,7 @@ export const RESPONSES_INCOMPLETE_REASON = {
 
 // Gemini finishReason values.
 export const GEMINI_FINISH = {
+  UNSPECIFIED: "FINISH_REASON_UNSPECIFIED",
   STOP: "STOP",
   MAX_TOKENS: "MAX_TOKENS",
   SAFETY: "SAFETY",
