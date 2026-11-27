@@ -1,0 +1,82 @@
+From 680a70fdd3436a263f2baf684f257945f9fa78d9 Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Fri, 27 Nov 2026 20:03:43 +0000
+Subject: [PATCH] fix(antigravity): preserve translated execute lifecycle
+
+---
+ open-sse/executors/antigravity.js     | 23 ++++++++++-------------
+ tests/unit/gemini-long-decode.test.js | 17 +++++++++++++++++
+ 2 files changed, 27 insertions(+), 13 deletions(-)
+
+diff --git a/open-sse/executors/antigravity.js b/open-sse/executors/antigravity.js
+index 7e2c20c4..057cc688 100644
+--- a/open-sse/executors/antigravity.js
++++ b/open-sse/executors/antigravity.js
+@@ -224,6 +224,16 @@ export class AntigravityExecutor extends BaseExecutor {
+   }
+ 
+   async execute(args) {
++    if (args.credentials?.nativeGeminiPassthrough) {
++      const nativeRequest = args.credentials.nativeGeminiRequest;
++      const error = validateAntigravityFieldMask(nativeRequest);
++      if (error) return { response: Response.json(error, { status: HTTP_STATUS.BAD_REQUEST }), headers: {}, url: null, transformedBody: null };
++      const jsonOutput = nativeGeminiRequestsJsonOutput(args.body);
++      const result = await super.execute(args);
++      result.response = await unwrapAntigravityResponse(result.response, args.stream, nativeRequest, { jsonOutput });
++      return result;
++    }
++
+     let result = await super.execute(args);
+     // A prompt rejection means systemInstruction carries text Google fingerprints that
+     // ANTIGRAVITY_PROMPT_REWRITES does not cover yet. Retry once with that text moved into the first
+@@ -529,19 +539,6 @@ export class AntigravityExecutor extends BaseExecutor {
+     };
+   }
+ 
+-  async execute(options) {
+-    const jsonOutput = Boolean(options.credentials?.nativeGeminiPassthrough && nativeGeminiRequestsJsonOutput(options.body));
+-    if (options.credentials?.nativeGeminiPassthrough) {
+-      const error = validateAntigravityFieldMask(options.credentials.nativeGeminiRequest);
+-      if (error) return { response: Response.json(error, { status: HTTP_STATUS.BAD_REQUEST }), headers: {}, url: null, transformedBody: null };
+-    }
+-    const result = await super.execute(options);
+-    if (options.credentials?.nativeGeminiPassthrough) {
+-      result.response = await unwrapAntigravityResponse(result.response, options.stream, options.credentials.nativeGeminiRequest, { jsonOutput });
+-    }
+-    return result;
+-  }
+-
+   async refreshCredentials(credentials, log, proxyOptions = null) {
+     if (!credentials.refreshToken) return null;
+ 
+diff --git a/tests/unit/gemini-long-decode.test.js b/tests/unit/gemini-long-decode.test.js
+index da0e09d7..2d7c95c3 100644
+--- a/tests/unit/gemini-long-decode.test.js
++++ b/tests/unit/gemini-long-decode.test.js
+@@ -195,6 +195,23 @@ describe("Antigravity (Cloud Code envelope) long decode", () => {
+     expect(events.map((e) => e.response.candidates[0].finishReason).filter(Boolean)).toEqual(["STOP"]);
+   });
+ 
++  it("leaves Hydrogen continuation to the native Gemini caller", async () => {
++    const native = {
++      candidates: [cand([{ text: "a" }], { finishReason: "CONTINUATION", continuationToken: "tok1" })],
++    };
++    fetchMock.mockResolvedValueOnce(jsonResponse({ response: native }));
++
++    const { response } = await ag.execute({
++      model: "gemini-4-hydrogen-high",
++      body: { contents, generationConfig: { maxOutputTokens: LONG } },
++      stream: false,
++      credentials: { ...credentials, nativeGeminiPassthrough: true },
++    });
++
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(await response.json()).toEqual(native);
++  });
++
+   it("still caps models without long decode at 64000", async () => {
+     fetchMock.mockResolvedValueOnce(jsonResponse({ response: { candidates: [cand([{ text: "x" }], { finishReason: "STOP" })] } }));
+     await run("gemini-4-argon-high", 300000);
+-- 
+2.55.0
+

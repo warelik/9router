@@ -1,12 +1,13 @@
-From 622ea37db37c6016df8a82999d96ffc2492f20b4 Mon Sep 17 00:00:00 2001
-From: warelik <warelik@gmail.com>
-Date: Mon, 9 Nov 2026 10:10:45 +0000
-Subject: [PATCH 11/18] Fix multipart uploads through the bundled Undici proxy
- fetch
+From 0d7eb97d86414610df34fe04c8a0dcde2d30ec47 Mon Sep 17 00:00:00 2001
+From: downstream <downstream@local>
+Date: Fri, 27 Nov 2026 20:00:00 +0000
+Subject: [PATCH 08/10] Normalize FormData at the proxy transport boundary
 
-The Cloudflare Worker admin deploy creates a global FormData in Node's bundled Undici realm, while proxyFetch deliberately sends requests through the package Undici instance. Package Undici does not recognize the foreign FormData as multipart and derives the first part's application/javascript+module type as the request Content-Type, so Cloudflare returns HTTP 415.
+Regroup existing application changes without changing the final tree.
+Previous carriers in overlay a97b678d:
+- 0011-proxy-fetch-formdata-compat.patch (prior application commit e976be06702d)
 
-Rebuild only foreign-realm FormData bodies with package Undici's FormData immediately before rawFetch, preserving entry order, filenames, and Blob values. Bodies already owned by package Undici remain untouched. This also restores multipart requests sent through the globally patched fetch.
+The historical migration source and cutoff are recorded in patches/source.json.
 ---
  open-sse/utils/proxyFetch.js                  |  44 +++++++-
  .../unit/proxy-fetch-formdata-compat.test.js  | 100 ++++++++++++++++++

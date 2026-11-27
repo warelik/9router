@@ -1,0 +1,664 @@
+From c621734d300ba8ed38d852c1c8a2246eaae62522 Mon Sep 17 00:00:00 2001
+From: warelik <warelik@gmail.com>
+Date: Fri, 27 Nov 2026 20:21:39 +0000
+Subject: [PATCH] Preserve native Gemini combo responses and nested model
+ identity
+
+---
+ open-sse/handlers/chatCore.js                 |  14 +-
+ open-sse/services/combo.js                    |  55 +++----
+ open-sse/services/emptyFailover.js            |  70 ++++++---
+ open-sse/utils/antigravityNative.js           |   2 +-
+ open-sse/utils/streamHelpers.js               |  17 ++-
+ src/sse/handlers/chat.js                      |  26 ++--
+ tests/unit/gemini-native-combo-effort.test.js | 142 +++++++++++++++++-
+ 7 files changed, 247 insertions(+), 79 deletions(-)
+
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index ceecf88a..dd8b90ee 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -12,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
+ import { PROVIDERS } from "../config/providers.js";
+ import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
+ import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
+-import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET, REWRITTEN_RESPONSE_HEADERS, AISTUDIO_NATIVE_GEMINI_API_VERSION, NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES, NATIVE_GEMINI_FIELD_MASK_HEADER_NAME } from "../config/runtimeConfig.js";
++import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET, REWRITTEN_RESPONSE_HEADERS, AISTUDIO_NATIVE_GEMINI_API_VERSION } from "../config/runtimeConfig.js";
+ import { handleBypassRequest } from "../utils/bypassHandler.js";
+ import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+ import { getExecutor } from "../executors/index.js";
+@@ -37,6 +37,7 @@ import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
+ import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
+ import { resolveSessionId } from "../utils/sessionManager.js";
+ import { isMuseCodeSubscription } from "../utils/museCloaking.js";
++import { getNativeGeminiResponseProjection } from "../utils/streamHelpers.js";
+ 
+ /**
+  * Core chat handler - shared between SSE and Worker
+@@ -129,16 +130,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   const nativeGemini = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
+   // A response projection can intentionally hide the native completion field.
+   // Keep this metadata out of the provider body and cache prefix.
+-  const nativeResponseProjection = nativeGemini ? {
+-    masks: [
+-      ...(clientRawRequest?.queryParams || [])
+-        .filter(([name]) => NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.includes(name))
+-        .map(([, value]) => value),
+-      ...Object.entries(clientRawRequest?.headers || {})
+-        .filter(([name]) => name.toLowerCase() === NATIVE_GEMINI_FIELD_MASK_HEADER_NAME)
+-        .map(([, value]) => value),
+-    ],
+-  } : null;
++  const nativeResponseProjection = nativeGemini ? getNativeGeminiResponseProjection(clientRawRequest) : null;
+   // When the model guard rejects the source-matched transport, translation
+   // must dispatch to the transport matching its target wire format.
+   const effectiveTransport = useTransport || resolveTransport(provider, targetFormat);
+diff --git a/open-sse/services/combo.js b/open-sse/services/combo.js
+index 65207b65..53847c42 100644
+--- a/open-sse/services/combo.js
++++ b/open-sse/services/combo.js
+@@ -8,7 +8,7 @@ import { unavailableResponse } from "../utils/error.js";
+ import { getCapabilitiesForModel } from "../providers/capabilities.js";
+ import { parseModel } from "./model.js";
+ import { extractTextContent } from "../translator/formats/gemini.js";
+-import { peekStreamForContent, reconstructStream, isNoRetryFinish } from "./emptyFailover.js";
++import { peekStreamForContent, reconstructStream, isNoRetryFinish, inspectGeminiResponse } from "./emptyFailover.js";
+ import {
+   getStickyComboModel,
+   setStickyComboModel,
+@@ -19,10 +19,10 @@ import {
+ // Peek a 2xx combo response for real content. Returns null for non-SSE responses (leave
+ // them untouched). For SSE, returns { outcome: "content"|"empty", finishReason, response }
+ // where `response` is a faithful replay of the original stream (head buffer + live reader).
+-async function peekComboResponse(result, log) {
++async function peekComboResponse(result, log, nativeResponseProjection = null) {
+   const ct = (result.headers.get("content-type") || "").toLowerCase();
+   if (!result.body || !ct.includes("text/event-stream")) return null;
+-  const peeked = await peekStreamForContent(result.body);
++  const peeked = await peekStreamForContent(result.body, { nativeResponseProjection });
+   const response = new Response(reconstructStream(peeked.head, peeked.reader, peeked.pendingRead), {
+     status: result.status,
+     statusText: result.statusText,
+@@ -299,7 +299,7 @@ export function getComboModelsFromData(modelStr, combosData) {
+  * (e.g. empty assistant message with in_progress/incomplete)
+  * so combo fallback can continue to the next model.
+  */
+-export function isZeroContentResponse(data) {
++export function isZeroContentResponse(data, nativeResponseProjection = null) {
+   if (!data || typeof data !== "object") return false;
+ 
+   // OpenAI chat format
+@@ -331,28 +331,13 @@ export function isZeroContentResponse(data) {
+     }
+   }
+ 
+-  // Gemini generateContent format
+-  const geminiCandidates = Array.isArray(data.candidates)
+-    ? data.candidates
+-    : (Array.isArray(data.response?.candidates) ? data.response.candidates : null);
+-  if (geminiCandidates) {
+-    if (geminiCandidates.length === 0) return true;
+-    const candidate = geminiCandidates[0];
+-    if (!candidate) return true;
+-    const parts = Array.isArray(candidate.content?.parts) ? candidate.content.parts : [];
+-    const hasContent = parts.some((p) =>
+-      (typeof p?.text === "string" && p.text.trim().length > 0 && p.thought !== true)
+-      || Boolean(p?.functionCall)
+-      || Boolean(p?.inlineData?.data)
+-      || Boolean(p?.fileData?.fileUri)
+-      || Boolean(p?.executableCode)
+-      || Boolean(p?.codeExecutionResult)
+-    );
+-    const finish = String(candidate.finishReason || "").toUpperCase();
+-    const isContentFilter = finish === "SAFETY" || finish === "RECITATION" || finish === "BLOCKLIST" || finish === "PROHIBITED_CONTENT";
+-    if (!hasContent && !isContentFilter && finish !== "STOP" && finish !== "MAX_TOKENS") {
+-      return true;
+-    }
++  // Native JSON streams can carry a terminal error without changing HTTP status.
++  if (Array.isArray(data) && data.some(frame => frame?.error || frame?.response?.error)) return false;
++  const gemini = Array.isArray(data)
++    ? data.map(frame => inspectGeminiResponse(frame, nativeResponseProjection)).filter(Boolean)
++    : [inspectGeminiResponse(data, nativeResponseProjection, true)].filter(Boolean);
++  if (gemini.length) {
++    return !gemini.some(({ content, finishReason }) => content || isNoRetryFinish(finishReason));
+   }
+ 
+   return false;
+@@ -402,6 +387,7 @@ export async function handleComboChat({
+   resolveSmartChoice = null,
+   holdDeadlineAt = null,
+   clientSignal = null,
++  nativeResponseProjection = null,
+ }) {
+   // True when at least one member failed on its accounts (not on the request):
+   // only then can waiting for an account to free up change the outcome.
+@@ -504,8 +490,10 @@ export async function handleComboChat({
+   }
+   
+   let lastError = null;
++  let lastEmptyError = null;
+   let earliestRetryAfter = null;
+   let lastStatus = null;
++  let skippedEmptyStream = false;
+   let requestScopedResult = null;
+ 
+   for (let i = 0; i < rotatedModels.length; i++) {
+@@ -528,7 +516,7 @@ export async function handleComboChat({
+       if (result.ok) {
+         let peeked = null;
+         try {
+-          peeked = await peekComboResponse(result, log);
++          peeked = await peekComboResponse(result, log, nativeResponseProjection);
+         } catch (peekErr) {
+           // peekStreamForContent is written not to throw; if reconstruction/Response
+           // construction ever does, result.body is already locked by getReader() and can no
+@@ -550,13 +538,12 @@ export async function handleComboChat({
+             if (contentType.includes("application/json")) {
+               try {
+                 const peekBody = await result.clone().json();
+-                if (isZeroContentResponse(peekBody)) {
++                if (isZeroContentResponse(peekBody, nativeResponseProjection)) {
+                   log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content, falling back to next model`);
+                   if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
+                     clearStickyComboSession(comboName, sessionId);
+                   }
+-                  lastError = "Zero usable content";
+-                  lastStatus = 200;
++                  lastEmptyError = "Zero usable content";
+                   continue;
+                 }
+               } catch {
+@@ -590,8 +577,8 @@ export async function handleComboChat({
+         }
+         // Drain/close the discarded stream in the background so its usage logging still runs.
+         peeked.response.body?.cancel?.().catch(() => {});
+-        lastError = `empty generation (${reasonLabel})`;
+-        if (!lastStatus) lastStatus = 502;
++        lastEmptyError = `empty generation (${reasonLabel})`;
++        skippedEmptyStream = true;
+         continue;
+       }
+ 
+@@ -697,11 +684,11 @@ export async function handleComboChat({
+   // the request itself is invalid, but here the providers are simply unavailable
+   // or have no active credentials. 503 is more accurate and retryable by clients.
+   const allDisabled = lastError && lastError.toLowerCase().includes("no credentials");
+-  let status = allDisabled ? 503 : (lastStatus || 503);
++  let status = allDisabled ? 503 : (lastStatus || (skippedEmptyStream ? 502 : 503));
+   // The wait deadline was configured and has now expired: report the router's
+   // own 502 rather than relaying an upstream 429/503 to the client.
+   if (holdDeadlineAt && (status === 429 || status === 503)) status = 502;
+-  const msg = lastError || "All combo models unavailable";
++  const msg = lastError || lastEmptyError || "All combo models unavailable";
+ 
+   if (earliestRetryAfter) {
+     const retryHuman = formatRetryAfter(earliestRetryAfter);
+diff --git a/open-sse/services/emptyFailover.js b/open-sse/services/emptyFailover.js
+index bc5ea7b7..0454ec6d 100644
+--- a/open-sse/services/emptyFailover.js
++++ b/open-sse/services/emptyFailover.js
+@@ -20,8 +20,9 @@ import { CLAUDE_BLOCK, RESPONSES_ITEM } from "../translator/schema/blocks.js";
+ import { CLAUDE_EVENT, CLAUDE_DELTA, RESPONSES_EVENT, RESPONSES_EVENT_PREFIX } from "../translator/schema/streamEvents.js";
+ import { toOpenAIFinish } from "../translator/concerns/finishReason.js";
+ import { FORMATS } from "../translator/formats.js";
+-import { EMPTY_PEEK_DEADLINE_MS } from "../config/runtimeConfig.js";
++import { EMPTY_PEEK_DEADLINE_MS, NATIVE_GEMINI_RESPONSE_FIELDS } from "../config/runtimeConfig.js";
+ import { parseSSELine } from "../utils/streamHelpers.js";
++import { parseFieldMask } from "../utils/antigravityNative.js";
+ 
+ // OpenAI chat content test. A chunk counts as content only if it carries
+ // assistant output the caller can consume:
+@@ -108,34 +109,60 @@ function inspectResponsesEvent(obj) {
+ 
+ // Inspect one complete client-format SSE line (parsed with the shared parseSSELine) and report
+ // whether it carries content and/or a finish reason. Non-data lines and "[DONE]" carry nothing.
+-function geminiPartHasClientContent(part) {
++function geminiPartHasClientContent(part, unary) {
+   if (!part || typeof part !== "object") return false;
+-  if (nonEmptyString(part.text) && part.thought !== true) return true;
++  if (nonEmptyString(part.text) && part.thought !== true && (!unary || part.text.trim())) return true;
+   if (part.functionCall || part.executableCode || part.codeExecutionResult) return true;
+   if (nonEmptyString(part.inlineData?.data) || nonEmptyString(part.fileData?.fileUri)) return true;
+   return false;
+ }
+ 
+-function inspectGeminiEvent(obj) {
+-  const candidates = Array.isArray(obj.candidates) ? obj.candidates : obj.response?.candidates;
+-  let content = false, finishReason = null;
++// A usage frame is output only when the caller excluded the candidate fields.
++function projectedGeminiMetadata(response, projection) {
++  const masks = projection?.masks?.map(value => String(value ?? "").trim()).filter(Boolean);
++  if (!masks?.length) return false;
++  const fields = NATIVE_GEMINI_RESPONSE_FIELDS.filter(field => field !== "candidates" && Object.hasOwn(response, field));
++  if (!fields.length) return false;
++  try {
++    // The query grammar accepts both query and header path separators.
++    const selectors = masks.map(mask => parseFieldMask(mask, "fields"));
++    return selectors.every(selector => selector && !selector.children.has("candidates"))
++      && fields.some(field => selectors.some(selector => selector.children.has(field)));
++  } catch {
++    return false;
++  }
++}
++
++export function inspectGeminiResponse(obj, nativeResponseProjection = null, unary = false) {
++  const response = Array.isArray(obj?.candidates) || obj?.promptFeedback?.blockReason
++    ? obj : (obj?.response || obj);
++  if (!response || typeof response !== "object") return null;
++  const projected = projectedGeminiMetadata(response, nativeResponseProjection);
++  const candidates = Array.isArray(response.candidates) ? response.candidates : null;
++  const blocked = !!response.promptFeedback?.blockReason;
++  if (!candidates && !blocked && !projected && !Object.hasOwn(response, "usageMetadata")) return null;
++
++  let content = projected;
++  let finishReason = blocked ? OPENAI_FINISH.CONTENT_FILTER : null;
+   for (const candidate of candidates || []) {
+-    for (const part of candidate?.content?.parts || []) {
+-      if (geminiPartHasClientContent(part)) content = true;
++    const parts = candidate?.content?.parts;
++    if (Array.isArray(parts) && parts.some(part => geminiPartHasClientContent(part, unary))) {
++      content = true;
+     }
+-    if (candidate?.finishReason) {
+-      finishReason = toOpenAIFinish(candidate.finishReason, FORMATS.GEMINI);
++    if (candidate?.finishReason && !isNoRetryFinish(finishReason)) {
++      const reason = toOpenAIFinish(candidate.finishReason, FORMATS.GEMINI);
++      if (unary && /^(STOP|MAX_TOKENS)$/i.test(candidate.finishReason)) content = true;
++      finishReason = reason;
+     }
+   }
+   return { content, finishReason };
+ }
+ 
+-export function inspectSSELine(line) {
++export function inspectSSELine(line, nativeResponseProjection = null) {
+   const parsed = parseSSELine(line.trimStart());
+   if (!parsed || parsed.done) return { content: false, finishReason: null };
+-  if (Array.isArray(parsed.candidates) || Array.isArray(parsed.response?.candidates)) {
+-    return inspectGeminiEvent(parsed);
+-  }
++  const gemini = inspectGeminiResponse(parsed, nativeResponseProjection);
++  if (gemini) return gemini;
+   if (typeof parsed.type === "string" && !Array.isArray(parsed.choices)) {
+     return parsed.type.startsWith(RESPONSES_EVENT_PREFIX) ? inspectResponsesEvent(parsed) : inspectClaudeEvent(parsed);
+   }
+@@ -150,13 +177,13 @@ export function inspectSSELine(line) {
+ // Scan the COMPLETE lines of a decoded SSE buffer and update the running decision.
+ // The trailing fragment (a line still being received) is not parsed — it is returned in
+ // `state.pending` for the caller to prepend to the next chunk. `sawContent` latches true.
+-export function scanSSEBuffer(text, state = { sawContent: false, finishReason: null }) {
++export function scanSSEBuffer(text, state = { sawContent: false, finishReason: null }, nativeResponseProjection = null) {
+   const lines = text.split("\n");
+   state.pending = lines.pop();
+   for (const line of lines) {
+-    const info = inspectSSELine(line);
++    const info = inspectSSELine(line, nativeResponseProjection);
+     if (info.content) state.sawContent = true;
+-    if (info.finishReason) state.finishReason = info.finishReason;
++    if (info.finishReason && !isNoRetryFinish(state.finishReason)) state.finishReason = info.finishReason;
+   }
+   return state;
+ }
+@@ -174,7 +201,10 @@ export function isNoRetryFinish(finishReason) {
+ // possibly-valid slow stream). Returns the decision, the buffered head bytes, the live reader,
+ // and — if the deadline fired mid-read — the still-pending read() (`pendingRead`) so the caller
+ // can resume from it WITHOUT abandoning the chunk it will deliver.
+-export async function peekStreamForContent(body, { deadlineMs = EMPTY_PEEK_DEADLINE_MS } = {}) {
++export async function peekStreamForContent(body, {
++  deadlineMs = EMPTY_PEEK_DEADLINE_MS,
++  nativeResponseProjection = null,
++} = {}) {
+   const reader = body.getReader();
+   const decoder = new TextDecoder();
+   const headChunks = [];
+@@ -208,12 +238,12 @@ export async function peekStreamForContent(body, { deadlineMs = EMPTY_PEEK_DEADL
+     const { done, value } = res;
+     pendingRead = null;
+     if (done) {
+-      if (textBuf) scanSSEBuffer(textBuf + "\n", state); // final line without a trailing newline
++      if (textBuf) scanSSEBuffer(textBuf + "\n", state, nativeResponseProjection); // final line without a trailing newline
+       return settle({ outcome: state.sawContent ? "content" : "empty", timedOut: false, head: headChunks, reader, pendingRead: null, finishReason: state.finishReason });
+     }
+     headChunks.push(value);
+     textBuf += decoder.decode(value, { stream: true });
+-    scanSSEBuffer(textBuf, state);
++    scanSSEBuffer(textBuf, state, nativeResponseProjection);
+     textBuf = state.pending; // only the not-yet-complete line carries over
+     if (state.sawContent) {
+       return settle({ outcome: "content", timedOut: false, head: headChunks, reader, pendingRead: null, finishReason: state.finishReason });
+diff --git a/open-sse/utils/antigravityNative.js b/open-sse/utils/antigravityNative.js
+index 5761ed80..da562a65 100644
+--- a/open-sse/utils/antigravityNative.js
++++ b/open-sse/utils/antigravityNative.js
+@@ -33,7 +33,7 @@ function fieldMaskSyntaxError(source, index, reason) {
+   return new Error(`Invalid ${source} field mask at position ${index + 1}: ${reason}`);
+ }
+ 
+-function parseFieldMask(rawMask, source) {
++export function parseFieldMask(rawMask, source) {
+   const text = String(rawMask ?? "").trim();
+   if (!text) return null;
+ 
+diff --git a/open-sse/utils/streamHelpers.js b/open-sse/utils/streamHelpers.js
+index 571d03df..6825fca1 100644
+--- a/open-sse/utils/streamHelpers.js
++++ b/open-sse/utils/streamHelpers.js
+@@ -2,10 +2,25 @@ import { FORMATS } from "../translator/formats.js";
+ import { fallbackToolCallId } from "../translator/concerns/toolCall.js";
+ import { buildErrorBody } from "./error.js";
+ import { SSE_DONE } from "./sseConstants.js";
+-import { NATIVE_GEMINI_RESPONSE_FIELDS, NATIVE_GEMINI_BRIDGE_FIELDS, NATIVE_GEMINI_FORMATS } from "../config/runtimeConfig.js";
++import {
++  NATIVE_GEMINI_RESPONSE_FIELDS, NATIVE_GEMINI_BRIDGE_FIELDS, NATIVE_GEMINI_FORMATS,
++  NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES, NATIVE_GEMINI_FIELD_MASK_HEADER_NAME,
++} from "../config/runtimeConfig.js";
+ 
+ const sharedEncoder = new TextEncoder();
+ 
++// Preserve the raw client projection for response validation and combo peeking.
++export function getNativeGeminiResponseProjection(clientRawRequest) {
++  const masks = [];
++  for (const [name, value] of clientRawRequest?.queryParams || []) {
++    if (NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.includes(name)) masks.push(value);
++  }
++  for (const [name, value] of Object.entries(clientRawRequest?.headers || {})) {
++    if (name.toLowerCase() === NATIVE_GEMINI_FIELD_MASK_HEADER_NAME) masks.push(value);
++  }
++  return masks.length ? { masks } : null;
++}
++
+ function nativeResponseProjectionAllowsEmpty(projection) {
+   return projection?.masks?.some(value => {
+     const mask = String(value ?? "").trim();
+diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
+index 9bec6ace..eaa3a67c 100644
+--- a/src/sse/handlers/chat.js
++++ b/src/sse/handlers/chat.js
+@@ -30,6 +30,7 @@ import { getProjectIdForConnection } from "open-sse/services/projectId.js";
+ import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
+ import { extractClientApiKey, getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
+ import { resolveSmartChoice } from "../services/systemoneRouter.js";
++import { getNativeGeminiResponseProjection } from "open-sse/utils/streamHelpers.js";
+ 
+ const GEMINI_ERROR_STATUS = Object.freeze({
+   400: "INVALID_ARGUMENT",
+@@ -263,7 +264,7 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
+             cleanRawReq = { ...clientRawRequest, body: cleanBody };
+           }
+-          return handleSingleModelChat(b, applyComboThinkingSuffix(m, comboSuffix), cleanRawReq, request, apiKey, null, options);
++          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options, comboSuffix);
+         },
+         log,
+         comboName,
+@@ -278,15 +279,17 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+     return responseErrorForClient(await handleComboChat({
+       body,
+       models: augmentedModels,
++      nativeResponseProjection: isNativeGeminiRequest(options) ? getNativeGeminiResponseProjection(clientRawRequest) : null,
+       handleSingleModel: withCapacityAdapterStripping(
+         (b, m) => handleSingleModelChat(
+           b,
+-          adapterAdded.includes(m) ? m : applyComboThinkingSuffix(m, comboSuffix),
++          m,
+           clientRawRequest,
+           request,
+           apiKey,
+           null,
+-          options
++          options,
++          adapterAdded.includes(m) ? null : comboSuffix
+         ),
+         adapterAdded
+       ),
+@@ -318,6 +321,7 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+     return handleComboChat({
+       body,
+       models: soloAugmented,
++      nativeResponseProjection: isNativeGeminiRequest(options) ? getNativeGeminiResponseProjection(clientRawRequest) : null,
+       handleSingleModel: withCapacityAdapterStripping(
+         (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
+         adapterAdded
+@@ -334,14 +338,15 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+ /**
+  * Handle single model chat request
+  */
+-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, options = {}) {
++async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, options = {}, inheritedComboSuffix = null) {
+   const modelInfo = await getModelInfo(modelStr);
+ 
+   // If provider is null, this might be a combo name - check and handle
+   if (!modelInfo.provider) {
+     const comboModels = await getComboModels(modelStr);
+     if (comboModels) {
+-      const { comboName, comboSuffix } = resolveComboInvocation(modelStr, modelInfo);
++      const { comboName, comboSuffix: localSuffix } = resolveComboInvocation(modelStr, modelInfo);
++      const comboSuffix = inheritedComboSuffix || localSuffix;
+       const chatSettings = await getSettings();
+       // Check for combo-specific strategy first, fallback to global
+       const comboStrategies = chatSettings.comboStrategies || {};
+@@ -366,7 +371,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
+               cleanRawReq = { ...clientRawRequest, body: cleanBody };
+             }
+-            return handleSingleModelChat(b, applyComboThinkingSuffix(m, comboSuffix), cleanRawReq, request, apiKey, null, options);
++            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, options, comboSuffix);
+           },
+           log,
+           comboName,
+@@ -383,15 +388,17 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+       return responseErrorForClient(await handleComboChat({
+         body,
+         models: augmentedModels,
++        nativeResponseProjection: isNativeGeminiRequest(options) ? getNativeGeminiResponseProjection(clientRawRequest) : null,
+         handleSingleModel: withCapacityAdapterStripping(
+           (b, m) => handleSingleModelChat(
+             b,
+-            adapterAdded.includes(m) ? m : applyComboThinkingSuffix(m, comboSuffix),
++            m,
+             clientRawRequest,
+             request,
+             apiKey,
+             null,
+-            options
++            options,
++            adapterAdded.includes(m) ? null : comboSuffix
+           ),
+           adapterAdded
+         ),
+@@ -417,7 +424,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+     return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Invalid model format", options);
+   }
+ 
+-  const { provider, model } = modelInfo;
++  const { provider } = modelInfo;
++  const model = applyComboThinkingSuffix(modelInfo.model, inheritedComboSuffix);
+ 
+   // Routing shown in the unified "▶" line (client model → provider/model)
+ 
+diff --git a/tests/unit/gemini-native-combo-effort.test.js b/tests/unit/gemini-native-combo-effort.test.js
+index 680f2667..037edb3c 100644
+--- a/tests/unit/gemini-native-combo-effort.test.js
++++ b/tests/unit/gemini-native-combo-effort.test.js
+@@ -9,6 +9,11 @@ import path from "node:path";
+ import vm from "node:vm";
+ import { createHash } from "node:crypto";
+ import { fileURLToPath } from "node:url";
++import {
++  NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES,
++  NATIVE_GEMINI_FIELD_MASK_HEADER_NAME,
++} from "../../open-sse/config/runtimeConfig.js";
++import * as streamHelpers from "../../open-sse/utils/streamHelpers.js";
+ 
+ const { network, executorInstances, fx } = vi.hoisted(() => ({
+   network: vi.fn(),
+@@ -18,8 +23,12 @@ const { network, executorInstances, fx } = vi.hoisted(() => ({
+       { id: "ccarbon", name: ".gemini-carbon", models: ["ag/gemini-4-carbon-high"] },
+       { id: "chydro", name: ".gemini-hydrogen", models: ["ag/gemini-4-hydrogen-xhigh"] },
+       { id: "cflash", name: ".gemini-flash-lite", models: ["aistudio/gemini-3.5-flash-lite", "gemini/gemini-3.5-flash-lite"] },
++      { id: "cag-fallback", name: ".antigravity-fallback", models: ["ag/gemini-4-carbon-high", "gemini/gemini-3.5-flash-lite"] },
+       { id: "cmain", name: "Main", models: ["openai/model-a", "openai/model-b"] },
+       { id: "cother", name: "other", models: ["openai/model-c"] },
++      { id: "couter", name: "outer", models: ["Panel(high)"] },
++      { id: "cpanel-literal", name: "Panel(high)", models: ["aistudio/literal-model(low)"] },
++      { id: "cpanel", name: "Panel", models: ["gemini/unrelated-model"] },
+     ],
+     nodes: [],
+     aliases: {},
+@@ -168,6 +177,9 @@ function loadRouteHarness({ flashImpl } = {}) {
+     PROVIDER_MODELS: { gemini: [], "gemini-tts-models": [] },
+     HTTP_STATUS: { BAD_REQUEST: 400, UNAUTHORIZED: 401, NOT_FOUND: 404, SERVER_ERROR: 500, SERVICE_UNAVAILABLE: 503 },
+     ACCOUNT_WAIT_DEADLINE_MS: 0,
++    NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES,
++    NATIVE_GEMINI_FIELD_MASK_HEADER_NAME,
++    getNativeGeminiResponseProjection: streamHelpers.getNativeGeminiResponseProjection,
+     FORMATS: { GEMINI: "gemini", OPENAI: "openai" },
+     DEFAULT_HEADROOM_URL: "http://unused.test",
+     getTargetFormat, supportsNativeGemini, resolveSessionIdentity,
+@@ -190,11 +202,11 @@ function loadRouteHarness({ flashImpl } = {}) {
+   return { context, services, flashCalls };
+ }
+ 
+-async function postCombo(context, comboWithAction, body) {
+-  const url = `https://router.test/v1beta/models/${comboWithAction}?alt=sse`;
++async function postCombo(context, comboWithAction, body, query = "alt=sse", headers = {}) {
++  const url = `https://router.test/v1beta/models/${comboWithAction}?${query}`;
+   const request = new Request(url, {
+     method: "POST",
+-    headers: { "Content-Type": "application/json" },
++    headers: { "Content-Type": "application/json", ...headers },
+     body: JSON.stringify(body),
+   });
+   return context.POST(request, { params: Promise.resolve({ path: comboWithAction.split("/") }) });
+@@ -387,4 +399,128 @@ describe("native Gemini combo routing end-to-end", () => {
+     expect(body.error.message).toContain("No active credentials");
+     expect(services.handleChatCore).toHaveBeenCalled();
+   });
++
++  it.each([
++    [false, "aistudio", 503],
++    [true, "aistudio", 503],
++    [false, "gemini", 200],
++    [true, "gemini", 200],
++    [false, null, 200],
++    [true, null, 200],
++  ])("keeps the right response with stream=%s and empty provider %s", async (stream, emptyProvider, expectedStatus) => {
++    const empty = { candidates: [{ finishReason: "MALFORMED_FUNCTION_CALL" }] };
++    const emptyResponse = stream
++      ? () => new Response(sseFrame(empty), { headers: { "Content-Type": "text/event-stream" } })
++      : () => Response.json(empty);
++    const { context, flashCalls } = loadRouteHarness({
++      flashImpl: async ({ modelInfo }) => !emptyProvider || modelInfo.provider === emptyProvider
++        ? { success: true, nativeResponse: true, response: emptyResponse() }
++        : {
++          success: false, nativeResponse: true, status: 503, error: "Temporarily unavailable",
++          response: Response.json({ error: { code: 503, status: "UNAVAILABLE", message: "Temporarily unavailable" } }, { status: 503 }),
++        },
++    });
++    const response = await postCombo(context, `.gemini-flash-lite:${stream ? "streamGenerateContent" : "generateContent"}`, nativeBody());
++    expect(flashCalls.map(call => call.modelInfo.provider)).toEqual(["aistudio", "gemini"]);
++    expect(response.status).toBe(expectedStatus);
++    if (expectedStatus === 503) {
++      expect(await response.json()).toEqual({ error: { code: 503, status: "UNAVAILABLE", message: "Temporarily unavailable" } });
++    } else if (stream) {
++      expect(await response.text()).toBe(sseFrame(empty));
++    } else {
++      expect(await response.json()).toEqual(empty);
++    }
++  });
++
++  it.each([false, true])("preserves native prompt blocking with stream=%s", async (stream) => {
++    const blocked = { candidates: [], promptFeedback: { blockReason: "SAFETY" } };
++    const { context, flashCalls } = loadRouteHarness({
++      flashImpl: async () => ({
++        success: true, nativeResponse: true,
++        response: stream ? new Response(sseFrame({ response: blocked }), { headers: { "Content-Type": "text/event-stream" } }) : Response.json(blocked),
++      }),
++    });
++    const response = await postCombo(context, `.gemini-flash-lite:${stream ? "streamGenerateContent" : "generateContent"}`, nativeBody());
++    expect(await response.text()).toContain("SAFETY");
++    expect(flashCalls).toHaveLength(1);
++  });
++
++  it("keeps a usable candidate after an earlier candidate aborted", async () => {
++    const reply = { candidates: [{ finishReason: "MALFORMED_FUNCTION_CALL" }, nativeChunk("second candidate").candidates[0]] };
++    const { context, flashCalls } = loadRouteHarness({
++      flashImpl: async () => ({ success: true, nativeResponse: true, response: Response.json(reply) }),
++    });
++    const response = await postCombo(context, ".gemini-flash-lite:generateContent", nativeBody());
++    expect(await response.json()).toEqual(reply);
++    expect(flashCalls).toHaveLength(1);
++  });
++
++  it.each([false, true])("keeps a terminal in-band JSON stream error (wrapped=%s)", async (wrapped) => {
++    const empty = { candidates: [{ finishReason: "MALFORMED_FUNCTION_CALL" }] };
++    const failure = { error: { code: 503, status: "UNAVAILABLE", message: "Generation interrupted" } };
++    const reply = [empty, wrapped ? { response: failure } : failure];
++    network.mockImplementation(async () => new Response(sseFrame({ response: empty }) + sseFrame(failure), {
++      headers: { "Content-Type": "text/event-stream" },
++    }));
++    const { context, services } = loadRouteHarness({
++      flashImpl: async ({ modelInfo }) => ({
++        success: true, nativeResponse: true,
++        response: Response.json(modelInfo.provider === "aistudio" ? reply : [nativeChunk("fallback")]),
++      }),
++    });
++    const combo = wrapped ? ".gemini-flash-lite" : ".antigravity-fallback";
++    const response = await postCombo(context, `${combo}:streamGenerateContent`, nativeBody(), "alt=json");
++    expect(response.status).toBe(200);
++    expect(await response.json()).toEqual(reply);
++    expect(services.handleChatCore).toHaveBeenCalledOnce();
++  });
++
++  it.each([
++    ["alt=sse&fields=usageMetadata", {}, 1],
++    ["alt=sse&fields=usageMetadata(totalTokenCount%2Cother)", {}, 1],
++    ["alt=sse&fields=usageMetadata.*", {}, 1],
++    ["alt=sse&fields=usageMetadata%2FtotalTokenCount", {}, 1],
++    ["alt=sse", { "x-goog-fieldmask": "usageMetadata.totalTokenCount" }, 1],
++    ["alt=sse&fields=candidates%2CusageMetadata", {}, 2],
++    ["alt=sse&fields=*%2CusageMetadata", {}, 2],
++    ["alt=sse", {}, 2],
++  ])("commits usage-only SSE only for a metadata projection (query %s, headers %j)", async (query, headers, count) => {
++    const metadata = { usageMetadata: { totalTokenCount: 10 } };
++    const { context, flashCalls } = loadRouteHarness({
++      flashImpl: async ({ modelInfo }) => ({
++        success: true, nativeResponse: true,
++        response: new Response(sseFrame(modelInfo.provider === "aistudio" ? metadata : nativeChunk("fallback")), {
++          headers: { "Content-Type": "text/event-stream" },
++        }),
++      }),
++    });
++    const response = await postCombo(context, ".gemini-flash-lite:streamGenerateContent", nativeBody(), query, headers);
++    expect(await response.text()).toContain(count === 1 ? "usageMetadata" : "fallback");
++    expect(flashCalls).toHaveLength(count);
++  });
++
++  it.each([
++    ["fields=usageMetadata", 1],
++    ["fields=candidates%2CusageMetadata", 2],
++    ["", 2],
++  ])("commits usage-only JSON only for a metadata projection (%s)", async (query, count) => {
++    const metadata = { usageMetadata: { totalTokenCount: 10 } };
++    const fallback = nativeChunk("fallback");
++    const { context, flashCalls } = loadRouteHarness({
++      flashImpl: async ({ modelInfo }) => ({
++        success: true, nativeResponse: true,
++        response: Response.json(modelInfo.provider === "aistudio" ? metadata : fallback),
++      }),
++    });
++    const response = await postCombo(context, ".gemini-flash-lite:generateContent", nativeBody(), query);
++    expect(await response.json()).toEqual(count === 1 ? metadata : fallback);
++    expect(flashCalls).toHaveLength(count);
++  });
++
++  it("resolves literal nested combo names before inheriting effort", async () => {
++    const { context, flashCalls } = loadRouteHarness();
++    const response = await postCombo(context, "outer(medium):streamGenerateContent", nativeBody());
++    expect(await response.text()).toContain("from-aistudio");
++    expect(flashCalls.map(call => call.body.model)).toEqual(["aistudio/literal-model(medium)"]);
++  });
+ });
+-- 
+2.55.0
+

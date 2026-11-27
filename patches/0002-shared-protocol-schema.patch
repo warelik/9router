@@ -1,0 +1,322 @@
+From 8455022b82bf34cfc33344640a961b4c29786ec1 Mon Sep 17 00:00:00 2001
+From: downstream <downstream@local>
+Date: Fri, 27 Nov 2026 20:00:00 +0000
+Subject: [PATCH 02/10] Share protocol schema and runtime configuration
+
+Regroup existing application changes without changing the final tree.
+Previous carriers in overlay a97b678d:
+- 0002-shared-protocol-schema-and-runtime-configuration.patch (prior application commit 1e31cc90eeb8)
+- 0007-account-availability-and-combo-waits.patch (prior application commit 7895a8010c59)
+
+The historical migration source and cutoff are recorded in patches/source.json.
+---
+ open-sse/config/runtimeConfig.js            | 71 +++++++++++++++++++++
+ open-sse/translator/concerns/toolCall.js    | 49 +++++++++-----
+ open-sse/translator/schema/blocks.js        | 26 +++++++-
+ open-sse/translator/schema/finishReasons.js |  1 +
+ open-sse/translator/schema/index.js         |  5 +-
+ open-sse/utils/sseConstants.js              |  4 +-
+ 6 files changed, 136 insertions(+), 20 deletions(-)
+
+diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
+index 858da168..2488824e 100644
+--- a/open-sse/config/runtimeConfig.js
++++ b/open-sse/config/runtimeConfig.js
+@@ -1,3 +1,5 @@
++import { FORMATS } from "../translator/formats.js";
++
+ // HTTP status codes
+ export const HTTP_STATUS = {
+   BAD_REQUEST: 400,
+@@ -8,6 +10,7 @@ export const HTTP_STATUS = {
+   NOT_ACCEPTABLE: 406,
+   REQUEST_TIMEOUT: 408,
+   RATE_LIMITED: 429,
++  CLIENT_CLOSED_REQUEST: 499,
+   SERVER_ERROR: 500,
+   BAD_GATEWAY: 502,
+   SERVICE_UNAVAILABLE: 503,
+@@ -114,9 +117,41 @@ export const GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS = envMs("GEMINI_NATIVE_TTS_FETCH
+ // Default token limits
+ export const DEFAULT_MAX_TOKENS = 64000;
+ export const DEFAULT_MIN_TOKENS = 32000;
++export const DEFAULT_PROVIDER_THINKING_BUDGET = 10000;
++
++export const FILE_EXTENSION_MIME = {
++  pdf: "application/pdf", json: "application/json",
++  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
++  mp3: "audio/mpeg", wav: "audio/wav", mp4: "video/mp4",
++  txt: "text/plain", md: "text/markdown", csv: "text/csv",
++};
++
++export const SCHEMA_MAP_KEYS = new Set(["properties", "$defs", "definitions", "patternProperties", "dependentSchemas"]);
++export const SCHEMA_ARRAY_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
++export const SCHEMA_SINGLE_KEYS = new Set(["items", "additionalProperties", "contains", "not", "if", "then", "else"]);
++export const PROTO_SCHEMA_TYPES = new Set(["OBJECT", "ARRAY", "STRING", "NUMBER", "INTEGER", "BOOLEAN", "NULL"]);
++export const LEGACY_PROTO_SCHEMA_KEYS = new Set(["type", "format", "description", "nullable", "enum", "items", "properties", "required", "propertyOrdering"]);
++
+ 
+ export const TOKEN_SAVER_HEADER = "x-9router-token-saver";
+ 
++export const PORTABLE_COLLABORATION = {
++  header: "x-9router-portable-collaboration",
++  namespace: "collaboration",
++  messageTools: ["spawn_agent", "send_message", "followup_task"],
++  aliasPrefix: "collab_plain_",
++  aliasHashLength: 16,
++  aliasNameLength: 30,
++  aliasCollisionBaseLength: 58,
++};
++
++export const RESPONSES_NAMESPACE_ALIAS = {
++  prefix: "ns_",
++  stemLength: 40,
++  hashLength: 16,
++  maxLength: 64,
++};
++
+ // Retry config for 429 responses (legacy - kept for backward compatibility)
+ export const RETRY_CONFIG = {
+   maxAttempts: 2,
+@@ -146,3 +181,39 @@ export function resolveRetryEntry(entry) {
+ export const SKIP_PATTERNS = [
+   "Please write a 5-10 word title for the following conversation:"
+ ];
++
++export const FERNET_ENCRYPTED_CONTENT_PREFIX = "gAAAAA";
++
++export const SSE_DONE_PAYLOAD = "[DONE]";
++export const SSE_DONE = `data: ${SSE_DONE_PAYLOAD}\n\n`;
++
++export const NATIVE_GEMINI_PRIVATE_HEADERS = new Set([
++  "authorization", "proxy-authorization", "x-goog-api-key", "x-api-key", "cookie", "set-cookie",
++  "host", "content-length", "connection", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer",
++]);
++
++export const NATIVE_GEMINI_THINKING_KEYS = ["thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"];
++
++export const NATIVE_GEMINI_RESPONSE_FIELDS = ["candidates", "promptFeedback", "usageMetadata", "modelVersion", "responseId", "modelStatus", "createTime"];
++export const NATIVE_GEMINI_BRIDGE_FIELDS = new Set(["message", "event", "data", "status", "code", "success", "response"]);
++
++export const NATIVE_GEMINI_ERROR_STATUSES = {
++  400: "INVALID_ARGUMENT",
++  401: "UNAUTHENTICATED",
++  403: "PERMISSION_DENIED",
++  404: "NOT_FOUND",
++  429: "RESOURCE_EXHAUSTED",
++  503: "UNAVAILABLE",
++  504: "DEADLINE_EXCEEDED",
++};
++
++export const NATIVE_GEMINI_API_VERSIONS = ["v1", "v1alpha"];
++export const NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES = ["fields", "$fields"];
++export const NATIVE_GEMINI_FIELD_MASK_HEADER_NAME = "x-goog-fieldmask";
++export const NATIVE_GEMINI_JSON_FENCE_PENDING_STATES = ["start", "possible", "open"];
++export const NATIVE_GEMINI_FINISH_REASON_FIELDS = ["finishReason", "finish_reason"];
++export const NATIVE_GEMINI_CANDIDATE_MASK_PREFIXES = ["*", "candidates", "candidates/*"];
++export const NATIVE_GEMINI_FORMATS = [FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY];
++export const REWRITTEN_RESPONSE_HEADERS = ["content-encoding", "content-length", "transfer-encoding"];
++export const AISTUDIO_NATIVE_GEMINI_API_VERSION = "v1beta";
++export const GEMINI_DEFAULT_FILE_MIME_TYPE = "application/octet-stream";
+diff --git a/open-sse/translator/concerns/toolCall.js b/open-sse/translator/concerns/toolCall.js
+index 251850c1..51d2372f 100644
+--- a/open-sse/translator/concerns/toolCall.js
++++ b/open-sse/translator/concerns/toolCall.js
+@@ -1,6 +1,7 @@
+ // Tool call helper functions for translator
+ 
+ import { FORMATS } from "../formats.js";
++import { CLAUDE_BLOCK, OPENAI_BLOCK, ROLE } from "../schema/index.js";
+ 
+ // Anthropic tool_use.id must match: ^[a-zA-Z0-9_-]+$
+ const TOOL_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+@@ -23,22 +24,32 @@ function sanitizeToolId(id) {
+   return sanitized.length > 0 ? sanitized : null;
+ }
+ 
++export function isGeminiFamilyTarget(targetFormat, model) {
++  if (targetFormat === FORMATS.GEMINI || targetFormat === FORMATS.GEMINI_CLI || targetFormat === FORMATS.VERTEX) {
++    return true;
++  }
++  if (targetFormat === FORMATS.ANTIGRAVITY) {
++    return !String(model || "").toLowerCase().includes("claude");
++  }
++  return false;
++}
++
+ // Ensure all tool_calls have valid id field and arguments is string (some providers require it)
+-export function ensureToolCallIds(body) {
++export function ensureToolCallIds(body, { preserveIds = false } = {}) {
+   if (!body.messages || !Array.isArray(body.messages)) return body;
+ 
+   for (let i = 0; i < body.messages.length; i++) {
+     const msg = body.messages[i];
+-    if (msg.role === "assistant" && msg.tool_calls && Array.isArray(msg.tool_calls)) {
++    if (msg.role === ROLE.ASSISTANT && msg.tool_calls && Array.isArray(msg.tool_calls)) {
+       for (let j = 0; j < msg.tool_calls.length; j++) {
+         const tc = msg.tool_calls[j];
+         // Validate or regenerate ID for Anthropic compatibility
+-        if (!tc.id || !TOOL_ID_PATTERN.test(tc.id)) {
+-          const sanitized = sanitizeToolId(tc.id);
++        if (preserveIds ? !tc.id : (!tc.id || !TOOL_ID_PATTERN.test(tc.id))) {
++          const sanitized = preserveIds ? null : sanitizeToolId(tc.id);
+           tc.id = sanitized || generateToolCallId(i, j, tc.function?.name);
+         }
+         if (!tc.type) {
+-          tc.type = "function";
++          tc.type = OPENAI_BLOCK.FUNCTION;
+         }
+         // Ensure arguments is JSON string, not object
+         if (tc.function?.arguments && typeof tc.function.arguments !== "string") {
+@@ -48,23 +59,29 @@ export function ensureToolCallIds(body) {
+     }
+ 
+     // Validate tool_call_id in tool messages (role: "tool")
+-    if (msg.role === "tool" && msg.tool_call_id && !TOOL_ID_PATTERN.test(msg.tool_call_id)) {
+-      const sanitized = sanitizeToolId(msg.tool_call_id);
+-      msg.tool_call_id = sanitized || generateToolCallId(i, 0);
++    if (msg.role === ROLE.TOOL) {
++      if (preserveIds ? !msg.tool_call_id : (msg.tool_call_id && !TOOL_ID_PATTERN.test(msg.tool_call_id))) {
++        const sanitized = preserveIds ? null : sanitizeToolId(msg.tool_call_id);
++        msg.tool_call_id = sanitized || generateToolCallId(i, 0);
++      }
+     }
+ 
+     // Also validate tool_use blocks in content (Claude format)
+     if (Array.isArray(msg.content)) {
+       for (let k = 0; k < msg.content.length; k++) {
+         const block = msg.content[k];
+-        if (block.type === "tool_use" && block.id && !TOOL_ID_PATTERN.test(block.id)) {
+-          const sanitized = sanitizeToolId(block.id);
+-          block.id = sanitized || generateToolCallId(i, k, block.name);
++        if (block.type === CLAUDE_BLOCK.TOOL_USE) {
++          if (preserveIds ? !block.id : (block.id && !TOOL_ID_PATTERN.test(block.id))) {
++            const sanitized = preserveIds ? null : sanitizeToolId(block.id);
++            block.id = sanitized || generateToolCallId(i, k, block.name);
++          }
+         }
+         // Validate tool_use_id in tool_result blocks
+-        if (block.type === "tool_result" && block.tool_use_id && !TOOL_ID_PATTERN.test(block.tool_use_id)) {
+-          const sanitized = sanitizeToolId(block.tool_use_id);
+-          block.tool_use_id = sanitized || generateToolCallId(i, k);
++        if (block.type === CLAUDE_BLOCK.TOOL_RESULT) {
++          if (preserveIds ? !block.tool_use_id : (block.tool_use_id && !TOOL_ID_PATTERN.test(block.tool_use_id))) {
++            const sanitized = preserveIds ? null : sanitizeToolId(block.tool_use_id);
++            block.tool_use_id = sanitized || generateToolCallId(i, k);
++          }
+         }
+       }
+     }
+@@ -75,7 +92,7 @@ export function ensureToolCallIds(body) {
+ 
+ // Get tool_call ids from assistant message (OpenAI format: tool_calls, Claude format: tool_use in content)
+ export function getToolCallIds(msg) {
+-  if (msg.role !== "assistant") return [];
++  if (msg.role !== ROLE.ASSISTANT) return [];
+ 
+   const ids = [];
+ 
+@@ -89,7 +106,7 @@ export function getToolCallIds(msg) {
+   // Claude format: tool_use blocks in content
+   if (Array.isArray(msg.content)) {
+     for (const block of msg.content) {
+-      if (block.type === "tool_use" && block.id) {
++      if (block.type === CLAUDE_BLOCK.TOOL_USE && block.id) {
+         ids.push(block.id);
+       }
+     }
+diff --git a/open-sse/translator/schema/blocks.js b/open-sse/translator/schema/blocks.js
+index d22468f7..6ed8d9e8 100644
+--- a/open-sse/translator/schema/blocks.js
++++ b/open-sse/translator/schema/blocks.js
+@@ -32,21 +32,45 @@ export const CLAUDE_BLOCK = {
+   WEB_SEARCH_TOOL_RESULT: "web_search_tool_result",
+ };
+ 
+-// OpenAI Responses API item types.
++// OpenAI Responses API item types and observed collaboration compatibility types.
+ export const RESPONSES_ITEM = {
+   MESSAGE: "message",
++  AGENT_MESSAGE: "agent_message",
+   FUNCTION_CALL: "function_call",
+   FUNCTION_CALL_OUTPUT: "function_call_output",
+   CUSTOM_TOOL_CALL: "custom_tool_call",
+   CUSTOM_TOOL_CALL_OUTPUT: "custom_tool_call_output",
++  WEB_SEARCH_CALL: "web_search_call",
+   ADDITIONAL_TOOLS: "additional_tools",
+   REASONING: "reasoning",
+   OUTPUT_TEXT: "output_text",
+   INPUT_TEXT: "input_text",
++  ENCRYPTED_CONTENT: "encrypted_content",
+   INPUT_IMAGE: "input_image",
++  INPUT_FILE: "input_file",
+   SUMMARY_TEXT: "summary_text",
+ };
+ 
++// OpenAI Responses tool declaration and tool-choice discriminator types.
++export const RESPONSES_TOOL = {
++  NAMESPACE: "namespace",
++  FUNCTION: "function",
++  CUSTOM: "custom",
++  WEB_SEARCH: "web_search",
++  ALLOWED_TOOLS: "allowed_tools",
++};
++
++// OpenAI client-facing tool_choice selectors.
++export const OPENAI_TOOL_CHOICE_AUTO = "auto";
++export const OPENAI_TOOL_CHOICE_NONE = "none";
++export const OPENAI_TOOL_CHOICE_REQUIRED = "required";
++
++// Gemini function-calling modes.
++export const GEMINI_FUNCTION_CALLING_MODE_AUTO = "AUTO";
++export const GEMINI_FUNCTION_CALLING_MODE_NONE = "NONE";
++export const GEMINI_FUNCTION_CALLING_MODE_ANY = "ANY";
++export const GEMINI_FUNCTION_CALLING_MODE_VALIDATED = "VALIDATED";
++
+ // Valid OpenAI block types (used by filterToOpenAIFormat).
+ export const VALID_OPENAI_CONTENT_TYPES = [
+   OPENAI_BLOCK.TEXT, OPENAI_BLOCK.IMAGE_URL, OPENAI_BLOCK.IMAGE, OPENAI_BLOCK.INPUT_AUDIO, OPENAI_BLOCK.AUDIO_URL, OPENAI_BLOCK.FILE,
+diff --git a/open-sse/translator/schema/finishReasons.js b/open-sse/translator/schema/finishReasons.js
+index d0cc6244..9143e9cf 100644
+--- a/open-sse/translator/schema/finishReasons.js
++++ b/open-sse/translator/schema/finishReasons.js
+@@ -32,6 +32,7 @@ export const RESPONSES_INCOMPLETE_REASON = {
+ 
+ // Gemini finishReason values.
+ export const GEMINI_FINISH = {
++  UNSPECIFIED: "FINISH_REASON_UNSPECIFIED",
+   STOP: "STOP",
+   MAX_TOKENS: "MAX_TOKENS",
+   SAFETY: "SAFETY",
+diff --git a/open-sse/translator/schema/index.js b/open-sse/translator/schema/index.js
+index be51a9be..e17f101a 100644
+--- a/open-sse/translator/schema/index.js
++++ b/open-sse/translator/schema/index.js
+@@ -1,8 +1,11 @@
+ // Translator schema barrel — pure data enums (roles, blocks). No logic here.
+ export { ROLE, GEMINI_ROLE } from "./roles.js";
+ export {
+-  OPENAI_BLOCK, CLAUDE_BLOCK, COMMANDCODE_BLOCK, RESPONSES_ITEM,
++  OPENAI_BLOCK, CLAUDE_BLOCK, COMMANDCODE_BLOCK, RESPONSES_ITEM, RESPONSES_TOOL,
+   VALID_OPENAI_CONTENT_TYPES, VALID_OPENAI_MESSAGE_TYPES,
++  OPENAI_TOOL_CHOICE_AUTO, OPENAI_TOOL_CHOICE_NONE, OPENAI_TOOL_CHOICE_REQUIRED,
++  GEMINI_FUNCTION_CALLING_MODE_AUTO, GEMINI_FUNCTION_CALLING_MODE_NONE,
++  GEMINI_FUNCTION_CALLING_MODE_ANY, GEMINI_FUNCTION_CALLING_MODE_VALIDATED,
+ } from "./blocks.js";
+ export { OPENAI_FINISH, CLAUDE_STOP, GEMINI_FINISH, RESPONSES_STATUS, RESPONSES_INCOMPLETE_REASON } from "./finishReasons.js";
+ export { CLAUDE_EVENT, CLAUDE_DELTA, RESPONSES_EVENT, RESPONSES_EVENT_PREFIX } from "./streamEvents.js";
+diff --git a/open-sse/utils/sseConstants.js b/open-sse/utils/sseConstants.js
+index 680a05ca..a7ae516d 100644
+--- a/open-sse/utils/sseConstants.js
++++ b/open-sse/utils/sseConstants.js
+@@ -1,5 +1,5 @@
+-// Shared SSE primitives (no imports → safe for executors + stream.js)
+-export const SSE_DONE = "data: [DONE]\n\n";
++// Shared SSE primitives re-exported from the central runtime config.
++export { SSE_DONE_PAYLOAD, SSE_DONE } from "../config/runtimeConfig.js";
+ 
+ export const SSE_HEADERS = {
+   "Content-Type": "text/event-stream",
+-- 
+2.55.0
+

@@ -1,0 +1,272 @@
+From 2157b941b59907821e06626e008d857415aaeeac Mon Sep 17 00:00:00 2001
+From: 9Router downstream <9router@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 20:07:25 +0000
+Subject: [PATCH] Preserve Muse top-level and namespace tool identity
+
+---
+ open-sse/translator/index.js         |  3 +-
+ open-sse/utils/museCloaking.js       | 33 ++++++-----
+ open-sse/utils/stream.js             |  3 +-
+ tests/unit/muse-cloaking.test.js     | 26 ++++++++-
+ tests/unit/muse-custom-tools.test.js | 82 ++++++++++++++++++++++++++++
+ 5 files changed, 129 insertions(+), 18 deletions(-)
+
+diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
+index 13b02925..64282020 100644
+--- a/open-sse/translator/index.js
++++ b/open-sse/translator/index.js
+@@ -3,7 +3,7 @@ import { OPENAI_TOOL_CHOICE_NONE } from "./schema/index.js";
+ import { ensureToolCallIds, fixMissingToolResponses, isGeminiFamilyTarget } from "./concerns/toolCall.js";
+ import { prepareClaudeRequest, ensureTrailingUserTurn } from "./formats/claude.js";
+ import { cloakClaudeTools, decloakStreamChunk } from "../utils/claudeCloaking.js";
+-import { cloakMuseTools, isMuseCodeSubscription, normalizeMuseResponsesTools } from "../utils/museCloaking.js";
++import { cloakMuseTools, isMuseCodeSubscription, normalizeMuseResponsesTools, reserveMuseTopLevelToolNames } from "../utils/museCloaking.js";
+ import { restoreToolNames } from "../utils/opencodeFingerprint.js";
+ import { filterToOpenAIFormat } from "./formats/openai.js";
+ import { adaptAIStudioStructuredOutput } from "./formats/gemini.js";
+@@ -271,6 +271,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+       for (const [dotted, descriptor] of normalized.namespaceToolNames) {
+         if (!merged.has(dotted)) merged.set(dotted, descriptor);
+       }
++      reserveMuseTopLevelToolNames(result, normalized.namespaceToolNames, merged);
+       result._toolNameMap = merged;
+     }
+   }
+diff --git a/open-sse/utils/museCloaking.js b/open-sse/utils/museCloaking.js
+index e2460925..c8e8e91e 100644
+--- a/open-sse/utils/museCloaking.js
++++ b/open-sse/utils/museCloaking.js
+@@ -14,7 +14,7 @@ export function isMuseCodeSubscription(credentials) {
+ 
+ function isClientTool(tool) {
+   return (tool?.type === RESPONSES_TOOL.FUNCTION || tool?.type === RESPONSES_TOOL.CUSTOM)
+-    && typeof tool?.name === "string" && tool.name.length > 0;
++    && !tool.namespace && typeof tool.name === "string" && tool.name.length > 0;
+ }
+ 
+ function allocateAlias(name, usedNames) {
+@@ -53,7 +53,7 @@ export function cloakMuseTools(body) {
+ 
+   const input = Array.isArray(body.input) ? body.input.map(item => {
+     if ((item?.type === RESPONSES_ITEM.FUNCTION_CALL || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL)
+-      && aliases.has(item.name)) {
++      && !item.namespace && aliases.has(item.name)) {
+       return { ...item, name: aliases.get(item.name) };
+     }
+     return item;
+@@ -61,8 +61,7 @@ export function cloakMuseTools(body) {
+ 
+   const cloakedBody = { ...body, tools, input };
+   const choice = body.tool_choice;
+-  if ((choice?.type === RESPONSES_TOOL.FUNCTION || choice?.type === RESPONSES_TOOL.CUSTOM)
+-    && aliases.has(choice.name)) {
++  if (isClientTool(choice) && aliases.has(choice.name)) {
+     cloakedBody.tool_choice = { ...choice, name: aliases.get(choice.name) };
+   } else if (choice?.type === RESPONSES_TOOL.ALLOWED_TOOLS && Array.isArray(choice.tools)) {
+     cloakedBody.tool_choice = {
+@@ -239,6 +238,22 @@ export function normalizeMuseResponsesTools(body) {
+   return { body: changed ? out : body, customToolNames, namespaceToolNames };
+ }
+ 
++// An actual top-level wire name takes precedence over a bare namespace fallback.
++export function reserveMuseTopLevelToolNames(body, namespaceToolNames, toolNameMap) {
++  const childNames = new Set([...namespaceToolNames.values()].map(tool => tool.name));
++  const deferred = Array.isArray(body.input)
++    ? body.input.filter(item => item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS).map(item => item.tools)
++    : [];
++  for (const tools of [body.tools, ...deferred]) {
++    if (!Array.isArray(tools)) continue;
++    for (const tool of tools) {
++      if (isClientTool(tool) && childNames.has(tool.name) && !toolNameMap.has(tool.name)) {
++        toolNameMap.set(tool.name, tool.name);
++      }
++    }
++  }
++}
++
+ /** The freeform input inside a converted function call's arguments. */
+ export function extractMuseCustomInput(argumentsText) {
+   if (typeof argumentsText !== "string") return "";
+@@ -258,14 +273,6 @@ export function isMuseCustomToolCall(item, customToolNames) {
+   if (!item.namespace) {
+     const dot = item.name.indexOf(".");
+     if (dot > 0 && customToolNames?.has(`${item.name.slice(0, dot)}/${item.name.slice(dot + 1)}`)) return true;
+-    // And, variability permitting, the model sometimes replies with the
+-    // bare child name instead; it is the custom tool only when exactly one
+-    // recorded namespace child carries that name.
+-    if (dot < 0 && customToolNames) {
+-      let matches = 0;
+-      for (const key of customToolNames) if (key.endsWith(`/${item.name}`)) matches += 1;
+-      if (matches === 1) return true;
+-    }
+   }
+   return false;
+ }
+@@ -286,7 +293,7 @@ export function qualifyMuseBareNamespaceCall(item, toolNameMap) {
+   if (!item || typeof item !== "object"
+     || (item.type !== RESPONSES_ITEM.FUNCTION_CALL && item.type !== RESPONSES_ITEM.CUSTOM_TOOL_CALL)
+     || typeof item.name !== "string" || !item.name
+-    || item.namespace || item.name.includes(".") || !toolNameMap) return;
++    || item.namespace || item.name.includes(".") || !toolNameMap || toolNameMap.has(item.name)) return;
+   let dotted = null;
+   for (const [key, descriptor] of toolNameMap) {
+     if (descriptor && typeof descriptor === "object" && descriptor.name === item.name) {
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index 83b27297..982218e4 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -438,6 +438,8 @@ export function createSSEStream(options = {}) {
+               // chunk reaches the client.
+               const toolCallIdFixed = ensureStreamToolCallIds(parsed, seenToolCallIds);
+ 
++              if (musePassthrough) restoreMuseNamespaceCalls(parsed, toolNameMap);
++
+               // Converted Muse custom calls: argument deltas are buffered
+               // (event dropped together with its held `event:` line), and a
+               // completed call is emitted as custom_tool_call_input events.
+@@ -470,7 +472,6 @@ export function createSSEStream(options = {}) {
+               // "Model tried to call unavailable tool 'read_client'" (#4986).
+               let toolNameRestored = false;
+               if (toolNameMap?.size) {
+-                if (musePassthrough) restoreMuseNamespaceCalls(parsed, toolNameMap);
+                 const restored = restoreToolNames(parsed, toolNameMap);
+                 if (restored !== parsed) {
+                   parsed = restored;
+diff --git a/tests/unit/muse-cloaking.test.js b/tests/unit/muse-cloaking.test.js
+index 1a515509..5c5aea23 100644
+--- a/tests/unit/muse-cloaking.test.js
++++ b/tests/unit/muse-cloaking.test.js
+@@ -88,14 +88,34 @@ describe("Muse Code request cloaking", () => {
+     );
+     expect(result.tools.map(tool => tool.name)).toEqual(nativeRequest().tools.map(tool => tool.name));
+     expect(result.input[0].name).toBe("read_file");
+-    // No cloaking aliases; the map carries only namespace descriptors used
+-    // to split Meta's flattened namespace calls back on the way out.
+-    expect([...(result._toolNameMap?.values() || [])].every(value => typeof value === "object")).toBe(true);
++    // No cloaking aliases; the map distinguishes the bare top-level name
++    // from the corresponding namespaced call.
++    expect([...(result._toolNameMap || [])].every(([wire, value]) => wire === value || typeof value === "object")).toBe(true);
+     expect(result._toolNameMap?.get("collaboration.read_file")).toEqual({
+       name: "read_file", namespace: "collaboration", type: "function",
+     });
+   });
+ 
++  it.each([false, true])("cloaks only top-level history and choices when a namespace shares the name (allowed=%s)", allowed => {
++    const request = nativeRequest();
++    const [topCall, topResult] = request.input;
++    const nsCall = { ...topCall, id: "fc_namespace", call_id: "call_namespace", namespace: "collaboration" };
++    const nsResult = { ...topResult, call_id: nsCall.call_id };
++    request.input.push(nsCall, nsResult);
++    const nsChoice = { type: "function", name: "read_file", namespace: "collaboration" };
++    request.tool_choice = allowed
++      ? { type: "allowed_tools", mode: "required", tools: [request.tool_choice, nsChoice] }
++      : nsChoice;
++
++    const result = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, MODEL, request, true, OAUTH, "muse");
++    expect(result.tools[0].name).toBe("read_file_muse");
++    expect(result.tools[3].tools[0].name).toBe("read_file");
++    expect(result.input).toEqual([{ ...topCall, name: "read_file_muse" }, topResult, nsCall, nsResult]);
++    expect(result.tool_choice).toEqual(allowed
++      ? { ...request.tool_choice, tools: [{ type: "function", name: "read_file_muse" }, nsChoice] }
++      : nsChoice);
++  });
++
+   it("allocates unique bounded aliases and rewrites allowed_tools without mutating hosted entries", () => {
+     const longName = "x".repeat(64);
+     const { body, toolNameMap } = cloakMuseTools({
+diff --git a/tests/unit/muse-custom-tools.test.js b/tests/unit/muse-custom-tools.test.js
+index 8930dce3..397480a4 100644
+--- a/tests/unit/muse-custom-tools.test.js
++++ b/tests/unit/muse-custom-tools.test.js
+@@ -369,6 +369,88 @@ describe("Muse custom tool restore (streaming passthrough)", () => {
+   });
+ });
+ 
++describe("Muse call identity with both top-level and namespaced tools", () => {
++  it.each(["json", "sse", "sse-to-json"])("preserves tool type, namespace and call_id through %s", async path => {
++    const body = {
++      model: MODEL,
++      input: [
++        { type: "additional_tools", tools: [{ type: "function", name: "inspect" }] },
++        { type: "message", role: "user", content: [{ type: "input_text", text: "Call the tools." }] },
++      ],
++      tools: [
++        { type: "custom", name: "send" },
++        { type: "namespace", name: "collaboration", tools: [
++          { type: "custom", name: "inspect" },
++          { type: "function", name: "send" },
++          { type: "custom", name: "write" },
++          { type: "custom", name: "format" },
++        ] },
++        { type: "namespace", name: "other", tools: [{ type: "function", name: "write" }] },
++      ],
++    };
++    const translated = translateRequest(
++      FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, MODEL, body, true, { apiKey: "test-only-payg-key" }, "muse",
++    );
++    const calls = [
++      ["inspect", '{"path":"fixture"}'],
++      ["collaboration.inspect", PATCH_ARGS],
++      ["send", PATCH_ARGS],
++      ["collaboration.send", '{"message":"hi"}'],
++      ["write", '{"file":"fixture"}'],
++      ["format", PATCH_ARGS],
++    ].map(([name, args], i) => ({ ...providerItem(name, args), id: `fc_${i}`, call_id: `call_${i}` }));
++    const customCall = ({ arguments: _, ...call }, namespace) => ({
++      ...call, type: "custom_tool_call", input: PATCH, ...(namespace ? { namespace } : {}),
++    });
++    const expected = [
++      calls[0],
++      { ...customCall(calls[1], "collaboration"), name: "inspect" },
++      customCall(calls[2]),
++      { ...calls[3], name: "send", namespace: "collaboration" },
++      calls[4],
++      customCall(calls[5], "collaboration"),
++    ];
++    const response = {
++      id: "resp_identity", object: "response", status: "completed", output: calls,
++      usage: { input_tokens: 7, output_tokens: 3 },
++    };
++    const events = calls.flatMap((item, output_index) => [
++      { type: "response.output_item.added", output_index, item: { ...item, arguments: "" } },
++      { type: "response.function_call_arguments.delta", output_index, item_id: item.id, delta: item.arguments },
++      { type: "response.function_call_arguments.done", output_index, item_id: item.id, arguments: item.arguments },
++      { type: "response.output_item.done", output_index, item },
++    ]);
++    events.push({ type: "response.completed", response });
++    const options = {
++      providerResponse: new Response(path === "json" ? JSON.stringify(response) : events.map(frame).join(""), {
++        headers: { "content-type": path === "json" ? "application/json" : "text/event-stream" },
++      }),
++      provider: "muse", model: MODEL, body,
++      sourceFormat: FORMATS.OPENAI_RESPONSES, targetFormat: FORMATS.OPENAI_RESPONSES,
++      stream: path === "sse", requestStartTime: Date.now(),
++      toolNameMap: translated._toolNameMap, customToolNames: new Set(translated._customToolNames),
++      trackDone() {}, appendLog() {},
++    };
++    if (path === "sse") {
++      const result = await handleStreamingResponse({
++        ...options, streamController: createStreamController({ provider: "muse", model: MODEL }),
++      });
++      const output = parseEvents(await result.response.text());
++      expect(output.filter(event => event.type === "response.output_item.done").map(event => event.item)).toEqual(expected);
++      expect(output.find(event => event.type === "response.completed").response.output).toEqual(expected);
++      expect(output.filter(event => event.type === "response.function_call_arguments.done").map(event => event.item_id))
++        .toEqual([calls[0].id, calls[3].id, calls[4].id]);
++      expect(output.filter(event => event.type === "response.custom_tool_call_input.done").map(event => event.item_id))
++        .toEqual([calls[1].id, calls[2].id, calls[5].id]);
++    } else {
++      const result = await (path === "json" ? handleNonStreamingResponse : handleForcedSSEToJson)({
++        ...options, reqLogger: { logProviderResponse() {}, logConvertedResponse() {} },
++      });
++      expect((await result.response.json()).output).toEqual(expected);
++    }
++  });
++});
++
+ describe("Muse portable Responses input (multi-agent histories)", () => {
+   it("declares the strict-input quirk on the Responses transport only", async () => {
+     const { resolveTransport } = await import("../../open-sse/services/provider.js");
+-- 
+2.55.0
+

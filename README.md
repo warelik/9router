@@ -7,12 +7,35 @@ snapshot, an ordered patch series, one reviewed build.
 The default `downstream` branch contains patches and build automation, not a
 second application tree. `master` preserves the original upstream checkout.
 
-## Initial patch series
+## Patch series and migration history
+
+The series was regrouped against upstream v0.5.123
+(`5ae63d22847e07042e235b40e1d926b65e509013`) into ten blocks:
+
+- Build, packaging and test harness.
+- Shared protocol and runtime configuration.
+- Responses and Codex transports, streaming and collaboration.
+- Claude and Kiro transports and signatures.
+- Native Gemini, Antigravity and AIStudio.
+- Account availability and combo routing.
+- Muse transport, recovery and tools.
+- Proxy multipart requests.
+- Local Gemini bridges.
+- Cloudflare and SystemOne.
+
+Four separate patches change behavior and add regressions:
+
+- Antigravity uses one executor implementation with retry and continuation intact.
+- Muse sends `delta` and `done` as two separately delimited SSE events.
+- Muse preserves tool namespace identity across calls and results.
+- Native Gemini combos preserve response status, prompt blocks and candidates,
+  and resolve nested combo names.
 
 The migration source is the old downstream's `e01983276cb2f9ce05dc167e4d56c2c040559fd6`
 from October 9, 2026, relative to upstream
 `ce4460ef79382bfddb4aa5fc0ff9f3cb0d5f95a8`.
-Only local application changes made before October 13 are carried.
+The initial migration carried only local application changes made before
+October 13, grouped as follows:
 
 1. Transport selection, Responses reasoning wire and SSE collection.
 2. Native Gemini APIs and AIStudio.
@@ -23,15 +46,14 @@ Only local application changes made before October 13 are carried.
 7. Cloudflare System One response envelopes.
 8. Historical regression fixtures.
 
-`patches/source.json` records the exact source commits and all 45 historical
-test files. The old `warelik/` controller, per-commit queue, notes state,
-deployment recipes, and downstream fixes made on October 13 or later are absent.
-The upstream snapshot itself remains current; this cutoff applies only to the
-local changes extracted during migration.
+`patches/source.json` preserves the migration's exact source commits and all 45
+historical test files. It lists later regressions separately. The initial
+migration excluded the old `warelik/` controller, per-commit queue, notes state,
+deployment recipes and downstream fixes made on or after October 13. That
+cutoff applies only to the migration.
 
-Later numbered patches repair discovered bugs in the selected upstream. Gemini
-server-executed tool history is scoped to a validated API key or the existing
-trusted local/CLI principal, then to its conversation. Local and CLI callers
+Gemini server-executed tool history is scoped to a validated API key or the
+existing trusted local/CLI principal, then to its conversation. Local and CLI callers
 retain their existing trust boundaries and stay separate from API-key tenants;
 client-declared session IDs and provider credentials alone do not establish a
 caller identity.
@@ -171,10 +193,10 @@ review or failed verification is a failed workflow, not a green `ready=false`;
 unavailable owner authorization remains an explicit platform blocker. The last
 verified release remains available throughout repair.
 
-Upstream omits its URL/header snapshot. When missing from reviewed source, the
-test job generates it from the exact clean upstream with the shared test harness,
-then compares the patched application against it with `CI=true`. It never accepts
-snapshot values generated from the patched application itself.
+The test job uses the shared harness to generate URL and header expectations
+from the exact clean upstream, then compares the patched application against
+them with `CI=true`. If upstream tracks a snapshot, the job first verifies that
+both checkouts match it, then generates fresh expectations from upstream.
 Both test phases run with disposable `HOME`, `XDG_*`, `TMPDIR` and `DATA_DIR`;
 client-config writers cannot use the operator's inherited configuration paths.
 
@@ -251,10 +273,11 @@ The compatibility regression covers this request shape without changing the
 application or weakening the prior malformed/source-movement checks.
 
 The official Node image index for the upstream-selected `node:22-alpine` tag is
-refreshed in patch0010 when registry preflight reports it stale. Source selection
-is emitted before assembly, so a failed preparation repairs the held upstream
-commit instead of selecting a different live HEAD. The source-selection
-regression covers the failure path before assembly completes.
+refreshed in the build and test harness patch (`0001`) when registry preflight
+reports it stale. Source selection is emitted before assembly, so a failed
+preparation repairs the held upstream commit instead of selecting a different
+live HEAD. The source-selection regression covers the failure path before
+assembly completes.
 
 Maintenance review input is open carried work and the exact current candidate. Archived closed discussions are excluded. The existing unresolved snapshot is written before superseded pairs are retired; `fixed` and `disproved` decisions are not reopened in later cycles. Native final-attempt accounting remains independent.
 

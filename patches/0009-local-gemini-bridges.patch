@@ -1,29 +1,38 @@
-From 792f05b03aec9cfa208ce8650ab0d4f4842a9acc Mon Sep 17 00:00:00 2001
-From: warelik <warelik@gmail.com>
-Date: Sun, 15 Nov 2026 17:18:28 +0000
-Subject: [PATCH 17/18] Add Gemini-Web2API provider and refresh AIStudio2API
- metadata
+From 87017a76893286f9c9dbef1c86644c77e31a34d1 Mon Sep 17 00:00:00 2001
+From: downstream <downstream@local>
+Date: Fri, 27 Nov 2026 20:00:00 +0000
+Subject: [PATCH 09/10] Register local Gemini and Antigravity bridges
 
+Regroup existing application changes without changing the final tree.
+Previous carriers in overlay a97b678d:
+- 0017-gemini-web2api-and-aistudio2api-provider.patch (prior application commit 3959bf47d562)
+- 0018-antigravity2api-provider.patch (prior application commit 43955ce15918)
+
+The historical migration source and cutoff are recorded in patches/source.json.
 ---
  open-sse/handlers/chatCore.js                 |   4 +-
  open-sse/providers/registry/aistudio.js       |   8 +-
+ .../providers/registry/antigravity2api.js     |  38 +++
  open-sse/providers/registry/gemini-web2api.js |  38 +++
- open-sse/providers/registry/index.js          |   2 +
+ open-sse/providers/registry/index.js          |   4 +
  open-sse/services/aistudioModels.js           |   7 +-
  open-sse/translator/index.js                  |   3 +
- src/app/api/providers/[id]/models/route.js    |   6 +
- src/app/api/providers/[id]/test/testUtils.js  |   1 +
- src/app/api/providers/validate/route.js       |   1 +
- src/app/api/v1/models/route.js                |   7 +
- src/shared/utils/providerIcon.js              |   2 +
+ src/app/api/providers/[id]/models/route.js    |  12 +
+ src/app/api/providers/[id]/test/testUtils.js  |   2 +
+ src/app/api/providers/validate/route.js       |   2 +
+ src/app/api/v1/models/route.js                |  14 +
+ src/shared/utils/providerIcon.js              |   3 +
  tests/translator/golden-url-header.test.js    |   4 +-
+ tests/unit/antigravity2api-provider.test.js   | 272 ++++++++++++++++
  tests/unit/gemini-web2api-provider.test.js    | 295 ++++++++++++++++++
- 13 files changed, 369 insertions(+), 9 deletions(-)
+ 15 files changed, 697 insertions(+), 9 deletions(-)
+ create mode 100644 open-sse/providers/registry/antigravity2api.js
  create mode 100644 open-sse/providers/registry/gemini-web2api.js
+ create mode 100644 tests/unit/antigravity2api-provider.test.js
  create mode 100644 tests/unit/gemini-web2api-provider.test.js
 
 diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
-index 80730230..6453ed66 100644
+index 80730230..ceecf88a 100644
 --- a/open-sse/handlers/chatCore.js
 +++ b/open-sse/handlers/chatCore.js
 @@ -226,8 +226,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
@@ -33,7 +42,7 @@ index 80730230..6453ed66 100644
 -      // browser-authenticated AIStudio generation API uses its beta wire.
 -      apiVersion: provider === "aistudio" ? AISTUDIO_NATIVE_GEMINI_API_VERSION : clientRawRequest?.apiVersion,
 +      // local browser-authenticated Gemini bridges use their beta wire.
-+      apiVersion: (provider === "aistudio" || provider === "gemini-web2api") ? AISTUDIO_NATIVE_GEMINI_API_VERSION : clientRawRequest?.apiVersion,
++      apiVersion: (provider === "aistudio" || provider === "gemini-web2api" || provider === "antigravity2api") ? AISTUDIO_NATIVE_GEMINI_API_VERSION : clientRawRequest?.apiVersion,
      };
    }
  
@@ -64,6 +73,50 @@ index 2eeed51b..f33cad85 100644
      },
    },
    category: "apikey",
+diff --git a/open-sse/providers/registry/antigravity2api.js b/open-sse/providers/registry/antigravity2api.js
+new file mode 100644
+index 00000000..b05eb6ba
+--- /dev/null
++++ b/open-sse/providers/registry/antigravity2api.js
+@@ -0,0 +1,38 @@
++// Antigravity2API (https://github.com/Mag1cFall/Antigravity2API): a local bridge to Google
++// Antigravity accounts on 127.0.0.1:8017. Kept distinct from upstream's `antigravity` OAuth
++// provider so upstream protocol implementations remain intact. Speaks the bridge's
++// Gemini-native `/v1beta` wire and discovers its unseeded model list dynamically from `/v1/models`.
++import { FORMATS } from "../../translator/formats.js";
++
++export default {
++  id: "antigravity2api",
++  priority: 70,
++  alias: "antigravity2api",
++  aliases: ["ag2"],
++  display: {
++    name: "Antigravity2API",
++    icon: "diamond",
++    color: "#F59E0B",
++    textIcon: "AG",
++    website: "https://github.com/Mag1cFall/Antigravity2API",
++    notice: {
++      text: "Local bridge on 127.0.0.1:8017 (Gemini-native wire). The API key is one of API_KEYS from the bridge's env file.",
++    },
++  },
++  category: "apikey",
++  authType: "apikey",
++  authModes: ["apikey"],
++  transport: {
++    baseUrl: "http://127.0.0.1:8017/v1beta/models",
++    format: FORMATS.GEMINI,
++    validateUrl: "http://127.0.0.1:8017/v1/models",
++    auth: {
++      apiKey: {
++        header: "x-goog-api-key",
++        scheme: "raw",
++      },
++    },
++  },
++  models: [],
++  passthroughModels: true,
++};
 diff --git a/open-sse/providers/registry/gemini-web2api.js b/open-sse/providers/registry/gemini-web2api.js
 new file mode 100644
 index 00000000..b2e9de61
@@ -109,22 +162,24 @@ index 00000000..b2e9de61
 +  passthroughModels: true,
 +};
 diff --git a/open-sse/providers/registry/index.js b/open-sse/providers/registry/index.js
-index 6f70eaa7..c4d4eff1 100644
+index 6f70eaa7..9cb60ca0 100644
 --- a/open-sse/providers/registry/index.js
 +++ b/open-sse/providers/registry/index.js
-@@ -140,6 +140,7 @@ import p136 from "./bedrock.js";
+@@ -140,6 +140,8 @@ import p136 from "./bedrock.js";
  import p137 from "./bedrock-xai.js";
  import p138 from "./nous.js";
  import pAistudio from "./aistudio.js";
 +import pGeminiWeb2Api from "./gemini-web2api.js";
++import pAntigravity2Api from "./antigravity2api.js";
  import p140 from "./deepseek-web.js";
  import p143 from "./gemini-web.js";
  import p144 from "./muse-web.js";
-@@ -293,6 +294,7 @@ export default [
+@@ -293,6 +295,8 @@ export default [
    p137,
    p138,
    pAistudio,
 +  pGeminiWeb2Api,
++  pAntigravity2Api,
    p140,
    p143,
    p144,
@@ -161,10 +216,10 @@ index fd9ca402..13b02925 100644
        result.tools = [...(Array.isArray(result.tools) ? result.tools : []), { googleSearch: {} }];
        result.toolConfig = {
 diff --git a/src/app/api/providers/[id]/models/route.js b/src/app/api/providers/[id]/models/route.js
-index 39183bfa..c218c5d7 100644
+index 39183bfa..fb947bac 100644
 --- a/src/app/api/providers/[id]/models/route.js
 +++ b/src/app/api/providers/[id]/models/route.js
-@@ -218,6 +218,12 @@ const PROVIDER_MODELS_CONFIG = {
+@@ -218,6 +218,18 @@ const PROVIDER_MODELS_CONFIG = {
        proxyOptions: await resolveConnectionProxyConfig(connection.providerSpecificData || {}),
      }),
    },
@@ -174,38 +229,46 @@ index 39183bfa..c218c5d7 100644
 +      proxyOptions: await resolveConnectionProxyConfig(connection.providerSpecificData || {}),
 +    }),
 +  },
++  "antigravity2api": {
++    customResolver: async (connection) => resolveAIStudioModels(connection, {
++      provider: "antigravity2api",
++      proxyOptions: await resolveConnectionProxyConfig(connection.providerSpecificData || {}),
++    }),
++  },
    "muse": {
      url: "https://api.meta.ai/v1/models",
      method: "GET",
 diff --git a/src/app/api/providers/[id]/test/testUtils.js b/src/app/api/providers/[id]/test/testUtils.js
-index cc8953a0..7be19279 100644
+index cc8953a0..cf2dfe74 100644
 --- a/src/app/api/providers/[id]/test/testUtils.js
 +++ b/src/app/api/providers/[id]/test/testUtils.js
-@@ -804,6 +804,7 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
+@@ -804,6 +804,8 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
        case "agnes":
        case "bai":
        case "aistudio":
 +      case "gemini-web2api":
++      case "antigravity2api":
        case "muse":
        case "runcrate":
        case "synthetic": {
 diff --git a/src/app/api/providers/validate/route.js b/src/app/api/providers/validate/route.js
-index 789f93a1..242a4fa6 100644
+index 789f93a1..f9899f3b 100644
 --- a/src/app/api/providers/validate/route.js
 +++ b/src/app/api/providers/validate/route.js
-@@ -399,6 +399,7 @@ export async function POST(request) {
+@@ -399,6 +399,8 @@ export async function POST(request) {
          }
  
          case "aistudio":
 +        case "gemini-web2api":
++        case "antigravity2api":
          case "deepseek":
          case "groq":
          case "xai":
 diff --git a/src/app/api/v1/models/route.js b/src/app/api/v1/models/route.js
-index c4bdf5cb..f3b0ed84 100644
+index c4bdf5cb..14dc0e97 100644
 --- a/src/app/api/v1/models/route.js
 +++ b/src/app/api/v1/models/route.js
-@@ -108,6 +108,13 @@ const LIVE_MODEL_RESOLVERS = {
+@@ -108,6 +108,20 @@ const LIVE_MODEL_RESOLVERS = {
      });
      return result?.models?.length ? { models: result.models } : null;
    },
@@ -216,24 +279,32 @@ index c4bdf5cb..f3b0ed84 100644
 +    });
 +    return result?.models?.length ? { models: result.models } : null;
 +  },
++  "antigravity2api": async (conn) => {
++    const result = await resolveAIStudioModels(conn, {
++      provider: "antigravity2api",
++      proxyOptions: await resolveConnectionProxyConfig(conn.providerSpecificData || {}),
++    });
++    return result?.models?.length ? { models: result.models } : null;
++  },
    kiro: async (conn) => {
      const result = await resolveKiroModels({
        accessToken: conn.accessToken,
 diff --git a/src/shared/utils/providerIcon.js b/src/shared/utils/providerIcon.js
-index d8bf5ba9..4a26a7a2 100644
+index d8bf5ba9..286cb74c 100644
 --- a/src/shared/utils/providerIcon.js
 +++ b/src/shared/utils/providerIcon.js
-@@ -15,6 +15,8 @@ const ICON_ALIASES = {
+@@ -15,6 +15,9 @@ const ICON_ALIASES = {
    "deepseek-web": "deepseek",
    "muse-web": "muse",
    "gemini-web": "gemini",
 +  "gemini-web2api": "gemini",
 +  "aistudio": "gemini",
++  "antigravity2api": "antigravity",
    "chatgpt-web": "openai",
  };
  
 diff --git a/tests/translator/golden-url-header.test.js b/tests/translator/golden-url-header.test.js
-index ddbfeda1..b7a87d68 100644
+index ddbfeda1..9faeb80c 100644
 --- a/tests/translator/golden-url-header.test.js
 +++ b/tests/translator/golden-url-header.test.js
 @@ -21,8 +21,8 @@ const SPECIALIZED = new Set([
@@ -243,10 +314,288 @@ index ddbfeda1..b7a87d68 100644
 -  // Fork-only local bridge; its URL and header contract is locked by unit/aistudio-provider.test.js.
 -  "aistudio",
 +  // Fork-only local bridges; their URL and header contracts are locked by unit/*-provider.test.js.
-+  "aistudio", "gemini-web2api",
++  "aistudio", "gemini-web2api", "antigravity2api",
  ]);
  
  // Per-process / per-request values: kimi's random device name, minimax's session UUID.
+diff --git a/tests/unit/antigravity2api-provider.test.js b/tests/unit/antigravity2api-provider.test.js
+new file mode 100644
+index 00000000..911a8bfa
+--- /dev/null
++++ b/tests/unit/antigravity2api-provider.test.js
+@@ -0,0 +1,272 @@
++import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
++
++const stub = vi.hoisted(() => ({
++  fetchCalls: [],
++  proxyCalls: [],
++  proxyMode: "ok",
++  connection: null,
++  connections: [],
++  customModels: [],
++  updated: [],
++  proxyConfig: { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy:3128" },
++}));
++
++vi.mock("open-sse/utils/proxyFetch.js", () => ({
++  proxyAwareFetch: async (url, options, proxyOptions) => {
++    stub.proxyCalls.push({ url: String(url), options, proxyOptions });
++    if (stub.proxyMode === "native-gemini") {
++      const reply = { candidates: [{ content: { role: "model", parts: [{ text: "AG2_OK" }] }, finishReason: "STOP" }] };
++      const isSse = options?.headers?.Accept === "text/event-stream";
++      return new Response(
++        isSse ? `data: ${JSON.stringify(reply)}\r\n\r\n` : JSON.stringify(reply),
++        { status: 200, headers: { "Content-Type": isSse ? "text/event-stream" : "application/json" } },
++      );
++    }
++    if (stub.proxyMode === "empty") return Response.json({ data: [] });
++    if (stub.proxyMode === "unauthorized") return new Response("denied", { status: 401 });
++    if (stub.proxyMode === "forbidden") return new Response("denied", { status: 403 });
++    if (stub.proxyMode === "reject") throw new Error("bridge offline");
++    return Response.json({
++      object: "list",
++      data: [{ id: "gemini-4-argon" }, { id: "claude-sonnet-5-5", display_name: "Claude Sonnet 5.5" }, { id: "" }],
++    });
++  },
++  default: async () => { throw new Error("patched fetch must not run"); },
++}));
++
++vi.mock("@/models", () => ({
++  getProviderConnectionById: async () => stub.connection,
++}));
++vi.mock("@/lib/localDb", () => ({
++  getProviderConnectionById: async () => stub.connection,
++  updateProviderConnection: async (id, data) => { stub.updated.push({ id, data }); },
++  getProviderConnections: async () => stub.connections || [],
++  getCombos: async () => [],
++  getCustomModels: async () => stub.customModels || [],
++  getModelAliases: async () => ({}),
++  getSettings: async () => ({ requireApiKey: false }),
++}));
++vi.mock("@/lib/disabledModelsDb", () => ({ getDisabledModels: async () => ({}) }));
++vi.mock("@/lib/network/connectionProxy", () => ({
++  resolveConnectionProxyConfig: async () => stub.proxyConfig || {},
++}));
++vi.mock("@/lib/network/proxyTest", () => ({ testProxyUrl: async () => ({ ok: true }) }));
++vi.mock("@/sse/services/keyAccess.js", () => ({
++  getKeyAccessContext: async () => null,
++  filterModelsListForKey: async (_ctx, data) => data,
++  extractClientApiKey: () => null,
++  enforceKeyAccessResolved: async () => null,
++}));
++vi.mock("../../open-sse/utils/requestLogger.js", () => ({
++  createRequestLogger: async () => new Proxy({}, { get: (_t, key) => (key === "then" ? undefined : vi.fn()) }),
++}));
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++
++const REGISTRY = (await import("../../open-sse/providers/registry/index.js")).default;
++const { PROVIDERS } = await import("../../open-sse/config/providers.js");
++const { FORMATS } = await import("../../open-sse/translator/formats.js");
++const { DefaultExecutor } = await import("../../open-sse/executors/default.js");
++const { getModelInfoCore } = await import("../../open-sse/services/model.js");
++const { getTargetFormat, supportsNativeGemini } = await import("../../open-sse/services/provider.js");
++const { resolveAIStudioModels } = await import("../../open-sse/services/aistudioModels.js");
++const { initTranslators } = await import("../../open-sse/translator/index.js");
++const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
++const { resolveProviderIconId } = await import("../../src/shared/utils/providerIcon.js");
++const validateRoute = await import("../../src/app/api/providers/validate/route.js");
++const { testSingleConnection } = await import("../../src/app/api/providers/[id]/test/testUtils.js");
++const dashboardModels = await import("../../src/app/api/providers/[id]/models/route.js");
++const v1Models = await import("../../src/app/api/v1/models/route.js");
++
++await initTranslators();
++
++const MODEL = "gemini-4-argon";
++const EXPECT_PLAIN_HEADERS = { "Content-Type": "application/json", "x-goog-api-key": "ag2-bridge-key" };
++const EXPECT_SSE_HEADERS = { ...EXPECT_PLAIN_HEADERS, Accept: "text/event-stream" };
++
++beforeEach(() => {
++  stub.fetchCalls = [];
++  stub.proxyCalls = [];
++  stub.proxyMode = "ok";
++  stub.connection = null;
++  stub.connections = [];
++  stub.customModels = [];
++  stub.updated = [];
++  stub.proxyConfig = { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy:3128" };
++  vi.stubGlobal("fetch", async (...args) => {
++    stub.fetchCalls.push(args);
++    return new Response("ok", { status: 200 });
++  });
++});
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++});
++
++describe("antigravity2api local Gemini bridge contract", () => {
++  it("registers antigravity2api without altering upstream antigravity OAuth provider", () => {
++    const ag2Entry = REGISTRY.find((entry) => entry.id === "antigravity2api");
++    const upstreamAntigravity = REGISTRY.find((entry) => entry.id === "antigravity");
++
++    expect(ag2Entry).toBeTruthy();
++    expect(ag2Entry.display.name).toBe("Antigravity2API");
++    expect(ag2Entry.display.website).toBe("https://github.com/Mag1cFall/Antigravity2API");
++    expect(ag2Entry.display.notice.text).toContain("127.0.0.1:8017");
++    expect(ag2Entry.display.notice.text).toContain("API_KEYS");
++    expect(ag2Entry.passthroughModels).toBe(true);
++    expect(ag2Entry.models).toEqual([]);
++
++    expect(upstreamAntigravity.category).toBe("oauth");
++    expect(upstreamAntigravity.transport.format).toBe("antigravity");
++
++    expect(PROVIDERS["antigravity2api"].format).toBe(FORMATS.GEMINI);
++    expect(getTargetFormat("antigravity2api", {})).toBe("gemini");
++    expect(supportsNativeGemini("antigravity2api", MODEL)).toBe(true);
++    expect(PROVIDERS["antigravity2api"].clientId).toBeUndefined();
++    expect(PROVIDERS["antigravity2api"].clientSecret).toBeUndefined();
++    expect(resolveProviderIconId("antigravity2api")).toBe("antigravity");
++  });
++
++  it("locks streaming and non-streaming URLs, headers, aliases, and path-traversal safety", async () => {
++    const executor = new DefaultExecutor("antigravity2api");
++    expect(PROVIDERS["antigravity2api"].baseUrl).toBe("http://127.0.0.1:8017/v1beta/models");
++    expect(executor.buildUrl(MODEL, false, 0, {})).toBe(`http://127.0.0.1:8017/v1beta/models/${MODEL}:generateContent`);
++    expect(executor.buildUrl(MODEL, true, 0, {})).toBe(`http://127.0.0.1:8017/v1beta/models/${MODEL}:streamGenerateContent?alt=sse`);
++
++    expect(executor.buildHeaders({ apiKey: "ag2-bridge-key" }, false, executor.buildUrl(MODEL, false, 0, {}), MODEL))
++      .toEqual(EXPECT_PLAIN_HEADERS);
++    expect(executor.buildHeaders({ apiKey: "ag2-bridge-key" }, true, executor.buildUrl(MODEL, true, 0, {}), MODEL))
++      .toEqual(EXPECT_SSE_HEADERS);
++
++    for (const prefix of ["antigravity2api", "ag2"]) {
++      const info = await getModelInfoCore(`${prefix}/${MODEL}`, {});
++      expect(info.provider).toBe("antigravity2api");
++      expect(info.model).toBe(MODEL);
++    }
++
++    for (const [raw, normalized] of [["../../admin?x=1", "../../admin?x=1"], ["%2e%2e%2fadmin", "%2e%2e%2fadmin"], ["модель/模型", "модель/模型"]]) {
++      for (const stream of [false, true]) {
++        const url = new URL(executor.buildUrl(raw, stream, 0, {}));
++        const action = stream ? ":streamGenerateContent" : ":generateContent";
++        expect(url.origin).toBe("http://127.0.0.1:8017");
++        expect(url.pathname.startsWith("/v1beta/models/")).toBe(true);
++        expect(url.pathname.endsWith(action)).toBe(true);
++        const segment = url.pathname.slice("/v1beta/models/".length, -action.length);
++        expect(segment).not.toContain("/");
++        expect(decodeURIComponent(segment)).toBe(normalized);
++      }
++    }
++  });
++
++  it("discovers models and validates credentials against 127.0.0.1:8017/v1/models with error propagation", async () => {
++    const discovered = await resolveAIStudioModels(
++      { apiKey: "ag2-key" },
++      { provider: "antigravity2api", proxyOptions: stub.proxyConfig },
++    );
++    expect(stub.proxyCalls).toHaveLength(1);
++    expect(stub.proxyCalls[0].url).toBe("http://127.0.0.1:8017/v1/models");
++    expect(stub.proxyCalls[0].options.headers.Authorization).toBe("Bearer ag2-key");
++    expect(discovered.models.map((m) => m.id)).toEqual(["gemini-4-argon", "claude-sonnet-5-5"]);
++    expect(discovered.models[1].name).toBe("Claude Sonnet 5.5");
++
++    expect(await resolveAIStudioModels({ apiKey: "ag2-key" }, { provider: "nonexistent-provider" }))
++      .toMatchObject({ status: 400 });
++
++    const validRes = await validateRoute.POST(new Request("http://localhost/api/providers/validate", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ provider: "antigravity2api", apiKey: "ag2-key" }),
++    }));
++    expect((await validRes.json()).valid).toBe(true);
++    expect(String(stub.fetchCalls[0][0])).toBe("http://127.0.0.1:8017/v1/models");
++    expect(stub.fetchCalls[0][1].headers.Authorization).toBe("Bearer ag2-key");
++
++    vi.stubGlobal("fetch", async () => new Response("denied", { status: 401 }));
++    const deniedRes = await validateRoute.POST(new Request("http://localhost/api/providers/validate", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ provider: "antigravity2api", apiKey: "bad-key" }),
++    }));
++    expect((await deniedRes.json()).valid).toBe(false);
++
++    stub.proxyCalls = [];
++    stub.connection = { id: "c-ag2", provider: "antigravity2api", authType: "apikey", apiKey: "ag2-key", providerSpecificData: {} };
++    expect(await testSingleConnection("c-ag2")).toMatchObject({ valid: true, error: null });
++    expect(stub.proxyCalls[0].url).toBe("http://127.0.0.1:8017/v1/models");
++
++    stub.proxyMode = "forbidden";
++    expect(await testSingleConnection("c-ag2")).toMatchObject({ valid: false, error: "Invalid API key" });
++
++    stub.proxyMode = "ok";
++    stub.proxyCalls = [];
++    const dashRes = await dashboardModels.GET(
++      new Request("http://localhost/api/providers/c-ag2/models"),
++      { params: Promise.resolve({ id: "c-ag2" }) },
++    );
++    expect(dashRes.status).toBe(200);
++    expect((await dashRes.json()).models.map((m) => m.id)).toContain("gemini-4-argon");
++
++    stub.proxyCalls = [];
++    stub.connections = [{ id: "c-ag2", provider: "antigravity2api", authType: "apikey", apiKey: "ag2-key", isActive: true, providerSpecificData: {} }];
++    const v1List = await v1Models.buildModelsList(["llm"]);
++    expect(stub.proxyCalls).toHaveLength(1);
++    expect(v1List.some((row) => row.id === "antigravity2api/gemini-4-argon")).toBe(true);
++  });
++
++  it("routes native Gemini v1, v1beta, and v1alpha requests (stream + non-stream) onto 127.0.0.1:8017/v1beta without rewriting responseJsonSchema", async () => {
++    stub.proxyMode = "native-gemini";
++    const nativeInput = {
++      contents: [{ role: "user", parts: [{ text: "Return JSON" }] }],
++      generationConfig: {
++        responseMimeType: "application/json",
++        responseJsonSchema: { type: "object", properties: { ok: { type: "boolean" } }, additionalProperties: false },
++      },
++    };
++
++    for (const clientApiVersion of ["v1", "v1beta", "v1alpha"]) {
++      for (const stream of [false, true]) {
++        stub.proxyCalls = [];
++        const credentials = { apiKey: "ag2-bridge-key", connectionId: "c-ag2", providerSpecificData: {} };
++        const result = await handleChatCore({
++          body: { ...nativeInput, model: `antigravity2api/${MODEL}`, stream },
++          modelInfo: { provider: "antigravity2api", model: MODEL },
++          credentials,
++          sourceFormatOverride: "gemini",
++          clientRawRequest: {
++            apiVersion: clientApiVersion,
++            body: nativeInput,
++            headers: {},
++            queryParams: stream
++              ? [["alt", "sse"], ["key", "client-secret"], ["fields", "candidates"]]
++              : [["$key", "client-secret"], ["fields", "candidates"]],
++          },
++          connectionId: "c-ag2",
++          userAgent: "ag2-native-test",
++          log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
++        });
++        expect(result.response.status).toBe(200);
++        await result.response.text();
++        expect(credentials.nativeGeminiRequest.apiVersion).toBe("v1beta");
++        expect(stub.proxyCalls).toHaveLength(1);
++        const upstreamUrl = new URL(stub.proxyCalls[0].url);
++        expect(upstreamUrl.origin).toBe("http://127.0.0.1:8017");
++        expect(upstreamUrl.pathname).toBe(`/v1beta/models/${MODEL}:${stream ? "streamGenerateContent" : "generateContent"}`);
++        expect(upstreamUrl.searchParams.has("key")).toBe(false);
++        expect(upstreamUrl.searchParams.has("$key")).toBe(false);
++        expect(upstreamUrl.searchParams.get("fields")).toBe("candidates");
++        expect(stub.proxyCalls[0].options.headers["x-goog-api-key"]).toBe("ag2-bridge-key");
++        const sentBody = JSON.parse(stub.proxyCalls[0].options.body);
++        expect(sentBody.generationConfig.responseJsonSchema).toEqual(nativeInput.generationConfig.responseJsonSchema);
++        expect(sentBody.generationConfig.responseFormat).toBeUndefined();
++      }
++    }
++  });
++
++});
 diff --git a/tests/unit/gemini-web2api-provider.test.js b/tests/unit/gemini-web2api-provider.test.js
 new file mode 100644
 index 00000000..dbb143c7

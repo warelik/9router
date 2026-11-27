@@ -1,0 +1,47 @@
+From c65d4120842c51622e59f18a32f5d0092af2b72d Mon Sep 17 00:00:00 2001
+From: 9Router downstream <9router@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 20:02:53 +0000
+Subject: [PATCH] Frame Muse custom tool events separately
+
+---
+ open-sse/utils/stream.js             |  2 +-
+ tests/unit/muse-custom-tools.test.js | 10 +++++++---
+ 2 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index bc8f5efd..83b27297 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -452,7 +452,7 @@ export function createSSEStream(options = {}) {
+                   pendingPassthroughEventLine = null;
+                   for (const convertedEvent of convertedEvents) {
+                     const restoredEvent = toolNameMap?.size ? restoreToolNames(convertedEvent, toolNameMap) : convertedEvent;
+-                    const framed = `${hadEventLine ? `event: ${restoredEvent.type}\n` : ""}data: ${JSON.stringify(restoredEvent)}\n`;
++                    const framed = `${hadEventLine ? `event: ${restoredEvent.type}\n` : ""}data: ${JSON.stringify(restoredEvent)}\n\n`;
+                     reqLogger?.appendConvertedChunk?.(framed);
+                     controller.enqueue(sharedEncoder.encode(framed));
+                   }
+diff --git a/tests/unit/muse-custom-tools.test.js b/tests/unit/muse-custom-tools.test.js
+index b2684700..8930dce3 100644
+--- a/tests/unit/muse-custom-tools.test.js
++++ b/tests/unit/muse-custom-tools.test.js
+@@ -239,9 +239,13 @@ describe("Muse custom tool restore (non-streaming)", () => {
+ });
+ 
+ const frame = event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+-const parseEvents = wire => wire.split("\n")
+-  .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
+-  .map(line => JSON.parse(line.slice(6)));
++const parseEvents = wire => wire.split(/\r?\n\r?\n/)
++  .flatMap(frame => {
++    const data = frame.split(/\r?\n/)
++      .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
++      .map(line => line.slice(6));
++    return data.length ? [JSON.parse(data.join("\n"))] : [];
++  });
+ 
+ function customStreamEvents() {
+   const item = providerItem("apply_patch_muse");
+-- 
+2.55.0
+

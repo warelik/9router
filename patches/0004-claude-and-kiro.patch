@@ -1,18 +1,19 @@
-From 68c5a4b88222cd7be105ada6e08b8a517990eaff Mon Sep 17 00:00:00 2001
+From 5a8c84cdc3629eb4b9cabe79718fc99fc1db62cc Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
-Date: Sat, 7 Nov 2026 17:42:31 +0000
-Subject: [PATCH 05/18] Claude and Kiro transports, thinking streams and
- signatures
+Date: Fri, 27 Nov 2026 20:00:00 +0000
+Subject: [PATCH 04/10] Preserve Claude and Kiro transport and signatures
 
-Consolidated from the following original patches (file custody by final owner):
+Regroup existing application changes without changing the final tree.
+Previous carriers in overlay a97b678d:
+- 0005-claude-kiro-transports-and-signatures.patch (prior application commit b4ca9f6b902d)
+- 0006-codex-responses-and-stream-lifecycle.patch (prior application commit 7b7a1acf34d3)
 
-- original #06: 0006 claude-thinking-streams
-- original #34: Validate both complete Claude signature encodings before
-- original #63: Keep parallel tool_use blocks sequential
-- original #66: Reject foreign thinking signatures that only share Claude's leading byte
+The historical migration source and cutoff are recorded in patches/source.json.
 ---
  open-sse/translator/formats/claude.js         |  12 +-
+ .../translator/response/claude-to-openai.js   |   3 +-
  .../translator/response/kiro-to-claude.js     |  92 +++++---
+ .../translator/response/kiro-to-openai.js     |   3 +-
  .../translator/response/openai-to-claude.js   |  99 +++++---
  open-sse/utils/claudeCloaking.js              |   6 +-
  open-sse/utils/claudeSignature.js             | 110 +++++++--
@@ -21,12 +22,14 @@ Consolidated from the following original patches (file custody by final owner):
  tests/unit/claude-same-format-stream.test.js  | 217 ++++++++++++++++++
  .../claude-signature-foreign-opaque.test.js   |  69 ++++++
  .../claude-signature-versioned-form.test.js   | 138 +++++++++++
- 10 files changed, 860 insertions(+), 89 deletions(-)
+ tests/unit/kiro-namespace-descriptors.test.js |  40 ++++
+ 13 files changed, 904 insertions(+), 91 deletions(-)
  create mode 100644 tests/translator/claude-adaptive-display.test.js
  create mode 100644 tests/translator/parallel-tool-blocks-sequential.test.js
  create mode 100644 tests/unit/claude-same-format-stream.test.js
  create mode 100644 tests/unit/claude-signature-foreign-opaque.test.js
  create mode 100644 tests/unit/claude-signature-versioned-form.test.js
+ create mode 100644 tests/unit/kiro-namespace-descriptors.test.js
 
 diff --git a/open-sse/translator/formats/claude.js b/open-sse/translator/formats/claude.js
 index 1ca50c81..da82ae38 100644
@@ -67,6 +70,27 @@ index 1ca50c81..da82ae38 100644
                  }
                } else if (deepSeekServed) {
                  hasKeptThinking = true;
+diff --git a/open-sse/translator/response/claude-to-openai.js b/open-sse/translator/response/claude-to-openai.js
+index 42a82a66..3e0906e1 100644
+--- a/open-sse/translator/response/claude-to-openai.js
++++ b/open-sse/translator/response/claude-to-openai.js
+@@ -5,6 +5,7 @@ import { buildChunk } from "../concerns/chunk.js";
+ import { toOpenAIUsage } from "../concerns/usage.js";
+ import { reasoningDelta } from "../concerns/reasoning.js";
+ import { toOpenAIFinish } from "../concerns/finishReason.js";
++import { resolveToolName } from "../../utils/opencodeFingerprint.js";
+ 
+ // Create OpenAI chunk helper
+ function createChunk(state, delta, finishReason = null) {
+@@ -62,7 +63,7 @@ export function claudeToOpenAIResponse(chunk, state) {
+       } else if (block?.type === CLAUDE_BLOCK.TOOL_USE) {
+         const toolCallIndex = state.toolCallIndex++;
+         // Restore original tool name from mapping (Claude OAuth)
+-        const toolName = state.toolNameMap?.get(block.name) || block.name;
++        const toolName = state.toolNameMap ? resolveToolName(block.name, state.toolNameMap).name : block.name;
+         const toolCall = {
+           index: toolCallIndex,
+           id: block.id,
 diff --git a/open-sse/translator/response/kiro-to-claude.js b/open-sse/translator/response/kiro-to-claude.js
 index d9fc0aab..40d9919f 100644
 --- a/open-sse/translator/response/kiro-to-claude.js
@@ -233,6 +257,27 @@ index d9fc0aab..40d9919f 100644
  
      state.finishReason = choice.finish_reason;
      const finalUsage = state.usage || { input_tokens: 0, output_tokens: 0 };
+diff --git a/open-sse/translator/response/kiro-to-openai.js b/open-sse/translator/response/kiro-to-openai.js
+index 8e713fd7..c0f2f7cf 100644
+--- a/open-sse/translator/response/kiro-to-openai.js
++++ b/open-sse/translator/response/kiro-to-openai.js
+@@ -10,6 +10,7 @@ import { toOpenAIUsage } from "../concerns/usage.js";
+ import { fallbackToolCallId } from "../concerns/toolCall.js";
+ import { reasoningDelta } from "../concerns/reasoning.js";
+ import { toOpenAIFinish } from "../concerns/finishReason.js";
++import { resolveToolName } from "../../utils/opencodeFingerprint.js";
+ 
+ // Build chunk meta for current kiro state
+ function chunkMeta(state) {
+@@ -25,7 +26,7 @@ function chunkMeta(state) {
+ function restoreToolName(state, name) {
+   const raw = name || "";
+   const map = state?.toolNameMap;
+-  return map && typeof map.get === "function" && map.has(raw) ? map.get(raw) : raw;
++  return resolveToolName(raw, map).name;
+ }
+ 
+ export function kiroToOpenAIResponse(chunk, state) {
 diff --git a/open-sse/translator/response/openai-to-claude.js b/open-sse/translator/response/openai-to-claude.js
 index 4d96fb92..7efb1cf9 100644
 --- a/open-sse/translator/response/openai-to-claude.js
@@ -1223,6 +1268,52 @@ index 00000000..ab81dbc7
 +    expect(content.some(block => block.signature === foreignMarker)).toBe(false);
 +    expect(content[0]).toMatchObject({ type: "thinking", thinking: "." });
 +    expect(content.at(-1)).toMatchObject({ type: "tool_use", id: "toolu_1" });
++  });
++});
+diff --git a/tests/unit/kiro-namespace-descriptors.test.js b/tests/unit/kiro-namespace-descriptors.test.js
+new file mode 100644
+index 00000000..a7104c88
+--- /dev/null
++++ b/tests/unit/kiro-namespace-descriptors.test.js
+@@ -0,0 +1,40 @@
++import { describe, expect, it } from "vitest";
++import { kiroToOpenAIResponse } from "../../open-sse/translator/response/kiro-to-openai.js";
++import { kiroToClaudeResponse, kiroToClaudeNonStreaming } from "../../open-sse/translator/response/kiro-to-claude.js";
++
++const wire = "alpha_read";
++const descriptorMap = () => new Map([[wire, { name: "read", namespace: "alpha", type: "function" }]]);
++const normalizedChunk = (name, delta = {}, finish = null) => ({
++  id: "chatcmpl-kiro", object: "chat.completion.chunk", created: 1, model: "kiro",
++  choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_kiro", type: "function", function: { name, arguments: '{"title":"x"}' } }], ...delta }, finish_reason: finish }],
++});
++
++describe("Kiro response adapters keep descriptor maps off the wire name", () => {
++  it("raw toolUseEvent yields the string wire alias", () => {
++    const out = kiroToOpenAIResponse({ toolUseEvent: { toolUseId: "call_kiro", name: wire, input: { title: "x" } } }, { toolNameMap: descriptorMap() });
++    const call = out.choices[0].delta.tool_calls[0];
++    expect(call.function.name).toBe(wire);
++    expect(call).toMatchObject({ id: "call_kiro" });
++    expect(call.function.arguments).toBe('{"title":"x"}');
++  });
++
++  it("executor-normalized chunk yields the string wire alias", () => {
++    const out = kiroToOpenAIResponse(normalizedChunk(wire), { toolNameMap: descriptorMap() });
++    expect(out.choices[0].delta.tool_calls[0].function.name).toBe(wire);
++  });
++
++  it("Kiro to Claude streaming and non-streaming yield the string wire alias", () => {
++    const state = { toolNameMap: descriptorMap(), nextBlockIndex: 0 };
++    const events = kiroToClaudeResponse(normalizedChunk(wire), state);
++    const start = events.find(e => e.type === "content_block_start");
++    expect(start.content_block.name).toBe(wire);
++    expect(start.content_block.id).toBe("call_kiro");
++    const message = kiroToClaudeNonStreaming({ _toolNameMap: descriptorMap(), choices: [{ message: { tool_calls: [{ id: "call_kiro", function: { name: wire, arguments: '{"title":"x"}' } }] }, finish_reason: "tool_calls" }] });
++    expect(message.content[0]).toMatchObject({ type: "tool_use", id: "call_kiro", name: wire, input: { title: "x" } });
++  });
++
++  it("plain string map entries still restore the original tool name", () => {
++    const out = kiroToOpenAIResponse(normalizedChunk("wire_plain"), { toolNameMap: new Map([["wire_plain", "original_tool"]]) });
++    expect(out.choices[0].delta.tool_calls[0].function.name).toBe("original_tool");
 +  });
 +});
 -- 

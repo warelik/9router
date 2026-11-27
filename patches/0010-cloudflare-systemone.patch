@@ -1,11 +1,13 @@
-From a985814070cc965920d828cd295a7cd2f11e10b9 Mon Sep 17 00:00:00 2001
+From 6e95eb6f6335011956bb84653b84150eb3ceb68f Mon Sep 17 00:00:00 2001
 From: downstream <downstream@local>
-Date: Sat, 7 Nov 2026 17:42:51 +0000
-Subject: [PATCH 09/18] Cloudflare AI and SystemOne provider
+Date: Fri, 27 Nov 2026 20:00:00 +0000
+Subject: [PATCH 10/10] Validate Cloudflare System One response envelopes
 
-Consolidated from the following original patches (file custody by final owner):
+Regroup existing application changes without changing the final tree.
+Previous carriers in overlay a97b678d:
+- 0009-cloudflare-and-systemone.patch (prior application commit 8b3f921038ff)
 
-- original #07: 0007 cloudflare-systemone
+The historical migration source and cutoff are recorded in patches/source.json.
 ---
  open-sse/handlers/systemoneCore.js           | 24 ++++--
  open-sse/providers/registry/cloudflare-ai.js |  1 +

@@ -90,6 +90,8 @@
     "tests/unit/muse-foreign-reasoning-retry.test.js",
     "tests/unit/muse-responses-wire.test.js",
     "tests/unit/provider-pricing-muse-wonder.test.js",
-    "tests/unit/proxy-fetch-formdata-compat.test.js"
+    "tests/unit/proxy-fetch-formdata-compat.test.js",
+    "tests/unit/antigravity-prompt-rejection.test.js",
+    "tests/unit/gemini-long-decode.test.js"
   ]
 }

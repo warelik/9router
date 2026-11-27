@@ -1,26 +1,188 @@
-From 1006d03f4e53e94892c266d6fc93a839594efada Mon Sep 17 00:00:00 2001
-From: warelik <warelik@gmail.com>
-Date: Fri, 13 Nov 2026 08:43:22 +0000
-Subject: [PATCH 16/18] Route native Gemini combos with effort suffixes and
- numeric thinkingLevel
+From 69ebae1a8aa4e2206b5275aa8473378812b0e11b Mon Sep 17 00:00:00 2001
+From: downstream <downstream@local>
+Date: Fri, 27 Nov 2026 20:00:00 +0000
+Subject: [PATCH 06/10] Manage account availability and native Gemini combos
 
+Regroup existing application changes without changing the final tree.
+Previous carriers in overlay a97b678d:
+- 0007-account-availability-and-combo-waits.patch (prior application commit 7895a8010c59)
+- 0016-gemini-native-combos-and-thinking-level.patch (prior application commit a12954bad6d1)
+
+The historical migration source and cutoff are recorded in patches/source.json.
 ---
- open-sse/services/combo.js                    |  24 ++
+ open-sse/config/errorConfig.js                |  14 +
+ open-sse/config/runtimeConfig.js              |  34 +-
+ open-sse/services/accountFallback.js          |  18 +-
+ open-sse/services/combo.js                    |  84 +++-
  open-sse/services/emptyFailover.js            |  25 ++
  .../translator/concerns/thinkingUnified.js    |  91 +++-
  src/app/api/v1beta/models/[...path]/route.js  |  27 +-
- src/sse/handlers/chat.js                      | 104 +++--
+ src/sse/handlers/chat.js                      | 113 +++--
+ src/sse/services/auth.js                      |  44 +-
  src/sse/services/keyAccess.js                 |  20 +-
  src/sse/services/model.js                     |  22 +-
+ tests/unit/account-cooldown-division.test.js  |  45 ++
+ tests/unit/combo-hold-deadline.test.js        |  88 ++++
+ tests/unit/combo-transient-no-sleep.test.js   |  63 +++
  tests/unit/gemini-native-combo-effort.test.js | 390 ++++++++++++++++++
- 8 files changed, 659 insertions(+), 44 deletions(-)
+ 15 files changed, 1012 insertions(+), 66 deletions(-)
+ create mode 100644 tests/unit/account-cooldown-division.test.js
+ create mode 100644 tests/unit/combo-hold-deadline.test.js
+ create mode 100644 tests/unit/combo-transient-no-sleep.test.js
  create mode 100644 tests/unit/gemini-native-combo-effort.test.js
 
+diff --git a/open-sse/config/errorConfig.js b/open-sse/config/errorConfig.js
+index 10356373..539bc8a2 100644
+--- a/open-sse/config/errorConfig.js
++++ b/open-sse/config/errorConfig.js
+@@ -36,6 +36,14 @@ export const BACKOFF_CONFIG = {
+ };
+ 
+ // Default cooldown for transient/unknown errors
++// Router-computed cooldowns triggered by 429/503 responses are scaled down
++// by this divisor: with several accounts in rotation and requests waiting
++// out exhaustion, long locks only starve the pool — a third of the nominal
++// backoff still spreads retries without keeping accounts out needlessly.
++// Provider-reported reset timestamps (resetsAtMs) are NOT scaled: they state
++// when the provider itself lifts the limit, and probing earlier is futile.
++export const RATE_LIMIT_COOLDOWN_DIVISOR = 3;
++
+ export const TRANSIENT_COOLDOWN_MS = 30 * 1000;
+ 
+ // Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h)
+@@ -82,6 +90,12 @@ export const ERROR_RULES = [
+   { status: 403, cooldownMs: COOLDOWN.long },
+   { status: 404, cooldownMs: COOLDOWN.long },
+   { status: 429, backoff: true },
++  // Transient upstream 5xx without a text match: switch accounts now, but let
++  // the account back in quickly — these usually clear in seconds, and the
++  // generic 30s transient cooldown kept healthy accounts out of rotation.
++  { status: 502, cooldownMs: COOLDOWN.short },
++  { status: 503, cooldownMs: COOLDOWN.short },
++  { status: 504, cooldownMs: COOLDOWN.short },
+ ];
+ 
+ // Backward compat: COOLDOWN_MS object (used by index.js re-export)
+diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
+index 2488824e..b08d78fc 100644
+--- a/open-sse/config/runtimeConfig.js
++++ b/open-sse/config/runtimeConfig.js
+@@ -160,13 +160,41 @@ export const RETRY_CONFIG = {
+ 
+ // Default retry config by status code: { attempts, delayMs }
+ // Backward compat: if value is a number, treated as attempts with RETRY_CONFIG.delayMs
++// Transient 429/5xx are NOT retried on the same account: the router switches
++// to the next account immediately (account fallback), and the failed account
++// cools down via ERROR_RULES instead of burning the request's latency budget
++// on repeat attempts against the endpoint that just rejected it.
+ export const DEFAULT_RETRY_CONFIG = {
+   429: { attempts: 0, delayMs: 0 },
+-  502: { attempts: 3, delayMs: 3000 },
+-  503: { attempts: 3, delayMs: 2000 },
+-  504: { attempts: 2, delayMs: 3000 }
++  502: { attempts: 0, delayMs: 0 },
++  503: { attempts: 0, delayMs: 0 },
++  504: { attempts: 0, delayMs: 0 }
+ };
+ 
++// How long a chat request may wait for a free account (polling account locks)
++// instead of surfacing a 429/503 to the client. Only after this deadline does
++// the router give up, answering 502 rather than the upstream 429/503.
++// Env: ACCOUNT_WAIT_DEADLINE_MS. 0 disables waiting.
++// Parsed separately from envMs: 0 must stay 0 (disables waiting), not fall back.
++export const ACCOUNT_WAIT_DEADLINE_MS = (() => {
++  const raw = process.env.ACCOUNT_WAIT_DEADLINE_MS;
++  if (raw == null || raw === "") return 10 * 60 * 1000;
++  const n = parseInt(raw, 10);
++  return Number.isFinite(n) && n >= 0 ? n : 10 * 60 * 1000;
++})();
++
++// Per-model share of the wait deadline inside a combo: a member whose
++// accounts are all busy waits at most this long before the combo moves to the
++// next member; when every member is busy the combo waits and re-passes the
++// member list until ACCOUNT_WAIT_DEADLINE_MS expires. Env: COMBO_MODEL_WAIT_MS.
++export const COMBO_MODEL_WAIT_MS = envMs("COMBO_MODEL_WAIT_MS", 20 * 1000);
++
++// Maximum request starts per account per rolling minute. An account at the
++// limit is skipped during selection (like a locked account) until its oldest
++// start leaves the window, spreading bursts across accounts before the
++// provider's own rate limit fires. Env: ACCOUNT_START_LIMIT_PER_MIN.
++export const ACCOUNT_START_LIMIT_PER_MIN = envMs("ACCOUNT_START_LIMIT_PER_MIN", 30);
++
+ // Normalize a retry entry to { attempts, delayMs }
+ export function resolveRetryEntry(entry) {
+   if (entry == null) return { attempts: 0, delayMs: RETRY_CONFIG.delayMs };
+diff --git a/open-sse/services/accountFallback.js b/open-sse/services/accountFallback.js
+index 2e3987f7..d9a0c3b1 100644
+--- a/open-sse/services/accountFallback.js
++++ b/open-sse/services/accountFallback.js
+@@ -1,4 +1,4 @@
+-import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS } from "../config/errorConfig.js";
++import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS, RATE_LIMIT_COOLDOWN_DIVISOR } from "../config/errorConfig.js";
+ 
+ /**
+  * Calculate exponential backoff cooldown for rate limits (429)
+@@ -27,6 +27,12 @@ export function getQuotaCooldown(backoffLevel = 0) {
+  * this request, so combo rotation must still try the next member.
+  */
+ export function checkFallbackError(status, errorText, backoffLevel = 0, provider = null) {
++  // Cooldowns caused by 429/503 responses are scaled down (see
++  // RATE_LIMIT_COOLDOWN_DIVISOR); the backoff level still advances as before,
++  // so the ladder keeps its shape at a third of the durations.
++  const scaleCooldown = (status === 429 || status === 503)
++    ? (ms) => Math.max(1, Math.round(ms / RATE_LIMIT_COOLDOWN_DIVISOR))
++    : (ms) => ms;
+   const lowerError = errorText
+     ? (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase()
+     : "";
+@@ -37,11 +43,11 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
+     if (rule.text && lowerError && lowerError.includes(rule.text)) {
+       if (rule.backoff) {
+         const newLevel = Math.min(backoffLevel + 1, BACKOFF_CONFIG.maxLevel);
+-        return { shouldFallback: true, cooldownMs: getQuotaCooldown(newLevel), newBackoffLevel: newLevel };
++        return { shouldFallback: true, cooldownMs: scaleCooldown(getQuotaCooldown(newLevel)), newBackoffLevel: newLevel };
+       }
+       return {
+         shouldFallback: true,
+-        cooldownMs: rule.cooldownMs,
++        cooldownMs: scaleCooldown(rule.cooldownMs),
+         modelScoped: Boolean(rule.modelScoped),
+       };
+     }
+@@ -50,9 +56,9 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
+     if (rule.status && rule.status === status) {
+       if (rule.backoff) {
+         const newLevel = Math.min(backoffLevel + 1, BACKOFF_CONFIG.maxLevel);
+-        return { shouldFallback: true, cooldownMs: getQuotaCooldown(newLevel), newBackoffLevel: newLevel };
++        return { shouldFallback: true, cooldownMs: scaleCooldown(getQuotaCooldown(newLevel)), newBackoffLevel: newLevel };
+       }
+-      return { shouldFallback: true, cooldownMs: rule.cooldownMs };
++      return { shouldFallback: true, cooldownMs: scaleCooldown(rule.cooldownMs) };
+     }
+   }
+ 
+@@ -71,7 +77,7 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
+   }
+ 
+   // Default: transient cooldown for any unmatched error
+-  return { shouldFallback: true, cooldownMs: TRANSIENT_COOLDOWN_MS };
++  return { shouldFallback: true, cooldownMs: scaleCooldown(TRANSIENT_COOLDOWN_MS) };
+ }
+ 
+ /**
 diff --git a/open-sse/services/combo.js b/open-sse/services/combo.js
-index b96a2efa..65207b65 100644
+index c1ec6906..65207b65 100644
 --- a/open-sse/services/combo.js
 +++ b/open-sse/services/combo.js
-@@ -331,6 +331,30 @@ export function isZeroContentResponse(data) {
+@@ -3,6 +3,7 @@
+  */
+ 
+ import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
++import { COMBO_MODEL_WAIT_MS } from "../config/runtimeConfig.js";
+ import { unavailableResponse } from "../utils/error.js";
+ import { getCapabilitiesForModel } from "../providers/capabilities.js";
+ import { parseModel } from "./model.js";
+@@ -330,6 +331,30 @@ export function isZeroContentResponse(data) {
      }
    }
  
@@ -51,6 +213,119 @@ index b96a2efa..65207b65 100644
    return false;
  }
  
+@@ -351,6 +376,16 @@ export function isZeroContentResponse(data) {
+  * @param {Function|null} [options.resolveSmartChoice=null] - Smart router resolver callback: (body, models) => Promise<{ choice, probabilities, confidence } | null>
+  * @returns {Promise<Response>}
+  */
++// Sleep that wakes early when the client disconnects, so a combo waiting for
++// a free account never lingers after its caller is gone.
++function sleepAbortable(ms, signal) {
++  if (!(ms > 0)) return Promise.resolve();
++  return new Promise((resolve) => {
++    const timer = setTimeout(resolve, ms);
++    signal?.addEventListener?.("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
++  });
++}
++
+ export async function handleComboChat({
+   body,
+   models,
+@@ -365,7 +400,12 @@ export async function handleComboChat({
+   sessionSticky = true,
+   confidenceThreshold = 0.8,
+   resolveSmartChoice = null,
++  holdDeadlineAt = null,
++  clientSignal = null,
+ }) {
++  // True when at least one member failed on its accounts (not on the request):
++  // only then can waiting for an account to free up change the outcome.
++  let sawAccountFailure = false;
+   let rotatedModels = models;
+   let activeStickyModel = null;
+ 
+@@ -473,7 +513,13 @@ export async function handleComboChat({
+     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
+ 
+     try {
+-      const result = await handleSingleModel(body, modelStr);
++      // Within the overall wait deadline each member gets a bounded share, so
++      // one exhausted provider cannot starve the remaining members; the pass
++      // loop below keeps cycling until the deadline itself expires.
++      const holdMs = holdDeadlineAt
++        ? Math.max(0, Math.min(COMBO_MODEL_WAIT_MS, holdDeadlineAt - Date.now()))
++        : undefined;
++      const result = await handleSingleModel(body, modelStr, holdMs);
+       
+       // Success (2xx). A 2xx is necessary but NOT sufficient: Gemini aborts (e.g.
+       // MALFORMED_FUNCTION_CALL) still return 200 and stream empty content, which would
+@@ -593,22 +639,19 @@ export async function handleComboChat({
+       // request-scoped fault must not evict a healthy account from rotation).
+       if (requestScoped) {
+         log.warn("COMBO", `Model ${modelStr} rejected the request (${result.status}), trying next`, { status: result.status });
+-        lastError = errorText || String(result.status);
++        sawAccountFailure = true;
++      lastError = errorText || String(result.status);
+         if (!lastStatus) lastStatus = result.status;
+         if (!requestScopedResult) requestScopedResult = result;
+         continue;
+       }
+ 
+-      // For transient errors (503/502/504), wait for cooldown before falling through
+-      // so a briefly-overloaded provider gets a chance to recover rather than being
+-      // skipped immediately (fixes: combo falls through on transient 503)
+-      if (cooldownMs && cooldownMs > 0 && cooldownMs <= 5000 &&
+-          (result.status === 503 || result.status === 502 || result.status === 504)) {
+-        log.info("COMBO", `Model ${modelStr} transient ${result.status}, waiting ${cooldownMs}ms before next`);
+-        await new Promise(r => setTimeout(r, cooldownMs));
+-      }
++      // Transient 502/503/504 move to the next combo model at once. The short account
++      // cooldown only marks the account unavailable (see checkFallbackError and
++      // markAccountUnavailable); it never delays the current request.
+ 
+       // Fallback to next model
++      sawAccountFailure = true;
+       lastError = errorText || String(result.status);
+       if (!lastStatus) lastStatus = result.status;
+       log.warn("COMBO", `Model ${modelStr} failed, trying next`, { status: result.status });
+@@ -617,10 +660,26 @@ export async function handleComboChat({
+       if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
+         clearStickyComboSession(comboName, sessionId);
+       }
++      sawAccountFailure = true;
+       lastError = error.message || String(error);
+       if (!lastStatus) lastStatus = 500;
+       log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
+     }
++
++    // Every member failed on account exhaustion (not on the request itself):
++    // wait for the earliest account to free up and pass the member list again
++    // instead of returning 429/503, until the wait deadline expires.
++    if (i === rotatedModels.length - 1 && holdDeadlineAt && sawAccountFailure && !clientSignal?.aborted) {
++      const now = Date.now();
++      if (now < holdDeadlineAt) {
++        let waitMs = earliestRetryAfter ? new Date(earliestRetryAfter).getTime() - now : 1000;
++        waitMs = Math.min(Math.max(waitMs, 250), 2000, holdDeadlineAt - now);
++        log.info("COMBO", `All models busy — waiting ${Math.round(waitMs)}ms before another pass (${Math.round((holdDeadlineAt - now) / 1000)}s left)`);
++        await sleepAbortable(waitMs, clientSignal);
++        earliestRetryAfter = null;
++        i = -1; // restart the member pass
++      }
++    }
+   }
+ 
+   // At least one member rejected the request itself. Hand back that member's own
+@@ -638,7 +697,10 @@ export async function handleComboChat({
+   // the request itself is invalid, but here the providers are simply unavailable
+   // or have no active credentials. 503 is more accurate and retryable by clients.
+   const allDisabled = lastError && lastError.toLowerCase().includes("no credentials");
+-  const status = allDisabled ? 503 : (lastStatus || 503);
++  let status = allDisabled ? 503 : (lastStatus || 503);
++  // The wait deadline was configured and has now expired: report the router's
++  // own 502 rather than relaying an upstream 429/503 to the client.
++  if (holdDeadlineAt && (status === 429 || status === 503)) status = 502;
+   const msg = lastError || "All combo models unavailable";
+ 
+   if (earliestRetryAfter) {
 diff --git a/open-sse/services/emptyFailover.js b/open-sse/services/emptyFailover.js
 index 5e8d1646..bc5ea7b7 100644
 --- a/open-sse/services/emptyFailover.js
@@ -254,9 +529,18 @@ index 203cac04..c893640d 100644
      // Keep the native request intact. The shared handler selects translation
      // only when the chosen provider speaks a different wire format.
 diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
-index 56036a4c..9bec6ace 100644
+index 145f6a87..9bec6ace 100644
 --- a/src/sse/handlers/chat.js
 +++ b/src/sse/handlers/chat.js
+@@ -21,7 +21,7 @@ import { upstreamResponseHeaders } from "open-sse/utils/upstreamHeaders.js";
+ import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "open-sse/services/combo.js";
+ import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
+ import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
+-import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
++import { HTTP_STATUS, ACCOUNT_WAIT_DEADLINE_MS } from "open-sse/config/runtimeConfig.js";
+ import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
+ import { resolveSessionIdentity } from "open-sse/utils/sessionManager.js";
+ import * as log from "../utils/logger.js";
 @@ -78,6 +78,7 @@ async function responseErrorForClient(response, options, fallbackMessage = "Requ
    let message = fallbackMessage;
    try {
@@ -304,7 +588,21 @@ index 56036a4c..9bec6ace 100644
  /**
   * Handle chat completion request
   * Supports: OpenAI, Claude, Gemini, OpenAI Responses API formats
-@@ -207,16 +240,21 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+@@ -178,6 +211,13 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+   }
+   options = { ...options, serverPartsTenant };
+ 
++  // Server-side wait deadline, applied once at the top-level chat boundary. An
++  // explicit holdUntil (including null from internal calls) is never overwritten,
++  // so recursive and combo calls do not extend the shared deadline. 0 disables waiting.
++  if (options.holdUntil === undefined && ACCOUNT_WAIT_DEADLINE_MS > 0) {
++    options.holdUntil = Date.now() + ACCOUNT_WAIT_DEADLINE_MS;
++  }
++
+   if (!modelStr) {
+     log.warn("CHAT", "Missing model");
+     return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Missing model", options);
+@@ -200,16 +240,21 @@ export async function handleChat(request, clientRawRequest = null, options = {})
    // Check if model is a combo (has multiple models with fallback)
    const comboModels = await getComboModels(modelStr);
    if (comboModels) {
@@ -328,7 +626,7 @@ index 56036a4c..9bec6ace 100644
          body,
          models: comboModels,
          handleSingleModel: (b, m, isPanel) => {
-@@ -225,27 +263,35 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+@@ -218,27 +263,35 @@ export async function handleChat(request, clientRawRequest = null, options = {})
              const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
              cleanRawReq = { ...clientRawRequest, body: cleanBody };
            }
@@ -355,7 +653,7 @@ index 56036a4c..9bec6ace 100644
        body,
        models: augmentedModels,
        handleSingleModel: withCapacityAdapterStripping(
--        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
+-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
 +        (b, m) => handleSingleModelChat(
 +          b,
 +          adapterAdded.includes(m) ? m : applyComboThinkingSuffix(m, comboSuffix),
@@ -373,7 +671,7 @@ index 56036a4c..9bec6ace 100644
        comboStrategy,
        comboStickyLimit,
        sessionId,
-@@ -260,7 +306,7 @@ export async function handleChat(request, clientRawRequest = null, options = {})
+@@ -253,7 +306,7 @@ export async function handleChat(request, clientRawRequest = null, options = {})
              log,
            })
          : null,
@@ -382,7 +680,7 @@ index 56036a4c..9bec6ace 100644
    }
  
    // Single model request — may still switch to a capacity-adapter model if the
-@@ -295,10 +341,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -288,10 +341,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
    if (!modelInfo.provider) {
      const comboModels = await getComboModels(modelStr);
      if (comboModels) {
@@ -396,7 +694,7 @@ index 56036a4c..9bec6ace 100644
        const comboStrategy = comboSpecificStrategy || chatSettings.comboStrategy || "fallback";
        const requiredCapabilities = detectRequiredCapabilities(body);
        // Nested combo (a combo member that is itself a combo): the access decision
-@@ -309,7 +357,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -302,7 +357,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
  
        if (comboStrategy === "fusion") {
          log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
@@ -405,7 +703,7 @@ index 56036a4c..9bec6ace 100644
            body,
            models: comboModels,
            handleSingleModel: (b, m, isPanel) => {
-@@ -318,29 +366,37 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -311,29 +366,37 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
                const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
                cleanRawReq = { ...clientRawRequest, body: cleanBody };
              }
@@ -434,7 +732,7 @@ index 56036a4c..9bec6ace 100644
          body,
          models: augmentedModels,
          handleSingleModel: withCapacityAdapterStripping(
--          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, options),
+-          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
 +          (b, m) => handleSingleModelChat(
 +            b,
 +            adapterAdded.includes(m) ? m : applyComboThinkingSuffix(m, comboSuffix),
@@ -452,7 +750,7 @@ index 56036a4c..9bec6ace 100644
          comboStrategy,
          comboStickyLimit,
          sessionId: nestedSessionId,
-@@ -355,7 +411,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -348,7 +411,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
                log,
              })
            : null,
@@ -461,6 +759,92 @@ index 56036a4c..9bec6ace 100644
      }
      log.warn("CHAT", "Invalid model format", { model: modelStr });
      return errorResponseForClient(HTTP_STATUS.BAD_REQUEST, "Invalid model format", options);
+diff --git a/src/sse/services/auth.js b/src/sse/services/auth.js
+index 035d969f..aea5340e 100644
+--- a/src/sse/services/auth.js
++++ b/src/sse/services/auth.js
+@@ -2,6 +2,7 @@ import { getProviderConnections, validateApiKey, updateProviderConnection, getSe
+ import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
+ import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
+ import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
++import { ACCOUNT_START_LIMIT_PER_MIN } from "open-sse/config/runtimeConfig.js";
+ import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
+ import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravityQuota.js";
+ import * as log from "../utils/logger.js";
+@@ -9,6 +10,35 @@ import * as log from "../utils/logger.js";
+ // Mutex to prevent race conditions during account selection
+ let selectionMutex = Promise.resolve();
+ 
++// Per-account request-start pacing: rolling 60s window of selection timestamps.
++// An account whose window is full is skipped during selection until its oldest
++// start expires, so bursts spread across accounts instead of concentrating on
++// the first one until the provider rate-limits it. In-memory only (like the
++// Antigravity quota cache); timestamps need no release bookkeeping.
++const ACCOUNT_START_WINDOW_MS = 60 * 1000;
++const accountStartLog = new Map(); // connectionId -> number[] (ascending ms)
++
++function pruneAccountStarts(connectionId, now) {
++  const starts = accountStartLog.get(connectionId);
++  if (!starts) return [];
++  while (starts.length > 0 && now - starts[0] >= ACCOUNT_START_WINDOW_MS) starts.shift();
++  if (starts.length === 0) accountStartLog.delete(connectionId);
++  return starts;
++}
++
++// Ms timestamp when a start slot frees for this account, or 0 if not saturated.
++function accountStartSaturatedUntil(connectionId, now) {
++  if (!ACCOUNT_START_LIMIT_PER_MIN) return 0;
++  const starts = pruneAccountStarts(connectionId, now);
++  return starts.length >= ACCOUNT_START_LIMIT_PER_MIN ? starts[0] + ACCOUNT_START_WINDOW_MS : 0;
++}
++
++function recordAccountStart(connectionId, now) {
++  const starts = pruneAccountStarts(connectionId, now);
++  starts.push(now);
++  accountStartLog.set(connectionId, starts);
++}
++
+ const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
+ 
+ function githubMonthlyResetMs(status, errorText, provider) {
+@@ -83,10 +113,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
+     const isAntigravity = providerId === "antigravity";
+     const antigravityQuotaCache = isAntigravity && model ? getAntigravityQuotaCache() : null;
+ 
+-    // Filter out model-locked, excluded, and Antigravity quota-exhausted connections.
++    // Filter out model-locked, excluded, start-saturated, and Antigravity quota-exhausted connections.
++    const selectionNow = Date.now();
+     const availableConnections = connections.filter(c => {
+       if (excludeSet.has(c.id)) return false;
+       if (isModelLockActive(c, model)) return false;
++      if (accountStartSaturatedUntil(c.id, selectionNow)) return false;
+       const enabled = c.providerSpecificData?.enabledModels;
+       if (providerId === "codex" && Array.isArray(enabled) && enabled.length && requestedModel && !enabled.includes(requestedModel)) return false;
+       // Antigravity: skip if live quota exhausted for this model
+@@ -116,6 +148,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
+       // Find earliest persistent lock or lazy Antigravity quota-cache reset for retry timing.
+       const lockedConns = connections.filter(c => isModelLockActive(c, model));
+       const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
++      // Start-saturated accounts also free up with time; their slot expiry is
++      // a valid retryAfter for the allRateLimited contract (callers may wait).
++      for (const c of connections) {
++        const saturatedUntil = accountStartSaturatedUntil(c.id, selectionNow);
++        if (saturatedUntil) expiries.push(new Date(saturatedUntil).toISOString());
++      }
+       if (isAntigravity && model && antigravityQuotaCache) {
+         connections.forEach((c) => {
+           const connQuotas = antigravityQuotaCache.get(c.id);
+@@ -201,6 +239,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
+ 
+     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
+ 
++    // Count this selection as a request start for pacing (still under the
++    // selection mutex, so concurrent selections observe the updated window).
++    recordAccountStart(connection.id, Date.now());
++
+     return {
+       authType: connection.authType,
+       apiKey: connection.apiKey,
 diff --git a/src/sse/services/keyAccess.js b/src/sse/services/keyAccess.js
 index 6de0e321..5643f494 100644
 --- a/src/sse/services/keyAccess.js
@@ -570,6 +954,220 @@ index 5dd25fe6..81d33b92 100644
    if (combo && combo.models && combo.models.length > 0) {
      return combo.models;
    }
+diff --git a/tests/unit/account-cooldown-division.test.js b/tests/unit/account-cooldown-division.test.js
+new file mode 100644
+index 00000000..b28d72c0
+--- /dev/null
++++ b/tests/unit/account-cooldown-division.test.js
+@@ -0,0 +1,45 @@
++// Regression for the 429/503 cooldown division (RATE_LIMIT_COOLDOWN_DIVISOR = 3).
++// Only cooldowns caused by 429 and 503 are divided. Other statuses keep their
++// configured duration, and provider-reported reset timestamps are never divided.
++import { describe, expect, it } from "vitest";
++import { checkFallbackError } from "../../open-sse/services/accountFallback.js";
++import { RATE_LIMIT_COOLDOWN_DIVISOR, COOLDOWN_MS, TRANSIENT_COOLDOWN_MS } from "../../open-sse/config/errorConfig.js";
++
++describe("RATE_LIMIT_COOLDOWN_DIVISOR scales only 429 and 503", () => {
++  it("the divisor is 3", () => {
++    expect(RATE_LIMIT_COOLDOWN_DIVISOR).toBe(3);
++  });
++
++  it("a 503 with the short cooldown is divided by 3", () => {
++    const r = checkFallbackError(503, "upstream unavailable", 0, "p");
++    // COOLDOWN.short is 5000 ms for 503; the divisor brings it to round(5000 / 3).
++    expect(r.cooldownMs).toBe(Math.round(5000 / RATE_LIMIT_COOLDOWN_DIVISOR));
++  });
++
++  it("a 429 backoff level is divided by 3", () => {
++    // Backoff level 1 gives the base 2000 ms (getQuotaCooldown(1)); the divisor
++    // must bring it to round(2000 / 3), not leave the nominal value.
++    const r = checkFallbackError(429, "rate limit", 0, "p");
++    expect(r.cooldownMs).toBe(Math.round(2000 / RATE_LIMIT_COOLDOWN_DIVISOR));
++  });
++
++  it("a 502 keeps its undivided short cooldown", () => {
++    const r = checkFallbackError(502, "upstream unavailable", 0, "p");
++    expect(r.cooldownMs).toBe(5000);
++  });
++
++  it("a 504 keeps its undivided short cooldown", () => {
++    const r = checkFallbackError(504, "upstream unavailable", 0, "p");
++    expect(r.cooldownMs).toBe(5000);
++  });
++
++  it("an unmatched transient error keeps the undivided default cooldown", () => {
++    const r = checkFallbackError(500, "strange failure", 0, "p");
++    expect(r.cooldownMs).toBe(TRANSIENT_COOLDOWN_MS);
++  });
++
++  it("a 401 keeps its undivided account cooldown", () => {
++    const r = checkFallbackError(401, "unauthorized", 0, "p");
++    expect(r.cooldownMs).toBe(COOLDOWN_MS.unauthorized);
++  });
++});
+diff --git a/tests/unit/combo-hold-deadline.test.js b/tests/unit/combo-hold-deadline.test.js
+new file mode 100644
+index 00000000..50cd6908
+--- /dev/null
++++ b/tests/unit/combo-hold-deadline.test.js
+@@ -0,0 +1,88 @@
++// Regression for the combo account-wait contract (0064). Waiting only happens when
++// the caller provides holdDeadlineAt; without it the historical immediate handoff
++// is kept. The wait ends at the deadline, stops on client abort, and an expired
++// deadline reports the router's own 502 instead of relaying an upstream 429/503.
++import { describe, expect, it, vi } from "vitest";
++import { handleComboChat } from "../../open-sse/services/combo.js";
++
++const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
++
++// combo reads ok, status, headers, body, clone and statusText from the result object.
++function resultFor(status, ok) {
++  const make = () => new Response(JSON.stringify({ error: { message: "account exhausted" } }), {
++    status,
++    headers: { "Content-Type": "application/json" },
++  });
++  const response = make();
++  return { ok, status, statusText: "", headers: response.headers, body: response.body, clone: () => make() };
++}
++
++// Every member fails on account exhaustion (429), so only waiting can change the outcome.
++function exhaustedMember() {
++  const calls = [];
++  const handleSingleModel = async (_body, modelStr) => {
++    calls.push(modelStr);
++    return resultFor(429, false);
++  };
++  return { calls, handleSingleModel };
++}
++
++describe("combo account wait is driven by holdDeadlineAt only", () => {
++  it("without holdDeadlineAt, exhaustion is handed back at once (no wait pass)", async () => {
++    const { calls, handleSingleModel } = exhaustedMember();
++    const started = Date.now();
++    await handleComboChat({
++      body: { model: "combo", messages: [{ role: "user", content: "hi" }] },
++      models: ["p/a", "p/b"],
++      handleSingleModel,
++      log,
++    });
++    expect(Date.now() - started).toBeLessThan(1000);
++    // One pass only: no re-pass of the member list.
++    expect(calls).toEqual(["p/a", "p/b"]);
++  });
++
++  it("with an expired holdDeadlineAt, the router answers 502 instead of 429", async () => {
++    const { handleSingleModel } = exhaustedMember();
++    const result = await handleComboChat({
++      body: { model: "combo", messages: [{ role: "user", content: "hi" }] },
++      models: ["p/a", "p/b"],
++      handleSingleModel,
++      log,
++      holdDeadlineAt: Date.now() - 1,
++    });
++    expect(result.status).toBe(502);
++  });
++
++  it("with a live holdDeadlineAt, exhausted members are re-passed until the deadline", async () => {
++    const { calls, handleSingleModel } = exhaustedMember();
++    const deadline = Date.now() + 1500;
++    await handleComboChat({
++      body: { model: "combo", messages: [{ role: "user", content: "hi" }] },
++      models: ["p/a", "p/b"],
++      handleSingleModel,
++      log,
++      holdDeadlineAt: deadline,
++    });
++    // More than one pass proves the wait re-pass ran; the deadline bounds it.
++    expect(calls.length).toBeGreaterThan(2);
++    expect(Date.now()).toBeGreaterThanOrEqual(deadline - 50);
++  });
++
++  it("a client abort during the wait ends it at once", async () => {
++    const { calls, handleSingleModel } = exhaustedMember();
++    const controller = new AbortController();
++    const started = Date.now();
++    setTimeout(() => controller.abort(), 100);
++    await handleComboChat({
++      body: { model: "combo", messages: [{ role: "user", content: "hi" }] },
++      models: ["p/a", "p/b"],
++      handleSingleModel,
++      log,
++      holdDeadlineAt: Date.now() + 5000,
++      clientSignal: controller.signal,
++    });
++    expect(Date.now() - started).toBeLessThan(1500);
++    expect(calls.length).toBeGreaterThanOrEqual(2);
++  });
++});
+diff --git a/tests/unit/combo-transient-no-sleep.test.js b/tests/unit/combo-transient-no-sleep.test.js
+new file mode 100644
+index 00000000..65a79c80
+--- /dev/null
++++ b/tests/unit/combo-transient-no-sleep.test.js
+@@ -0,0 +1,63 @@
++// Regression: a transient 502/503/504 from one combo model must move to the next
++// model at once, without sleeping on the account cooldown. The short cooldown only
++// marks the account unavailable; it must never delay the current request.
++import { describe, expect, it, vi } from "vitest";
++import { handleComboChat } from "../../open-sse/services/combo.js";
++import { checkFallbackError } from "../../open-sse/services/accountFallback.js";
++
++const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
++
++// combo reads ok, status, headers, body, clone and statusText from the result object.
++function resultFor(status, ok) {
++  const make = () => new Response(JSON.stringify({ error: { message: "upstream unavailable" } }), {
++    status,
++    headers: { "Content-Type": "application/json" },
++  });
++  const response = make();
++  return {
++    ok,
++    status,
++    statusText: "",
++    headers: response.headers,
++    body: response.body,
++    clone: () => make(),
++  };
++}
++
++describe("combo transient 502/503/504 do not sleep before the next model", () => {
++  for (const status of [502, 503, 504]) {
++    it(`status ${status}: the next model runs without waiting on the cooldown`, async () => {
++      const calls = [];
++      const handleSingleModel = async (_body, modelStr) => {
++        calls.push({ modelStr, at: Date.now() });
++        if (modelStr === "p/first") return resultFor(status, false);
++        return resultFor(200, true);
++      };
++
++      const started = Date.now();
++      const result = await handleComboChat({
++        body: { model: "combo", messages: [{ role: "user", content: "hi" }] },
++        models: ["p/first", "p/second"],
++        handleSingleModel,
++        log,
++      });
++      const elapsed = Date.now() - started;
++
++      expect(calls.map(c => c.modelStr)).toEqual(["p/first", "p/second"]);
++      // Without the sleep the whole handoff is effectively immediate; the old 5s pause
++      // would blow well past this bound.
++      expect(elapsed).toBeLessThan(1000);
++      expect(result).toBeDefined();
++    });
++  }
++});
++
++describe("account cooldown classification stays short", () => {
++  it("a bare 502 gets the transient account cooldown, not a sleep budget", () => {
++    const r = checkFallbackError(502, "upstream unavailable", 0, "p");
++    expect(r.shouldFallback).toBe(true);
++    expect(typeof r.cooldownMs).toBe("number");
++    expect(r.cooldownMs).toBeGreaterThan(0);
++  });
++
++});
 diff --git a/tests/unit/gemini-native-combo-effort.test.js b/tests/unit/gemini-native-combo-effort.test.js
 new file mode 100644
 index 00000000..680f2667

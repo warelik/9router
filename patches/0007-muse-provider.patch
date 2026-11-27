@@ -1,0 +1,2453 @@
+From 0e4625f9a20abd62d93148e093a1bd1023a9ba52 Mon Sep 17 00:00:00 2001
+From: downstream <downstream@local>
+Date: Fri, 27 Nov 2026 20:00:00 +0000
+Subject: [PATCH 07/10] Adapt Muse transport, retry recovery, tools, and
+ pricing
+
+Regroup existing application changes without changing the final tree.
+Previous carriers in overlay a97b678d:
+- 0008-muse-provider-recovery-and-pricing.patch (prior application commit 51d5b79a4d2d)
+- 0010-muse-foreign-reasoning-recovery-ladder.patch (prior application commit cc12f269ec52)
+- 0012-muse-custom-tools-and-hosted-search.patch (prior application commit 15a3e7d9bf4d)
+- 0013-muse-portable-responses-input.patch (prior application commit 5ea622bc771f)
+- 0014-muse-namespace-call-restore.patch (prior application commit 9a448840c192)
+- 0015-muse-bare-namespace-and-plaintext-tasks.patch (prior application commit 780dfc206a94)
+
+The historical migration source and cutoff are recorded in patches/source.json.
+---
+ open-sse/config/errorConfig.js                |   8 +
+ open-sse/executors/index.js                   |   3 +
+ open-sse/executors/muse.js                    | 323 +++++++++++++
+ open-sse/handlers/chatCore.js                 |  13 +-
+ .../handlers/chatCore/nonStreamingHandler.js  |   3 +-
+ .../handlers/chatCore/sseToJsonHandler.js     |   3 +-
+ .../handlers/chatCore/streamingHandler.js     |   4 +-
+ open-sse/providers/capabilities.js            |  16 +-
+ open-sse/providers/pricing.js                 |   5 +
+ open-sse/providers/registry/muse.js           |  13 +-
+ open-sse/providers/thinkingLevels.js          |   3 +
+ open-sse/translator/index.js                  |  52 ++-
+ open-sse/utils/museCloaking.js                | 396 ++++++++++++++++
+ open-sse/utils/stream.js                      |  67 ++-
+ tests/unit/muse-cloaking.test.js              | 276 +++++++++++
+ tests/unit/muse-custom-tools.test.js          | 437 ++++++++++++++++++
+ .../unit/muse-foreign-reasoning-retry.test.js | 372 +++++++++++++++
+ tests/unit/muse-responses-wire.test.js        |  37 ++
+ .../unit/provider-pricing-muse-wonder.test.js |  29 ++
+ 19 files changed, 2038 insertions(+), 22 deletions(-)
+ create mode 100644 open-sse/executors/muse.js
+ create mode 100644 open-sse/utils/museCloaking.js
+ create mode 100644 tests/unit/muse-cloaking.test.js
+ create mode 100644 tests/unit/muse-custom-tools.test.js
+ create mode 100644 tests/unit/muse-foreign-reasoning-retry.test.js
+ create mode 100644 tests/unit/provider-pricing-muse-wonder.test.js
+
+diff --git a/open-sse/config/errorConfig.js b/open-sse/config/errorConfig.js
+index 539bc8a2..1e340006 100644
+--- a/open-sse/config/errorConfig.js
++++ b/open-sse/config/errorConfig.js
+@@ -73,6 +73,14 @@ export const ERROR_RULES = [
+   // NVIDIA NIM returns 400 with "degraded" when specific model cluster is unhealthy.
+   // Lock only the degraded model (modelScoped: true) without locking the API key.
+   { provider: "nvidia", text: "degraded", cooldownMs: 15 * 60 * 1000, modelScoped: true },
++  // Muse reasoning continuity is bound to the caller that issued it: a 400
++  // naming a foreign or expired reasoning item indicts this credential for
++  // this history, not the request itself — another account (the issuer)
++  // may serve it as-is. The Muse executor first tries to recover in place
++  // by stripping/dropping that state; a rejection that still reaches here
++  // rotates to the next account without cooling this healthy one down.
++  { provider: "muse", text: "was not issued to this caller", cooldownMs: 0 },
++  { provider: "muse", text: "referenced reasoning item", cooldownMs: 0 },
+   { text: "no credentials",           cooldownMs: COOLDOWN.long },
+   { text: "request not allowed",      cooldownMs: COOLDOWN.short },
+   { text: "improperly formed request", cooldownMs: COOLDOWN.long },
+diff --git a/open-sse/executors/index.js b/open-sse/executors/index.js
+index 9ed15fee..cf7ca340 100644
+--- a/open-sse/executors/index.js
++++ b/open-sse/executors/index.js
+@@ -19,6 +19,7 @@ import { PerplexityWebExecutor } from "./perplexity-web.js";
+ import { DeepSeekWebExecutor } from "./deepseek-web.js";
+ import { GeminiWebExecutor } from "./gemini-web.js";
+ import { MuseWebExecutor } from "./muse-web.js";
++import { MuseExecutor } from "./muse.js";
+ import { VeoAiFreeWebExecutor } from "./veoaifree-web.js";
+ import { UcWebExecutor } from "./uc-web.js";
+ import { ChatGptWebExecutor } from "./chatgpt-web.js";
+@@ -61,6 +62,7 @@ const executors = {
+   "perplexity-web": new PerplexityWebExecutor(),
+   "deepseek-web": new DeepSeekWebExecutor(),
+   "gemini-web": new GeminiWebExecutor(),
++  muse: new MuseExecutor(),
+   "muse-web": new MuseWebExecutor(),
+   "veoaifree-web": new VeoAiFreeWebExecutor(),
+   "veo-free": new VeoAiFreeWebExecutor(), // Alias
+@@ -123,6 +125,7 @@ export { GrokCliExecutor } from "./grok-cli.js";
+ export { PerplexityWebExecutor } from "./perplexity-web.js";
+ export { DeepSeekWebExecutor } from "./deepseek-web.js";
+ export { GeminiWebExecutor } from "./gemini-web.js";
++export { MuseExecutor } from "./muse.js";
+ export { MuseWebExecutor } from "./muse-web.js";
+ export { ChatGptWebExecutor } from "./chatgpt-web.js";
+ export { OllamaLocalExecutor } from "./ollama-local.js";
+diff --git a/open-sse/executors/muse.js b/open-sse/executors/muse.js
+new file mode 100644
+index 00000000..2bec85ca
+--- /dev/null
++++ b/open-sse/executors/muse.js
+@@ -0,0 +1,323 @@
++import { createHash } from "node:crypto";
++
++import { DefaultExecutor } from "./default.js";
++
++const FOREIGN_REASONING_ERROR = "reasoning `encrypted_content` was not issued to this caller";
++const EXPIRED_REASONING_REFERENCE = /Referenced reasoning item '([^']+)' was not found or has expired/;
++const MAX_TRACKED_CALLERS = 64;
++const MAX_TRACKED_HASHES_PER_CALLER = 10000;
++const MAX_RECOVERY_ATTEMPTS = 4;
++
++function hashValue(value) {
++  return createHash("sha256").update(value).digest("hex");
++}
++
++function encryptedValues(item) {
++  return [
++    item?.encrypted_content,
++    item?.reasoning_encrypted_content,
++    item?.reasoning?.encrypted_content,
++  ].filter((value) => typeof value === "string" && value.length > 0);
++}
++
++function hasSummary(item) {
++  return Array.isArray(item?.summary)
++    && item.summary.some((part) => typeof part?.text === "string" && part.text.length > 0);
++}
++
++function hasContent(item) {
++  return Array.isArray(item?.content) && item.content.length > 0;
++}
++
++/**
++ * Remove caller-bound encrypted reasoning payloads while preserving the rest
++ * of the Responses history. Reasoning items keep their summary/content when
++ * present; items that consisted only of the encrypted continuity blob are
++ * dropped because an anonymous empty reasoning item carries no usable state.
++ *
++ * When incompatibleHashes is provided, only payloads already known to be
++ * rejected for this caller are removed. Without it, every encrypted payload
++ * is removed for a recovery attempt after Meta has identified a mismatch.
++ */
++export function sanitizeMuseForeignReasoning(body, incompatibleHashes = null) {
++  if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.input)) {
++    return { body, removedHashes: [] };
++  }
++
++  let changed = false;
++  const removedHashes = [];
++  const input = [];
++
++  for (const item of body.input) {
++    if (!item || typeof item !== "object" || Array.isArray(item)) {
++      input.push(item);
++      continue;
++    }
++
++    const hashes = encryptedValues(item).map(hashValue);
++    if (!hashes.length || (incompatibleHashes && !hashes.some((hash) => incompatibleHashes.has(hash)))) {
++      input.push(item);
++      continue;
++    }
++
++    changed = true;
++    removedHashes.push(...hashes);
++
++    const clean = { ...item };
++    delete clean.encrypted_content;
++    delete clean.reasoning_encrypted_content;
++    if (clean.reasoning && typeof clean.reasoning === "object" && !Array.isArray(clean.reasoning)) {
++      clean.reasoning = { ...clean.reasoning };
++      delete clean.reasoning.encrypted_content;
++    }
++
++    if (item.type !== "reasoning") {
++      input.push(clean);
++      continue;
++    }
++
++    // The id identifies the stored item issued under the previous caller.
++    // Keep only portable summary/content once its encrypted state is removed.
++    delete clean.id;
++    if (hasSummary(clean) || hasContent(clean)) input.push(clean);
++  }
++
++  return {
++    body: changed ? { ...body, input } : body,
++    removedHashes,
++  };
++}
++
++/**
++ * Remove reasoning items whose server-side reference Meta no longer holds.
++ * The referenced form carries only an id (plus summary); without the stored
++ * object the caller cannot resolve it, so keep the portable summary/content
++ * when present and drop the id, dropping the item when nothing usable remains.
++ */
++export function dropMuseReasoningReferences(body, referencedIds) {
++  if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.input)
++    || !(referencedIds instanceof Set) || !referencedIds.size) {
++    return { body, removedIds: [] };
++  }
++
++  let changed = false;
++  const removedIds = [];
++  const input = [];
++
++  for (const item of body.input) {
++    if (!item || typeof item !== "object" || Array.isArray(item)
++      || item.type !== "reasoning" || !referencedIds.has(item.id)) {
++      input.push(item);
++      continue;
++    }
++
++    changed = true;
++    removedIds.push(item.id);
++    const clean = { ...item };
++    delete clean.id;
++    if (hasSummary(clean) || hasContent(clean)) input.push(clean);
++  }
++
++  return {
++    body: changed ? { ...body, input } : body,
++    removedIds,
++  };
++}
++
++/**
++ * Last-resort recovery: drop prior reasoning items entirely instead of
++ * replaying them summary-only. Caller-bound encrypted payloads on other
++ * item types are stripped as in sanitizeMuseForeignReasoning. The rest of
++ * the history (messages, function calls and outputs) is preserved, so a
++ * tool-calling loop can continue without its encrypted continuity state.
++ */
++export function dropMuseReasoningItems(body) {
++  if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.input)) {
++    return { body, removedItems: 0, removedHashes: [] };
++  }
++
++  const sanitized = sanitizeMuseForeignReasoning(body);
++  const input = sanitized.body.input.filter((item) => item?.type !== "reasoning");
++  const removedItems = sanitized.body.input.length - input.length;
++  if (!removedItems && !sanitized.removedHashes.length) {
++    return { body, removedItems: 0, removedHashes: [] };
++  }
++
++  return {
++    body: { ...sanitized.body, input },
++    removedItems,
++    removedHashes: sanitized.removedHashes,
++  };
++}
++
++export class MuseExecutor extends DefaultExecutor {
++  constructor() {
++    super("muse");
++    this._foreignReasoningByScope = new Map();
++    this._expiredReferencesByScope = new Map();
++  }
++
++  _callerScope(args) {
++    const credentials = args?.credentials || {};
++    const secret = credentials.accessToken || credentials.apiKey || "";
++    return secret
++      ? hashValue(String(secret))
++      : (credentials.connectionId || "unknown-caller");
++  }
++
++  _knownForeignHashes(scope) {
++    const known = this._foreignReasoningByScope.get(scope);
++    if (!known) return null;
++    // Refresh LRU position; a session can legitimately run for many turns.
++    this._foreignReasoningByScope.delete(scope);
++    this._foreignReasoningByScope.set(scope, known);
++    return known;
++  }
++
++  _rememberForeignHashes(scope, hashes) {
++    if (!hashes.length) return;
++    let known = this._foreignReasoningByScope.get(scope);
++    if (!known) {
++      known = new Set();
++      this._foreignReasoningByScope.set(scope, known);
++    }
++    for (const hash of hashes) known.add(hash);
++    while (known.size > MAX_TRACKED_HASHES_PER_CALLER) {
++      known.delete(known.values().next().value);
++    }
++
++    while (this._foreignReasoningByScope.size > MAX_TRACKED_CALLERS) {
++      const oldest = this._foreignReasoningByScope.keys().next().value;
++      this._foreignReasoningByScope.delete(oldest);
++    }
++  }
++
++  _knownExpiredReferences(scope) {
++    const known = this._expiredReferencesByScope.get(scope);
++    if (!known) return null;
++    this._expiredReferencesByScope.delete(scope);
++    this._expiredReferencesByScope.set(scope, known);
++    return known;
++  }
++
++  _rememberExpiredReferences(scope, ids) {
++    if (!ids.length) return;
++    let known = this._expiredReferencesByScope.get(scope);
++    if (!known) {
++      known = new Set();
++      this._expiredReferencesByScope.set(scope, known);
++    }
++    for (const id of ids) known.add(id);
++    while (known.size > MAX_TRACKED_HASHES_PER_CALLER) {
++      known.delete(known.values().next().value);
++    }
++
++    while (this._expiredReferencesByScope.size > MAX_TRACKED_CALLERS) {
++      const oldest = this._expiredReferencesByScope.keys().next().value;
++      this._expiredReferencesByScope.delete(oldest);
++    }
++  }
++
++  async execute(args) {
++    const scope = this._callerScope(args);
++    const knownForeignHashes = this._knownForeignHashes(scope);
++    const knownExpiredReferences = this._knownExpiredReferences(scope);
++    let body = knownForeignHashes
++      ? sanitizeMuseForeignReasoning(args.body, knownForeignHashes).body
++      : args.body;
++    if (knownExpiredReferences) {
++      body = dropMuseReasoningReferences(body, knownExpiredReferences).body;
++    }
++
++    // Recovery is a bounded ladder, not a single retry: strip the encrypted
++    // payloads (keeping summaries), then drop the prior reasoning items
++    // entirely, dropping server-side references whenever Meta names one.
++    // Each rung runs only after Meta rejected the previous form, and only
++    // while it changes the body. The outcome of a recovery attempt is never
++    // masked by the original rejection: a newer upstream error is the one
++    // returned, and a transport failure propagates so account fallback can
++    // try another caller (possibly the one that issued the blobs) instead
++    // of the request being filed as an unrecoverable request-scoped 400.
++    let strippedEncrypted = false;
++    let droppedReasoning = false;
++    for (let recoveries = 0; ; recoveries++) {
++      const result = await super.execute({ ...args, body });
++
++      if (result.response?.status !== 400 || typeof result.response.clone !== "function"
++        || recoveries >= MAX_RECOVERY_ATTEMPTS) {
++        return result;
++      }
++
++      let errorText = "";
++      try {
++        errorText = await result.response.clone().text();
++      } catch {
++        return result;
++      }
++
++      const expiredMatch = errorText.match(EXPIRED_REASONING_REFERENCE);
++      if (expiredMatch) {
++        const dropped = dropMuseReasoningReferences(body, new Set([expiredMatch[1]]));
++        if (dropped.removedIds.length) {
++          this._rememberExpiredReferences(scope, dropped.removedIds);
++          args.log?.warn?.(
++            "RETRY",
++            `MUSE | expired reasoning reference rejected; retrying without ${dropped.removedIds.length} referenced item(s)`,
++          );
++          body = dropped.body;
++          continue;
++        }
++        // The named reference is not a top-level reasoning id in this body;
++        // fall through to dropping the reasoning items outright.
++        if (!droppedReasoning) {
++          const droppedAll = dropMuseReasoningItems(body);
++          droppedReasoning = true;
++          if (droppedAll.removedItems || droppedAll.removedHashes.length) {
++            this._rememberForeignHashes(scope, droppedAll.removedHashes);
++            args.log?.warn?.(
++              "RETRY",
++              `MUSE | expired reasoning reference has no droppable id; retrying without ${droppedAll.removedItems} reasoning item(s)`,
++            );
++            body = droppedAll.body;
++            continue;
++          }
++        }
++        return result;
++      }
++
++      if (!errorText.includes(FOREIGN_REASONING_ERROR)) return result;
++
++      if (!strippedEncrypted) {
++        const sanitized = sanitizeMuseForeignReasoning(body);
++        strippedEncrypted = true;
++        if (sanitized.removedHashes.length) {
++          this._rememberForeignHashes(scope, sanitized.removedHashes);
++          args.log?.warn?.(
++            "RETRY",
++            `MUSE | foreign reasoning state rejected; retrying without ${sanitized.removedHashes.length} encrypted item(s)`,
++          );
++          body = sanitized.body;
++          continue;
++        }
++      }
++
++      if (!droppedReasoning) {
++        const droppedAll = dropMuseReasoningItems(body);
++        droppedReasoning = true;
++        if (droppedAll.removedItems || droppedAll.removedHashes.length) {
++          this._rememberForeignHashes(scope, droppedAll.removedHashes);
++          args.log?.warn?.(
++            "RETRY",
++            `MUSE | foreign reasoning state still rejected; retrying without ${droppedAll.removedItems} reasoning item(s)`,
++          );
++          body = droppedAll.body;
++          continue;
++        }
++      }
++
++      return result;
++    }
++  }
++}
++
++export default MuseExecutor;
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index ab2dc75e..80730230 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -36,6 +36,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
+ import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
+ import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
+ import { resolveSessionId } from "../utils/sessionManager.js";
++import { isMuseCodeSubscription } from "../utils/museCloaking.js";
+ 
+ /**
+  * Core chat handler - shared between SSE and Worker
+@@ -105,9 +106,15 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   // translated to the Responses body (`input`) yet POSTed to the default Chat
+   // Completions URL, and upstream rejects it: "unknown parameter `input`".
+   const modelTargetTransport = modelTargetFormat ? resolveTransport(provider, modelTargetFormat) : null;
+-  const useTransport = (!modelSupportedFormats || modelSupportedFormats.includes(sourceFormat))
++  // Muse Code subscriptions are accepted only on Responses, including dynamic
++  // passthrough models that have no registry entry. Pay-as-you-go API keys keep
++  // the ordinary source/model transport selection above.
++  const museCodeTransport = provider === "muse" && isMuseCodeSubscription(credentials)
++    ? resolveTransport(provider, FORMATS.OPENAI_RESPONSES)
++    : null;
++  const useTransport = museCodeTransport || ((!modelSupportedFormats || modelSupportedFormats.includes(sourceFormat))
+     ? runtimeTransport
+-    : modelTargetTransport;
++    : modelTargetTransport);
+   // A source-format-matched endpoint keeps the request lossless. Prefer it
+   // over a model-level targetFormat, which is only the fallback for clients
+   // whose wire format has no supported transport (for example MiniMax-M3:
+@@ -271,7 +278,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+     }
+     toolNameMap = translatedBody._toolNameMap;
+     delete translatedBody._toolNameMap;
+-    customToolNames = translatedBody._customToolNames;
++    customToolNames = translatedBody._customToolNames ? new Set(translatedBody._customToolNames) : null;
+     delete translatedBody._customToolNames;
+     translatedBody.model = stripThinkingSuffix(upstreamModel);
+     stripContinuityFields(translatedBody);
+diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
+index c3dbc3b0..ebde4067 100644
+--- a/open-sse/handlers/chatCore/nonStreamingHandler.js
++++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
+@@ -14,6 +14,7 @@ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, sav
+ import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+ import { decloakToolNames } from "../../utils/claudeCloaking.js";
+ import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
++import { restoreMuseCustomToolCalls, restoreMuseNamespaceCalls } from "../../utils/museCloaking.js";
+ import { ROLE, RESPONSES_ITEM, OPENAI_FINISH, GEMINI_FINISH } from "../../translator/schema/index.js";
+ import { storeGeminiTurnSignature, storeGeminiThoughtSignature, storeGeminiServerParts, storeGeminiServerPartsForTurn } from "../../services/thoughtSignatureStore.js";
+ import { toOpenAIFinish } from "../../translator/concerns/finishReason.js";
+@@ -447,7 +448,7 @@ export async function handleNonStreamingResponse({ credentials, providerResponse
+ 
+   return {
+     success: true,
+-    response: new Response(JSON.stringify(restoreToolNames(translatedResponse, toolNameMap)), {
++    response: new Response(JSON.stringify(restoreToolNames(restoreMuseCustomToolCalls(provider === "muse" ? restoreMuseNamespaceCalls(translatedResponse, toolNameMap) : translatedResponse, customToolNames), toolNameMap)), {
+       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", ...upstreamResponseHeaders(providerResponse.headers) }
+     })
+   };
+diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
+index 3bcd7f81..f243ddca 100644
+--- a/open-sse/handlers/chatCore/sseToJsonHandler.js
++++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
+@@ -1,5 +1,6 @@
+ import { convertResponsesStreamToJson } from "../../transformer/streamToJsonConverter.js";
+ import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
++import { restoreMuseCustomToolCalls, restoreMuseNamespaceCalls } from "../../utils/museCloaking.js";
+ import { createErrorResult } from "../../utils/error.js";
+ import { HTTP_STATUS } from "../../config/runtimeConfig.js";
+ import { FORMATS } from "../../translator/formats.js";
+@@ -233,7 +234,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
+ 
+       // Client is Responses API → return as-is
+       if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
+-        return { success: true, response: new Response(JSON.stringify(restoreToolNames(jsonResponse, toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
++        return { success: true, response: new Response(JSON.stringify(restoreToolNames(restoreMuseCustomToolCalls(provider === "muse" ? restoreMuseNamespaceCalls(jsonResponse, toolNameMap) : jsonResponse, customToolNames), toolNameMap)), { headers: { ...upstreamResponseHeaders(providerResponse.headers), "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+       }
+ 
+       // Build client-format response.
+diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
+index 094ae16f..ca9e6890 100644
+--- a/open-sse/handlers/chatCore/streamingHandler.js
++++ b/open-sse/handlers/chatCore/streamingHandler.js
+@@ -46,7 +46,9 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
+   // The passthrough path has no format translation, so the fingerprint's tool
+   // rename map (read -> read_client) has to be handed over explicitly —
+   // otherwise the client receives a call to a tool it never declared (#4986).
+-  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, toolNameMap, sourceFormat, nativeJson, nativeResponseProjection, onNativeResponseSuccess);
++  // Muse custom tools were sent upstream as functions; the passthrough needs
++  // their wire names to present the calls back as custom_tool_call items.
++  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, toolNameMap, sourceFormat, nativeJson, nativeResponseProjection, onNativeResponseSuccess, provider === "muse" ? customToolNames : null);
+ }
+ 
+ /**
+diff --git a/open-sse/providers/capabilities.js b/open-sse/providers/capabilities.js
+index b8993ce3..610285fc 100644
+--- a/open-sse/providers/capabilities.js
++++ b/open-sse/providers/capabilities.js
+@@ -53,6 +53,7 @@ export const DEFAULT_CAPABILITIES = {
+   audioOutput: false,   // generate audio
+   // features
+   search: false,        // built-in web search tool / grounding
++  serverSideToolInvocations: false, // expose hosted-tool calls alongside function calls
+   tools: true,          // function / tool calling
+   reasoning: false,     // thinking / reasoning
+   // thinking wire format (only meaningful when reasoning:true). null → derive from transport.format.
+@@ -568,13 +569,13 @@ export const PATTERN_CAPABILITIES = [
+   // Gemini 4 Hydrogen: text/image/video/audio/PDF in, 1M unified window, 64K per request
+   // (models/gemini-4-hydrogen: inputTokenLimit 1048576, outputTokenLimit 65536). Levels in thinkingLevels.js.
+   // longDecode: a max_tokens above 64K runs CONTINUATION hops up to 1M (utils/geminiLongDecode.js).
+-  { pattern: "*gemini-4-hydrogen*", caps: { vision: true, pdf: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536, longDecode: true } },
++  { pattern: "*gemini-4-hydrogen*", caps: { vision: true, pdf: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536, longDecode: true } },
+   // Gemini 4 (Carbon/Argon): no "minimal" tier (400) and no thinkingBudget — LOW/MEDIUM/HIGH only, cannot disable.
+-  { pattern: "*gemini-4*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
+-  { pattern: "*gemini-3.8*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
+-  { pattern: "*gemini-3.7*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
+-  { pattern: "*gemini-3*pro*",  caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65535 } },
+-  { pattern: "*gemini-3*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
++  { pattern: "*gemini-4*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
++  { pattern: "*gemini-3.8*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
++  { pattern: "*gemini-3.7*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
++  { pattern: "*gemini-3*pro*",  caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65535 } },
++  { pattern: "*gemini-3*",      caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, serverSideToolInvocations: true, thinkingFormat: "gemini-level", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 65536 } },
+   { pattern: "*gemini-2.5*",    caps: { vision: true, audioInput: true, videoInput: true, reasoning: true, search: true, thinkingFormat: "gemini-budget", thinkingRange: { min: 0, max: 24576 }, contextWindow: 1048576, maxOutput: 65536 } },
+   { pattern: "*gemini-2*",      caps: { vision: true, audioInput: true, videoInput: true, search: true, contextWindow: 1048576, maxOutput: 65536 } },
+   { pattern: "*gemini*",        caps: { vision: true, search: true, contextWindow: 1048576 } },
+@@ -721,7 +722,8 @@ export const PATTERN_CAPABILITIES = [
+   { pattern: "*laguna*",        caps: { reasoning: true, thinkingFormat: "openai", contextWindow: 200000, maxOutput: 32000 } },
+ 
+ 
+-  // ── OpenCode Free Muse Spark (multimodal text+image; OpenAI Responses reasoning supports up to xhigh) ─
++  // ── Muse (Meta): multimodal 1M models; Wonder reasons from minimal through max and cannot disable thinking ─
++  { pattern: "*muse*wonder*",   caps: { vision: true, pdf: true, audioInput: true, videoInput: true, search: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 1048576, maxOutput: 131072 } },
+   { pattern: "*muse*spark*",    caps: { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 1048576, maxOutput: 131072 } },
+   // ── Others ───────────────────────────────────────────────────────
+   { pattern: "*hunyuan*",       caps: { reasoning: true, thinkingFormat: "hunyuan", contextWindow: 262144, maxOutput: 262144 } },
+diff --git a/open-sse/providers/pricing.js b/open-sse/providers/pricing.js
+index e267eda8..82b459e2 100644
+--- a/open-sse/providers/pricing.js
++++ b/open-sse/providers/pricing.js
+@@ -183,6 +183,11 @@ export const MODEL_PRICING = {
+   "muse-spark-1.1":                { input: 1.25, output: 4.25, cached: 0.15,  reasoning: 4.25,   cache_creation: 0 },
+   "muse-spark-1.3-contributor":    { input: 0.10, output: 0.20, cached: 0.002, reasoning: 0.20,   cache_creation: 0 },
+   "muse-spark-1.2-contributor":    { input: 0.10, output: 0.20, cached: 0.002, reasoning: 0.20,   cache_creation: 0 },
++  // Wonder has no public pay-as-you-go rate; the full variant is subscription
++  // only. Use the published muse-wonder-1.0 API rates so usage costing is
++  // visible instead of silently zero.
++  "muse-wonder-1.0":               { input: 4.00, output: 20.00, cached: 0.20,  reasoning: 20.00,  cache_creation: 0 },
++  "muse-wonder-full-1.0-contributor": { input: 4.00, output: 20.00, cached: 0.20,  reasoning: 20.00,  cache_creation: 0 },
+ 
+   // === OpenRouter fallback ===
+   "auto":                         { input: 2.00,  output: 8.00,  cached: 1.00,  reasoning: 12.00,  cache_creation: 2.00  },
+diff --git a/open-sse/providers/registry/muse.js b/open-sse/providers/registry/muse.js
+index a5f2728f..ed187a14 100644
+--- a/open-sse/providers/registry/muse.js
++++ b/open-sse/providers/registry/muse.js
+@@ -36,9 +36,9 @@ export default {
+     auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["museHeaders"] },
+   },
+   // Multi-endpoint: Meta accepts Chat Completions and Responses wire formats on
+-  // the same key (https://dev.meta.ai/docs/protocols). Muse Spark reasoning
+-  // (incl. encrypted_content replay) only round-trips on Responses, so models
+-  // pin targetFormat there.
++  // the same key (https://dev.meta.ai/docs/protocols). Muse reasoning (incl.
++  // encrypted_content replay) only round-trips on Responses, so models pin
++  // targetFormat there.
+   transports: [
+     {
+       format: "openai",
+@@ -51,9 +51,16 @@ export default {
+       auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["museHeaders"] },
+       // Strict Responses API: rejects top-level reasoning_effort, needs reasoning:{effort,summary}.
+       thinkingFormat: "openai-responses",
++      // Strict input schema: Codex multi-agent items (agent_message,
++      // call_id-less delegation outputs, Fernet reasoning) are rejected as
++      // unsupported input types — rewrite them to portable shapes.
++      // Provider-native encrypted reasoning (non-Fernet) is preserved.
++      quirks: { portableResponsesInput: true },
+     },
+   ],
+   models: [
++    { id: "muse-wonder-1.0", name: "Muse Wonder 1.0", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
++    { id: "muse-wonder-1.0-contributor", name: "Muse Wonder 1.0 Contributor", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
+     { id: "muse-spark-1.3", name: "Muse Spark 1.3", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
+     { id: "muse-spark-1.2", name: "Muse Spark 1.2", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
+     { id: "muse-spark-1.1", name: "Muse Spark 1.1", targetFormat: "openai-responses", supportedFormats: ["openai-responses"] },
+diff --git a/open-sse/providers/thinkingLevels.js b/open-sse/providers/thinkingLevels.js
+index 63198f8c..8d3f0083 100644
+--- a/open-sse/providers/thinkingLevels.js
++++ b/open-sse/providers/thinkingLevels.js
+@@ -45,6 +45,9 @@ const PATTERN_THINKING = [
+   // Gemini 4 Neon & Hydrogen support xhigh in addition to low/medium/high (no minimal/none).
+   { pattern: "*gemini-4-neon*", levels: ["low", "medium", "high", "xhigh"] },
+   { pattern: "*gemini-4-hydrogen*", levels: ["low", "medium", "high", "xhigh"] },
++  // Meta documents the complete minimal..max range for Muse Wonder; reasoning
++  // cannot be disabled (capabilities.js removes "none" from this list).
++  { pattern: "*muse*wonder*", levels: ["minimal", "low", "medium", "high", "xhigh", "max"] },
+   // Gemini 4 (Argon, Carbon) rejects "minimal" with 400 — LOW is the floor; cannot disable thinking.
+   { pattern: "*gemini-4*", levels: ["low", "medium", "high"] },
+   // Antigravity Claude 5.5 supports low, medium, high, max (no xhigh, no none).
+diff --git a/open-sse/translator/index.js b/open-sse/translator/index.js
+index 243cade3..fd9ca402 100644
+--- a/open-sse/translator/index.js
++++ b/open-sse/translator/index.js
+@@ -3,6 +3,7 @@ import { OPENAI_TOOL_CHOICE_NONE } from "./schema/index.js";
+ import { ensureToolCallIds, fixMissingToolResponses, isGeminiFamilyTarget } from "./concerns/toolCall.js";
+ import { prepareClaudeRequest, ensureTrailingUserTurn } from "./formats/claude.js";
+ import { cloakClaudeTools, decloakStreamChunk } from "../utils/claudeCloaking.js";
++import { cloakMuseTools, isMuseCodeSubscription, normalizeMuseResponsesTools } from "../utils/museCloaking.js";
+ import { restoreToolNames } from "../utils/opencodeFingerprint.js";
+ import { filterToOpenAIFormat } from "./formats/openai.js";
+ import { adaptAIStudioStructuredOutput } from "./formats/gemini.js";
+@@ -228,6 +229,49 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+     }
+   }
+ 
++  // Meta's Responses executor accepts only a subset of the Codex tool
++  // dialect: `search_content_types` is rejected on every search tool shape
++  // and `custom` tools outright. Rewrite both into the accepted forms for
++  // every Muse credential (the API-key lane reaches the same endpoint);
++  // the converted custom identities ride _customToolNames to the response
++  // restorers, under their wire names.
++  //
++  // Muse Code subscription attestation additionally rejects builtin names
++  // carrying foreign schemas. Rename client function/custom tools after
++  // conversion to Responses; the shared restorer uses the same per-request
++  // map on every response path.
++  if (provider === "muse" && targetFormat === FORMATS.OPENAI_RESPONSES) {
++    const normalized = normalizeMuseResponsesTools(result);
++    result = normalized.body;
++    let museCustomToolNames = normalized.customToolNames;
++    if (isMuseCodeSubscription(credentials)) {
++      const { body: cloakedBody, toolNameMap } = cloakMuseTools(result);
++      result = cloakedBody;
++      if (toolNameMap?.size > 0) {
++        const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
++        for (const [key, value] of toolNameMap) merged.set(key, value);
++        result._toolNameMap = merged;
++        if (museCustomToolNames.size > 0) {
++          const aliasByOriginal = new Map([...toolNameMap].map(([alias, original]) => [original, alias]));
++          museCustomToolNames = new Set([...museCustomToolNames].map(key => aliasByOriginal.get(key) ?? key));
++        }
++      }
++    }
++    if (museCustomToolNames.size > 0) {
++      result._customToolNames = [...new Set([...(result._customToolNames || []), ...museCustomToolNames])];
++    }
++    // Meta answers namespace calls flattened ("collaboration.spawn_agent",
++    // no namespace field); the descriptors let the shared restorer split
++    // them back into name + namespace on every response path.
++    if (normalized.namespaceToolNames?.size > 0) {
++      const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
++      for (const [dotted, descriptor] of normalized.namespaceToolNames) {
++        if (!merged.has(dotted)) merged.set(dotted, descriptor);
++      }
++      result._toolNameMap = merged;
++    }
++  }
++
+   if (sourceToolNameMap) {
+     const targetMap = result._toolNameMap instanceof Map ? result._toolNameMap : null;
+     const merged = new Map();
+@@ -254,10 +298,10 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
+ // Translate response chunk: target -> openai -> source
+ export function translateResponse(targetFormat, sourceFormat, chunk, state) {
+   ensureInitialized();
+-  // If same format, return as-is — except the tool name may still be cloaked:
+-  // translateRequest() suffixes client tools for OAuth-cloaked Claude providers
+-  // even when no format conversion is needed, so streamed tool_use blocks must
+-  // be decloaked here or the client sees an unknown ("_ide"-suffixed) tool.
++  // If same format, return as-is — except tool names may still be cloaked:
++  // translateRequest() renames client tools for OAuth-cloaked Claude and Muse
++  // Code providers even without format conversion, so streamed calls must be
++  // restored here or the client sees a name it never declared.
+   if (sourceFormat === targetFormat) {
+     // Same-format (openai→openai) passthrough: the upstream chunk reaches the
+     // client as-is. A fragment that opens a new tool-call index without an id
+diff --git a/open-sse/utils/museCloaking.js b/open-sse/utils/museCloaking.js
+new file mode 100644
+index 00000000..e2460925
+--- /dev/null
++++ b/open-sse/utils/museCloaking.js
+@@ -0,0 +1,396 @@
++import { RESPONSES_ITEM, RESPONSES_TOOL } from "../translator/schema/index.js";
++
++// Meta rejects a Muse Code subscription request when a client declaration uses
++// a Muse builtin name with a different schema. Unknown function names are
++// accepted, so keep the client's schema and rename only its wire identifier.
++export const MUSE_TOOL_SUFFIX = "_muse";
++const MAX_TOOL_NAME_LENGTH = 64;
++
++// OAuth connections mint a subscription key; API-key connections are pay as
++// you go and are not subject to the Muse Code client-attestation contract.
++export function isMuseCodeSubscription(credentials) {
++  return Boolean(credentials?.accessToken && !credentials?.apiKey);
++}
++
++function isClientTool(tool) {
++  return (tool?.type === RESPONSES_TOOL.FUNCTION || tool?.type === RESPONSES_TOOL.CUSTOM)
++    && typeof tool?.name === "string" && tool.name.length > 0;
++}
++
++function allocateAlias(name, usedNames) {
++  const base = `${name}${MUSE_TOOL_SUFFIX}`.slice(0, MAX_TOOL_NAME_LENGTH);
++  let alias = base;
++  for (let index = 2; usedNames.has(alias); index += 1) {
++    const suffix = `_${index}`;
++    alias = `${base.slice(0, MAX_TOOL_NAME_LENGTH - suffix.length)}${suffix}`;
++  }
++  usedNames.add(alias);
++  return alias;
++}
++
++/**
++ * Cloak Responses function/custom tools for a Muse Code subscription.
++ * Returns a per-request cloaked → original map for the shared response
++ * restorer. Hosted and namespaced tools keep their protocol-defined names.
++ */
++export function cloakMuseTools(body) {
++  if (!Array.isArray(body?.tools)) return { body, toolNameMap: null };
++
++  const usedNames = new Set(body.tools.map(tool => typeof tool?.name === "string" ? tool.name : null).filter(Boolean));
++  const aliases = new Map();
++  const toolNameMap = new Map();
++  const aliasFor = (name) => {
++    if (!aliases.has(name)) {
++      const alias = allocateAlias(name, usedNames);
++      aliases.set(name, alias);
++      toolNameMap.set(alias, name);
++    }
++    return aliases.get(name);
++  };
++
++  const tools = body.tools.map(tool => isClientTool(tool) ? { ...tool, name: aliasFor(tool.name) } : tool);
++  if (toolNameMap.size === 0) return { body, toolNameMap: null };
++
++  const input = Array.isArray(body.input) ? body.input.map(item => {
++    if ((item?.type === RESPONSES_ITEM.FUNCTION_CALL || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL)
++      && aliases.has(item.name)) {
++      return { ...item, name: aliases.get(item.name) };
++    }
++    return item;
++  }) : body.input;
++
++  const cloakedBody = { ...body, tools, input };
++  const choice = body.tool_choice;
++  if ((choice?.type === RESPONSES_TOOL.FUNCTION || choice?.type === RESPONSES_TOOL.CUSTOM)
++    && aliases.has(choice.name)) {
++    cloakedBody.tool_choice = { ...choice, name: aliases.get(choice.name) };
++  } else if (choice?.type === RESPONSES_TOOL.ALLOWED_TOOLS && Array.isArray(choice.tools)) {
++    cloakedBody.tool_choice = {
++      ...choice,
++      tools: choice.tools.map(tool => isClientTool(tool) && aliases.has(tool.name)
++        ? { ...tool, name: aliases.get(tool.name) }
++        : tool),
++    };
++  }
++
++  return { body: cloakedBody, toolNameMap };
++}
++
++// --- Muse Responses tool normalization -------------------------------------
++//
++// Meta's Responses executor is a strict subset of the Codex dialect:
++//   * `search_content_types` is rejected on every tool shape ("only supported
++//     for web_search_preview tools" on web_search, and "not supported by the
++//     current Responses web_search executor" on web_search_preview itself),
++//     while a bare web_search tool is accepted. Codex sends the field
++//     whenever the model catalog declares text_and_image search.
++//   * `custom` tools are not supported at all ("`custom` tools are not
++//     supported on this endpoint"), which rejects Codex's freeform
++//     apply_patch declaration before the first token.
++//
++// Custom tools are therefore sent as ordinary function tools carrying one
++// raw `input` string — the same shape the Responses→Chat translator uses —
++// and the replies are converted back with restoreMuseCustomToolCalls (JSON
++// bodies) and convertMuseCustomStreamEvent (SSE). Identity travels as
++// `customToolNames`: the wire name for a top-level tool, or
++// `namespace/name` for a namespaced child (namespaces keep their children,
++// only the child's type changes).
++
++/** Identity key of a custom tool: its name, namespaced when it has one. */
++export function museCustomToolKey(name, namespace) {
++  return typeof namespace === "string" && namespace ? `${namespace}/${name}` : name;
++}
++
++function customToolAsFunction(tool) {
++  const formatHint = [tool.format?.syntax, tool.format?.definition].filter(Boolean).join("\n");
++  return {
++    type: RESPONSES_TOOL.FUNCTION,
++    name: tool.name,
++    description: [String(tool.description || ""), formatHint].filter(Boolean).join("\n\n"),
++    parameters: {
++      type: "object",
++      properties: {
++        input: { type: "string", description: "Raw freeform input for this custom tool" },
++      },
++      required: ["input"],
++      additionalProperties: false,
++    },
++    strict: false,
++  };
++}
++
++// Returns { tools, changed }; the input list and its tools are never mutated.
++// Every namespaced child is also recorded in namespaceToolNames under its
++// flattened `namespace.child` spelling: Meta answers namespace calls in
++// exactly that dotted form without a namespace field, which strict
++// Responses clients (Codex) refuse to route ("unsupported call"). The
++// descriptors let the shared name restorer split them back.
++function normalizeMuseToolList(tools, customToolNames, namespaceToolNames, namespace = null) {
++  if (!Array.isArray(tools)) return { tools, changed: false };
++  let changed = false;
++  const out = tools.map(tool => {
++    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return tool;
++    let next = tool;
++    if (Object.hasOwn(next, "search_content_types")) {
++      next = { ...next };
++      delete next.search_content_types;
++      changed = true;
++    }
++    if (namespace && (next.type === RESPONSES_TOOL.FUNCTION || next.type === RESPONSES_TOOL.CUSTOM)
++      && typeof next.name === "string" && next.name) {
++      const dotted = `${namespace}.${next.name}`;
++      if (!namespaceToolNames.has(dotted)) {
++        namespaceToolNames.set(dotted, {
++          name: next.name,
++          namespace,
++          type: next.type === RESPONSES_TOOL.CUSTOM ? RESPONSES_TOOL.CUSTOM : RESPONSES_TOOL.FUNCTION,
++        });
++      }
++    }
++    if (next.type === RESPONSES_TOOL.NAMESPACE && Array.isArray(next.tools)) {
++      const children = normalizeMuseToolList(next.tools, customToolNames, namespaceToolNames, next.name);
++      if (children.changed) {
++        changed = true;
++        return { ...next, tools: children.tools };
++      }
++      return next;
++    }
++    if (next.type === RESPONSES_TOOL.CUSTOM && typeof next.name === "string" && next.name) {
++      customToolNames.add(museCustomToolKey(next.name, namespace));
++      changed = true;
++      return customToolAsFunction(next);
++    }
++    return next;
++  });
++  return { tools: changed ? out : tools, changed };
++}
++
++function normalizeMuseToolChoice(choice, customToolNames) {
++  if (!choice || typeof choice !== "object" || Array.isArray(choice)) return { choice, changed: false };
++  if (choice.type === RESPONSES_TOOL.CUSTOM && typeof choice.name === "string") {
++    customToolNames.add(museCustomToolKey(choice.name, choice.namespace));
++    return { choice: { ...choice, type: RESPONSES_TOOL.FUNCTION }, changed: true };
++  }
++  if (choice.type === RESPONSES_TOOL.ALLOWED_TOOLS && Array.isArray(choice.tools)) {
++    let changed = false;
++    const tools = choice.tools.map(entry => {
++      const normalized = normalizeMuseToolChoice(entry, customToolNames);
++      changed = changed || normalized.changed;
++      return normalized.choice;
++    });
++    return { choice: changed ? { ...choice, tools } : choice, changed };
++  }
++  return { choice, changed: false };
++}
++
++/**
++ * Rewrite a Responses request into the subset Meta accepts: hosted search
++ * tools lose `search_content_types`, custom tools (declarations, history
++ * calls/outputs and tool_choice) become their function form. Returns the
++ * client-side custom identities; the caller maps top-level names through
++ * any later renaming (cloaking) before handing the set to the restorers.
++ */
++export function normalizeMuseResponsesTools(body) {
++  const customToolNames = new Set();
++  const namespaceToolNames = new Map();
++  if (!body || typeof body !== "object" || Array.isArray(body)) return { body, customToolNames, namespaceToolNames };
++
++  let changed = false;
++  const out = { ...body };
++
++  const tools = normalizeMuseToolList(body.tools, customToolNames, namespaceToolNames);
++  if (tools.changed) { out.tools = tools.tools; changed = true; }
++
++  if (Array.isArray(body.input)) {
++    let inputChanged = false;
++    const input = body.input.map(item => {
++      if (!item || typeof item !== "object" || Array.isArray(item)) return item;
++      if (item.type === RESPONSES_ITEM.ADDITIONAL_TOOLS) {
++        const declared = normalizeMuseToolList(item.tools, customToolNames, namespaceToolNames);
++        if (!declared.changed) return item;
++        inputChanged = true;
++        return { ...item, tools: declared.tools };
++      }
++      if (item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL) {
++        if (typeof item.name === "string" && item.name) {
++          customToolNames.add(museCustomToolKey(item.name, item.namespace));
++        }
++        inputChanged = true;
++        const converted = {
++          ...item,
++          type: RESPONSES_ITEM.FUNCTION_CALL,
++          arguments: JSON.stringify({ input: typeof item.input === "string" ? item.input : JSON.stringify(item.input ?? "") }),
++        };
++        delete converted.input;
++        return converted;
++      }
++      if (item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL_OUTPUT) {
++        inputChanged = true;
++        return { ...item, type: RESPONSES_ITEM.FUNCTION_CALL_OUTPUT };
++      }
++      return item;
++    });
++    if (inputChanged) { out.input = input; changed = true; }
++  }
++
++  const choice = normalizeMuseToolChoice(body.tool_choice, customToolNames);
++  if (choice.changed) { out.tool_choice = choice.choice; changed = true; }
++
++  return { body: changed ? out : body, customToolNames, namespaceToolNames };
++}
++
++/** The freeform input inside a converted function call's arguments. */
++export function extractMuseCustomInput(argumentsText) {
++  if (typeof argumentsText !== "string") return "";
++  try {
++    const parsed = JSON.parse(argumentsText);
++    if (parsed && typeof parsed === "object" && typeof parsed.input === "string") return parsed.input;
++  } catch { /* incomplete or raw freeform input */ }
++  return argumentsText;
++}
++
++/** True when a function_call item is one of the converted custom tools. */
++export function isMuseCustomToolCall(item, customToolNames) {
++  if (item?.type !== RESPONSES_ITEM.FUNCTION_CALL || typeof item.name !== "string") return false;
++  if (customToolNames?.has(museCustomToolKey(item.name, item.namespace))) return true;
++  // Meta flattens a namespaced call into the dotted name without a
++  // namespace field; its identity key is the same pair joined by "/".
++  if (!item.namespace) {
++    const dot = item.name.indexOf(".");
++    if (dot > 0 && customToolNames?.has(`${item.name.slice(0, dot)}/${item.name.slice(dot + 1)}`)) return true;
++    // And, variability permitting, the model sometimes replies with the
++    // bare child name instead; it is the custom tool only when exactly one
++    // recorded namespace child carries that name.
++    if (dot < 0 && customToolNames) {
++      let matches = 0;
++      for (const key of customToolNames) if (key.endsWith(`/${item.name}`)) matches += 1;
++      if (matches === 1) return true;
++    }
++  }
++  return false;
++}
++
++function museCustomItem(item) {
++  const converted = { ...item, type: RESPONSES_ITEM.CUSTOM_TOOL_CALL, input: extractMuseCustomInput(item.arguments) };
++  delete converted.arguments;
++  return converted;
++}
++
++/**
++ * Rewrite a bare namespace-child call ("spawn_agent") to the dotted key
++ * its namespace descriptor is filed under ("collaboration.spawn_agent"),
++ * in place, so the shared restorer can split it back into name +
++ * namespace right after. Only a uniquely matching child qualifies.
++ */
++export function qualifyMuseBareNamespaceCall(item, toolNameMap) {
++  if (!item || typeof item !== "object"
++    || (item.type !== RESPONSES_ITEM.FUNCTION_CALL && item.type !== RESPONSES_ITEM.CUSTOM_TOOL_CALL)
++    || typeof item.name !== "string" || !item.name
++    || item.namespace || item.name.includes(".") || !toolNameMap) return;
++  let dotted = null;
++  for (const [key, descriptor] of toolNameMap) {
++    if (descriptor && typeof descriptor === "object" && descriptor.name === item.name) {
++      if (dotted) return; // ambiguous: the bare name belongs to several namespaces
++      dotted = key;
++    }
++  }
++  if (dotted) item.name = dotted;
++}
++
++/**
++ * Qualify every bare namespace-child call in a payload (in place) so the
++ * shared restorer splits it into name + namespace right after. Returns the
++ * payload for chaining ahead of restoreToolNames.
++ */
++export function restoreMuseNamespaceCalls(payload, toolNameMap) {
++  if (!payload || typeof payload !== "object" || !toolNameMap?.size) return payload;
++  if (Array.isArray(payload)) {
++    for (const item of payload) restoreMuseNamespaceCalls(item, toolNameMap);
++    return payload;
++  }
++  qualifyMuseBareNamespaceCall(payload, toolNameMap);
++  for (const key of ["output", "item", "response", "data"]) {
++    const value = payload[key];
++    if (value && typeof value === "object") restoreMuseNamespaceCalls(value, toolNameMap);
++  }
++  return payload;
++}
++
++/**
++ * Convert function_call items of converted custom tools back to
++ * custom_tool_call in a JSON payload (a Response body, a lifecycle event's
++ * response.output, a lone output item). Payloads sharing no converted call
++ * are returned by identity.
++ */
++export function restoreMuseCustomToolCalls(payload, customToolNames) {
++  if (!customToolNames?.size || !payload) return payload;
++  if (Array.isArray(payload)) {
++    let changed = false;
++    const out = payload.map(item => {
++      const restored = restoreMuseCustomToolCalls(item, customToolNames);
++      changed = changed || restored !== item;
++      return restored;
++    });
++    return changed ? out : payload;
++  }
++  if (typeof payload !== "object") return payload;
++  if (isMuseCustomToolCall(payload, customToolNames)) return museCustomItem(payload);
++
++  let out = payload;
++  const put = (key, value) => {
++    if (out === payload) out = { ...payload };
++    out[key] = value;
++  };
++  for (const key of ["output", "item", "response", "data"]) {
++    const value = payload[key];
++    if (value && typeof value === "object") {
++      const restored = restoreMuseCustomToolCalls(value, customToolNames);
++      if (restored !== value) put(key, restored);
++    }
++  }
++  return out;
++}
++
++/**
++ * Convert one upstream Responses SSE event for the passthrough stream.
++ * `pending` is a per-stream Map of item_id → accumulated function arguments
++ * for converted calls: their argument deltas are JSON fragments of the
++ * `{input}` wrapper, so they are buffered and emitted once, unwrapped, as
++ * custom_tool_call_input delta+done when the arguments complete — mirroring
++ * the translated stream. Returns the events to forward (possibly none);
++ * unconverted events are returned by identity.
++ */
++export function convertMuseCustomStreamEvent(event, customToolNames, pending) {
++  if (!event || typeof event !== "object" || !customToolNames?.size) return [event];
++
++  switch (event.type) {
++    case "response.output_item.added": {
++      if (!isMuseCustomToolCall(event.item, customToolNames)) return [event];
++      if (typeof event.item.id === "string") pending.set(event.item.id, "");
++      return [{ ...event, item: { ...museCustomItem(event.item), input: "" } }];
++    }
++    case "response.function_call_arguments.delta": {
++      if (!pending.has(event.item_id)) return [event];
++      if (typeof event.delta === "string") pending.set(event.item_id, pending.get(event.item_id) + event.delta);
++      return [];
++    }
++    case "response.function_call_arguments.done": {
++      if (!pending.has(event.item_id)) return [event];
++      const input = extractMuseCustomInput(typeof event.arguments === "string" ? event.arguments : pending.get(event.item_id));
++      const { arguments: _arguments, delta: _delta, ...common } = event;
++      return [
++        { ...common, type: "response.custom_tool_call_input.delta", delta: input },
++        { ...common, type: "response.custom_tool_call_input.done", input },
++      ];
++    }
++    case "response.output_item.done": {
++      if (typeof event.item?.id === "string") pending.delete(event.item.id);
++      if (!isMuseCustomToolCall(event.item, customToolNames)) return [event];
++      return [{ ...event, item: museCustomItem(event.item) }];
++    }
++    default: {
++      const restored = restoreMuseCustomToolCalls(event, customToolNames);
++      return [restored];
++    }
++  }
++}
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+index 80914b3d..bc8f5efd 100644
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -11,6 +11,7 @@ import {
+   isValidNativeGeminiResponse,
+ } from "./streamHelpers.js";
+ import { restoreToolNames } from "./opencodeFingerprint.js";
++import { convertMuseCustomStreamEvent, restoreMuseNamespaceCalls } from "./museCloaking.js";
+ import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
+ import { dbg, isDebugEnabled } from "./debugLog.js";
+ 
+@@ -140,6 +141,18 @@ export function createSSEStream(options = {}) {
+   // tool_call without a string id (#4992).
+   const seenToolCallIds = new Map();
+ 
++  // Muse custom tools travel upstream as functions (see
++  // normalizeMuseResponsesTools); on this no-translation path their calls
++  // are converted back per event, which needs their wire names plus a
++  // per-item argument buffer. An `event:` line is held until its data line
++  // is seen, because conversion may suppress or rename the event.
++  const passthroughCustomToolNames = mode === STREAM_MODE.PASSTHROUGH && customToolNames
++    ? new Set(customToolNames)
++    : null;
++  const musePassthrough = mode === STREAM_MODE.PASSTHROUGH && provider === "muse";
++  const museCustomCallItems = new Map();
++  let pendingPassthroughEventLine = null;
++
+   // Per-stream decoder with stream:true to correctly handle multi-byte chars split across chunks
+   const decoder = new TextDecoder("utf-8", { fatal: false });
+ 
+@@ -397,9 +410,19 @@ export function createSSEStream(options = {}) {
+ 
+         // Passthrough mode: normalize and forward
+         if (mode === STREAM_MODE.PASSTHROUGH) {
++          if (passthroughCustomToolNames?.size && trimmed.startsWith("event:")) {
++            if (pendingPassthroughEventLine !== null) {
++              const held = pendingPassthroughEventLine + "\n";
++              reqLogger?.appendConvertedChunk?.(held);
++              controller.enqueue(sharedEncoder.encode(held));
++            }
++            pendingPassthroughEventLine = line;
++            continue;
++          }
+           let output;
+           let injectedUsage = false;
+           let responsesTerminal = false;
++          let customConverted = false;
+ 
+           // Upstream already sent the sentinel; flush() must not append a second one.
+           if (trimmed.startsWith("data:") && trimmed.slice(5).trim() === "[DONE]") streamDoneSent = true;
+@@ -415,12 +438,39 @@ export function createSSEStream(options = {}) {
+               // chunk reaches the client.
+               const toolCallIdFixed = ensureStreamToolCallIds(parsed, seenToolCallIds);
+ 
++              // Converted Muse custom calls: argument deltas are buffered
++              // (event dropped together with its held `event:` line), and a
++              // completed call is emitted as custom_tool_call_input events.
++              if (passthroughCustomToolNames?.size) {
++                const convertedEvents = convertMuseCustomStreamEvent(parsed, passthroughCustomToolNames, museCustomCallItems);
++                if (convertedEvents.length === 0) {
++                  pendingPassthroughEventLine = null;
++                  continue;
++                }
++                if (convertedEvents.length > 1) {
++                  const hadEventLine = pendingPassthroughEventLine !== null;
++                  pendingPassthroughEventLine = null;
++                  for (const convertedEvent of convertedEvents) {
++                    const restoredEvent = toolNameMap?.size ? restoreToolNames(convertedEvent, toolNameMap) : convertedEvent;
++                    const framed = `${hadEventLine ? `event: ${restoredEvent.type}\n` : ""}data: ${JSON.stringify(restoredEvent)}\n`;
++                    reqLogger?.appendConvertedChunk?.(framed);
++                    controller.enqueue(sharedEncoder.encode(framed));
++                  }
++                  continue;
++                }
++                if (convertedEvents[0] !== parsed) {
++                  parsed = convertedEvents[0];
++                  customConverted = true;
++                }
++              }
++
+               // The fingerprint pass renames a colliding caller tool to an alias
+               // (read -> read_client). On this path nothing restored it, so the
+               // client received a call to a tool it never declared and answered
+               // "Model tried to call unavailable tool 'read_client'" (#4986).
+               let toolNameRestored = false;
+               if (toolNameMap?.size) {
++                if (musePassthrough) restoreMuseNamespaceCalls(parsed, toolNameMap);
+                 const restored = restoreToolNames(parsed, toolNameMap);
+                 if (restored !== parsed) {
+                   parsed = restored;
+@@ -478,6 +528,7 @@ export function createSSEStream(options = {}) {
+               }
+ 
+               if (!hasValuableContent(parsed, FORMATS.OPENAI)) {
++                pendingPassthroughEventLine = null;
+                 continue;
+               }
+ 
+@@ -512,7 +563,7 @@ export function createSSEStream(options = {}) {
+                 parsed.usage = filterUsageForFormat(buffered, FORMATS.OPENAI);
+                 output = `data: ${JSON.stringify(parsed)}\n`;
+                 injectedUsage = true;
+-              } else if (idFixed || fieldsInjected || toolCallIdFixed || toolNameRestored) {
++              } else if (idFixed || fieldsInjected || toolCallIdFixed || toolNameRestored || customConverted) {
+                 output = `data: ${JSON.stringify(parsed)}\n`;
+                 injectedUsage = true;
+               }
+@@ -520,6 +571,7 @@ export function createSSEStream(options = {}) {
+               // Skip non-JSON data lines silently — don't forward garbage to clients.
+               // Upstream providers sometimes return plain-text errors (HTML, rate-limit
+               // messages) in the SSE stream that would break downstream JSON decoders.
++              pendingPassthroughEventLine = null;
+               continue;
+             }
+           }
+@@ -532,6 +584,12 @@ export function createSSEStream(options = {}) {
+             }
+           }
+ 
++          if (pendingPassthroughEventLine !== null) {
++            const eventLine = pendingPassthroughEventLine + "\n";
++            pendingPassthroughEventLine = null;
++            reqLogger?.appendConvertedChunk?.(eventLine);
++            controller.enqueue(sharedEncoder.encode(eventLine));
++          }
+           reqLogger?.appendConvertedChunk?.(output);
+           controller.enqueue(sharedEncoder.encode(output));
+           // Responses clients (codex CLI) close on response.completed instead of [DONE]
+@@ -825,6 +883,10 @@ export function createSSEStream(options = {}) {
+             }
+             output = restoreSseEvent([output], toolNameMap);
+             if (!output.endsWith("\n")) output += "\n\n";
++            if (pendingPassthroughEventLine !== null) {
++              controller.enqueue(sharedEncoder.encode(pendingPassthroughEventLine + "\n"));
++              pendingPassthroughEventLine = null;
++            }
+             reqLogger?.appendConvertedChunk?.(output);
+             controller.enqueue(sharedEncoder.encode(output));
+           }
+@@ -974,7 +1036,7 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
+   });
+ }
+ 
+-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null, onNativeResponseSuccess = null) {
++export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, sourceFormat = FORMATS.OPENAI, nativeJson = false, nativeResponseProjection = null, onNativeResponseSuccess = null, customToolNames = null) {
+   return createSSEStream({
+     mode: STREAM_MODE.PASSTHROUGH,
+     sourceFormat,
+@@ -984,6 +1046,7 @@ export function createPassthroughStreamWithLogger(provider = null, reqLogger = n
+     provider,
+     reqLogger,
+     toolNameMap,
++    customToolNames,
+     model,
+     connectionId,
+     body,
+diff --git a/tests/unit/muse-cloaking.test.js b/tests/unit/muse-cloaking.test.js
+new file mode 100644
+index 00000000..1a515509
+--- /dev/null
++++ b/tests/unit/muse-cloaking.test.js
+@@ -0,0 +1,276 @@
++import { describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++  saveUsageStats: vi.fn(),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", async importOriginal => ({
++  ...await importOriginal(),
++  buildRequestDetail: () => ({}),
++  extractRequestConfig: (body, stream) => ({ body, stream }),
++  saveUsageStats: () => {},
++  formatDoneLine: () => "",
++}));
++
++import "../translator/registerAll.js";
++import { handleStreamingResponse } from "../../open-sse/handlers/chatCore/streamingHandler.js";
++import { handleNonStreamingResponse } from "../../open-sse/handlers/chatCore/nonStreamingHandler.js";
++import { handleForcedSSEToJson } from "../../open-sse/handlers/chatCore/sseToJsonHandler.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { cloakMuseTools } from "../../open-sse/utils/museCloaking.js";
++import { createStreamController } from "../../open-sse/utils/streamHandler.js";
++
++const MODEL = "muse-wonder-1.0-contributor";
++const OAUTH = { accessToken: "test-only-muse-oauth" };
++
++function nativeRequest() {
++  return {
++    model: MODEL,
++    input: [
++      { type: "function_call", id: "fc_history", call_id: "call_history", name: "read_file", arguments: '{"Path":"before.txt"}' },
++      { type: "function_call_output", call_id: "call_history", output: "previous result" },
++    ],
++    tools: [
++      { type: "function", name: "read_file", description: "client schema", parameters: { type: "object", properties: {} } },
++      { type: "custom", name: "exec", description: "client custom tool" },
++      { type: "web_search" },
++      { type: "namespace", name: "collaboration", tools: [{ type: "function", name: "read_file" }] },
++    ],
++    tool_choice: { type: "function", name: "read_file" },
++  };
++}
++
++function derive() {
++  const result = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, MODEL, nativeRequest(), true, OAUTH, "muse");
++  return { upstreamRequest: result, toolNameMap: result._toolNameMap };
++}
++
++const upstreamName = (map, original) => [...map].find(([, name]) => name === original)?.[0];
++const frame = event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
++const parseEvents = wire => wire.split("\n")
++  .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
++  .map(line => JSON.parse(line.slice(6)));
++
++describe("Muse Code request cloaking", () => {
++  it("renames Responses declarations, history and forced choice without changing hosted tools or call identity", () => {
++    const original = nativeRequest();
++    const snapshot = structuredClone(original);
++    const { upstreamRequest, toolNameMap } = derive();
++    const readAlias = upstreamName(toolNameMap, "read_file");
++
++    expect(readAlias).toBe("read_file_muse");
++    expect(upstreamRequest.tools[0]).toMatchObject({ type: "function", name: readAlias, description: "client schema" });
++    expect(upstreamRequest.tools[1].name).toBe("exec_muse");
++    expect(upstreamRequest.tools[2]).toEqual({ type: "web_search" });
++    expect(upstreamRequest.tools[3]).toEqual(original.tools[3]);
++    expect(upstreamRequest.input[0]).toMatchObject({ type: "function_call", call_id: "call_history", name: readAlias });
++    expect(upstreamRequest.input[1]).toEqual(original.input[1]);
++    expect(upstreamRequest.tool_choice).toEqual({ type: "function", name: readAlias });
++    expect(original).toEqual(snapshot);
++  });
++
++  it("keeps pay-as-you-go API-key declarations uncloaked", () => {
++    const result = translateRequest(
++      FORMATS.OPENAI_RESPONSES,
++      FORMATS.OPENAI_RESPONSES,
++      MODEL,
++      nativeRequest(),
++      true,
++      { apiKey: "test-only-payg-key" },
++      "muse",
++    );
++    expect(result.tools.map(tool => tool.name)).toEqual(nativeRequest().tools.map(tool => tool.name));
++    expect(result.input[0].name).toBe("read_file");
++    // No cloaking aliases; the map carries only namespace descriptors used
++    // to split Meta's flattened namespace calls back on the way out.
++    expect([...(result._toolNameMap?.values() || [])].every(value => typeof value === "object")).toBe(true);
++    expect(result._toolNameMap?.get("collaboration.read_file")).toEqual({
++      name: "read_file", namespace: "collaboration", type: "function",
++    });
++  });
++
++  it("allocates unique bounded aliases and rewrites allowed_tools without mutating hosted entries", () => {
++    const longName = "x".repeat(64);
++    const { body, toolNameMap } = cloakMuseTools({
++      tools: [
++        { type: "function", name: "read_file" },
++        { type: "function", name: "read_file_muse" },
++        { type: "function", name: longName },
++        { type: "web_search" },
++      ],
++      tool_choice: {
++        type: "allowed_tools",
++        tools: [{ type: "function", name: "read_file" }, { type: "web_search" }],
++      },
++    });
++    const aliases = body.tools.slice(0, 3).map(tool => tool.name);
++
++    expect(new Set(aliases).size).toBe(3);
++    expect(aliases.every(name => name.length <= 64)).toBe(true);
++    expect(aliases).not.toContain("read_file");
++    expect(aliases).not.toContain("read_file_muse");
++    expect(aliases).not.toContain(longName);
++    expect(toolNameMap.size).toBe(3);
++    expect(body.tools[3]).toEqual({ type: "web_search" });
++    expect(body.tool_choice.tools[0].name).toBe(aliases[0]);
++    expect(body.tool_choice.tools[1]).toEqual({ type: "web_search" });
++  });
++});
++
++function providerBody(toolNameMap) {
++  return {
++    id: "resp_muse_nonstream",
++    object: "response",
++    status: "completed",
++    output: [{
++      type: "function_call",
++      id: "fc_nonstream",
++      call_id: "call_nonstream",
++      name: upstreamName(toolNameMap, "read_file"),
++      arguments: '{"Path":"now.txt"}',
++    }],
++    usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
++  };
++}
++
++describe("Muse Code non-streaming decloaking", () => {
++  it("restores a native Responses call without changing call id or arguments", async () => {
++    const { toolNameMap } = derive();
++    const upstream = providerBody(toolNameMap);
++    const result = await handleNonStreamingResponse({
++      providerResponse: new Response(JSON.stringify(upstream), { status: 200, headers: { "content-type": "application/json" } }),
++      provider: "muse",
++      model: MODEL,
++      sourceFormat: FORMATS.OPENAI_RESPONSES,
++      targetFormat: FORMATS.OPENAI_RESPONSES,
++      body: nativeRequest(),
++      stream: false,
++      requestStartTime: Date.now(),
++      toolNameMap,
++      reqLogger: { logProviderResponse() {}, logConvertedResponse() {} },
++      trackDone() {},
++      appendLog() {},
++    });
++    const body = await result.response.json();
++    const call = body.output[0];
++
++    expect(call.name).toBe("read_file");
++    expect(call.call_id).toBe("call_nonstream");
++    expect(call.arguments).toBe('{"Path":"now.txt"}');
++  });
++
++  it("restores a Chat call when the client requested JSON but upstream used SSE", async () => {
++    const { toolNameMap } = derive();
++    const item = providerBody(toolNameMap).output[0];
++    const events = [
++      { type: "response.output_item.done", output_index: 0, item },
++      { type: "response.completed", response: { status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } },
++    ];
++    const result = await handleForcedSSEToJson({
++      providerResponse: new Response(events.map(frame).join(""), { headers: { "content-type": "text/event-stream" } }),
++      provider: "muse",
++      model: MODEL,
++      sourceFormat: FORMATS.OPENAI,
++      targetFormat: FORMATS.OPENAI_RESPONSES,
++      body: nativeRequest(),
++      stream: false,
++      requestStartTime: Date.now(),
++      toolNameMap,
++      trackDone() {},
++      appendLog() {},
++    });
++    const body = await result.response.json();
++    const call = body.choices[0].message.tool_calls[0];
++
++    expect(call.function.name).toBe("read_file");
++    expect(call.id).toBe("call_nonstream");
++    expect(call.function.arguments).toBe('{"Path":"now.txt"}');
++  });
++});
++
++function streamEvents(toolNameMap) {
++  const name = upstreamName(toolNameMap, "read_file");
++  const item = { type: "function_call", id: "fc_stream", call_id: "call_stream", name, arguments: '{"Path":"stream.txt"}' };
++  return [
++    { type: "response.created", response: { id: "resp_muse_stream", object: "response", status: "in_progress" } },
++    { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } },
++    { type: "response.output_item.done", output_index: 0, item },
++    {
++      type: "response.completed",
++      response: {
++        id: "resp_muse_stream",
++        object: "response",
++        status: "completed",
++        output: [item],
++        usage: { input_tokens: 9, output_tokens: 4, total_tokens: 13 },
++      },
++    },
++  ];
++}
++
++async function runStream(sourceFormat, fragmented) {
++  const { toolNameMap } = derive();
++  const events = streamEvents(toolNameMap);
++  const bytes = new TextEncoder().encode(events.map(frame).join(""));
++  const chunks = fragmented ? [...bytes].map(byte => Uint8Array.of(byte)) : [bytes];
++  const providerResponse = new Response(new ReadableStream({
++    start(controller) {
++      for (const chunk of chunks) controller.enqueue(chunk);
++      controller.close();
++    },
++  }), { headers: { "content-type": "text/event-stream" } });
++  const result = await handleStreamingResponse({
++    providerResponse,
++    provider: "muse",
++    model: MODEL,
++    sourceFormat,
++    targetFormat: FORMATS.OPENAI_RESPONSES,
++    body: nativeRequest(),
++    stream: true,
++    requestStartTime: Date.now(),
++    toolNameMap,
++    streamController: createStreamController({ provider: "muse", model: MODEL }),
++  });
++  return { raw: await result.response.text(), events, toolNameMap };
++}
++
++describe("Muse Code streaming decloaking", () => {
++  it.each([false, true])("restores every Responses tool item on the passthrough path (fragmented=%s)", async fragmented => {
++    const { raw, events, toolNameMap } = await runStream(FORMATS.OPENAI_RESPONSES, fragmented);
++    const output = parseEvents(raw);
++    const names = output.flatMap(event => [
++      ...(event.item?.type === "function_call" ? [event.item.name] : []),
++      ...(event.response?.output || []).filter(item => item.type === "function_call").map(item => item.name),
++    ]);
++
++    expect(names).toEqual(["read_file", "read_file", "read_file"]);
++    expect(output.find(event => event.type === "response.completed").response.output[0]).toMatchObject({
++      call_id: "call_stream",
++      arguments: '{"Path":"stream.txt"}',
++    });
++    expect(raw).not.toContain(upstreamName(toolNameMap, "read_file"));
++    expect(events).toEqual(streamEvents(toolNameMap));
++  });
++
++  it.each([false, true])("restores translated Chat tool calls (fragmented=%s)", async fragmented => {
++    const { raw, toolNameMap } = await runStream(FORMATS.OPENAI, fragmented);
++    const output = parseEvents(raw);
++    const calls = output.flatMap(event => event.choices || []).flatMap(choice => [
++      ...(choice.delta?.tool_calls || []),
++      ...(choice.message?.tool_calls || []),
++    ]);
++    const named = calls.filter(call => call.function?.name);
++
++    expect(named.length).toBeGreaterThan(0);
++    expect(named.every(call => call.function.name === "read_file")).toBe(true);
++    expect(calls[0].id).toBe("call_stream");
++    expect(raw).not.toContain(upstreamName(toolNameMap, "read_file"));
++  });
++});
+diff --git a/tests/unit/muse-custom-tools.test.js b/tests/unit/muse-custom-tools.test.js
+new file mode 100644
+index 00000000..b2684700
+--- /dev/null
++++ b/tests/unit/muse-custom-tools.test.js
+@@ -0,0 +1,437 @@
++/**
++ * Meta's Responses executor rejects two shapes Codex sends for every model
++ * whose catalog entry is inherited from an OpenAI model:
++ *   - `{"type":"web_search","search_content_types":["text","image"]}`
++ *     → 400 "`tools[].search_content_types` is only supported for
++ *       web_search_preview tools" (and web_search_preview with the field is
++ *       rejected too: "not supported by the current Responses web_search
++ *       executor"); a bare web_search tool is accepted.
++ *   - the freeform `{"type":"custom","name":"apply_patch",...}` tool
++ *     → 400 "`custom` tools are not supported on this endpoint".
++ *
++ * The Muse lane therefore strips search_content_types and sends custom
++ * tools as functions with one raw `input` string (the Responses→Chat
++ * shape), converting the calls back to custom_tool_call on every response
++ * path: non-streaming JSON, forced SSE→JSON, and the passthrough stream
++ * Codex actually consumes.
++ */
++import { describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/usageDb.js", () => ({
++  trackPendingRequest: vi.fn(),
++  appendRequestLog: vi.fn(async () => {}),
++  saveRequestDetail: vi.fn(async () => {}),
++  saveRequestUsage: vi.fn(async () => {}),
++  saveUsageStats: vi.fn(),
++}));
++vi.mock("@/lib/db/helpers/kvStore.js", () => ({
++  makeKv: () => ({ get: async () => null, set: async () => {}, remove: async () => {}, getAll: async () => ({}) }),
++}));
++vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", async importOriginal => ({
++  ...await importOriginal(),
++  buildRequestDetail: () => ({}),
++  extractRequestConfig: (body, stream) => ({ body, stream }),
++  saveUsageStats: () => {},
++  formatDoneLine: () => "",
++}));
++
++import "../translator/registerAll.js";
++import { handleStreamingResponse } from "../../open-sse/handlers/chatCore/streamingHandler.js";
++import { handleNonStreamingResponse } from "../../open-sse/handlers/chatCore/nonStreamingHandler.js";
++import { handleForcedSSEToJson } from "../../open-sse/handlers/chatCore/sseToJsonHandler.js";
++import { translateRequest } from "../../open-sse/translator/index.js";
++import { FORMATS } from "../../open-sse/translator/formats.js";
++import { normalizeMuseResponsesTools } from "../../open-sse/utils/museCloaking.js";
++import { createStreamController } from "../../open-sse/utils/streamHandler.js";
++
++const MODEL = "muse-wonder-full-1.0-contributor";
++const OAUTH = { accessToken: "test-only-muse-oauth" };
++const PATCH = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch";
++const PATCH_ARGS = JSON.stringify({ input: PATCH });
++
++function codexRequest() {
++  return {
++    model: MODEL,
++    input: [
++      {
++        type: "additional_tools",
++        tools: [
++          { type: "custom", name: "deferred_patch" },
++          { type: "web_search", search_content_types: ["text", "image"] },
++        ],
++      },
++      { type: "custom_tool_call", call_id: "call_prev", name: "apply_patch", input: PATCH },
++      { type: "custom_tool_call_output", call_id: "call_prev", output: "patched" },
++      { type: "message", role: "user", content: [{ type: "input_text", text: "again" }] },
++    ],
++    tools: [
++      { type: "function", name: "read_file", description: "read", strict: false, parameters: { type: "object", properties: {} } },
++      {
++        type: "custom", name: "apply_patch", description: "edit files",
++        format: { type: "grammar", syntax: "lark", definition: "start: begin_patch" },
++      },
++      { type: "web_search", external_web_access: true, search_content_types: ["text", "image"] },
++      { type: "web_search_preview", search_content_types: ["text"] },
++      {
++        type: "namespace", name: "collaboration", description: "sub-agents",
++        tools: [
++          { type: "function", name: "spawn_agent", parameters: { type: "object", properties: {} } },
++          { type: "custom", name: "send_patch", description: "raw patch" },
++        ],
++      },
++    ],
++    tool_choice: { type: "custom", name: "apply_patch" },
++  };
++}
++
++function derive(credentials = OAUTH) {
++  const result = translateRequest(
++    FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, MODEL, codexRequest(), true, credentials, "muse",
++  );
++  return {
++    upstreamRequest: result,
++    toolNameMap: result._toolNameMap,
++    customToolNames: new Set(result._customToolNames || []),
++  };
++}
++
++describe("Muse request tool normalization", () => {
++  it("does not mutate the caller's body", () => {
++    const request = codexRequest();
++    const snapshot = structuredClone(request);
++    const { body } = normalizeMuseResponsesTools(request);
++    expect(body).not.toBe(request);
++    expect(request).toEqual(snapshot);
++  });
++
++  it("strips search_content_types everywhere and rewrites custom tools as functions", () => {
++    const { upstreamRequest, customToolNames, toolNameMap } = derive();
++
++    expect(JSON.stringify(upstreamRequest)).not.toContain("search_content_types");
++    expect(upstreamRequest.tools[2]).toEqual({ type: "web_search", external_web_access: true });
++    expect(upstreamRequest.tools[3]).toEqual({ type: "web_search_preview" });
++
++    const patch = upstreamRequest.tools[1];
++    expect(patch.type).toBe("function");
++    expect(patch.name).toBe("apply_patch_muse");
++    expect(patch.description).toContain("edit files");
++    expect(patch.description).toContain("start: begin_patch");
++    expect(patch.parameters).toEqual({
++      type: "object",
++      properties: { input: { type: "string", description: "Raw freeform input for this custom tool" } },
++      required: ["input"],
++      additionalProperties: false,
++    });
++    expect(patch.format).toBeUndefined();
++
++    const namespace = upstreamRequest.tools[4];
++    expect(namespace.tools[0]).toMatchObject({ type: "function", name: "spawn_agent" });
++    expect(namespace.tools[1]).toMatchObject({ type: "function", name: "send_patch" });
++
++    const deferred = upstreamRequest.input[0];
++    // Cloaking renames body.tools only; deferred declarations keep their name.
++    expect(deferred.tools[0]).toMatchObject({ type: "function", name: "deferred_patch" });
++    expect(deferred.tools[1]).toEqual({ type: "web_search" });
++
++    expect(upstreamRequest.input[1]).toEqual({
++      type: "function_call", call_id: "call_prev", name: "apply_patch_muse", arguments: PATCH_ARGS,
++    });
++    expect(upstreamRequest.input[2]).toEqual({
++      type: "function_call_output", call_id: "call_prev", output: "patched",
++    });
++    expect(upstreamRequest.tool_choice).toEqual({ type: "function", name: "apply_patch_muse" });
++
++    expect(customToolNames).toContain("apply_patch_muse");
++    expect(customToolNames).toContain("deferred_patch");
++    expect(customToolNames).toContain("collaboration/send_patch");
++
++    // Meta flattens namespace calls in its replies; the descriptors are
++    // what the response restorers split them back with.
++    expect(toolNameMap.get("collaboration.spawn_agent")).toEqual({
++      name: "spawn_agent", namespace: "collaboration", type: "function",
++    });
++    expect(toolNameMap.get("collaboration.send_patch")).toEqual({
++      name: "send_patch", namespace: "collaboration", type: "custom",
++    });
++  });
++
++  it("normalizes pay-as-you-go requests without cloaking their names", () => {
++    const { upstreamRequest, customToolNames } = derive({ apiKey: "test-only-payg-key" });
++    expect(upstreamRequest.tools[1]).toMatchObject({ type: "function", name: "apply_patch" });
++    expect(upstreamRequest.input[1].name).toBe("apply_patch");
++    expect(JSON.stringify(upstreamRequest)).not.toContain("search_content_types");
++    expect(customToolNames).toContain("apply_patch");
++  });
++});
++
++function providerItem(name, args = PATCH_ARGS) {
++  return { type: "function_call", id: "fc_1", call_id: "call_1", name, arguments: args };
++}
++
++describe("Muse custom tool restore (non-streaming)", () => {
++  it("returns a custom_tool_call with the unwrapped raw input", async () => {
++    const { toolNameMap, customToolNames } = derive();
++    const result = await handleNonStreamingResponse({
++      providerResponse: new Response(JSON.stringify({
++        id: "resp_1", object: "response", status: "completed",
++        output: [providerItem("apply_patch_muse")],
++        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
++      }), { status: 200, headers: { "content-type": "application/json" } }),
++      provider: "muse",
++      model: MODEL,
++      sourceFormat: FORMATS.OPENAI_RESPONSES,
++      targetFormat: FORMATS.OPENAI_RESPONSES,
++      body: codexRequest(),
++      stream: false,
++      requestStartTime: Date.now(),
++      toolNameMap,
++      customToolNames,
++      reqLogger: { logProviderResponse() {}, logConvertedResponse() {} },
++      trackDone() {},
++      appendLog() {},
++    });
++    const body = await result.response.json();
++    expect(body.output[0]).toEqual({
++      type: "custom_tool_call", id: "fc_1", call_id: "call_1", name: "apply_patch", input: PATCH,
++    });
++  });
++
++  it("splits Meta's flattened namespace calls back into name + namespace", async () => {
++    const { toolNameMap, customToolNames } = derive();
++    const result = await handleNonStreamingResponse({
++      providerResponse: new Response(JSON.stringify({
++        id: "resp_2", object: "response", status: "completed",
++        output: [
++          { type: "function_call", id: "fc_2", call_id: "call_2", name: "collaboration.spawn_agent", arguments: '{"message":"hi"}' },
++          { type: "function_call", id: "fc_3", call_id: "call_3", name: "collaboration.send_patch", arguments: PATCH_ARGS },
++          // Meta also sometimes answers with the bare child name.
++          { type: "function_call", id: "fc_4", call_id: "call_4", name: "spawn_agent", arguments: '{"message":"again"}' },
++        ],
++        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
++      }), { status: 200, headers: { "content-type": "application/json" } }),
++      provider: "muse",
++      model: MODEL,
++      sourceFormat: FORMATS.OPENAI_RESPONSES,
++      targetFormat: FORMATS.OPENAI_RESPONSES,
++      body: codexRequest(),
++      stream: false,
++      requestStartTime: Date.now(),
++      toolNameMap,
++      customToolNames,
++      reqLogger: { logProviderResponse() {}, logConvertedResponse() {} },
++      trackDone() {},
++      appendLog() {},
++    });
++    const body = await result.response.json();
++    expect(body.output[0]).toEqual({
++      type: "function_call", id: "fc_2", call_id: "call_2",
++      name: "spawn_agent", namespace: "collaboration", arguments: '{"message":"hi"}',
++    });
++    expect(body.output[1]).toEqual({
++      type: "custom_tool_call", id: "fc_3", call_id: "call_3",
++      name: "send_patch", namespace: "collaboration", input: PATCH,
++    });
++    expect(body.output[2]).toEqual({
++      type: "function_call", id: "fc_4", call_id: "call_4",
++      name: "spawn_agent", namespace: "collaboration", arguments: '{"message":"again"}',
++    });
++  });
++});
++
++const frame = event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
++const parseEvents = wire => wire.split("\n")
++  .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
++  .map(line => JSON.parse(line.slice(6)));
++
++function customStreamEvents() {
++  const item = providerItem("apply_patch_muse");
++  const fnItem = { type: "function_call", id: "fc_2", call_id: "call_2", name: "read_file_muse", arguments: '{"Path":"x"}' };
++  const nsItem = { type: "function_call", id: "fc_3", call_id: "call_3", name: "collaboration.spawn_agent", arguments: '{"message":"hi"}' };
++  return [
++    { type: "response.created", sequence_number: 0, response: { id: "resp_s", object: "response", status: "in_progress", output: [] } },
++    { type: "response.output_item.added", sequence_number: 1, output_index: 0, item: { ...item, arguments: "" } },
++    { type: "response.function_call_arguments.delta", sequence_number: 2, item_id: "fc_1", output_index: 0, delta: PATCH_ARGS.slice(0, 12) },
++    { type: "response.function_call_arguments.delta", sequence_number: 3, item_id: "fc_1", output_index: 0, delta: PATCH_ARGS.slice(12) },
++    { type: "response.function_call_arguments.done", sequence_number: 4, item_id: "fc_1", output_index: 0, arguments: PATCH_ARGS },
++    { type: "response.output_item.done", sequence_number: 5, output_index: 0, item },
++    { type: "response.output_item.added", sequence_number: 6, output_index: 1, item: { ...fnItem, arguments: "" } },
++    { type: "response.function_call_arguments.delta", sequence_number: 7, item_id: "fc_2", output_index: 1, delta: '{"Path":"x"}' },
++    { type: "response.function_call_arguments.done", sequence_number: 8, item_id: "fc_2", output_index: 1, arguments: '{"Path":"x"}' },
++    { type: "response.output_item.done", sequence_number: 9, output_index: 1, item: fnItem },
++    { type: "response.output_item.added", sequence_number: 10, output_index: 2, item: { ...nsItem, arguments: "" } },
++    { type: "response.function_call_arguments.delta", sequence_number: 11, item_id: "fc_3", output_index: 2, delta: '{"message":"hi"}' },
++    { type: "response.function_call_arguments.done", sequence_number: 12, item_id: "fc_3", output_index: 2, arguments: '{"message":"hi"}' },
++    { type: "response.output_item.done", sequence_number: 13, output_index: 2, item: nsItem },
++    {
++      type: "response.completed", sequence_number: 14,
++      response: {
++        id: "resp_s", object: "response", status: "completed",
++        output: [item, fnItem, nsItem],
++        usage: { input_tokens: 9, output_tokens: 4, total_tokens: 13 },
++      },
++    },
++  ];
++}
++
++async function runStream(fragmented) {
++  const { toolNameMap, customToolNames } = derive();
++  const bytes = new TextEncoder().encode(customStreamEvents().map(frame).join(""));
++  const chunks = fragmented ? [...bytes].map(byte => Uint8Array.of(byte)) : [bytes];
++  const providerResponse = new Response(new ReadableStream({
++    start(controller) {
++      for (const chunk of chunks) controller.enqueue(chunk);
++      controller.close();
++    },
++  }), { headers: { "content-type": "text/event-stream" } });
++  const result = await handleStreamingResponse({
++    providerResponse,
++    provider: "muse",
++    model: MODEL,
++    sourceFormat: FORMATS.OPENAI_RESPONSES,
++    targetFormat: FORMATS.OPENAI_RESPONSES,
++    body: codexRequest(),
++    stream: true,
++    requestStartTime: Date.now(),
++    toolNameMap,
++    customToolNames,
++    streamController: createStreamController({ provider: "muse", model: MODEL }),
++  });
++  return result.response.text();
++}
++
++describe("Muse custom tool restore (streaming passthrough)", () => {
++  it.each([false, true])("buffers custom argument fragments and emits custom_tool_call_input (fragmented=%s)", async fragmented => {
++    const raw = await runStream(fragmented);
++    const output = parseEvents(raw);
++
++    const added = output.find(event => event.type === "response.output_item.added" && event.item?.call_id === "call_1");
++    expect(added.item).toMatchObject({ type: "custom_tool_call", name: "apply_patch", input: "" });
++    expect(added.item.arguments).toBeUndefined();
++
++    const kinds = output.map(event => event.type);
++    expect(kinds.filter(type => type === "response.custom_tool_call_input.delta")).toHaveLength(1);
++    expect(kinds.filter(type => type === "response.custom_tool_call_input.done")).toHaveLength(1);
++    expect(output.find(event => event.type === "response.custom_tool_call_input.delta")?.delta).toBe(PATCH);
++    expect(output.find(event => event.type === "response.custom_tool_call_input.done")?.input).toBe(PATCH);
++
++    // The ordinary function call beside it streams through untouched.
++    const fnDeltas = output.filter(event => event.type === "response.function_call_arguments.delta");
++    expect(fnDeltas.map(event => event.item_id)).toEqual(["fc_2", "fc_3"]);
++    expect(raw).toContain("event: response.function_call_arguments.delta");
++
++    // Meta's flattened namespace call is split back for the client router.
++    const nsAdded = output.find(event => event.type === "response.output_item.added" && event.item?.call_id === "call_3");
++    expect(nsAdded.item).toMatchObject({ type: "function_call", name: "spawn_agent", namespace: "collaboration" });
++
++    const done = output.find(event => event.type === "response.output_item.done" && event.item?.call_id === "call_1");
++    expect(done.item).toMatchObject({ type: "custom_tool_call", name: "apply_patch", input: PATCH });
++    const completed = output.find(event => event.type === "response.completed");
++    expect(completed.response.output[0]).toMatchObject({ type: "custom_tool_call", name: "apply_patch", input: PATCH });
++    expect(completed.response.output[1]).toMatchObject({ type: "function_call", name: "read_file", arguments: '{"Path":"x"}' });
++    expect(completed.response.output[2]).toMatchObject({
++      type: "function_call", name: "spawn_agent", namespace: "collaboration", arguments: '{"message":"hi"}',
++    });
++    expect(raw).not.toContain("collaboration.spawn_agent");
++
++    expect(raw).toContain("event: response.custom_tool_call_input.delta");
++    expect(raw).toContain("event: response.custom_tool_call_input.done");
++    expect(raw).not.toContain("apply_patch_muse");
++    expect(raw).not.toContain("read_file_muse");
++  });
++
++  it("restores the call when a JSON client is served from the SSE stream", async () => {
++    const { toolNameMap, customToolNames } = derive();
++    const item = providerItem("apply_patch_muse");
++    const events = [
++      { type: "response.output_item.done", output_index: 0, item },
++      { type: "response.completed", response: { status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } },
++    ];
++    const result = await handleForcedSSEToJson({
++      providerResponse: new Response(events.map(frame).join(""), { headers: { "content-type": "text/event-stream" } }),
++      provider: "muse",
++      model: MODEL,
++      sourceFormat: FORMATS.OPENAI_RESPONSES,
++      targetFormat: FORMATS.OPENAI_RESPONSES,
++      body: codexRequest(),
++      stream: false,
++      requestStartTime: Date.now(),
++      toolNameMap,
++      customToolNames,
++      trackDone() {},
++      appendLog() {},
++    });
++    const body = await result.response.json();
++    expect(body.output[0]).toMatchObject({ type: "custom_tool_call", name: "apply_patch", call_id: "call_1", input: PATCH });
++  });
++});
++
++describe("Muse portable Responses input (multi-agent histories)", () => {
++  it("declares the strict-input quirk on the Responses transport only", async () => {
++    const { resolveTransport } = await import("../../open-sse/services/provider.js");
++    expect(resolveTransport("muse", "openai-responses")?.quirks?.portableResponsesInput).toBe(true);
++    expect(resolveTransport("muse", "openai")?.quirks?.portableResponsesInput).toBeUndefined();
++  });
++
++  it("rewrites agent_message for Meta while keeping its native reasoning", async () => {
++    const { toPortableResponsesInput } = await import("../../open-sse/translator/formats/responsesApi.js");
++    const metaReasoning = {
++      type: "reasoning", id: "rs_meta", status: "completed", summary: [],
++      encrypted_content: "Q-PaDgFdLdBPCAXOYA7lSpfH-meta-native",
++    };
++    const out = toPortableResponsesInput([
++      {
++        type: "agent_message", author: "/root/child", recipient: "/root",
++        content: [
++          { type: "input_text", text: "child: done" },
++          { type: "encrypted_content", encrypted_content: "gAAAAABh-codex-fernet" },
++        ],
++      },
++      { type: "function_call_output", name: "send_message_to_thread", namespace: "codex_tui", output: "delegated" },
++      metaReasoning,
++    ]);
++    expect(out[0]).toEqual({
++      type: "message", role: "user",
++      content: [{ type: "input_text", text: "child: done" }],
++    });
++    expect(out[1]).toEqual({
++      type: "message", role: "user",
++      content: [{ type: "input_text", text: "delegated" }],
++    });
++    expect(out[2]).toBe(metaReasoning);
++  });
++});
++
++describe("Hybrid spawn: a Muse parent's task reaching a Codex-provider child", () => {
++  it("surfaces the plaintext task carrier instead of letting the backend decrypt it", async () => {
++    const { CodexExecutor } = await import("../../open-sse/executors/codex.js");
++    const executor = new CodexExecutor();
++    const body = executor.transformRequest("gpt-6.1-terra", {
++      model: "gpt-6.1-terra",
++      instructions: "child instructions",
++      tools: [],
++      input: [
++        { type: "message", role: "user", content: [{ type: "input_text", text: "context" }] },
++        {
++          type: "agent_message", author: "/root", recipient: "/root/child",
++          content: [
++            { type: "input_text", text: "Message Type: NEW_TASK\nPayload:\n" },
++            { type: "encrypted_content", encrypted_content: "Say hello in Russian." },
++          ],
++        },
++        {
++          type: "agent_message", author: "/root", recipient: "/root/other",
++          content: [{ type: "encrypted_content", encrypted_content: "gAAAAABh-real-openai-fernet" }],
++        },
++      ],
++    }, true, { connectionId: "fixture", accessToken: "fixture-token" });
++
++    const [plain, fernet] = body.input.filter(item => item.type === "agent_message");
++    expect(plain.content).toEqual([
++      { type: "input_text", text: "Message Type: NEW_TASK\nPayload:\n" },
++      { type: "input_text", text: "Say hello in Russian." },
++    ]);
++    expect(fernet.content).toEqual([
++      { type: "encrypted_content", encrypted_content: "gAAAAABh-real-openai-fernet" },
++    ]);
++  });
++});
+diff --git a/tests/unit/muse-foreign-reasoning-retry.test.js b/tests/unit/muse-foreign-reasoning-retry.test.js
+new file mode 100644
+index 00000000..03a78fb7
+--- /dev/null
++++ b/tests/unit/muse-foreign-reasoning-retry.test.js
+@@ -0,0 +1,372 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const fetchMock = vi.fn();
++vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
++  proxyAwareFetch: (...args) => fetchMock(...args),
++}));
++
++const { MuseExecutor, sanitizeMuseForeignReasoning, dropMuseReasoningReferences, dropMuseReasoningItems } = await import("../../open-sse/executors/muse.js");
++const { getExecutor } = await import("../../open-sse/executors/index.js");
++const { checkFallbackError } = await import("../../open-sse/services/accountFallback.js");
++
++const FOREIGN_ERROR = {
++  error: {
++    code: null,
++    message: "reasoning `encrypted_content` was not issued to this caller",
++    param: null,
++    type: "invalid_request_error",
++  },
++};
++
++const EXPIRED_ERROR = {
++  error: {
++    code: null,
++    message: "Referenced reasoning item 'rs_stale' was not found or has expired.",
++    param: null,
++    type: "invalid_request_error",
++  },
++};
++
++function makeExpiredBody() {
++  return {
++    model: "muse-spark-1.3-contributor",
++    stream: false,
++    store: false,
++    input: [
++      { type: "message", role: "user", content: [{ type: "input_text", text: "first" }] },
++      {
++        type: "reasoning",
++        id: "rs_stale",
++        summary: [{ type: "summary_text", text: "stale plan" }],
++      },
++      {
++        type: "reasoning",
++        id: "rs_current",
++        status: "completed",
++        summary: [{ type: "summary_text", text: "current plan" }],
++        encrypted_content: "current-blob",
++      },
++      { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
++    ],
++  };
++}
++
++function response(status, body) {
++  return new Response(JSON.stringify(body), {
++    status,
++    headers: { "content-type": "application/json" },
++  });
++}
++
++function makeBody() {
++  return {
++    model: "muse-wonder-1.0-contributor",
++    stream: false,
++    store: false,
++    include: ["reasoning.encrypted_content"],
++    reasoning: { effort: "high", summary: "auto" },
++    input: [
++      { type: "message", role: "user", content: [{ type: "input_text", text: "first" }] },
++      {
++        type: "reasoning",
++        id: "rs_foreign",
++        status: "completed",
++        summary: [{ type: "summary_text", text: "prior plan" }],
++        encrypted_content: "foreign-blob",
++      },
++      {
++        type: "reasoning",
++        id: "rs_empty",
++        status: "completed",
++        summary: [],
++        encrypted_content: "foreign-empty",
++      },
++      { type: "function_call", call_id: "call_1", name: "lookup", arguments: "{}" },
++      { type: "function_call_output", call_id: "call_1", output: "ok" },
++      { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
++    ],
++  };
++}
++
++function makeArgs(body, overrides = {}) {
++  return {
++    model: "muse-wonder-1.0-contributor",
++    body,
++    stream: false,
++    credentials: {
++      accessToken: "test-only-caller-b",
++      connectionId: "muse-connection-b",
++      providerSpecificData: {},
++      runtimeTransport: {
++        baseUrl: "https://api.meta.ai/v1/responses",
++        format: "openai-responses",
++        headers: {},
++        auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["museHeaders"] },
++      },
++    },
++    providerSessionId: "session-1",
++    log: { debug: vi.fn(), warn: vi.fn() },
++    ...overrides,
++  };
++}
++
++function sentBody(callIndex) {
++  return JSON.parse(fetchMock.mock.calls[callIndex][1].body);
++}
++
++describe("Muse foreign reasoning recovery", () => {
++  beforeEach(() => {
++    fetchMock.mockReset();
++  });
++
++  it("registers the dedicated Muse executor", () => {
++    expect(getExecutor("muse")).toBeInstanceOf(MuseExecutor);
++  });
++
++  it("keeps encrypted reasoning intact on a successful first attempt", async () => {
++    fetchMock.mockResolvedValueOnce(response(200, { id: "resp_ok", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(sentBody(0).input).toEqual(expect.arrayContaining([
++      expect.objectContaining({ type: "reasoning", encrypted_content: "foreign-blob" }),
++    ]));
++  });
++
++  it("retries only after Meta rejects foreign encrypted reasoning", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_retry", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    expect(sentBody(0).input).toEqual(expect.arrayContaining([
++      expect.objectContaining({ encrypted_content: "foreign-blob" }),
++    ]));
++
++    const retryInput = sentBody(1).input;
++    expect(JSON.stringify(retryInput)).not.toContain("foreign-blob");
++    expect(JSON.stringify(retryInput)).not.toContain("foreign-empty");
++    expect(retryInput).toEqual(expect.arrayContaining([
++      {
++        type: "reasoning",
++        status: "completed",
++        summary: [{ type: "summary_text", text: "prior plan" }],
++      },
++      expect.objectContaining({ type: "function_call", call_id: "call_1" }),
++      expect.objectContaining({ type: "function_call_output", call_id: "call_1" }),
++    ]));
++    expect(retryInput.filter((item) => item.type === "reasoning")).toHaveLength(1);
++  });
++
++  it("pre-strips only hashes already rejected for this session and caller", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_retry", status: "completed", output: [] }))
++      .mockResolvedValueOnce(response(200, { id: "resp_next", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    await executor.execute(makeArgs(makeBody()));
++
++    const nextBody = makeBody();
++    nextBody.input.splice(3, 0, {
++      type: "reasoning",
++      id: "rs_current",
++      status: "completed",
++      summary: [{ type: "summary_text", text: "current plan" }],
++      encrypted_content: "current-caller-blob",
++    });
++    const out = await executor.execute(makeArgs(nextBody));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(3);
++    const sent = sentBody(2);
++    expect(JSON.stringify(sent.input)).not.toContain("foreign-blob");
++    expect(sent.input).toEqual(expect.arrayContaining([
++      expect.objectContaining({ type: "reasoning", encrypted_content: "current-caller-blob" }),
++    ]));
++  });
++
++  it("does not retry unrelated 400 errors", async () => {
++    fetchMock.mockResolvedValueOnce(response(400, { error: { message: "unknown parameter" } }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(400);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++  });
++
++  it("sanitizer preserves summaries and drops empty reasoning items", () => {
++    const { body, removedHashes } = sanitizeMuseForeignReasoning(makeBody());
++
++    expect(removedHashes).toHaveLength(2);
++    expect(body.input.filter((item) => item.type === "reasoning")).toEqual([{
++      type: "reasoning",
++      status: "completed",
++      summary: [{ type: "summary_text", text: "prior plan" }],
++    }]);
++  });
++
++  it("retries without the referenced item after Meta reports it expired", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, EXPIRED_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_retry", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeExpiredBody()));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    const retryInput = sentBody(1).input;
++    expect(JSON.stringify(retryInput)).not.toContain("rs_stale");
++    expect(retryInput).toEqual(expect.arrayContaining([
++      { type: "reasoning", summary: [{ type: "summary_text", text: "stale plan" }] },
++      expect.objectContaining({ type: "reasoning", id: "rs_current", encrypted_content: "current-blob" }),
++    ]));
++  });
++
++  it("pre-strips expired references already rejected for this caller", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, EXPIRED_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_retry", status: "completed", output: [] }))
++      .mockResolvedValueOnce(response(200, { id: "resp_next", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    await executor.execute(makeArgs(makeExpiredBody()));
++    const out = await executor.execute(makeArgs(makeExpiredBody()));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(3);
++    expect(JSON.stringify(sentBody(2).input)).not.toContain("rs_stale");
++    expect(JSON.stringify(sentBody(2).input)).toContain("current-blob");
++  });
++
++  it("reference dropper keeps summaries and removes only named ids", () => {
++    const { body, removedIds } = dropMuseReasoningReferences(
++      makeExpiredBody(),
++      new Set(["rs_stale"]),
++    );
++
++    expect(removedIds).toEqual(["rs_stale"]);
++    expect(body.input.filter((item) => item.type === "reasoning")).toEqual([
++      { type: "reasoning", summary: [{ type: "summary_text", text: "stale plan" }] },
++      expect.objectContaining({ type: "reasoning", id: "rs_current" }),
++    ]);
++  });
++
++  // Regression (2026-11-08): the original one-shot recovery returned the
++  // first foreign-reasoning 400 whenever its single retry also failed,
++  // whatever the retry's actual outcome was. Two live requests died that
++  // way while the same sanitized body is accepted by Meta on replay.
++  it("escalates to dropping reasoning items when summary-only replay is still rejected", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_escalated", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(3);
++    const thirdInput = sentBody(2).input;
++    expect(thirdInput.filter((item) => item.type === "reasoning")).toHaveLength(0);
++    expect(thirdInput).toEqual(expect.arrayContaining([
++      expect.objectContaining({ type: "function_call", call_id: "call_1" }),
++      expect.objectContaining({ type: "function_call_output", call_id: "call_1" }),
++    ]));
++  });
++
++  it("recovers a composite foreign-then-expired rejection in one execution", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(400, EXPIRED_ERROR))
++      .mockResolvedValueOnce(response(200, { id: "resp_composite", status: "completed", output: [] }));
++    const executor = new MuseExecutor();
++
++    const body = makeBody();
++    body.input.splice(3, 0, {
++      type: "reasoning",
++      id: "rs_stale",
++      summary: [{ type: "summary_text", text: "stale plan" }],
++    });
++    const out = await executor.execute(makeArgs(body));
++
++    expect(out.response.status).toBe(200);
++    expect(fetchMock).toHaveBeenCalledTimes(3);
++    const thirdInput = sentBody(2).input;
++    expect(JSON.stringify(thirdInput)).not.toContain("foreign-blob");
++    expect(JSON.stringify(thirdInput)).not.toContain("rs_stale");
++    expect(thirdInput.filter((item) => item.type === "reasoning")).toEqual([
++      { type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: "prior plan" }] },
++      { type: "reasoning", summary: [{ type: "summary_text", text: "stale plan" }] },
++    ]);
++  });
++
++  it("does not mask a transport failure of the recovery attempt as the first 400", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockRejectedValueOnce(new Error("fetch failed"));
++    const executor = new MuseExecutor();
++
++    await expect(executor.execute(makeArgs(makeBody()))).rejects.toThrow("fetch failed");
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  it("returns the recovery attempt's own error instead of the first rejection", async () => {
++    fetchMock
++      .mockResolvedValueOnce(response(400, FOREIGN_ERROR))
++      .mockResolvedValueOnce(response(400, {
++        error: { message: "The request contains invalid parameters." },
++      }));
++    const executor = new MuseExecutor();
++
++    const out = await executor.execute(makeArgs(makeBody()));
++
++    expect(out.response.status).toBe(400);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    const returned = await out.response.text();
++    expect(returned).toContain("invalid parameters");
++    expect(returned).not.toContain("was not issued to this caller");
++  });
++
++  it("reasoning item dropper removes reasoning items and strips encrypted payloads", () => {
++    const { body, removedItems, removedHashes } = dropMuseReasoningItems(makeBody());
++
++    expect(removedHashes).toHaveLength(2);
++    expect(removedItems).toBe(1);
++    expect(body.input.some((item) => item.type === "reasoning")).toBe(false);
++    expect(JSON.stringify(body.input)).not.toContain("foreign-blob");
++    expect(body.input).toEqual(expect.arrayContaining([
++      expect.objectContaining({ type: "function_call", call_id: "call_1" }),
++      expect.objectContaining({ type: "function_call_output", call_id: "call_1" }),
++    ]));
++  });
++
++  it("classifies Muse foreign/expired reasoning rejections as caller-scoped", () => {
++    const foreign = checkFallbackError(400, FOREIGN_ERROR.error.message, 0, "muse");
++    expect(foreign.shouldFallback).toBe(true);
++    expect(foreign.cooldownMs).toBe(0);
++    expect(foreign.requestScoped).toBeFalsy();
++
++    const expired = checkFallbackError(400, EXPIRED_ERROR.error.message, 0, "muse");
++    expect(expired.shouldFallback).toBe(true);
++    expect(expired.cooldownMs).toBe(0);
++    expect(expired.requestScoped).toBeFalsy();
++
++    const generic = checkFallbackError(400, "The request contains invalid parameters.", 0, "muse");
++    expect(generic.requestScoped).toBe(true);
++    expect(generic.shouldFallback).toBe(false);
++
++    const otherProvider = checkFallbackError(400, FOREIGN_ERROR.error.message, 0, "openai");
++    expect(otherProvider.requestScoped).toBe(true);
++    expect(otherProvider.shouldFallback).toBe(false);
++  });
++});
+diff --git a/tests/unit/muse-responses-wire.test.js b/tests/unit/muse-responses-wire.test.js
+index 46b828d1..bdeef99d 100644
+--- a/tests/unit/muse-responses-wire.test.js
++++ b/tests/unit/muse-responses-wire.test.js
+@@ -18,6 +18,8 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelUpstreamId, PRO
+ import { resolveTransport } from "../../open-sse/services/provider.js";
+ import { applyThinking } from "../../open-sse/translator/concerns/thinkingUnified.js";
+ import { FORMATS } from "../../open-sse/translator/formats.js";
++import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.js";
++import { getThinkingLevels } from "../../open-sse/providers/thinkingLevels.js";
+ 
+ // Mirrors the transport selection in open-sse/handlers/chatCore.js so the
+ // invariant (body wire === endpoint wire) can be asserted without the full
+@@ -56,6 +58,41 @@ describe("Muse Responses wire routing", () => {
+   });
+ });
+ 
++describe("Muse Wonder registry and documented capabilities", () => {
++  it.each(["muse-wonder-1.0", "muse-wonder-1.0-contributor"])("routes %s through Responses", (model) => {
++    const { targetFormat, useTransport } = selectTransport("muse", model, FORMATS.OPENAI);
++    expect(targetFormat).toBe(FORMATS.OPENAI_RESPONSES);
++    expect(useTransport?.baseUrl).toBe("https://api.meta.ai/v1/responses");
++    expect(getModelSupportedFormats("muse", model)).toEqual([FORMATS.OPENAI_RESPONSES]);
++  });
++
++  it.each(["muse-wonder-1.0", "muse-wonder-1.0-contributor"])("publishes the Meta/models.dev parameters for %s", (model) => {
++    expect(getCapabilitiesForModel("muse", model)).toMatchObject({
++      vision: true,
++      pdf: true,
++      audioInput: true,
++      videoInput: true,
++      search: true,
++      reasoning: true,
++      thinkingFormat: "openai",
++      thinkingCanDisable: false,
++      contextWindow: 1048576,
++      maxOutput: 131072,
++    });
++    expect(getThinkingLevels("muse", model)).toEqual(["minimal", "low", "medium", "high", "xhigh", "max"]);
++  });
++
++  it("keeps Wonder max and clamps unsupported none to minimal", () => {
++    const maxBody = { input: [] };
++    applyThinking(FORMATS.OPENAI_RESPONSES, "muse-wonder-1.0", maxBody, "muse", { mode: "level", level: "max" });
++    expect(maxBody.reasoning).toEqual({ effort: "max", summary: "auto" });
++
++    const noneBody = { input: [] };
++    applyThinking(FORMATS.OPENAI_RESPONSES, "muse-wonder-1.0-contributor", noneBody, "muse", { mode: "none" });
++    expect(noneBody.reasoning).toEqual({ effort: "minimal", summary: "auto" });
++  });
++});
++
+ describe("Muse Responses thinking wire shape", () => {
+   it("writes reasoning.effort (not top-level reasoning_effort) for the Responses wire", () => {
+     const body = { input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }] };
+diff --git a/tests/unit/provider-pricing-muse-wonder.test.js b/tests/unit/provider-pricing-muse-wonder.test.js
+new file mode 100644
+index 00000000..69c37cbf
+--- /dev/null
++++ b/tests/unit/provider-pricing-muse-wonder.test.js
+@@ -0,0 +1,29 @@
++import { describe, it, expect } from "vitest";
++import { MODEL_PRICING, getPricingForModel, calculateCostFromTokens } from "../../open-sse/providers/pricing.js";
++
++describe("Muse Wonder pricing", () => {
++  it("includes muse-wonder-1.0 and the full contributor variant", () => {
++    expect(MODEL_PRICING["muse-wonder-1.0"]).toBeDefined();
++    expect(MODEL_PRICING["muse-wonder-full-1.0-contributor"]).toBeDefined();
++  });
++
++  it("uses the published wonder rates (input 4.00, output 20.00, cached 0.20)", () => {
++    expect(MODEL_PRICING["muse-wonder-1.0"]).toMatchObject({ input: 4.00, output: 20.00, cached: 0.20 });
++    expect(MODEL_PRICING["muse-wonder-full-1.0-contributor"]).toMatchObject({ input: 4.00, output: 20.00, cached: 0.20 });
++  });
++
++  it("resolves pricing for the live muse surface ids", () => {
++    expect(getPricingForModel("muse", "muse-wonder-full-1.0-contributor")).not.toBeNull();
++    expect(getPricingForModel("openrouter", "meta/muse-wonder-1.0")).not.toBeNull();
++  });
++
++  it("charges cached input at the cached rate, not the full input rate", () => {
++    const pricing = MODEL_PRICING["muse-wonder-full-1.0-contributor"];
++    const cost = calculateCostFromTokens(
++      { input_tokens: 1_000_000, cached_tokens: 990_000, output_tokens: 10_000 },
++      pricing,
++    );
++    // 10k fresh * 4/M + 990k cached * 0.20/M + 10k out * 20/M
++    expect(cost).toBeCloseTo(0.04 + 0.198 + 0.20, 6);
++  });
++});
+-- 
+2.55.0
+
