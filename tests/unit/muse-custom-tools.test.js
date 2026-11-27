@@ -369,6 +369,88 @@ describe("Muse custom tool restore (streaming passthrough)", () => {
   });
 });
 
+describe("Muse call identity with both top-level and namespaced tools", () => {
+  it.each(["json", "sse", "sse-to-json"])("preserves tool type, namespace and call_id through %s", async path => {
+    const body = {
+      model: MODEL,
+      input: [
+        { type: "additional_tools", tools: [{ type: "function", name: "inspect" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Call the tools." }] },
+      ],
+      tools: [
+        { type: "custom", name: "send" },
+        { type: "namespace", name: "collaboration", tools: [
+          { type: "custom", name: "inspect" },
+          { type: "function", name: "send" },
+          { type: "custom", name: "write" },
+          { type: "custom", name: "format" },
+        ] },
+        { type: "namespace", name: "other", tools: [{ type: "function", name: "write" }] },
+      ],
+    };
+    const translated = translateRequest(
+      FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, MODEL, body, true, { apiKey: "test-only-payg-key" }, "muse",
+    );
+    const calls = [
+      ["inspect", '{"path":"fixture"}'],
+      ["collaboration.inspect", PATCH_ARGS],
+      ["send", PATCH_ARGS],
+      ["collaboration.send", '{"message":"hi"}'],
+      ["write", '{"file":"fixture"}'],
+      ["format", PATCH_ARGS],
+    ].map(([name, args], i) => ({ ...providerItem(name, args), id: `fc_${i}`, call_id: `call_${i}` }));
+    const customCall = ({ arguments: _, ...call }, namespace) => ({
+      ...call, type: "custom_tool_call", input: PATCH, ...(namespace ? { namespace } : {}),
+    });
+    const expected = [
+      calls[0],
+      { ...customCall(calls[1], "collaboration"), name: "inspect" },
+      customCall(calls[2]),
+      { ...calls[3], name: "send", namespace: "collaboration" },
+      calls[4],
+      customCall(calls[5], "collaboration"),
+    ];
+    const response = {
+      id: "resp_identity", object: "response", status: "completed", output: calls,
+      usage: { input_tokens: 7, output_tokens: 3 },
+    };
+    const events = calls.flatMap((item, output_index) => [
+      { type: "response.output_item.added", output_index, item: { ...item, arguments: "" } },
+      { type: "response.function_call_arguments.delta", output_index, item_id: item.id, delta: item.arguments },
+      { type: "response.function_call_arguments.done", output_index, item_id: item.id, arguments: item.arguments },
+      { type: "response.output_item.done", output_index, item },
+    ]);
+    events.push({ type: "response.completed", response });
+    const options = {
+      providerResponse: new Response(path === "json" ? JSON.stringify(response) : events.map(frame).join(""), {
+        headers: { "content-type": path === "json" ? "application/json" : "text/event-stream" },
+      }),
+      provider: "muse", model: MODEL, body,
+      sourceFormat: FORMATS.OPENAI_RESPONSES, targetFormat: FORMATS.OPENAI_RESPONSES,
+      stream: path === "sse", requestStartTime: Date.now(),
+      toolNameMap: translated._toolNameMap, customToolNames: new Set(translated._customToolNames),
+      trackDone() {}, appendLog() {},
+    };
+    if (path === "sse") {
+      const result = await handleStreamingResponse({
+        ...options, streamController: createStreamController({ provider: "muse", model: MODEL }),
+      });
+      const output = parseEvents(await result.response.text());
+      expect(output.filter(event => event.type === "response.output_item.done").map(event => event.item)).toEqual(expected);
+      expect(output.find(event => event.type === "response.completed").response.output).toEqual(expected);
+      expect(output.filter(event => event.type === "response.function_call_arguments.done").map(event => event.item_id))
+        .toEqual([calls[0].id, calls[3].id, calls[4].id]);
+      expect(output.filter(event => event.type === "response.custom_tool_call_input.done").map(event => event.item_id))
+        .toEqual([calls[1].id, calls[2].id, calls[5].id]);
+    } else {
+      const result = await (path === "json" ? handleNonStreamingResponse : handleForcedSSEToJson)({
+        ...options, reqLogger: { logProviderResponse() {}, logConvertedResponse() {} },
+      });
+      expect((await result.response.json()).output).toEqual(expected);
+    }
+  });
+});
+
 describe("Muse portable Responses input (multi-agent histories)", () => {
   it("declares the strict-input quirk on the Responses transport only", async () => {
     const { resolveTransport } = await import("../../open-sse/services/provider.js");

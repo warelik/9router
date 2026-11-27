@@ -88,12 +88,32 @@ describe("Muse Code request cloaking", () => {
     );
     expect(result.tools.map(tool => tool.name)).toEqual(nativeRequest().tools.map(tool => tool.name));
     expect(result.input[0].name).toBe("read_file");
-    // No cloaking aliases; the map carries only namespace descriptors used
-    // to split Meta's flattened namespace calls back on the way out.
-    expect([...(result._toolNameMap?.values() || [])].every(value => typeof value === "object")).toBe(true);
+    // No cloaking aliases; the map distinguishes the bare top-level name
+    // from the corresponding namespaced call.
+    expect([...(result._toolNameMap || [])].every(([wire, value]) => wire === value || typeof value === "object")).toBe(true);
     expect(result._toolNameMap?.get("collaboration.read_file")).toEqual({
       name: "read_file", namespace: "collaboration", type: "function",
     });
+  });
+
+  it.each([false, true])("cloaks only top-level history and choices when a namespace shares the name (allowed=%s)", allowed => {
+    const request = nativeRequest();
+    const [topCall, topResult] = request.input;
+    const nsCall = { ...topCall, id: "fc_namespace", call_id: "call_namespace", namespace: "collaboration" };
+    const nsResult = { ...topResult, call_id: nsCall.call_id };
+    request.input.push(nsCall, nsResult);
+    const nsChoice = { type: "function", name: "read_file", namespace: "collaboration" };
+    request.tool_choice = allowed
+      ? { type: "allowed_tools", mode: "required", tools: [request.tool_choice, nsChoice] }
+      : nsChoice;
+
+    const result = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, MODEL, request, true, OAUTH, "muse");
+    expect(result.tools[0].name).toBe("read_file_muse");
+    expect(result.tools[3].tools[0].name).toBe("read_file");
+    expect(result.input).toEqual([{ ...topCall, name: "read_file_muse" }, topResult, nsCall, nsResult]);
+    expect(result.tool_choice).toEqual(allowed
+      ? { ...request.tool_choice, tools: [{ type: "function", name: "read_file_muse" }, nsChoice] }
+      : nsChoice);
   });
 
   it("allocates unique bounded aliases and rewrites allowed_tools without mutating hosted entries", () => {

@@ -14,7 +14,7 @@ export function isMuseCodeSubscription(credentials) {
 
 function isClientTool(tool) {
   return (tool?.type === RESPONSES_TOOL.FUNCTION || tool?.type === RESPONSES_TOOL.CUSTOM)
-    && typeof tool?.name === "string" && tool.name.length > 0;
+    && !tool.namespace && typeof tool.name === "string" && tool.name.length > 0;
 }
 
 function allocateAlias(name, usedNames) {
@@ -53,7 +53,7 @@ export function cloakMuseTools(body) {
 
   const input = Array.isArray(body.input) ? body.input.map(item => {
     if ((item?.type === RESPONSES_ITEM.FUNCTION_CALL || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL)
-      && aliases.has(item.name)) {
+      && !item.namespace && aliases.has(item.name)) {
       return { ...item, name: aliases.get(item.name) };
     }
     return item;
@@ -61,8 +61,7 @@ export function cloakMuseTools(body) {
 
   const cloakedBody = { ...body, tools, input };
   const choice = body.tool_choice;
-  if ((choice?.type === RESPONSES_TOOL.FUNCTION || choice?.type === RESPONSES_TOOL.CUSTOM)
-    && aliases.has(choice.name)) {
+  if (isClientTool(choice) && aliases.has(choice.name)) {
     cloakedBody.tool_choice = { ...choice, name: aliases.get(choice.name) };
   } else if (choice?.type === RESPONSES_TOOL.ALLOWED_TOOLS && Array.isArray(choice.tools)) {
     cloakedBody.tool_choice = {
@@ -239,6 +238,22 @@ export function normalizeMuseResponsesTools(body) {
   return { body: changed ? out : body, customToolNames, namespaceToolNames };
 }
 
+// An actual top-level wire name takes precedence over a bare namespace fallback.
+export function reserveMuseTopLevelToolNames(body, namespaceToolNames, toolNameMap) {
+  const childNames = new Set([...namespaceToolNames.values()].map(tool => tool.name));
+  const deferred = Array.isArray(body.input)
+    ? body.input.filter(item => item?.type === RESPONSES_ITEM.ADDITIONAL_TOOLS).map(item => item.tools)
+    : [];
+  for (const tools of [body.tools, ...deferred]) {
+    if (!Array.isArray(tools)) continue;
+    for (const tool of tools) {
+      if (isClientTool(tool) && childNames.has(tool.name) && !toolNameMap.has(tool.name)) {
+        toolNameMap.set(tool.name, tool.name);
+      }
+    }
+  }
+}
+
 /** The freeform input inside a converted function call's arguments. */
 export function extractMuseCustomInput(argumentsText) {
   if (typeof argumentsText !== "string") return "";
@@ -258,14 +273,6 @@ export function isMuseCustomToolCall(item, customToolNames) {
   if (!item.namespace) {
     const dot = item.name.indexOf(".");
     if (dot > 0 && customToolNames?.has(`${item.name.slice(0, dot)}/${item.name.slice(dot + 1)}`)) return true;
-    // And, variability permitting, the model sometimes replies with the
-    // bare child name instead; it is the custom tool only when exactly one
-    // recorded namespace child carries that name.
-    if (dot < 0 && customToolNames) {
-      let matches = 0;
-      for (const key of customToolNames) if (key.endsWith(`/${item.name}`)) matches += 1;
-      if (matches === 1) return true;
-    }
   }
   return false;
 }
@@ -286,7 +293,7 @@ export function qualifyMuseBareNamespaceCall(item, toolNameMap) {
   if (!item || typeof item !== "object"
     || (item.type !== RESPONSES_ITEM.FUNCTION_CALL && item.type !== RESPONSES_ITEM.CUSTOM_TOOL_CALL)
     || typeof item.name !== "string" || !item.name
-    || item.namespace || item.name.includes(".") || !toolNameMap) return;
+    || item.namespace || item.name.includes(".") || !toolNameMap || toolNameMap.has(item.name)) return;
   let dotted = null;
   for (const [key, descriptor] of toolNameMap) {
     if (descriptor && typeof descriptor === "object" && descriptor.name === item.name) {

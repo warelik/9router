@@ -438,6 +438,8 @@ export function createSSEStream(options = {}) {
               // chunk reaches the client.
               const toolCallIdFixed = ensureStreamToolCallIds(parsed, seenToolCallIds);
 
+              if (musePassthrough) restoreMuseNamespaceCalls(parsed, toolNameMap);
+
               // Converted Muse custom calls: argument deltas are buffered
               // (event dropped together with its held `event:` line), and a
               // completed call is emitted as custom_tool_call_input events.
@@ -470,7 +472,6 @@ export function createSSEStream(options = {}) {
               // "Model tried to call unavailable tool 'read_client'" (#4986).
               let toolNameRestored = false;
               if (toolNameMap?.size) {
-                if (musePassthrough) restoreMuseNamespaceCalls(parsed, toolNameMap);
                 const restored = restoreToolNames(parsed, toolNameMap);
                 if (restored !== parsed) {
                   parsed = restored;

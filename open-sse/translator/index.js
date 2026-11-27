@@ -3,7 +3,7 @@ import { OPENAI_TOOL_CHOICE_NONE } from "./schema/index.js";
 import { ensureToolCallIds, fixMissingToolResponses, isGeminiFamilyTarget } from "./concerns/toolCall.js";
 import { prepareClaudeRequest, ensureTrailingUserTurn } from "./formats/claude.js";
 import { cloakClaudeTools, decloakStreamChunk } from "../utils/claudeCloaking.js";
-import { cloakMuseTools, isMuseCodeSubscription, normalizeMuseResponsesTools } from "../utils/museCloaking.js";
+import { cloakMuseTools, isMuseCodeSubscription, normalizeMuseResponsesTools, reserveMuseTopLevelToolNames } from "../utils/museCloaking.js";
 import { restoreToolNames } from "../utils/opencodeFingerprint.js";
 import { filterToOpenAIFormat } from "./formats/openai.js";
 import { adaptAIStudioStructuredOutput } from "./formats/gemini.js";
@@ -271,6 +271,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
       for (const [dotted, descriptor] of normalized.namespaceToolNames) {
         if (!merged.has(dotted)) merged.set(dotted, descriptor);
       }
+      reserveMuseTopLevelToolNames(result, normalized.namespaceToolNames, merged);
       result._toolNameMap = merged;
     }
   }
