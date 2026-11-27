@@ -45,6 +45,9 @@ const PATTERN_THINKING = [
   // Gemini 4 Neon & Hydrogen support xhigh in addition to low/medium/high (no minimal/none).
   { pattern: "*gemini-4-neon*", levels: ["low", "medium", "high", "xhigh"] },
   { pattern: "*gemini-4-hydrogen*", levels: ["low", "medium", "high", "xhigh"] },
+  // Meta documents the complete minimal..max range for Muse Wonder; reasoning
+  // cannot be disabled (capabilities.js removes "none" from this list).
+  { pattern: "*muse*wonder*", levels: ["minimal", "low", "medium", "high", "xhigh", "max"] },
   // Gemini 4 (Argon, Carbon) rejects "minimal" with 400 — LOW is the floor; cannot disable thinking.
   { pattern: "*gemini-4*", levels: ["low", "medium", "high"] },
   // Antigravity Claude 5.5 supports low, medium, high, max (no xhigh, no none).
