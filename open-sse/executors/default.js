@@ -9,6 +9,7 @@ import { buildKiroIdentityHeaders } from "../shared/kiroIdentity.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
+import { FORMATS } from "../translator/formats.js";
 import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
 import { wantsGeminiLongDecode, withGeminiLongDecode } from "../utils/geminiLongDecode.js";
 
@@ -92,6 +93,27 @@ const REFRESH_GRANTS = Object.fromEntries(
     })
 );
 
+function isResponsesWire(provider, config, credentials) {
+  const runtimeFormat = credentials?.runtimeTransport?.format;
+  if (runtimeFormat) return runtimeFormat === FORMATS.OPENAI_RESPONSES;
+  if (provider?.startsWith?.("openai-compatible-")) {
+    return resolveOpenAICompatibleApiType(provider, credentials) === "responses";
+  }
+  return config?.format === FORMATS.OPENAI_RESPONSES;
+}
+
+function normalizeResponsesReasoning(body) {
+  if (!body || typeof body !== "object" || body.reasoning_effort === undefined) return body;
+
+  const reasoning = body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning)
+    ? { ...body.reasoning }
+    : {};
+  reasoning.effort = body.reasoning_effort;
+  body.reasoning = reasoning;
+  delete body.reasoning_effort;
+  return body;
+}
+
 export class DefaultExecutor extends BaseExecutor {
   constructor(provider) {
     super(provider, PROVIDERS[provider] || PROVIDERS.openai);
@@ -125,7 +147,10 @@ export class DefaultExecutor extends BaseExecutor {
       stripUnsupportedParams(this.provider, model, transformed);
     }
 
-    return injectReasoningContent({ provider: this.provider, model, body: transformed });
+    const injected = injectReasoningContent({ provider: this.provider, model, body: transformed });
+    return isResponsesWire(this.provider, this.config, credentials)
+      ? normalizeResponsesReasoning(injected)
+      : injected;
   }
 
   applyNousAttribution(model, body, stream, credentials) {

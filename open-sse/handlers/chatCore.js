@@ -2,6 +2,8 @@ import { detectFormat, getTargetFormat, resolveTransport } from "../services/pro
 import { translateRequest } from "../translator/index.js";
 import { applyThinking, extractThinking, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
 import { FORMATS } from "../translator/formats.js";
+import { toPortableResponsesInput } from "../translator/formats/responsesApi.js";
+import { hasUndeliverableAgentMessage, preparePortableCollaboration } from "../translator/concerns/portableCollaboration.js";
 import { normalizeClaudePassthrough, anchorClaudeCache } from "../translator/formats/claude.js";
 import { createStreamController } from "../utils/streamHandler.js";
 import { refreshWithRetry } from "../services/tokenRefresh.js";
@@ -10,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
 import { PROVIDERS } from "../config/providers.js";
 import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
 import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
-import { HTTP_STATUS, TOKEN_SAVER_HEADER } from "../config/runtimeConfig.js";
+import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER } from "../config/runtimeConfig.js";
 import { handleBypassRequest } from "../utils/bypassHandler.js";
 import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { getExecutor } from "../executors/index.js";
@@ -110,7 +112,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // OpenAI clients should stay on /chat/completions; other clients can fall
   // back to its declared Claude target).
   const targetFormat = useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
-  if (useTransport && credentials) credentials.runtimeTransport = useTransport;
+  // When the model guard rejects the source-matched transport, translation
+  // must dispatch to the transport matching its target wire format.
+  const effectiveTransport = useTransport || resolveTransport(provider, targetFormat);
+  if (effectiveTransport && credentials) credentials.runtimeTransport = effectiveTransport;
   const stripList = getModelStrip(alias, model);
 
   // Inject provider-level thinking config override (only if client hasn't set)
@@ -171,6 +176,13 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const reqLogger = await createRequestLogger(sourceFormat, targetFormat, model);
   if (clientRawRequest) reqLogger.logClientRawRequest(clientRawRequest.endpoint, clientRawRequest.body, clientRawRequest.headers);
   reqLogger.logRawRequest(body);
+  // Reject opaque-only tasks before a translator or strict Responses transport drops their payload; readable mixed histories keep the provider's existing contract.
+  if (sourceFormat === FORMATS.OPENAI_RESPONSES
+    && (targetFormat !== FORMATS.OPENAI_RESPONSES || effectiveTransport?.quirks?.portableResponsesInput)
+    && hasUndeliverableAgentMessage(body.input)) {
+    return createErrorResult(HTTP_STATUS.BAD_REQUEST,
+      "This history contains an encrypted Codex agent_message that this provider cannot read. Enable portable collaboration on the parent and start a new child with a plaintext task; existing encrypted task history cannot be recovered by this route.");
+  }
   log?.debug?.("FORMAT", `${sourceFormat} → ${targetFormat} | stream=${stream}`);
 
   // Native passthrough: CLI tool and provider are the same ecosystem
@@ -226,6 +238,21 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     delete translatedBody._customToolNames;
     translatedBody.model = stripThinkingSuffix(upstreamModel);
     stripContinuityFields(translatedBody);
+    // Strict Responses upstreams (quirks.portableResponsesInput) reject Codex
+    // multi-agent/delegation history items — rewrite them to portable shapes.
+    if (effectiveTransport?.quirks?.portableResponsesInput
+      && targetFormat === FORMATS.OPENAI_RESPONSES
+      && Array.isArray(translatedBody.input)) {
+      translatedBody.input = toPortableResponsesInput(translatedBody.input);
+    }
+  }
+
+  const portableCollaboration = Object.entries(clientRawRequest?.headers || {}).some(
+    ([name, value]) => name.toLowerCase() === PORTABLE_COLLABORATION.header && String(value).toLowerCase() === "true");
+  if (portableCollaboration && sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES) {
+    const prepared = preparePortableCollaboration(translatedBody);
+    translatedBody = prepared.body;
+    if (prepared.toolNameMap.size) toolNameMap = new Map([...(toolNameMap || []), ...prepared.toolNameMap]);
   }
 
   // Tool normalization: MCP-equivalent built-in dedup (Claude clients) + same-name

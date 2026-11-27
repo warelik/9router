@@ -97,6 +97,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   const clientSessionId = captureSessionId(result, credentials, connectionId, targetFormat);
   // Expose to downstream translators (gemini-cli/antigravity envelopes) that run after envelope is stripped
   if (credentials) credentials._clientSessionId = clientSessionId;
+  let sourceToolNameMap = null;
 
   const translationOptions = {
     preserveCacheControl: targetFormat === FORMATS.OPENAI && !!PROVIDERS[provider]?.quirks?.preserveCacheControl,
@@ -110,6 +111,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     const directFn = requestRegistry.get(`${sourceFormat}:${targetFormat}`);
     if (directFn) {
       result = directFn(model, result, stream, credentials, translationOptions);
+      if (result._toolNameMap instanceof Map) sourceToolNameMap = result._toolNameMap;
     } else {
       // Step 1: source -> openai (if source is not openai)
       if (sourceFormat !== FORMATS.OPENAI) {
@@ -120,6 +122,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
           reqLogger?.logOpenAIRequest?.(result);
         }
       }
+      if (result._toolNameMap instanceof Map) sourceToolNameMap = result._toolNameMap;
 
       // Step 2: openai -> target (if target is not openai)
       if (targetFormat !== FORMATS.OPENAI) {
@@ -139,7 +142,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     targetFormat === FORMATS.KIRO &&
     (sourceFormat === FORMATS.OPENAI || sourceFormat === FORMATS.CLAUDE);
   if (!kiroThinkingMappedByTranslator) {
-    applyThinking(targetFormat, model, result, provider, thinkingIntent);
+    applyThinking(targetFormat, model, result, provider, thinkingIntent, { preserveResponsesOptions: targetFormat === FORMATS.OPENAI_RESPONSES });
   }
 
   // Always normalize to clean OpenAI format when target is OpenAI
@@ -163,9 +166,22 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
       const { body: cloakedBody, toolNameMap } = cloakClaudeTools(result);
       result = cloakedBody;
       if (toolNameMap?.size > 0) {
-        result._toolNameMap = toolNameMap;
+        const merged = result._toolNameMap instanceof Map ? result._toolNameMap : new Map();
+        for (const [key, value] of toolNameMap) merged.set(key, value);
+        result._toolNameMap = merged;
       }
     }
+  }
+
+  if (sourceToolNameMap) {
+    const targetMap = result._toolNameMap instanceof Map ? result._toolNameMap : null;
+    const merged = new Map();
+    if (targetMap) for (const [key, value] of targetMap) merged.set(key, value);
+    for (const [key, value] of sourceToolNameMap) {
+      if (value !== null && typeof value === "object") merged.set(key, value);
+      else if (!merged.has(key)) merged.set(key, value);
+    }
+    if (merged.size > 0) result._toolNameMap = merged;
   }
 
   // Antigravity cloaking disabled

@@ -12,7 +12,7 @@ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, sav
 import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
 import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
-import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
+import { ROLE, RESPONSES_ITEM, OPENAI_FINISH } from "../../translator/schema/index.js";
 
 /**
  * Convert an OpenAI Chat Completions non-streaming response body into the
@@ -72,7 +72,10 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
   }
 
   const usage = responseBody.usage || {};
-  const status = choice.finish_reason === "tool_calls" ? "completed" : (choice.finish_reason === "stop" ? "completed" : (choice.finish_reason || "completed"));
+  // Responses has no "length"/"content_filter" status: a cut-off turn is `incomplete` with a reason.
+  const incompleteReason = choice.finish_reason === OPENAI_FINISH.LENGTH ? "max_output_tokens"
+    : choice.finish_reason === OPENAI_FINISH.CONTENT_FILTER ? "content_filter" : null;
+  const status = incompleteReason ? "incomplete" : "completed";
 
   return {
     id: `resp_${responseBody.id || ""}`.replace(/^resp_chatcmpl-/, "resp_"),
@@ -82,11 +85,14 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
     status,
     background: false,
     error: null,
+    ...(incompleteReason ? { incomplete_details: { reason: incompleteReason } } : {}),
     output,
     usage: {
       input_tokens: usage.prompt_tokens || usage.input_tokens || 0,
       output_tokens: usage.completion_tokens || usage.output_tokens || 0,
       total_tokens: usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
+      ...(usage.prompt_tokens_details ? { input_tokens_details: usage.prompt_tokens_details } : {}),
+      ...(usage.completion_tokens_details ? { output_tokens_details: usage.completion_tokens_details } : {}),
     },
   };
 }

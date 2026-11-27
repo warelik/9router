@@ -56,6 +56,9 @@ export default {
     {
       format: "openai-responses",
       baseUrl: "https://api.kimi.com/coding/v1/responses",
+      // Strict input: Codex multi-agent/delegation history items must be rewritten
+      // to portable user messages before dispatch.
+      quirks: { portableResponsesInput: true },
       auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["kimiHeaders"] },
     },
   ],
