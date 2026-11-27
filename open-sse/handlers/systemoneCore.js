@@ -60,8 +60,10 @@ export function buildSystemoneUrl(override, cfg) {
 /**
  * Core System One (Jev) handler — native decision payload pass-through.
  * URL/headers come from the registry's systemoneConfig; body and JSON response
- * are forwarded untouched (decision models have no chat translation layer), except that
- * Cloudflare's { result } envelope is unwrapped.
+ * are forwarded untouched (decision models have no chat translation layer).
+ * Providers whose REST API wraps the native result in an envelope (Cloudflare
+ * /ai/run: { success, result, errors }) declare systemoneConfig.responseRoot;
+ * only that envelope is removed, the native payload itself is not changed.
  *
  * @returns {Promise<{ success: boolean, response: Response, usage?: object, status?: number, error?: string }>}
  */
@@ -149,10 +151,20 @@ export async function handleSystemoneCore({
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
   }
 
-  // Cloudflare's REST API wraps the answer as { result: {...}, success, errors, messages }.
-  // Callers speak System One, so hand them the inner result like any other provider's.
-  if (responseBody?.result?.answers && !responseBody.answers) {
-    responseBody = responseBody.result;
+  const responseRoot = cfg.responseRoot;
+  if (responseRoot) {
+    if (responseBody?.success === false) {
+      const detail = Array.isArray(responseBody.errors) ? responseBody.errors.find((e) => e?.message)?.message : null;
+      return createErrorResult(
+        HTTP_STATUS.BAD_GATEWAY,
+        formatProviderError(new Error(detail || `${provider} reported an unsuccessful System One response`), provider, model, HTTP_STATUS.BAD_GATEWAY)
+      );
+    }
+    const native = responseBody?.[responseRoot];
+    if (!native || typeof native !== "object" || Array.isArray(native)) {
+      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid System One response from ${provider}: missing ${responseRoot}`);
+    }
+    responseBody = native;
   }
 
   if (onRequestSuccess) await onRequestSuccess();
