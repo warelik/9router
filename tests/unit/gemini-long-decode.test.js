@@ -195,6 +195,23 @@ describe("Antigravity (Cloud Code envelope) long decode", () => {
     expect(events.map((e) => e.response.candidates[0].finishReason).filter(Boolean)).toEqual(["STOP"]);
   });
 
+  it("leaves Hydrogen continuation to the native Gemini caller", async () => {
+    const native = {
+      candidates: [cand([{ text: "a" }], { finishReason: "CONTINUATION", continuationToken: "tok1" })],
+    };
+    fetchMock.mockResolvedValueOnce(jsonResponse({ response: native }));
+
+    const { response } = await ag.execute({
+      model: "gemini-4-hydrogen-high",
+      body: { contents, generationConfig: { maxOutputTokens: LONG } },
+      stream: false,
+      credentials: { ...credentials, nativeGeminiPassthrough: true },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(await response.json()).toEqual(native);
+  });
+
   it("still caps models without long decode at 64000", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ response: { candidates: [cand([{ text: "x" }], { finishReason: "STOP" })] } }));
     await run("gemini-4-argon-high", 300000);

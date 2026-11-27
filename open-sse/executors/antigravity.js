@@ -224,6 +224,16 @@ export class AntigravityExecutor extends BaseExecutor {
   }
 
   async execute(args) {
+    if (args.credentials?.nativeGeminiPassthrough) {
+      const nativeRequest = args.credentials.nativeGeminiRequest;
+      const error = validateAntigravityFieldMask(nativeRequest);
+      if (error) return { response: Response.json(error, { status: HTTP_STATUS.BAD_REQUEST }), headers: {}, url: null, transformedBody: null };
+      const jsonOutput = nativeGeminiRequestsJsonOutput(args.body);
+      const result = await super.execute(args);
+      result.response = await unwrapAntigravityResponse(result.response, args.stream, nativeRequest, { jsonOutput });
+      return result;
+    }
+
     let result = await super.execute(args);
     // A prompt rejection means systemInstruction carries text Google fingerprints that
     // ANTIGRAVITY_PROMPT_REWRITES does not cover yet. Retry once with that text moved into the first
@@ -527,19 +537,6 @@ export class AntigravityExecutor extends BaseExecutor {
       requestId: buildIdeRequestId({ body, request: transformedRequest, credentials, model, requestType: "agent" }),
       request: transformedRequest
     };
-  }
-
-  async execute(options) {
-    const jsonOutput = Boolean(options.credentials?.nativeGeminiPassthrough && nativeGeminiRequestsJsonOutput(options.body));
-    if (options.credentials?.nativeGeminiPassthrough) {
-      const error = validateAntigravityFieldMask(options.credentials.nativeGeminiRequest);
-      if (error) return { response: Response.json(error, { status: HTTP_STATUS.BAD_REQUEST }), headers: {}, url: null, transformedBody: null };
-    }
-    const result = await super.execute(options);
-    if (options.credentials?.nativeGeminiPassthrough) {
-      result.response = await unwrapAntigravityResponse(result.response, options.stream, options.credentials.nativeGeminiRequest, { jsonOutput });
-    }
-    return result;
   }
 
   async refreshCredentials(credentials, log, proxyOptions = null) {
