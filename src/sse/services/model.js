@@ -1,6 +1,7 @@
 // Re-export from open-sse with localDb integration
 import { getModelAliases, getComboByName, getProviderNodes, getProviderConnections } from "@/lib/localDb";
 import { parseModel as parseModelCore, resolveModelAliasFromMap, getModelInfoCore } from "open-sse/services/model.js";
+import { extractThinkingSuffix } from "open-sse/translator/concerns/thinkingUnified.js";
 import REGISTRY from "open-sse/providers/registry/index.js";
 
 // Local provider alias overrides (HMR-friendly, applied on top of open-sse map)
@@ -22,6 +23,17 @@ export function parseModel(modelStr) {
     return { ...parsed, provider: LOCAL_PROVIDER_ALIASES[parsed.providerAlias] };
   }
   return parsed;
+}
+
+async function resolveCombo(modelStr) {
+  if (typeof modelStr !== "string" || !modelStr || modelStr.includes("/")) return null;
+  const exact = await getComboByName(modelStr);
+  if (exact) return exact;
+  const { cleanModel, suffix } = extractThinkingSuffix(modelStr);
+  if (suffix && cleanModel && !cleanModel.includes("/")) {
+    return await getComboByName(cleanModel);
+  }
+  return null;
 }
 
 /**
@@ -68,11 +80,15 @@ export async function getModelInfo(modelStr) {
 
   // Check if this is a combo name before resolving as alias
   // This prevents combo names from being incorrectly routed to providers
-  const combo = await getComboByName(parsed.model);
+  const combo = await resolveCombo(parsed.model);
   if (combo) {
     // Return null provider to signal this should be handled as combo
     // The caller (handleChat) will detect this and handle it as combo
-    return { provider: null, model: parsed.model };
+    return {
+      provider: null,
+      model: combo.name,
+      ...(Array.isArray(combo.models) ? { comboModels: combo.models } : {}),
+    };
   }
 
   return fallbackToClaudeOAuth(await getModelInfoCore(modelStr, getModelAliases));
@@ -86,7 +102,7 @@ export async function getComboModels(modelStr) {
   // Only check if it's not in provider/model format
   if (modelStr.includes("/")) return null;
 
-  const combo = await getComboByName(modelStr);
+  const combo = await resolveCombo(modelStr);
   if (combo && combo.models && combo.models.length > 0) {
     return combo.models;
   }
