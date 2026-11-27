@@ -190,7 +190,7 @@ describe("functionResponse `$ref` sanitization", () => {
     const frs = out.contents.flatMap(c => c.parts).filter(p => p.functionResponse);
     expect(frs).toHaveLength(1);
     expect(JSON.stringify(frs[0].functionResponse.response)).not.toContain('"$ref"');
-    expect(frs[0].functionResponse.response.result._ref).toBe("#/$defs/Config");
+    expect(frs[0].functionResponse.response.result).toBe(JSON.stringify(schemaResult));
+    expect(JSON.parse(frs[0].functionResponse.response.result)).toEqual(schemaResult);
   });
 });
-

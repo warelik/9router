@@ -2,8 +2,49 @@ import { FORMATS } from "../translator/formats.js";
 import { fallbackToolCallId } from "../translator/concerns/toolCall.js";
 import { buildErrorBody } from "./error.js";
 import { SSE_DONE } from "./sseConstants.js";
+import { NATIVE_GEMINI_RESPONSE_FIELDS, NATIVE_GEMINI_BRIDGE_FIELDS, NATIVE_GEMINI_FORMATS } from "../config/runtimeConfig.js";
 
 const sharedEncoder = new TextEncoder();
+
+function nativeResponseProjectionAllowsEmpty(projection) {
+  return projection?.masks?.some(value => {
+    const mask = String(value ?? "").trim();
+    return mask.length > 0 && mask !== "*";
+  }) || false;
+}
+
+export function isValidNativeGeminiResponse(response, projection = null, allowUnrecognized = false, allowOpaqueExtensions = false) {
+  if (!response || typeof response !== "object" || Array.isArray(response)) return false;
+  const allowsEmpty = nativeResponseProjectionAllowsEmpty(projection);
+  if (!allowsEmpty && Object.keys(response).length === 0) return false;
+  if (response.error) return true;
+
+  const nativeResponse = response.response || response;
+  if (!nativeResponse || typeof nativeResponse !== "object" || Array.isArray(nativeResponse)) return false;
+  if (!allowsEmpty && Object.keys(nativeResponse).length === 0) return false;
+  if (nativeResponse.error) return true;
+  // GenerateContent metadata can be the whole reply. Keep unknown extensions
+  // opaque for non-streaming replies. An SSE transport-only frame must not
+  // become successful response evidence at EOF.
+  const nativeFields = NATIVE_GEMINI_RESPONSE_FIELDS;
+  const bridgeFields = NATIVE_GEMINI_BRIDGE_FIELDS;
+  const hasOpaqueExtension = Object.keys(nativeResponse).some(field => !bridgeFields.has(field));
+  if (!allowsEmpty && !allowUnrecognized && !nativeFields.some(field => Object.hasOwn(nativeResponse, field)) && !(allowOpaqueExtensions && hasOpaqueExtension)) return false;
+  if (nativeResponse.candidates !== undefined) {
+    if (!Array.isArray(nativeResponse.candidates)) return false;
+    for (const candidate of nativeResponse.candidates) {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+      if (candidate.content === undefined) continue;
+      const content = candidate.content;
+      if (!content || typeof content !== "object" || Array.isArray(content)) return false;
+      if (content.parts !== undefined && (
+        !Array.isArray(content.parts)
+        || content.parts.some(part => !part || typeof part !== "object" || Array.isArray(part))
+      )) return false;
+    }
+  }
+  return true;
+}
 
 // Parse SSE data line
 export function parseSSELine(line, format = null) {
@@ -56,8 +97,9 @@ export function hasValuableContent(chunk, format) {
     const hasText = chunk.delta?.text && chunk.delta.text !== "";
     const hasThinking = chunk.delta?.thinking && chunk.delta.thinking !== "";
     const hasInputJson = chunk.delta?.partial_json && chunk.delta.partial_json !== "";
+    const hasSignature = chunk.delta?.signature && chunk.delta.signature !== "";
     
-    if (isContentBlockDelta && !hasText && !hasThinking && !hasInputJson) {
+    if (isContentBlockDelta && !hasText && !hasThinking && !hasInputJson && !hasSignature) {
       return false;
     }
     return true;
@@ -183,6 +225,12 @@ export function formatSSE(data, sourceFormat) {
 // practice because detectFormatByEndpoint never resolves to OLLAMA.
 export function buildStreamErrorBytes(statusCode, message, clientFormat) {
   const { error } = buildErrorBody(statusCode, message);
+
+  if (NATIVE_GEMINI_FORMATS.includes(clientFormat)) {
+    // Gemini clients decode every data payload as JSON and terminate at EOF.
+    // Keep the numeric failure code instead of an OpenAI symbolic error code.
+    return sharedEncoder.encode(formatSSE({ error: { code: statusCode, message: error.message } }, clientFormat));
+  }
 
   const sse = clientFormat === FORMATS.CLAUDE
     ? formatSSE({ type: "error", error }, FORMATS.CLAUDE)

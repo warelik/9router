@@ -1,6 +1,6 @@
-import { detectFormat, getTargetFormat, resolveTransport } from "../services/provider.js";
+import { detectFormat, getTargetFormat, resolveTransport, supportsNativeGemini } from "../services/provider.js";
 import { translateRequest } from "../translator/index.js";
-import { applyThinking, extractThinking, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
+import { applyThinking, applyNativeGeminiThinking, extractThinking, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
 import { FORMATS } from "../translator/formats.js";
 import { toPortableResponsesInput } from "../translator/formats/responsesApi.js";
 import { hasUndeliverableAgentMessage, preparePortableCollaboration } from "../translator/concerns/portableCollaboration.js";
@@ -12,7 +12,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
 import { PROVIDERS } from "../config/providers.js";
 import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
 import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
-import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER } from "../config/runtimeConfig.js";
+import { HTTP_STATUS, PORTABLE_COLLABORATION, TOKEN_SAVER_HEADER, DEFAULT_PROVIDER_THINKING_BUDGET, REWRITTEN_RESPONSE_HEADERS, AISTUDIO_NATIVE_GEMINI_API_VERSION, NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES, NATIVE_GEMINI_FIELD_MASK_HEADER_NAME } from "../config/runtimeConfig.js";
 import { handleBypassRequest } from "../utils/bypassHandler.js";
 import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { getExecutor } from "../executors/index.js";
@@ -64,8 +64,10 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, reaAllowEnabled, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onRequestFailure, onDisconnect, clientRawRequest, clientSignal, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, reaAllowEnabled, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, serverPartsTenant = null, providerThinking, providerOverrides }) {
+  if (credentials) credentials._geminiServerPartsSessionId = null;
   const { provider, model } = modelInfo;
+  if (clientSignal?.aborted) return createErrorResult(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
   const requestStartTime = Date.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
   const sessionSeed = (() => {
@@ -111,7 +113,25 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // whose wire format has no supported transport (for example MiniMax-M3:
   // OpenAI clients should stay on /chat/completions; other clients can fall
   // back to its declared Claude target).
-  const targetFormat = useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
+  const nativeAntigravity = sourceFormat === FORMATS.GEMINI && provider === "antigravity"
+    && supportsNativeGemini(provider, model);
+  // The executor unwraps Cloud Code responses into Gemini for this source only.
+  // Its global Antigravity format remains in use for OpenAI/Claude/IDE clients.
+  const targetFormat = nativeAntigravity ? FORMATS.GEMINI
+    : useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
+  const nativeGemini = sourceFormat === FORMATS.GEMINI && targetFormat === FORMATS.GEMINI;
+  // A response projection can intentionally hide the native completion field.
+  // Keep this metadata out of the provider body and cache prefix.
+  const nativeResponseProjection = nativeGemini ? {
+    masks: [
+      ...(clientRawRequest?.queryParams || [])
+        .filter(([name]) => NATIVE_GEMINI_FIELD_MASK_QUERY_NAMES.includes(name))
+        .map(([, value]) => value),
+      ...Object.entries(clientRawRequest?.headers || {})
+        .filter(([name]) => name.toLowerCase() === NATIVE_GEMINI_FIELD_MASK_HEADER_NAME)
+        .map(([, value]) => value),
+    ],
+  } : null;
   // When the model guard rejects the source-matched transport, translation
   // must dispatch to the transport matching its target wire format.
   const effectiveTransport = useTransport || resolveTransport(provider, targetFormat);
@@ -120,11 +140,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   // Inject provider-level thinking config override (only if client hasn't set)
   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
-  if (providerThinking?.mode && providerThinking.mode !== "auto") {
+  if (!nativeGemini && providerThinking?.mode && providerThinking.mode !== "auto") {
     const mode = providerThinking.mode;
     if (mode === "on" && !body.thinking) {
       console.log("Injecting provider-level thinking config override: on");
-      body = { ...body, thinking: { type: "enabled", budget_tokens: 10000 } };
+      body = { ...body, thinking: { type: "enabled", budget_tokens: DEFAULT_PROVIDER_THINKING_BUDGET } };
     } else if (mode === "off" && !body.thinking) {
       body = { ...body, thinking: { type: "disabled" } };
     } else if (!body.reasoning_effort) {
@@ -147,7 +167,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const preTranslateRtkLine = formatRtkLog(preTranslateRtk);
   if (preTranslateRtkLine) console.log(preTranslateRtkLine);
 
-  const clientRequestedStreaming = body.stream === true || sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI;
+  const clientRequestedStreaming = body.stream === true || (body.stream !== false && (sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI));
   const providerRequiresStreaming = PROVIDERS[provider]?.forceStream === true;
   let stream = providerRequiresStreaming ? true : (body.stream !== false);
 
@@ -188,10 +208,21 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Native passthrough: CLI tool and provider are the same ecosystem
   // Skip all translation/normalization — only model and Bearer are swapped
   const clientTool = detectClientTool(clientRawRequest?.headers || {}, body);
-  const passthrough = isNativePassthrough(clientTool, provider);
+  const passthrough = nativeGemini || isNativePassthrough(clientTool, provider);
 
   // Expose raw client headers to translators/executors for session-id resolution
   if (credentials) credentials.rawHeaders = clientRawRequest?.headers || {};
+  if (provider === "antigravity" && credentials) credentials.nativeGeminiPassthrough = nativeAntigravity;
+  if (nativeGemini && credentials) {
+    credentials.nativeGeminiPassthrough = true;
+    credentials.nativeGeminiRequest = {
+      query: clientRawRequest?.queryParams,
+      headers: clientRawRequest?.headers || {},
+      // Client and provider versions are separate routing decisions. The
+      // browser-authenticated AIStudio generation API uses its beta wire.
+      apiVersion: provider === "aistudio" ? AISTUDIO_NATIVE_GEMINI_API_VERSION : clientRawRequest?.apiVersion,
+    };
+  }
 
   // Auto-strip media blocks the model can't read (vision/audio/pdf) before translation.
   if (!passthrough) {
@@ -212,6 +243,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   if (passthrough) {
     log?.debug?.("PASSTHROUGH", `${clientTool} → ${provider} | native lossless`);
     translatedBody = { ...body, model: stripThinkingSuffix(upstreamModel) };
+    if (nativeGemini) {
+      translatedBody = applyNativeGeminiThinking(upstreamModel, translatedBody, provider, providerThinking);
+      // Routing/action controls belong to the router, not GenerateContent JSON.
+      delete translatedBody.model;
+      delete translatedBody.stream;
+    }
     if (provider === "codex") {
       const suffixThinking = {};
       applyThinking(sourceFormat, upstreamModel, suffixThinking, provider);
@@ -227,7 +264,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     // Normalize newer Cowork/CC beta shapes (adaptive thinking, mid-conversation system) the API rejects
     if (clientTool === "claude") normalizeClaudePassthrough(translatedBody, translatedBody.model);
   } else {
-    translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool);
+    translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool, serverPartsTenant);
     if (!translatedBody) {
       trackPendingRequest(model, provider, connectionId, false, true);
       return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Failed to translate request for ${sourceFormat} → ${targetFormat}`);
@@ -375,6 +412,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${model} | ${msgCount} msgs`);
 
   const streamController = createStreamController({
+    clientSignal,
     onDisconnect: (reason) => {
       trackPendingRequest(model, provider, connectionId, false);
       if (onDisconnect) onDisconnect(reason);
@@ -387,6 +425,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     connectionProxyEnabled: credentials?.providerSpecificData?.connectionProxyEnabled === true,
     connectionProxyUrl: credentials?.providerSpecificData?.connectionProxyUrl || "",
     connectionNoProxy: credentials?.providerSpecificData?.connectionNoProxy || "",
+    strictProxy: credentials?.providerSpecificData?.strictProxy === true,
     vercelRelayUrl: credentials?.providerSpecificData?.vercelRelayUrl || "",
     // Strict pools must never silently fall back to a direct connection —
     // honored on the Cursor AgentService h2 path and in proxyFetch (#4333).
@@ -427,7 +466,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   let providerResponseFormat = targetFormat;
   try {
     const result = await executor.execute({
-      model,
+      model: nativeGemini ? stripThinkingSuffix(upstreamModel) : model,
       body: translatedBody,
       stream,
       credentials,
@@ -496,7 +535,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         }
         try {
           const retryResult = await executor.execute({
-            model,
+            model: nativeGemini ? stripThinkingSuffix(upstreamModel) : model,
             body: translatedBody,
             stream,
             credentials,
@@ -523,6 +562,17 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   // Provider returned error
   if (!providerResponse.ok) {
+    let nativeErrorResponse = null;
+    if (nativeGemini) {
+      const headers = new Headers(providerResponse.headers);
+      // fetch exposes decoded bytes; forwarding compressed-length headers makes
+      // native clients decompress them twice or wait for bytes that cannot arrive.
+      for (const name of REWRITTEN_RESPONSE_HEADERS) headers.delete(name);
+      headers.set("Access-Control-Allow-Origin", "*");
+      nativeErrorResponse = new Response(providerResponse.clone().body, {
+        status: providerResponse.status, statusText: providerResponse.statusText, headers,
+      });
+    }
     trackPendingRequest(model, provider, connectionId, false, true);
     const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
     appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
@@ -543,10 +593,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       log.errorLine(reqTag, "✗", `ERROR ${statusCode} · ${provider}/${model} · ${Date.now() - requestStartTime}ms${urlStr}\n    ${errMsg}`);
     }
     reqLogger.logError(new Error(message), finalBody || translatedBody);
-    return createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
+    const result = createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
+    return nativeErrorResponse ? { ...result, response: nativeErrorResponse, nativeResponse: true } : result;
   }
 
-  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };
+  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, onRequestFailure, pxpipe: pxpipeSummary, reqTag, log, nativeResponseProjection };
   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
 
@@ -561,7 +612,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   // True non-streaming response
   if (!stream) {
-    const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, customToolNames, trackDone, appendLog });
+    const result = await handleNonStreamingResponse({ ...sharedCtx, credentials, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, customToolNames, trackDone, appendLog });
     streamController.handleComplete();
     return result;
   }
